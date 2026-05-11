@@ -1,0 +1,1498 @@
+use std::{
+    collections::{HashMap, VecDeque},
+    error::Error as StdError,
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use futures_util::future::try_join_all;
+use once_cell::sync::Lazy;
+use reqwest::StatusCode;
+use serde::{Deserialize, Serialize};
+
+use crate::client::{Client, CommitReceiveOutcome, EpochChangeOutput};
+use crate::http_retry::{
+    is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
+    retry_transient_http_async, RetryDecision,
+};
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "cmd", rename_all = "snake_case")]
+pub enum Command {
+    CreateGroup,
+    GenerateKeyPackage,
+    AddMembers {
+        members: Vec<String>,
+    },
+    JoinFromWelcome,
+    SendApplicationMessage {
+        message: String,
+    },
+    ReceiveApplicationMessage {
+        profile: bool,
+    },
+    SelfUpdate,
+    RemoveMembers {
+        members: Vec<String>,
+    },
+    ReceiveCommit,
+    ProcessPending {
+        kinds: Option<Vec<PendingKind>>,
+        max_messages: Option<usize>,
+        expected_epoch: Option<u64>,
+    },
+    ShowGroupState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    Commits,
+    Welcomes,
+    ApplicationMessages,
+}
+
+impl Command {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::CreateGroup => "CreateGroup",
+            Command::GenerateKeyPackage => "GenerateKeyPackage",
+            Command::AddMembers { .. } => "AddMembers",
+            Command::JoinFromWelcome => "JoinFromWelcome",
+            Command::SendApplicationMessage { .. } => "SendApplicationMessage",
+            Command::ReceiveApplicationMessage { .. } => "ReceiveApplicationMessage",
+            Command::SelfUpdate => "SelfUpdate",
+            Command::RemoveMembers { .. } => "RemoveMembers",
+            Command::ReceiveCommit => "ReceiveCommit",
+            Command::ProcessPending { .. } => "ProcessPending",
+            Command::ShowGroupState => "ShowGroupState",
+        }
+    }
+
+    pub fn is_mls_mutating(&self) -> bool {
+        matches!(
+            self,
+            Command::CreateGroup
+                | Command::AddMembers { .. }
+                | Command::JoinFromWelcome
+                | Command::SelfUpdate
+                | Command::RemoveMembers { .. }
+                | Command::ReceiveCommit
+                | Command::ProcessPending { .. }
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRequestEnvelope {
+    pub request_id: String,
+    pub command: Command,
+    #[serde(default)]
+    pub expected_epoch: Option<u64>,
+    #[serde(default)]
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum IncomingCommandRequest {
+    Envelope(CommandRequestEnvelope),
+    Raw(Command),
+}
+
+impl IncomingCommandRequest {
+    pub fn into_parts(self) -> (Option<String>, Command, Option<u64>, Option<String>) {
+        match self {
+            IncomingCommandRequest::Envelope(envelope) => (
+                Some(envelope.request_id),
+                envelope.command,
+                envelope.expected_epoch,
+                envelope.phase,
+            ),
+            IncomingCommandRequest::Raw(command) => (None, command, None, None),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandResponse {
+    pub status: String,
+    pub message: String,
+}
+
+impl CommandResponse {
+    pub fn ok(message: impl Into<String>) -> Self {
+        Self {
+            status: "ok".to_string(),
+            message: message.into(),
+        }
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            status: "error".to_string(),
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCommandRequest {
+    pub items: Vec<BatchCommandItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCommandItem {
+    pub client_id: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub command: Command,
+    #[serde(default)]
+    pub expected_epoch: Option<u64>,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub profile: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCommandResponse {
+    pub items: Vec<BatchCommandResult>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchCommandResult {
+    pub client_id: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub response: CommandResponse,
+}
+
+#[derive(Debug, Clone)]
+struct CachedCommandResponse {
+    response: CommandResponse,
+    completed_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct CompletedCommandCache {
+    entries: HashMap<String, CachedCommandResponse>,
+    order: VecDeque<String>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl CompletedCommandCache {
+    pub fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+            ttl,
+        }
+    }
+
+    pub fn get(&mut self, request_id: &str) -> Option<CommandResponse> {
+        self.prune_expired();
+        self.entries
+            .get(request_id)
+            .map(|cached| cached.response.clone())
+    }
+
+    pub fn insert(&mut self, request_id: String, response: CommandResponse) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        self.prune_expired();
+
+        if !self.entries.contains_key(&request_id) {
+            self.order.push_back(request_id.clone());
+        }
+
+        self.entries.insert(
+            request_id,
+            CachedCommandResponse {
+                response,
+                completed_at: Instant::now(),
+            },
+        );
+
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn prune_expired(&mut self) {
+        if self.ttl.is_zero() {
+            self.entries.clear();
+            self.order.clear();
+            return;
+        }
+
+        let now = Instant::now();
+
+        while let Some(request_id) = self.order.front() {
+            let expired = self
+                .entries
+                .get(request_id)
+                .map(|cached| now.duration_since(cached.completed_at) > self.ttl)
+                .unwrap_or(true);
+
+            if !expired {
+                break;
+            }
+
+            let request_id = self.order.pop_front().expect("front checked above");
+            self.entries.remove(&request_id);
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct GroupStatePutRequest {
+    members: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum PendingIntent {
+    AddMembers {
+        members: Vec<String>,
+        key_package_bytes_list: Vec<Vec<u8>>,
+    },
+    RemoveMembers {
+        members: Vec<String>,
+    },
+    SelfUpdate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_command_cache_replays_same_request_once() {
+        let mut cache = CompletedCommandCache::new(8, Duration::from_secs(60));
+        let response = CommandResponse::ok("mutating command processed");
+
+        assert!(cache.get("req-1").is_none());
+
+        cache.insert("req-1".to_string(), response.clone());
+
+        let replayed = cache
+            .get("req-1")
+            .expect("cached response should be available");
+        assert_eq!(replayed.status, response.status);
+        assert_eq!(replayed.message, response.message);
+    }
+
+    #[test]
+    fn completed_command_cache_is_bounded() {
+        let mut cache = CompletedCommandCache::new(2, Duration::from_secs(60));
+
+        cache.insert("req-1".to_string(), CommandResponse::ok("one"));
+        cache.insert("req-2".to_string(), CommandResponse::ok("two"));
+        cache.insert("req-3".to_string(), CommandResponse::ok("three"));
+
+        assert!(cache.get("req-1").is_none());
+        assert!(cache.get("req-2").is_some());
+        assert!(cache.get("req-3").is_some());
+    }
+}
+
+pub enum DsPostResult {
+    Ok,
+    Conflict(String),
+}
+
+static CONTROL_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_millis(worker_http_connect_timeout_ms()))
+        .timeout(Duration::from_millis(worker_http_request_timeout_ms()))
+        .pool_max_idle_per_host(control_http_pool_max_idle_per_host())
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .build()
+        .expect("failed to build shared worker control HTTP client")
+});
+
+static OUTBOUND_HTTP_SEMAPHORE: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(worker_outbound_http_permits()));
+
+fn control_http_pool_max_idle_per_host() -> usize {
+    std::env::var("OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST")
+        .or_else(|_| std::env::var("OPENMLS_BENCH_HTTP_POOL_MAX_IDLE_PER_HOST"))
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(32)
+}
+
+fn worker_http_connect_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(5_000)
+}
+
+fn worker_http_request_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30_000)
+}
+
+fn worker_outbound_http_permits() -> usize {
+    std::env::var("OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|permits| *permits > 0)
+        .unwrap_or(32)
+}
+
+fn control_http_client() -> &'static reqwest::Client {
+    &CONTROL_HTTP_CLIENT
+}
+
+async fn acquire_outbound_http_permit() -> tokio::sync::SemaphorePermit<'static> {
+    OUTBOUND_HTTP_SEMAPHORE
+        .acquire()
+        .await
+        .expect("worker outbound HTTP semaphore was closed")
+}
+
+fn transient_or_fatal<T>(err: reqwest::Error) -> RetryDecision<T> {
+    if is_transient_reqwest_error(&err) {
+        RetryDecision::Transient(reqwest_error_diagnostic(&err))
+    } else {
+        RetryDecision::Fatal(anyhow!(err))
+    }
+}
+
+fn reqwest_error_diagnostic(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("top_level={}", err));
+    parts.push(format!("is_connect={}", err.is_connect()));
+    parts.push(format!("is_timeout={}", err.is_timeout()));
+    parts.push(format!("is_request={}", err.is_request()));
+    parts.push(format!("is_body={}", err.is_body()));
+    parts.push(format!(
+        "connect_stage={}",
+        is_connect_stage_reqwest_error(err)
+    ));
+
+    let mut source = err.source();
+    let mut idx = 0usize;
+    while let Some(err) = source {
+        parts.push(format!("source[{}]={}", idx, err));
+        source = err.source();
+        idx += 1;
+    }
+
+    parts.join("; ")
+}
+
+async fn read_response_text(response: reqwest::Response) -> String {
+    response.text().await.unwrap_or_default()
+}
+
+pub async fn ds_post_bytes_allow_conflict(
+    ds_url: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    op: &str,
+    client_id: &str,
+) -> Result<DsPostResult> {
+    let url = format!("{ds_url}{path}");
+    let http = control_http_client();
+
+    retry_transient_http_async(op, Some(client_id), &url, || {
+        let request_bytes = bytes.clone();
+        async {
+            let _permit = acquire_outbound_http_permit().await;
+            let response = match http.post(&url).body(request_bytes).send().await {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
+
+            let status = response.status();
+
+            if status.is_success() {
+                return RetryDecision::Success(DsPostResult::Ok);
+            }
+
+            let body = read_response_text(response).await;
+
+            if status == StatusCode::CONFLICT {
+                return RetryDecision::Success(DsPostResult::Conflict(body));
+            }
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            RetryDecision::Fatal(anyhow!("DS POST failed with status {}: {}", status, body))
+        }
+    })
+    .await
+}
+
+pub async fn ds_post_bytes(
+    ds_url: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    op: &str,
+    client_id: &str,
+) -> Result<()> {
+    match ds_post_bytes_allow_conflict(ds_url, path, bytes, op, client_id).await? {
+        DsPostResult::Ok => Ok(()),
+        DsPostResult::Conflict(message) => Err(anyhow!("Unexpected DS conflict: {}", message)),
+    }
+}
+
+pub async fn ds_put_json<T: Serialize>(
+    ds_url: &str,
+    path: &str,
+    body: &T,
+    op: &str,
+    client_id: &str,
+) -> Result<()> {
+    let url = format!("{ds_url}{path}");
+    let http = control_http_client();
+
+    retry_transient_http_async(op, Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.put(&url).json(body).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if status.is_success() {
+            return RetryDecision::Success(());
+        }
+
+        let response_body = read_response_text(response).await;
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, response_body));
+        }
+
+        RetryDecision::Fatal(anyhow!(
+            "DS PUT failed with status {}: {}",
+            status,
+            response_body
+        ))
+    })
+    .await
+}
+
+pub async fn ds_get_bytes(ds_url: &str, path: &str, op: &str, client_id: &str) -> Result<Vec<u8>> {
+    let url = format!("{ds_url}{path}");
+    let http = control_http_client();
+
+    retry_transient_http_async(op, Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_response_text(response).await;
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            return RetryDecision::Fatal(anyhow!("DS GET failed with status {}: {}", status, body));
+        }
+
+        match response.bytes().await {
+            Ok(bytes) => RetryDecision::Success(bytes.to_vec()),
+            Err(err) => transient_or_fatal(err),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingCommitDeliveryResponse {
+    id: String,
+    group_id: String,
+    epoch: u64,
+    sender: String,
+    commit_hex: String,
+}
+
+async fn ds_get_pending_commit_delivery(
+    ds_url: &str,
+    client_id: &str,
+) -> Result<PendingCommitDeliveryResponse> {
+    let url = format!("{ds_url}/commit/{client_id}/pending");
+    let http = control_http_client();
+
+    retry_transient_http_async("fetch_pending_commit", Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_response_text(response).await;
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            return RetryDecision::Fatal(anyhow!(
+                "DS pending commit GET failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        match response.json::<PendingCommitDeliveryResponse>().await {
+            Ok(delivery) => RetryDecision::Success(delivery),
+            Err(err) => transient_or_fatal(err),
+        }
+    })
+    .await
+}
+
+async fn ds_ack_commit_delivery(ds_url: &str, client_id: &str, delivery_id: &str) -> Result<()> {
+    let url = format!("{ds_url}/commit/{client_id}/ack/{delivery_id}");
+    let http = control_http_client();
+
+    retry_transient_http_async("ack_commit", Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.post(&url).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if status.is_success() {
+            return RetryDecision::Success(());
+        }
+
+        let body = read_response_text(response).await;
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+        }
+
+        RetryDecision::Fatal(anyhow!(
+            "DS ack commit failed with status {}: {}",
+            status,
+            body
+        ))
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingCommitResponse {
+    group_id: String,
+    epoch: u64,
+    sender: String,
+    commit_hex: String,
+}
+
+async fn ds_get_pending_commits(
+    ds_url: &str,
+    client_id: &str,
+    after_epoch: u64,
+) -> Result<Vec<PendingCommitResponse>> {
+    let url = format!("{ds_url}/commits/pending?client={client_id}&after_epoch={after_epoch}");
+    let http = control_http_client();
+
+    retry_transient_http_async("fetch_pending_commits", Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_response_text(response).await;
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            return RetryDecision::Fatal(anyhow!(
+                "DS pending commits GET failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        match response.json::<Vec<PendingCommitResponse>>().await {
+            Ok(commits) => RetryDecision::Success(commits),
+            Err(err) => transient_or_fatal(err),
+        }
+    })
+    .await
+}
+
+pub async fn relay_post_application_message(
+    relay_url: &str,
+    group_id: &str,
+    sender: &str,
+    recipients: &[String],
+    bytes: Vec<u8>,
+) -> Result<()> {
+    let url = format!(
+        "{}/group/{}/application-message/{}",
+        relay_url.trim_end_matches('/'),
+        group_id,
+        sender
+    );
+
+    let recipients_header = recipients.join(",");
+    let http = control_http_client();
+
+    retry_transient_http_async(
+        "relay.publish_application_message",
+        Some(sender),
+        &url,
+        || {
+            let recipients_header = recipients_header.clone();
+            let request_bytes = bytes.clone();
+            async {
+                let _permit = acquire_outbound_http_permit().await;
+                let response = match http
+                    .post(&url)
+                    .header("x-recipients", recipients_header)
+                    .body(request_bytes)
+                    .send()
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(err) => return transient_or_fatal(err),
+                };
+
+                let status = response.status();
+
+                if status.is_success() {
+                    return RetryDecision::Success(());
+                }
+
+                let body = read_response_text(response).await;
+
+                if is_transient_status(status) {
+                    return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+                }
+
+                RetryDecision::Fatal(anyhow!(
+                    "Relay POST failed with status {}: {}",
+                    status,
+                    body
+                ))
+            }
+        },
+    )
+    .await
+}
+
+pub async fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result<Vec<u8>> {
+    let url = format!(
+        "{}/application-message/{}",
+        relay_url.trim_end_matches('/'),
+        recipient
+    );
+    let http = control_http_client();
+
+    retry_transient_http_async(
+        "relay.fetch_application_message",
+        Some(recipient),
+        &url,
+        || async {
+            let _permit = acquire_outbound_http_permit().await;
+            let response = match http.get(&url).send().await {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
+
+            let status = response.status();
+
+            if !status.is_success() {
+                let body = read_response_text(response).await;
+
+                if is_transient_status(status) {
+                    return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+                }
+
+                return RetryDecision::Fatal(anyhow!(
+                    "Relay GET failed with status {}: {}",
+                    status,
+                    body
+                ));
+            }
+
+            match response.bytes().await {
+                Ok(bytes) => RetryDecision::Success(bytes.to_vec()),
+                Err(err) => transient_or_fatal(err),
+            }
+        },
+    )
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingApplicationMessageResponse {
+    id: String,
+    group_id: String,
+    sender: String,
+    message_hex: String,
+}
+
+async fn relay_get_pending_application_message(
+    relay_url: &str,
+    recipient: &str,
+) -> Result<PendingApplicationMessageResponse> {
+    let url = format!(
+        "{}/application-message/{}/pending",
+        relay_url.trim_end_matches('/'),
+        recipient
+    );
+    let http = control_http_client();
+
+    retry_transient_http_async(
+        "relay.fetch_pending_application_message",
+        Some(recipient),
+        &url,
+        || async {
+            let _permit = acquire_outbound_http_permit().await;
+            let response = match http.get(&url).send().await {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
+
+            let status = response.status();
+
+            if !status.is_success() {
+                let body = read_response_text(response).await;
+
+                if is_transient_status(status) {
+                    return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+                }
+
+                return RetryDecision::Fatal(anyhow!(
+                    "Relay pending message GET failed with status {}: {}",
+                    status,
+                    body
+                ));
+            }
+
+            match response.json::<PendingApplicationMessageResponse>().await {
+                Ok(message) => RetryDecision::Success(message),
+                Err(err) => transient_or_fatal(err),
+            }
+        },
+    )
+    .await
+}
+
+async fn relay_ack_application_message(
+    relay_url: &str,
+    recipient: &str,
+    message_id: &str,
+) -> Result<()> {
+    let url = format!(
+        "{}/application-message/{}/ack/{}",
+        relay_url.trim_end_matches('/'),
+        recipient,
+        message_id
+    );
+    let http = control_http_client();
+
+    retry_transient_http_async(
+        "relay.ack_application_message",
+        Some(recipient),
+        &url,
+        || async {
+            let _permit = acquire_outbound_http_permit().await;
+            let response = match http.post(&url).send().await {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
+
+            let status = response.status();
+
+            if status.is_success() {
+                return RetryDecision::Success(());
+            }
+
+            let body = read_response_text(response).await;
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            RetryDecision::Fatal(anyhow!(
+                "Relay ack application message failed with status {}: {}",
+                status,
+                body
+            ))
+        },
+    )
+    .await
+}
+
+pub async fn update_ds_group_state(client: &Client, ds_url: &str) -> Result<()> {
+    let group_id = client.group_id_hex()?;
+    let epoch = client.current_epoch_u64()?;
+    let members = client.member_names()?;
+
+    let path = format!("/group/{group_id}/state/{epoch}");
+    let body = GroupStatePutRequest { members };
+
+    ds_put_json(ds_url, &path, &body, "update_group_state", &client.name).await
+}
+
+pub async fn publish_epoch_change(
+    client: &mut Client,
+    ds_url: &str,
+    result: EpochChangeOutput,
+) -> Result<DsPostResult> {
+    let group_id = client.group_id_hex()?;
+    let epoch = client.current_epoch_u64()?;
+    let path = format!("/group/{group_id}/commit/{}/{epoch}", client.name);
+
+    ds_post_bytes_allow_conflict(
+        ds_url,
+        &path,
+        result.commit_bytes,
+        "submit_commit",
+        &client.name,
+    )
+    .await
+}
+
+pub async fn try_start_intent(
+    client: &mut Client,
+    ds_url: &str,
+    intent: &PendingIntent,
+) -> Result<DsPostResult> {
+    let result = match intent {
+        PendingIntent::AddMembers {
+            members,
+            key_package_bytes_list,
+        } => client.add_members(key_package_bytes_list, members)?,
+        PendingIntent::RemoveMembers { members } => client.remove_members(members)?,
+        PendingIntent::SelfUpdate => client.self_update()?,
+    };
+
+    match publish_epoch_change(client, ds_url, result).await? {
+        DsPostResult::Ok => Ok(DsPostResult::Ok),
+        DsPostResult::Conflict(message) => {
+            client.rollback_pending_commit()?;
+            Ok(DsPostResult::Conflict(message))
+        }
+    }
+}
+
+pub async fn maybe_retry_pending_intent(
+    client: &mut Client,
+    ds_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+) -> Result<Option<String>> {
+    let Some(intent) = queued_intent.clone() else {
+        return Ok(None);
+    };
+
+    match try_start_intent(client, ds_url, &intent).await? {
+        DsPostResult::Ok => {
+            *queued_intent = None;
+
+            let text = match intent {
+                PendingIntent::AddMembers { members, .. } => {
+                    format!(
+                        "queued add_members for {:?} was retried and published",
+                        members
+                    )
+                }
+                PendingIntent::RemoveMembers { members } => {
+                    format!(
+                        "queued remove_members for {:?} was retried and published",
+                        members
+                    )
+                }
+                PendingIntent::SelfUpdate => {
+                    "queued self_update was retried and published".to_string()
+                }
+            };
+
+            Ok(Some(text))
+        }
+        DsPostResult::Conflict(message) => {
+            *queued_intent = Some(intent);
+            Ok(Some(format!(
+                "queued intent retry still conflicted and remains queued: {}",
+                message
+            )))
+        }
+    }
+}
+
+async fn apply_commit_bytes(
+    client: &mut Client,
+    ds_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    commit_bytes: &[u8],
+) -> Result<String> {
+    match client.receive_commit(commit_bytes)? {
+        CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
+            if self_removed {
+                *queued_intent = None;
+                Ok("external commit received and processed; this client was removed and local group state was cleared".to_string())
+            } else {
+                update_ds_group_state(client, ds_url).await?;
+
+                let retry_message =
+                    maybe_retry_pending_intent(client, ds_url, queued_intent).await?;
+
+                match retry_message {
+                    Some(text) => Ok(format!(
+                        "external commit received and processed; DS group state updated; {}",
+                        text
+                    )),
+                    None => Ok(
+                        "external commit received and processed; DS group state updated"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+
+        CommitReceiveOutcome::OwnCommitAccepted {
+            self_removed,
+            welcome_recipients,
+            welcome_bytes,
+            ratchet_tree_bytes,
+        } => {
+            if self_removed {
+                *queued_intent = None;
+                Ok("own commit accepted from DS; this client was removed and local group state was cleared".to_string())
+            } else {
+                if let (Some(welcome), Some(tree)) = (welcome_bytes, ratchet_tree_bytes) {
+                    let client_id = client.name.clone();
+                    let publish_tasks = welcome_recipients.iter().map(|recipient| {
+                        let recipient = recipient.clone();
+                        let welcome = welcome.clone();
+                        let tree = tree.clone();
+                        let client_id = client_id.clone();
+                        async move {
+                            let welcome_path = format!("/welcome/{recipient}");
+                            ds_post_bytes(
+                                ds_url,
+                                &welcome_path,
+                                welcome.clone(),
+                                "store_welcome",
+                                &client_id,
+                            )
+                            .await?;
+
+                            let tree_path = format!("/ratchet-tree/{recipient}");
+                            ds_post_bytes(
+                                ds_url,
+                                &tree_path,
+                                tree.clone(),
+                                "store_ratchet_tree",
+                                &client_id,
+                            )
+                            .await
+                        }
+                    });
+                    try_join_all(publish_tasks).await?;
+                }
+
+                update_ds_group_state(client, ds_url).await?;
+                Ok(
+                    "own commit accepted from DS; local state updated and welcome/tree published"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
+fn current_epoch_reached(client: &Client, epoch: u64) -> bool {
+    client
+        .current_epoch_u64()
+        .map(|current| current >= epoch)
+        .unwrap_or(false)
+}
+
+async fn ack_commit_delivery_best_effort(
+    ds_url: &str,
+    client_id: &str,
+    delivery_id: &str,
+    delivery_epoch: u64,
+) -> bool {
+    match ds_ack_commit_delivery(ds_url, client_id, delivery_id).await {
+        Ok(()) => true,
+        Err(err) => {
+            eprintln!(
+                "[delivery-ack] commit ack failed client={} delivery_id={} epoch={} error={:#}",
+                client_id, delivery_id, delivery_epoch, err
+            );
+            false
+        }
+    }
+}
+
+async fn receive_commit_delivery(
+    client: &mut Client,
+    ds_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    expected_epoch: Option<u64>,
+) -> Result<String> {
+    let mut stale_acked = 0usize;
+
+    loop {
+        let delivery = match ds_get_pending_commit_delivery(ds_url, &client.name).await {
+            Ok(delivery) => delivery,
+            Err(err) => {
+                if let Some(expected) = expected_epoch {
+                    if current_epoch_reached(client, expected) {
+                        return Ok(format!(
+                            "commit already applied; no pending delivery and current epoch has reached expected_epoch={} stale_acked={}",
+                            expected, stale_acked
+                        ));
+                    }
+                }
+
+                return Err(err);
+            }
+        };
+
+        if current_epoch_reached(client, delivery.epoch) {
+            let acked =
+                ack_commit_delivery_best_effort(ds_url, &client.name, &delivery.id, delivery.epoch)
+                    .await;
+            if !acked {
+                if let Some(expected) = expected_epoch {
+                    if current_epoch_reached(client, expected) {
+                        return Ok(format!(
+                            "commit already applied; stale delivery ack failed but current epoch has reached expected_epoch={} delivery_id={} group={} epoch={} sender={}",
+                            expected, delivery.id, delivery.group_id, delivery.epoch, delivery.sender
+                        ));
+                    }
+                }
+
+                return Err(anyhow!(
+                    "stale commit delivery could not be acked before next receive: delivery_id={} group={} epoch={} sender={}",
+                    delivery.id,
+                    delivery.group_id,
+                    delivery.epoch,
+                    delivery.sender
+                ));
+            }
+
+            stale_acked += 1;
+            if let Some(expected) = expected_epoch {
+                if current_epoch_reached(client, expected) {
+                    return Ok(format!(
+                        "commit delivery already applied; delivery_id={} group={} epoch={} sender={} stale_acked={}",
+                        delivery.id, delivery.group_id, delivery.epoch, delivery.sender, stale_acked
+                    ));
+                }
+            }
+            continue;
+        }
+
+        let commit_bytes = hex::decode(&delivery.commit_hex).with_context(|| {
+            format!(
+                "decode pending commit delivery id={} group={} epoch={} sender={}",
+                delivery.id, delivery.group_id, delivery.epoch, delivery.sender
+            )
+        })?;
+
+        let result = apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await?;
+        ack_commit_delivery_best_effort(ds_url, &client.name, &delivery.id, delivery.epoch).await;
+
+        return Ok(format!(
+            "{}; commit_delivery_id={} group={} epoch={} sender={} stale_acked={}",
+            result, delivery.id, delivery.group_id, delivery.epoch, delivery.sender, stale_acked
+        ));
+    }
+}
+
+async fn ack_application_message_best_effort(
+    relay_url: &str,
+    client_id: &str,
+    message_id: &str,
+    group_id: &str,
+    sender: &str,
+) {
+    if let Err(err) = relay_ack_application_message(relay_url, client_id, message_id).await {
+        eprintln!(
+            "[delivery-ack] application message ack failed client={} message_id={} group={} sender={} error={:#}",
+            client_id, message_id, group_id, sender, err
+        );
+    }
+}
+
+fn looks_like_duplicate_application_receive(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("replay")
+        || lower.contains("duplicate")
+        || lower.contains("already")
+        || lower.contains("generation")
+        || lower.contains("out of order")
+        || lower.contains("stale")
+}
+
+async fn receive_application_delivery(
+    client: &mut Client,
+    relay_url: &str,
+    profile: bool,
+) -> Result<String> {
+    let delivery = relay_get_pending_application_message(relay_url, &client.name).await?;
+    let message_bytes = hex::decode(&delivery.message_hex).with_context(|| {
+        format!(
+            "decode pending application message id={} group={} sender={}",
+            delivery.id, delivery.group_id, delivery.sender
+        )
+    })?;
+
+    match client.receive_application_message(&message_bytes, profile) {
+        Ok(plaintext) => {
+            ack_application_message_best_effort(
+                relay_url,
+                &client.name,
+                &delivery.id,
+                &delivery.group_id,
+                &delivery.sender,
+            )
+            .await;
+            let text = String::from_utf8_lossy(&plaintext).to_string();
+            Ok(format!(
+                "application message received: {}; message_id={} group={} sender={}",
+                text, delivery.id, delivery.group_id, delivery.sender
+            ))
+        }
+        Err(err) => {
+            let text = format!("{:#}", err);
+            if looks_like_duplicate_application_receive(&text) {
+                ack_application_message_best_effort(
+                    relay_url,
+                    &client.name,
+                    &delivery.id,
+                    &delivery.group_id,
+                    &delivery.sender,
+                )
+                .await;
+                return Ok(format!(
+                    "application message already processed: message_id={} group={} sender={}",
+                    delivery.id, delivery.group_id, delivery.sender
+                ));
+            }
+
+            Err(anyhow!(text))
+        }
+    }
+}
+
+async fn process_pending(
+    client: &mut Client,
+    ds_url: &str,
+    relay_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    kinds: Option<Vec<PendingKind>>,
+    max_messages: Option<usize>,
+    expected_epoch: Option<u64>,
+) -> Result<String> {
+    let kinds = kinds.unwrap_or_else(|| {
+        vec![
+            PendingKind::Commits,
+            PendingKind::Welcomes,
+            PendingKind::ApplicationMessages,
+        ]
+    });
+    let max_messages = max_messages.unwrap_or(usize::MAX);
+    let mut remaining = max_messages;
+    let mut commits_processed = 0usize;
+    let mut welcomes_processed = 0usize;
+    let mut application_messages_processed = 0usize;
+    let mut errors = Vec::new();
+
+    if remaining > 0 && kinds.contains(&PendingKind::Commits) {
+        let after_epoch = client.current_epoch_u64().unwrap_or(0);
+        let pending_commits = ds_get_pending_commits(ds_url, &client.name, after_epoch).await?;
+
+        for pending in pending_commits.into_iter().take(remaining) {
+            let commit_bytes = hex::decode(&pending.commit_hex).with_context(|| {
+                format!(
+                    "decode pending commit group={} epoch={} sender={}",
+                    pending.group_id, pending.epoch, pending.sender
+                )
+            })?;
+
+            match apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await {
+                Ok(_) => {
+                    commits_processed += 1;
+                    remaining = remaining.saturating_sub(1);
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "commit group={} epoch={} sender={} error={:#}",
+                        pending.group_id, pending.epoch, pending.sender, err
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    if remaining > 0 && kinds.contains(&PendingKind::Welcomes) {
+        let welcome_path = format!("/welcome/{}", client.name);
+        let tree_path = format!("/ratchet-tree/{}", client.name);
+
+        match ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name).await {
+            Ok(welcome_bytes) => {
+                let ratchet_tree_bytes =
+                    ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name).await?;
+                client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
+                welcomes_processed += 1;
+                remaining = remaining.saturating_sub(1);
+            }
+            Err(err) => {
+                let text = format!("{:#}", err);
+                if !text.contains("404 Not Found") {
+                    errors.push(format!("welcome error={}", text));
+                }
+            }
+        }
+    }
+
+    if remaining > 0 && kinds.contains(&PendingKind::ApplicationMessages) {
+        match receive_application_delivery(client, relay_url, false).await {
+            Ok(_) => {
+                application_messages_processed += 1;
+            }
+            Err(err) => {
+                let text = format!("{:#}", err);
+                if !text.contains("404 Not Found") {
+                    errors.push(format!("application_message error={}", text));
+                }
+            }
+        }
+    }
+
+    let final_epoch = client.current_epoch_u64().ok();
+    let current_member_count = client.member_names().ok().map(|members| members.len());
+
+    if let (Some(expected), Some(actual)) = (expected_epoch, final_epoch) {
+        if actual < expected {
+            errors.push(format!(
+                "expected_epoch_not_reached expected={} actual={}",
+                expected, actual
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(format!(
+            "process_pending processed; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors=[]",
+            commits_processed,
+            welcomes_processed,
+            application_messages_processed,
+            final_epoch,
+            current_member_count
+        ))
+    } else {
+        Err(anyhow!(
+            "process_pending errors; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors={:?}",
+            commits_processed,
+            welcomes_processed,
+            application_messages_processed,
+            final_epoch,
+            current_member_count,
+            errors
+        ))
+    }
+}
+
+pub async fn handle_command(
+    client: &mut Client,
+    ds_url: &str,
+    relay_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    command: Command,
+    expected_epoch: Option<u64>,
+) -> Result<String> {
+    match command {
+        Command::CreateGroup => {
+            client.create_group()?;
+            update_ds_group_state(client, ds_url).await?;
+            Ok("group created and DS group state registered".to_string())
+        }
+
+        Command::GenerateKeyPackage => {
+            let key_package_bytes = client.generate_key_package()?;
+            let path = format!("/keypackage/{}", client.name);
+            ds_post_bytes(
+                ds_url,
+                &path,
+                key_package_bytes,
+                "store_keypackage",
+                &client.name,
+            )
+            .await?;
+            Ok(format!("key package uploaded for {}", client.name))
+        }
+
+        Command::AddMembers { members } => {
+            let client_id = client.name.clone();
+            let key_package_fetches = members.iter().map(|member| {
+                let kp_path = format!("/keypackage/{member}");
+                let client_id = client_id.clone();
+                async move {
+                    ds_get_bytes(ds_url, &kp_path, "fetch_keypackage", &client_id)
+                        .await
+                        .with_context(|| format!("fetch key package for {}", member))
+                }
+            });
+            let key_package_bytes_list = try_join_all(key_package_fetches).await?;
+
+            let intent = PendingIntent::AddMembers {
+                members: members.clone(),
+                key_package_bytes_list,
+            };
+
+            match try_start_intent(client, ds_url, &intent).await? {
+                DsPostResult::Ok => Ok(format!(
+                    "members {:?} added locally in one commit; commit published, waiting for DS echo",
+                    members
+                )),
+                DsPostResult::Conflict(message) => {
+                    *queued_intent = Some(intent);
+                    Ok(format!(
+                        "add_members for {:?} lost the epoch race and was queued for retry: {}",
+                        members, message
+                    ))
+                }
+            }
+        }
+
+        Command::JoinFromWelcome => {
+            let welcome_path = format!("/welcome/{}", client.name);
+            let tree_path = format!("/ratchet-tree/{}", client.name);
+
+            let welcome_bytes =
+                ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name).await?;
+            let ratchet_tree_bytes =
+                ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name).await?;
+
+            client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
+
+            Ok(format!("{} joined from welcome", client.name))
+        }
+
+        Command::SendApplicationMessage { message } => {
+            let message_bytes = client.send_application_message(message.as_bytes())?;
+            let group_id = client.group_id_hex()?;
+            let sender = client.name.clone();
+
+            let mut recipients = client.member_names()?;
+            recipients.retain(|recipient| recipient != &sender);
+
+            relay_post_application_message(
+                relay_url,
+                &group_id,
+                &sender,
+                &recipients,
+                message_bytes,
+            )
+            .await?;
+
+            Ok("application message broadcast to group".to_string())
+        }
+
+        Command::ReceiveApplicationMessage { profile } => {
+            receive_application_delivery(client, relay_url, profile).await
+        }
+
+        Command::SelfUpdate => {
+            let intent = PendingIntent::SelfUpdate;
+
+            match try_start_intent(client, ds_url, &intent).await? {
+                DsPostResult::Ok => Ok("self_update commit published to group".to_string()),
+                DsPostResult::Conflict(message) => {
+                    *queued_intent = Some(intent);
+                    Ok(format!(
+                        "self_update lost the epoch race and was queued for retry: {}",
+                        message
+                    ))
+                }
+            }
+        }
+
+        Command::RemoveMembers { members } => {
+            let intent = PendingIntent::RemoveMembers {
+                members: members.clone(),
+            };
+
+            match try_start_intent(client, ds_url, &intent).await? {
+                DsPostResult::Ok => Ok(format!(
+                    "members {:?} removed locally; group commit published",
+                    members
+                )),
+                DsPostResult::Conflict(message) => {
+                    *queued_intent = Some(intent);
+                    Ok(format!(
+                        "remove_members for {:?} lost the epoch race and was queued for retry: {}",
+                        members, message
+                    ))
+                }
+            }
+        }
+
+        Command::ReceiveCommit => {
+            receive_commit_delivery(client, ds_url, queued_intent, expected_epoch).await
+        }
+
+        Command::ProcessPending {
+            kinds,
+            max_messages,
+            expected_epoch,
+        } => {
+            process_pending(
+                client,
+                ds_url,
+                relay_url,
+                queued_intent,
+                kinds,
+                max_messages,
+                expected_epoch,
+            )
+            .await
+        }
+
+        Command::ShowGroupState => {
+            let group_id = client.group_id_hex()?;
+            let epoch = client.current_epoch_u64()?;
+            let members = client.member_names()?;
+
+            Ok(format!(
+                "group_id={}, epoch={}, members={:?}",
+                group_id, epoch, members
+            ))
+        }
+    }
+}

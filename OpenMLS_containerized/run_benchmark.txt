@@ -1,0 +1,45 @@
+python3 scripts/run_compose_benchmark.py \
+  --workers 1024 \
+  --bridge-count 10 \
+  --runner-in-docker \
+  --build-images \
+  --include-netcheck \
+  --worker-layout-mode hybrid \
+  --singleton-min-count 32 \
+  --singleton-fraction 0.125 \
+  --packed-clients-per-container 16 \
+  --singleton-selection-seed 1 \
+  --singleton-selection-strategy evenly-spaced \
+  --profile-only-singletons \
+  --min-size 2 \
+  --max-size 1024 \
+  --step-size 128 \
+  --roundtrips 1 \
+  --update-rounds 1 \
+  --max-update-samples-per-plateau 1 \
+  --app-rounds 1 \
+  --max-app-samples-per-payload 1 \
+  --payload-sizes 32 \
+  --startup-batch-size 64 \
+  --startup-batch-sleep-seconds 1 \
+  --post-startup-settle-seconds 20 \
+  --worker-health-timeout-seconds 900 \
+  --worker-health-poll-ms 500 \
+  --max-fanout-parallelism 32 \
+  --min-fanout-parallelism 4 \
+  --fanout-adaptive \
+  --fanout-error-rate-threshold 0.02 \
+  --fanout-p95-threshold-ms 5000 \
+  --http-pool-max-idle-per-host 4 \
+  --worker-http-pool-max-idle-per-host 4 \
+  --worker-http-connect-timeout-ms 2000 \
+  --worker-http-request-timeout-ms 15000 \
+  --worker-outbound-http-permits 2 \
+  --ds-delivery-mode group-log \
+  --process-pending-fanout \
+  --compose-parallel-limit 32 \
+  --teardown-batch-size 128 \
+  --teardown-batch-sleep-seconds 1 \
+  --keep-stack-up-on-failure \
+  --run-id openmls-1024-group-log-adaptive \
+  --scenario openmls-1024-group-log-adaptive

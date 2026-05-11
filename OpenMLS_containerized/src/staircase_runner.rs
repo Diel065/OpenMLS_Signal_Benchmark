@@ -1,0 +1,4118 @@
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    error::Error as StdError,
+    fs::{self, File},
+    future::Future,
+    io::{self, BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
+
+use anyhow::{anyhow, Context, Result};
+use futures_util::stream::{self, StreamExt};
+use rand::{thread_rng, Rng};
+use serde::{Deserialize, Serialize};
+
+use crate::http_retry::{
+    is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
+    retry_transient_http_async, RetryDecision,
+};
+use crate::worker_api::PendingKind;
+use crate::worker_api::{
+    BatchCommandItem, BatchCommandRequest, BatchCommandResponse, Command, CommandRequestEnvelope,
+    CommandResponse,
+};
+
+const WORKER_COMMAND_MAX_ATTEMPTS: usize = 10;
+const WORKER_COMMAND_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const WORKER_COMMAND_MAX_DELAY: Duration = Duration::from_secs(3);
+const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 4;
+const DEFAULT_MAX_FANOUT_PARALLELISM: usize = 32;
+const DEFAULT_MIN_FANOUT_PARALLELISM: usize = 1;
+const ADAPTIVE_FANOUT_START: usize = 16;
+const FANOUT_LATENCY_SPIKE_P95_MS: u128 = 5_000;
+const FANOUT_STABLE_INCREASE_AFTER: usize = 20;
+const DEFAULT_FANOUT_ERROR_RATE_THRESHOLD: f64 = 0.02;
+const DEFAULT_RUNNER_HTTP_CONNECT_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_FANOUT_RETRY_PASSES: usize = 1;
+const SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE: usize = 16;
+const MAX_RANDOM_MEMBERSHIP_BATCH_SIZE: usize = 8;
+
+static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone)]
+pub struct StaircaseConfig {
+    pub preflight_only: bool,
+    pub ds_url: String,
+    pub workers: Vec<WorkerSpec>,
+    pub min_size: usize,
+    pub max_size: Option<usize>,
+    pub step_size: usize,
+    pub roundtrips: usize,
+    pub update_rounds: usize,
+    pub app_rounds: usize,
+    pub max_update_samples_per_plateau: usize,
+    pub max_app_samples_per_payload: usize,
+    pub payload_sizes: Vec<usize>,
+    pub run_id: String,
+    pub scenario: String,
+    pub output_dir: String,
+    pub worker_health_timeout_seconds: u64,
+    pub worker_health_poll_ms: u64,
+    pub max_fanout_parallelism: usize,
+    pub min_fanout_parallelism: usize,
+    pub fanout_adaptive: Option<bool>,
+    pub fanout_error_rate_threshold: f64,
+    pub fanout_p95_threshold_ms: u128,
+    pub http_pool_max_idle_per_host: usize,
+    pub process_pending_fanout: bool,
+    pub profile_only_singletons: bool,
+    pub worker_layout: Option<WorkerLayout>,
+    pub no_aggregate: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerMode {
+    Singleton,
+    Packed,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkerSpec {
+    pub id: String,
+    pub url: String,
+    pub command_url: String,
+    pub health_url: String,
+    pub physical_worker_id: String,
+    pub container_mode: ContainerMode,
+    pub profile_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLayoutClient {
+    pub client_id: String,
+    pub physical_worker_id: String,
+    pub container_mode: String,
+    pub profile_enabled: bool,
+    pub command_url: String,
+    pub health_url: String,
+    #[serde(default)]
+    pub execution_backend: String,
+    #[serde(default)]
+    pub device_kind: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub access_backend: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub rust_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLayoutPhysicalWorker {
+    pub physical_worker_id: String,
+    pub container_mode: String,
+    pub client_ids: Vec<String>,
+    pub base_url: String,
+    pub profile_enabled_client_ids: Vec<String>,
+    #[serde(default)]
+    pub execution_backend: String,
+    #[serde(default)]
+    pub device_kind: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub access_backend: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub rust_target: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLayout {
+    pub version: u32,
+    pub logical_worker_count: usize,
+    pub physical_worker_count: usize,
+    pub layout_mode: String,
+    #[serde(default)]
+    pub singleton_min_count: usize,
+    #[serde(default)]
+    pub singleton_fraction: f64,
+    #[serde(default)]
+    pub packed_clients_per_container: usize,
+    #[serde(default)]
+    pub singleton_selection_seed: u64,
+    pub profile_policy: String,
+    pub clients: Vec<WorkerLayoutClient>,
+    pub physical_workers: Vec<WorkerLayoutPhysicalWorker>,
+    #[serde(default)]
+    pub execution_backend: String,
+    #[serde(default)]
+    pub device_kind: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub access_backend: String,
+    #[serde(default)]
+    pub arch: String,
+    #[serde(default)]
+    pub rust_target: String,
+}
+
+impl WorkerSpec {
+    pub fn legacy(id: String, url: String) -> Self {
+        Self {
+            id: id.clone(),
+            url: url.clone(),
+            command_url: format!("{}/command", url.trim_end_matches('/')),
+            health_url: format!("{}/health", url.trim_end_matches('/')),
+            physical_worker_id: id,
+            container_mode: ContainerMode::Singleton,
+            profile_enabled: true,
+        }
+    }
+}
+
+pub fn parse_worker_layout(path: &Path) -> Result<WorkerLayout> {
+    let content = fs::read_to_string(path)
+        .with_context(|| format!("Failed to read worker layout file '{}'", path.display()))?;
+    let layout: WorkerLayout = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Failed to parse worker layout JSON from '{}'",
+            path.display()
+        )
+    })?;
+    Ok(layout)
+}
+
+pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
+    layout
+        .clients
+        .iter()
+        .map(|c| {
+            let container_mode = match c.container_mode.as_str() {
+                "packed" => ContainerMode::Packed,
+                _ => ContainerMode::Singleton,
+            };
+            WorkerSpec {
+                id: c.client_id.clone(),
+                url: c.command_url.clone(),
+                command_url: c.command_url.clone(),
+                health_url: c.health_url.clone(),
+                physical_worker_id: c.physical_worker_id.clone(),
+                container_mode,
+                profile_enabled: c.profile_enabled,
+            }
+        })
+        .collect()
+}
+
+pub fn measured_active_clients(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
+    active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+pub fn physical_groups<'a>(
+    workers: impl Iterator<Item = &'a WorkerSpec>,
+) -> HashMap<String, Vec<&'a WorkerSpec>> {
+    let mut groups: HashMap<String, Vec<&'a WorkerSpec>> = HashMap::new();
+    for w in workers {
+        groups
+            .entry(w.physical_worker_id.clone())
+            .or_default()
+            .push(w);
+    }
+    groups
+}
+
+#[derive(Debug, Clone)]
+struct GroupStateSnapshot {
+    group_id: String,
+    epoch: u64,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct NetworkPhaseMetrics {
+    pub phase: String,
+    pub group_size: usize,
+    pub operation: String,
+    pub request_count: usize,
+    pub recipient_count: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub timeout_count: usize,
+    pub connect_error_count: usize,
+    pub max_parallelism: usize,
+    pub effective_parallelism: usize,
+    pub wall_ms: u128,
+    pub retry_count: usize,
+    pub retry_sleep_ms: u128,
+    pub retry_pass_count: usize,
+    pub failures: usize,
+    pub worker_latency_p50_ms: Option<u128>,
+    pub worker_latency_p95_ms: Option<u128>,
+    pub worker_latency_p99_ms: Option<u128>,
+    pub worker_latency_max_ms: Option<u128>,
+    pub slowest_worker_ids: Vec<String>,
+    #[serde(default)]
+    pub logical_request_count: usize,
+    #[serde(default)]
+    pub physical_request_count: usize,
+    #[serde(default)]
+    pub singleton_request_count: usize,
+    #[serde(default)]
+    pub packed_request_count: usize,
+    #[serde(default)]
+    pub packed_logical_client_count: usize,
+    #[serde(default)]
+    pub profile_enabled_recipient_count: usize,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct ProfileEvent {
+    ts_unix_ns: u128,
+    op: String,
+    implementation: String,
+    wall_ns: u128,
+    cpu_thread_ns: Option<u128>,
+    alloc_bytes: Option<u64>,
+    alloc_count: Option<u64>,
+    artifact_size_bytes: Option<usize>,
+    encrypted_group_info_bytes: Option<usize>,
+    encrypted_secrets_count: Option<usize>,
+    group_epoch: Option<u64>,
+    tree_size: Option<u32>,
+    member_count: Option<usize>,
+    invitee_count: Option<isize>,
+    ciphersuite: Option<String>,
+    app_msg_plaintext_bytes: Option<usize>,
+    app_msg_padding_bytes: Option<usize>,
+    app_msg_ciphertext_bytes: Option<usize>,
+    aad_bytes: Option<usize>,
+    pid: u32,
+    thread_id: String,
+    run_id: Option<String>,
+    scenario: Option<String>,
+    node_name: Option<String>,
+    pod_name: Option<String>,
+}
+
+struct Progress {
+    total_units: usize,
+    completed_units: usize,
+    start: Instant,
+}
+
+impl Progress {
+    fn new(total_units: usize) -> Self {
+        Self {
+            total_units: total_units.max(1),
+            completed_units: 0,
+            start: Instant::now(),
+        }
+    }
+
+    fn tick(&mut self, label: &str) {
+        self.tick_units(1, label);
+    }
+
+    fn tick_units(&mut self, units: usize, label: &str) {
+        self.completed_units = self
+            .completed_units
+            .saturating_add(units)
+            .min(self.total_units);
+        self.render(label);
+    }
+
+    fn render(&self, label: &str) {
+        let width = 32usize;
+        let ratio = self.completed_units as f64 / self.total_units as f64;
+        let filled = ((ratio * width as f64).round() as usize).min(width);
+
+        let mut bar = String::with_capacity(width);
+        for _ in 0..filled {
+            bar.push('#');
+        }
+        for _ in filled..width {
+            bar.push('-');
+        }
+
+        let elapsed = self.start.elapsed();
+        let eta = if self.completed_units == 0 {
+            None
+        } else {
+            let elapsed_secs = elapsed.as_secs_f64();
+            let per_unit = elapsed_secs / self.completed_units as f64;
+            let remaining = self.total_units.saturating_sub(self.completed_units) as f64;
+            Some(Duration::from_secs_f64(per_unit * remaining))
+        };
+
+        let percent = ratio * 100.0;
+        let eta_text = eta
+            .map(format_hms)
+            .unwrap_or_else(|| "--:--:--".to_string());
+
+        eprint!(
+            "\r[{}] {:6.2}% | {}/{} units | elapsed {} | ETA {} | {}",
+            bar,
+            percent,
+            self.completed_units,
+            self.total_units,
+            format_hms(elapsed),
+            eta_text,
+            label
+        );
+        let _ = io::stderr().flush();
+    }
+
+    fn finish(&self) {
+        eprintln!();
+    }
+}
+
+#[derive(Debug)]
+struct FanoutController {
+    max_parallelism: usize,
+    min_parallelism: usize,
+    current_parallelism: usize,
+    adaptive: bool,
+    stable_successes: usize,
+    error_rate_threshold: f64,
+    p95_threshold_ms: u128,
+}
+
+impl FanoutController {
+    fn new(
+        max_parallelism: usize,
+        min_parallelism: usize,
+        adaptive: bool,
+        error_rate_threshold: f64,
+        p95_threshold_ms: u128,
+    ) -> Self {
+        let max_parallelism = max_parallelism.max(1);
+        let min_parallelism = min_parallelism.clamp(1, max_parallelism);
+        let current_parallelism = if adaptive {
+            ADAPTIVE_FANOUT_START
+                .min(max_parallelism)
+                .max(min_parallelism)
+        } else {
+            max_parallelism
+        };
+
+        Self {
+            max_parallelism,
+            min_parallelism,
+            current_parallelism,
+            adaptive,
+            stable_successes: 0,
+            error_rate_threshold,
+            p95_threshold_ms,
+        }
+    }
+
+    fn parallelism(&self) -> usize {
+        self.current_parallelism.max(1)
+    }
+
+    fn record(&mut self, phase: &str, operation: &str, summary: &FanoutSummary) {
+        if !self.adaptive {
+            return;
+        }
+
+        let p95 = summary.latency_p95_ms.unwrap_or(0);
+        let error_rate = if summary.request_count == 0 {
+            0.0
+        } else {
+            summary.failure_count as f64 / summary.request_count as f64
+        };
+        let latency_spike = p95 >= self.p95_threshold_ms;
+        let error_spike = error_rate >= self.error_rate_threshold && summary.failure_count > 0;
+        let should_reduce = latency_spike || error_spike;
+
+        if should_reduce {
+            let previous = self.current_parallelism;
+            self.current_parallelism = (self.current_parallelism / 2).max(self.min_parallelism);
+            self.stable_successes = 0;
+
+            if self.current_parallelism != previous {
+                eprintln!(
+                    "[fanout-adaptive] phase={} operation={} reducing parallelism {} -> {} failures={} error_rate={:.4} p95_ms={} reason={}",
+                    phase,
+                    operation,
+                    previous,
+                    self.current_parallelism,
+                    summary.failure_count,
+                    error_rate,
+                    p95,
+                    if error_spike { "error_rate" } else { "p95_latency" }
+                );
+            }
+            return;
+        }
+
+        self.stable_successes += 1;
+        if self.stable_successes >= FANOUT_STABLE_INCREASE_AFTER
+            && self.current_parallelism < self.max_parallelism
+        {
+            let previous = self.current_parallelism;
+            self.current_parallelism = (self.current_parallelism + 4).min(self.max_parallelism);
+            self.stable_successes = 0;
+
+            eprintln!(
+                "[fanout-adaptive] phase={} operation={} increasing parallelism {} -> {} p95_ms={} stable_successes={}",
+                phase,
+                operation,
+                previous,
+                self.current_parallelism,
+                p95,
+                FANOUT_STABLE_INCREASE_AFTER
+            );
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct MembershipBatchPlanner {
+    plateau_size: Option<usize>,
+    single_member_batch_required: bool,
+}
+
+impl MembershipBatchPlanner {
+    fn enter_plateau(&mut self, plateau_size: usize) {
+        if self.plateau_size != Some(plateau_size) {
+            self.plateau_size = Some(plateau_size);
+            self.single_member_batch_required = true;
+        }
+    }
+
+    fn next_batch_size(&mut self, current_group_size: usize, max_allowed: usize) -> usize {
+        if max_allowed == 0 {
+            return 0;
+        }
+
+        let batch_size = if self.single_member_batch_required {
+            self.single_member_batch_required = false;
+            1
+        } else {
+            calculate_batch_size(current_group_size)
+        };
+
+        batch_size.min(max_allowed).max(1)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FanoutSummary {
+    request_count: usize,
+    recipient_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    timeout_count: usize,
+    connect_error_count: usize,
+    max_parallelism: usize,
+    effective_parallelism: usize,
+    retry_pass_count: usize,
+    wall_ms: u128,
+    latency_p50_ms: Option<u128>,
+    latency_p95_ms: Option<u128>,
+    latency_p99_ms: Option<u128>,
+    latency_max_ms: Option<u128>,
+    slowest_worker_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedGroupState {
+    group_id: String,
+    epoch: u64,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+enum ExpectedReceiveCommitState {
+    Group(ExpectedGroupState),
+    Removed { expected_epoch: u64 },
+}
+
+impl From<GroupStateSnapshot> for ExpectedGroupState {
+    fn from(snapshot: GroupStateSnapshot) -> Self {
+        Self {
+            group_id: snapshot.group_id,
+            epoch: snapshot.epoch,
+            members: snapshot.members,
+        }
+    }
+}
+
+impl ExpectedGroupState {
+    fn matches(&self, snapshot: &GroupStateSnapshot) -> bool {
+        snapshot.group_id == self.group_id
+            && snapshot.epoch == self.epoch
+            && snapshot.members == self.members
+    }
+}
+
+pub fn parse_worker_specs(raw_specs: &[String]) -> Result<Vec<WorkerSpec>> {
+    let mut workers = Vec::with_capacity(raw_specs.len());
+
+    for raw in raw_specs {
+        let spec = parse_worker_spec(raw)?;
+        if workers.iter().any(|w: &WorkerSpec| w.id == spec.id) {
+            return Err(anyhow!("Duplicate worker id '{}'", spec.id));
+        }
+        workers.push(spec);
+    }
+
+    if workers.is_empty() {
+        return Err(anyhow!("At least one worker must be provided"));
+    }
+
+    Ok(workers)
+}
+
+pub fn run_dir_for(output_dir: &str, run_id: &str) -> PathBuf {
+    PathBuf::from(output_dir).join(run_id)
+}
+
+pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
+    let worker_threads = std::thread::available_parallelism()
+        .map(|threads| threads.get())
+        .unwrap_or(4);
+
+    eprintln!(
+        "[runtime] benchmark runner using multi-thread Tokio runtime with {} worker threads",
+        worker_threads
+    );
+
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()
+        .context("Failed to build benchmark runner Tokio runtime")?
+        .block_on(run_staircase_benchmark_async(config))
+}
+
+async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
+    let max_size = validate_config(&config, config.workers.len())?;
+
+    let run_dir = run_dir_for(&config.output_dir, &config.run_id);
+    fs::create_dir_all(&run_dir)?;
+
+    let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
+    let min_fanout_parallelism =
+        effective_min_fanout_parallelism(config.min_fanout_parallelism, max_fanout_parallelism);
+    let fanout_adaptive = effective_fanout_adaptive(config.fanout_adaptive, config.workers.len());
+    let fanout_error_rate_threshold =
+        effective_fanout_error_rate_threshold(config.fanout_error_rate_threshold);
+    let fanout_p95_threshold_ms = effective_fanout_p95_threshold_ms(config.fanout_p95_threshold_ms);
+    let mut fanout = FanoutController::new(
+        max_fanout_parallelism,
+        min_fanout_parallelism,
+        fanout_adaptive,
+        fanout_error_rate_threshold,
+        fanout_p95_threshold_ms,
+    );
+    let http_pool_max_idle_per_host =
+        effective_http_pool_max_idle_per_host(config.http_pool_max_idle_per_host);
+    let runner_http_connect_timeout = Duration::from_millis(runner_http_connect_timeout_ms());
+    let runner_http_request_timeout = Duration::from_millis(runner_http_request_timeout_ms());
+
+    eprintln!(
+        "[network] runner http_pool_max_idle_per_host={} connect_timeout_ms={} request_timeout_ms={} max_fanout_parallelism={} min_fanout_parallelism={} fanout_adaptive={} initial_effective_fanout_parallelism={} fanout_error_rate_threshold={:.4} fanout_p95_threshold_ms={} process_pending_fanout={}",
+        http_pool_max_idle_per_host,
+        runner_http_connect_timeout.as_millis(),
+        runner_http_request_timeout.as_millis(),
+        max_fanout_parallelism,
+        min_fanout_parallelism,
+        fanout_adaptive,
+        fanout.parallelism(),
+        fanout_error_rate_threshold,
+        fanout_p95_threshold_ms,
+        config.process_pending_fanout
+    );
+
+    let http = reqwest::Client::builder()
+        .connect_timeout(runner_http_connect_timeout)
+        .timeout(runner_http_request_timeout)
+        .pool_max_idle_per_host(http_pool_max_idle_per_host)
+        .pool_idle_timeout(Duration::from_secs(30))
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .build()
+        .context("Failed to build HTTP client")?;
+
+    wait_for_health(&http, &config.ds_url, Duration::from_secs(10))
+        .await
+        .with_context(|| format!("DS at {} is not healthy", config.ds_url))?;
+
+    let worker_health_timeout = Duration::from_secs(config.worker_health_timeout_seconds);
+    let worker_health_poll = Duration::from_millis(config.worker_health_poll_ms);
+
+    eprintln!(
+        "[preflight] waiting up to {} for {} workers to become healthy",
+        format_hms(worker_health_timeout),
+        config.workers.len()
+    );
+
+    wait_for_all_workers_healthy(
+        &http,
+        &config.workers,
+        worker_health_timeout,
+        worker_health_poll,
+        max_fanout_parallelism,
+    )
+    .await?;
+
+    if config.preflight_only {
+        eprintln!("[preflight] preflight-only mode complete; skipping MLS benchmark logic");
+        return Ok(());
+    }
+
+    let plateau_sequence = build_plateau_sequence(
+        config.min_size,
+        max_size,
+        config.step_size,
+        config.roundtrips,
+    );
+
+    let total_units = estimate_total_units(
+        &plateau_sequence,
+        config.update_rounds,
+        config.app_rounds,
+        config.max_update_samples_per_plateau,
+        config.max_app_samples_per_payload,
+        config.payload_sizes.len(),
+    );
+
+    eprintln!(
+        "Scenario plan: plateaus={:?}, payload_sizes={:?}, update_cap={}, app_cap={}, total_units≈{}",
+        plateau_sequence,
+        config.payload_sizes,
+        config.max_update_samples_per_plateau,
+        config.max_app_samples_per_payload,
+        total_units
+    );
+
+    let mut progress = Progress::new(total_units);
+    progress.render("starting");
+
+    let leader = config.workers[0].clone();
+    let mut active = vec![leader.clone()];
+    let mut idle: VecDeque<WorkerSpec> = config.workers.iter().skip(1).cloned().collect();
+    let mut membership_batches = MembershipBatchPlanner::default();
+
+    create_group(&http, &leader, &mut progress).await?;
+    let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
+    let initial_state =
+        ensure_converged(&http, &active, &active_ids, max_fanout_parallelism).await?;
+    eprintln!(
+        "\nInitial convergence: group_id={}, epoch={}, members={:?}",
+        initial_state.group_id, initial_state.epoch, initial_state.members
+    );
+
+    for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
+        eprintln!(
+            "\n=== Plateau {}/{} | target active members = {} ===",
+            plateau_idx + 1,
+            plateau_sequence.len(),
+            target_size
+        );
+        membership_batches.enter_plateau(target_size);
+
+        transition_to_size(
+            &http,
+            &mut active,
+            &mut idle,
+            target_size,
+            &mut fanout,
+            &mut membership_batches,
+            &mut progress,
+            config.process_pending_fanout,
+        )
+        .await?;
+
+        let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
+        let state = ensure_converged(&http, &active, &active_ids, max_fanout_parallelism).await?;
+        eprintln!(
+            "\n[plateau {}] converged at epoch {} with members {:?}",
+            target_size, state.epoch, state.members
+        );
+
+        run_update_phase(
+            &http,
+            &active,
+            target_size,
+            config.update_rounds,
+            config.max_update_samples_per_plateau,
+            &mut fanout,
+            &mut progress,
+            config.process_pending_fanout,
+        )
+        .await?;
+
+        let state_after_updates =
+            ensure_converged(&http, &active, &active_ids, max_fanout_parallelism).await?;
+        eprintln!(
+            "\n[plateau {}] post-update convergence at epoch {}",
+            target_size, state_after_updates.epoch
+        );
+
+        run_application_phase(
+            &http,
+            &active,
+            target_size,
+            config.app_rounds,
+            config.max_app_samples_per_payload,
+            &config.payload_sizes,
+            &mut fanout,
+            &mut progress,
+        )
+        .await?;
+
+        eprintln!("\n=== Plateau {} complete ===", target_size);
+    }
+
+    progress.finish();
+
+    let worker_ids: Vec<String> = config.workers.iter().map(|w| w.id.clone()).collect();
+    if !config.no_aggregate {
+        aggregate_csv(&run_dir, &worker_ids, &config.worker_layout)?;
+    } else {
+        eprintln!("[aggregate] --no-aggregate set, skipping CSV aggregation");
+    }
+
+    println!(
+        "HTTP staircase benchmark finished. Output in {}",
+        run_dir.display()
+    );
+    Ok(())
+}
+
+fn effective_max_fanout_parallelism(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+
+    DEFAULT_MAX_FANOUT_PARALLELISM
+}
+
+fn effective_min_fanout_parallelism(configured: usize, max_parallelism: usize) -> usize {
+    let value = if configured > 0 {
+        configured
+    } else {
+        DEFAULT_MIN_FANOUT_PARALLELISM
+    };
+
+    value.clamp(1, max_parallelism.max(1))
+}
+
+fn effective_fanout_adaptive(configured: Option<bool>, worker_count: usize) -> bool {
+    configured.unwrap_or(worker_count >= 256)
+}
+
+fn effective_fanout_error_rate_threshold(configured: f64) -> f64 {
+    if configured.is_finite() && configured > 0.0 {
+        configured
+    } else {
+        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD
+    }
+}
+
+fn effective_fanout_p95_threshold_ms(configured: u128) -> u128 {
+    if configured > 0 {
+        configured
+    } else {
+        FANOUT_LATENCY_SPIKE_P95_MS
+    }
+}
+
+fn effective_http_pool_max_idle_per_host(configured: usize) -> usize {
+    if configured > 0 {
+        configured
+    } else {
+        DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST
+    }
+}
+
+fn runner_http_connect_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_RUNNER_HTTP_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_RUNNER_HTTP_CONNECT_TIMEOUT_MS)
+}
+
+fn runner_http_request_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_RUNNER_HTTP_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS)
+}
+
+fn format_hms(d: Duration) -> String {
+    let total = d.as_secs();
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
+fn parse_worker_spec(raw: &str) -> Result<WorkerSpec> {
+    let (id, url) = raw
+        .split_once('=')
+        .ok_or_else(|| anyhow!("Invalid worker '{}', expected ID=URL", raw))?;
+
+    let id = id.trim();
+    let url = url.trim().trim_end_matches('/');
+
+    if id.is_empty() {
+        return Err(anyhow!("Worker id cannot be empty in '{}'", raw));
+    }
+    if url.is_empty() {
+        return Err(anyhow!("Worker url cannot be empty in '{}'", raw));
+    }
+
+    Ok(WorkerSpec::legacy(id.to_string(), url.to_string()))
+}
+
+async fn wait_for_health(http: &reqwest::Client, base_url: &str, timeout: Duration) -> Result<()> {
+    let url = format!("{}/health", base_url.trim_end_matches('/'));
+    let per_request_timeout = timeout.min(Duration::from_secs(5));
+
+    retry_transient_http_async("ds.health", None, &url, || async {
+        let response = match http.get(&url).timeout(per_request_timeout).send().await {
+            Ok(response) => response,
+            Err(err) if is_transient_reqwest_error(&err) => {
+                return RetryDecision::Transient(err.to_string())
+            }
+            Err(err) => return RetryDecision::Fatal(anyhow!(err)),
+        };
+
+        let status = response.status();
+
+        if status.is_success() {
+            return RetryDecision::Success(());
+        }
+
+        let body = response.text().await.unwrap_or_default();
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+        }
+
+        RetryDecision::Fatal(anyhow!(
+            "Health check failed with status {}: {}",
+            status,
+            body
+        ))
+    })
+    .await
+}
+
+async fn wait_for_all_workers_healthy(
+    http: &reqwest::Client,
+    workers: &[WorkerSpec],
+    timeout: Duration,
+    poll: Duration,
+    max_parallelism: usize,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut remaining: Vec<usize> = (0..workers.len()).collect();
+    let mut last_report = Instant::now();
+    let max_parallelism = max_parallelism.max(1);
+
+    while start.elapsed() < timeout {
+        let mut still_unhealthy = Vec::new();
+        let mut latencies = Vec::new();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let remaining_snapshot = remaining.clone();
+
+        let mut probes = stream::iter(remaining_snapshot.into_iter())
+            .map(|idx| {
+                let worker = &workers[idx];
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
+                async move {
+                    let command_started = Instant::now();
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    update_atomic_max(&max_in_flight, current);
+                    let url = format!("{}/health", worker.url.trim_end_matches('/'));
+                    let healthy = matches!(
+                        http.get(&url).send().await,
+                        Ok(resp) if resp.status().is_success()
+                    );
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    (idx, healthy, command_started.elapsed().as_millis())
+                }
+            })
+            .buffer_unordered(max_parallelism);
+
+        while let Some((idx, healthy, latency_ms)) = probes.next().await {
+            latencies.push(latency_ms);
+            if !healthy {
+                still_unhealthy.push(idx);
+            }
+        }
+
+        let healthy_count = workers.len().saturating_sub(still_unhealthy.len());
+
+        if still_unhealthy.is_empty() {
+            let (p50, p95, p99, max) = latency_percentiles(latencies);
+            eprintln!(
+                "[preflight] all {} workers are healthy after {}",
+                workers.len(),
+                format_hms(start.elapsed())
+            );
+            emit_network_metrics(NetworkPhaseMetrics {
+                phase: "preflight".to_string(),
+                group_size: workers.len(),
+                operation: "worker_health".to_string(),
+                request_count: workers.len(),
+                recipient_count: workers.len(),
+                success_count: workers.len(),
+                failure_count: 0,
+                timeout_count: 0,
+                connect_error_count: 0,
+                max_parallelism,
+                effective_parallelism: max_in_flight.load(Ordering::SeqCst),
+                wall_ms: start.elapsed().as_millis(),
+                retry_count: 0,
+                retry_sleep_ms: 0,
+                retry_pass_count: 0,
+                failures: 0,
+                worker_latency_p50_ms: p50,
+                worker_latency_p95_ms: p95,
+                worker_latency_p99_ms: p99,
+                worker_latency_max_ms: max,
+                slowest_worker_ids: Vec::new(),
+                logical_request_count: workers.len(),
+                physical_request_count: workers.len(),
+                singleton_request_count: workers.len(),
+                packed_request_count: 0,
+                packed_logical_client_count: 0,
+                profile_enabled_recipient_count: workers
+                    .iter()
+                    .filter(|w| w.profile_enabled)
+                    .count(),
+            });
+            return Ok(());
+        }
+
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            let examples: Vec<String> = still_unhealthy
+                .iter()
+                .take(10)
+                .map(|&idx| workers[idx].id.clone())
+                .collect();
+
+            eprintln!(
+                "[preflight] {}/{} workers healthy; still waiting for {}. Examples: {:?}",
+                healthy_count,
+                workers.len(),
+                still_unhealthy.len(),
+                examples
+            );
+
+            last_report = Instant::now();
+        }
+
+        remaining = still_unhealthy;
+        tokio::time::sleep(poll).await;
+    }
+
+    let examples: Vec<String> = remaining
+        .iter()
+        .take(25)
+        .map(|&idx| {
+            let worker = &workers[idx];
+            format!("{}={}", worker.id, worker.url)
+        })
+        .collect();
+
+    emit_network_metrics(NetworkPhaseMetrics {
+        phase: "preflight".to_string(),
+        group_size: workers.len(),
+        operation: "worker_health".to_string(),
+        request_count: workers.len(),
+        recipient_count: workers.len(),
+        success_count: workers.len().saturating_sub(remaining.len()),
+        failure_count: remaining.len(),
+        timeout_count: 0,
+        connect_error_count: 0,
+        max_parallelism,
+        effective_parallelism: max_parallelism.min(workers.len()),
+        wall_ms: start.elapsed().as_millis(),
+        retry_count: 0,
+        retry_sleep_ms: 0,
+        retry_pass_count: 0,
+        failures: remaining.len(),
+        worker_latency_p50_ms: None,
+        worker_latency_p95_ms: None,
+        worker_latency_p99_ms: None,
+        worker_latency_max_ms: None,
+        slowest_worker_ids: remaining
+            .iter()
+            .take(5)
+            .map(|&idx| workers[idx].id.clone())
+            .collect(),
+        logical_request_count: workers.len(),
+        physical_request_count: workers.len(),
+        singleton_request_count: workers.iter().filter(|w| w.profile_enabled).count(),
+        packed_request_count: workers.iter().filter(|w| !w.profile_enabled).count(),
+        packed_logical_client_count: workers.iter().filter(|w| !w.profile_enabled).count(),
+        profile_enabled_recipient_count: workers.iter().filter(|w| w.profile_enabled).count(),
+    });
+
+    Err(anyhow!(
+        "Timeout waiting for worker readiness after {}. {}/{} workers still unhealthy. Examples: {:?}",
+        format_hms(timeout),
+        remaining.len(),
+        workers.len(),
+        examples
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct WorkerCommandContext {
+    request_id: String,
+    expected_epoch: Option<u64>,
+    phase: Option<String>,
+}
+
+impl WorkerCommandContext {
+    fn new(worker: &WorkerSpec, command: &Command) -> Self {
+        Self::with_metadata(worker, command, None, None)
+    }
+
+    fn with_metadata(
+        worker: &WorkerSpec,
+        command: &Command,
+        expected_epoch: Option<u64>,
+        phase: Option<&str>,
+    ) -> Self {
+        let seq = WORKER_COMMAND_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!(
+            "runner-{}-{}-{}-{}",
+            std::process::id(),
+            worker.id,
+            command.kind(),
+            seq
+        );
+
+        Self {
+            request_id,
+            expected_epoch,
+            phase: phase.map(ToOwned::to_owned),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCommandErrorClass {
+    TransportRetryable,
+    FatalHttpStatus,
+    FatalDecode,
+}
+
+impl WorkerCommandErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkerCommandErrorClass::TransportRetryable => "transport-retryable",
+            WorkerCommandErrorClass::FatalHttpStatus => "fatal-http-status",
+            WorkerCommandErrorClass::FatalDecode => "fatal-decode",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkerCommandError {
+    worker_id: String,
+    command: &'static str,
+    url: String,
+    request_id: String,
+    attempts: usize,
+    classification: WorkerCommandErrorClass,
+    last_error: String,
+    diagnostic: Option<String>,
+}
+
+impl WorkerCommandError {
+    fn is_ambiguous_transport(&self) -> bool {
+        self.classification == WorkerCommandErrorClass::TransportRetryable
+    }
+}
+
+impl std::fmt::Display for WorkerCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "runner.worker_command failed: worker={} command={} url={} request_id={} attempts={} classification={} last_error={}",
+            self.worker_id,
+            self.command,
+            self.url,
+            self.request_id,
+            self.attempts,
+            self.classification.as_str(),
+            self.last_error
+        )?;
+
+        if let Some(diagnostic) = &self.diagnostic {
+            write!(f, " diagnostics={}", diagnostic)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl StdError for WorkerCommandError {}
+
+fn reqwest_error_diagnostic(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("top_level={}", err));
+    parts.push(format!("is_connect={}", err.is_connect()));
+    parts.push(format!("is_timeout={}", err.is_timeout()));
+    parts.push(format!("is_request={}", err.is_request()));
+    parts.push(format!("is_body={}", err.is_body()));
+    parts.push(format!(
+        "status={}",
+        err.status()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+
+    let inferred_stage = if err.is_connect() {
+        "connect"
+    } else if err.is_timeout() {
+        "timeout while connecting, writing request, or waiting for response"
+    } else if err.is_body() {
+        "reading response body"
+    } else if err.is_request() {
+        "writing request or waiting for response headers"
+    } else {
+        "unknown"
+    };
+    parts.push(format!("inferred_stage={}", inferred_stage));
+
+    let mut source = err.source();
+    let mut idx = 0usize;
+    while let Some(err) = source {
+        parts.push(format!("source[{}]={}", idx, err));
+        source = err.source();
+        idx += 1;
+    }
+
+    parts.join("; ")
+}
+
+async fn retry_worker_command_sleep(
+    worker: &WorkerSpec,
+    command_name: &str,
+    attempt: usize,
+    delay: &mut Duration,
+    url: &str,
+    err_text: &str,
+) {
+    let sleep_for = worker_command_with_jitter(*delay);
+    eprintln!(
+        "[retry] op=runner.worker_command worker={} command={} attempt={}/{} delay_ms={} url={} error={}",
+        worker.id,
+        command_name,
+        attempt,
+        WORKER_COMMAND_MAX_ATTEMPTS,
+        sleep_for.as_millis(),
+        url,
+        err_text
+    );
+    tokio::time::sleep(sleep_for).await;
+    *delay = worker_command_next_delay(*delay);
+}
+
+async fn send_command_with_context(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+    context: &WorkerCommandContext,
+) -> Result<CommandResponse> {
+    let url = format!("{}/command", worker.url);
+    let command_name = command.kind();
+    let mut delay = WORKER_COMMAND_INITIAL_DELAY;
+    let request = CommandRequestEnvelope {
+        request_id: context.request_id.clone(),
+        command: command.clone(),
+        expected_epoch: context.expected_epoch,
+        phase: context.phase.clone(),
+    };
+
+    for attempt in 1..=WORKER_COMMAND_MAX_ATTEMPTS {
+        let response = match http.post(&url).json(&request).send().await {
+            Ok(response) => response,
+            Err(err)
+                if is_transient_reqwest_error(&err) || is_connect_stage_reqwest_error(&err) =>
+            {
+                let err_text = err.to_string();
+                let diagnostic = reqwest_error_diagnostic(&err);
+
+                if attempt == WORKER_COMMAND_MAX_ATTEMPTS {
+                    return Err(WorkerCommandError {
+                        worker_id: worker.id.clone(),
+                        command: command_name,
+                        url: url.clone(),
+                        request_id: context.request_id.clone(),
+                        attempts: attempt,
+                        classification: WorkerCommandErrorClass::TransportRetryable,
+                        last_error: err_text,
+                        diagnostic: Some(diagnostic),
+                    }
+                    .into());
+                }
+
+                retry_worker_command_sleep(
+                    worker,
+                    command_name,
+                    attempt,
+                    &mut delay,
+                    &url,
+                    &format!("{} ({})", err_text, diagnostic),
+                )
+                .await;
+                continue;
+            }
+            Err(err) => {
+                return Err(WorkerCommandError {
+                    worker_id: worker.id.clone(),
+                    command: command_name,
+                    url,
+                    request_id: context.request_id.clone(),
+                    attempts: attempt,
+                    classification: WorkerCommandErrorClass::FatalDecode,
+                    last_error: err.to_string(),
+                    diagnostic: Some(reqwest_error_diagnostic(&err)),
+                }
+                .into());
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            let last_error = format!("HTTP {}: {}", status, body);
+
+            if is_transient_status(status) && attempt < WORKER_COMMAND_MAX_ATTEMPTS {
+                retry_worker_command_sleep(
+                    worker,
+                    command_name,
+                    attempt,
+                    &mut delay,
+                    &url,
+                    &last_error,
+                )
+                .await;
+                continue;
+            }
+
+            return Err(WorkerCommandError {
+                worker_id: worker.id.clone(),
+                command: command_name,
+                url,
+                request_id: context.request_id.clone(),
+                attempts: attempt,
+                classification: WorkerCommandErrorClass::FatalHttpStatus,
+                last_error,
+                diagnostic: None,
+            }
+            .into());
+        }
+
+        match response.json::<CommandResponse>().await {
+            Ok(parsed) => return Ok(parsed),
+            Err(err) if is_transient_reqwest_error(&err) => {
+                let err_text = err.to_string();
+                let diagnostic = reqwest_error_diagnostic(&err);
+
+                if attempt == WORKER_COMMAND_MAX_ATTEMPTS {
+                    return Err(WorkerCommandError {
+                        worker_id: worker.id.clone(),
+                        command: command_name,
+                        url,
+                        request_id: context.request_id.clone(),
+                        attempts: attempt,
+                        classification: WorkerCommandErrorClass::TransportRetryable,
+                        last_error: err_text,
+                        diagnostic: Some(diagnostic),
+                    }
+                    .into());
+                }
+
+                retry_worker_command_sleep(
+                    worker,
+                    command_name,
+                    attempt,
+                    &mut delay,
+                    &url,
+                    &format!("{} ({})", err_text, diagnostic),
+                )
+                .await;
+                continue;
+            }
+            Err(err) => {
+                return Err(WorkerCommandError {
+                    worker_id: worker.id.clone(),
+                    command: command_name,
+                    url,
+                    request_id: context.request_id.clone(),
+                    attempts: attempt,
+                    classification: WorkerCommandErrorClass::FatalDecode,
+                    last_error: err.to_string(),
+                    diagnostic: Some(reqwest_error_diagnostic(&err)),
+                }
+                .into());
+            }
+        }
+    }
+
+    unreachable!("worker command retry loop always returns")
+}
+
+async fn send_command(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+) -> Result<CommandResponse> {
+    let context = WorkerCommandContext::new(worker, command);
+    send_command_with_context(http, worker, command, &context).await
+}
+
+fn worker_command_next_delay(delay: Duration) -> Duration {
+    let doubled_ms = delay.as_millis().saturating_mul(2);
+    let max_ms = WORKER_COMMAND_MAX_DELAY.as_millis();
+    Duration::from_millis(doubled_ms.min(max_ms) as u64)
+}
+
+fn worker_command_with_jitter(delay: Duration) -> Duration {
+    let base_ms = delay.as_millis() as u64;
+    let jitter_cap_ms = (base_ms / 10).clamp(1, 100);
+    let jitter_ms = thread_rng().gen_range(0..=jitter_cap_ms);
+    Duration::from_millis(base_ms + jitter_ms)
+}
+
+async fn send_cmd_expect_ok_fragment(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+    ok_fragment: &str,
+) -> Result<String> {
+    let context = WorkerCommandContext::new(worker, command);
+    send_cmd_expect_ok_fragment_with_context(http, worker, command, ok_fragment, &context).await
+}
+
+async fn send_cmd_expect_ok_fragment_with_context(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+    ok_fragment: &str,
+    context: &WorkerCommandContext,
+) -> Result<String> {
+    let response = send_command_with_context(http, worker, command, context).await?;
+
+    match response.status.as_str() {
+        "ok" if response.message.contains(ok_fragment) => Ok(response.message),
+        "ok" => Err(anyhow!(
+            "Worker {} returned unexpected ok message: {}",
+            worker.id,
+            response.message
+        )),
+        "error" => Err(anyhow!("Worker {} error: {}", worker.id, response.message)),
+        other => Err(anyhow!(
+            "Worker {} returned unknown status '{}': {}",
+            worker.id,
+            other,
+            response.message
+        )),
+    }
+}
+
+async fn send_cmd_until_ok(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+    ok_fragment: &str,
+    retryable_error_fragment: &str,
+    timeout: Duration,
+) -> Result<String> {
+    let start = Instant::now();
+
+    while start.elapsed() < timeout {
+        let response = send_command(http, worker, command).await?;
+
+        match response.status.as_str() {
+            "ok" if response.message.contains(ok_fragment) => return Ok(response.message),
+            "ok" => {
+                return Err(anyhow!(
+                    "Worker {} returned unexpected ok message: {}",
+                    worker.id,
+                    response.message
+                ));
+            }
+            "error" if response.message.contains(retryable_error_fragment) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            "error" => {
+                return Err(anyhow!("Worker {} error: {}", worker.id, response.message));
+            }
+            other => {
+                return Err(anyhow!(
+                    "Worker {} returned unknown status '{}': {}",
+                    worker.id,
+                    other,
+                    response.message
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "Timeout waiting for ok fragment '{}' from worker {}",
+        ok_fragment,
+        worker.id
+    ))
+}
+
+fn parse_group_state_message(message: &str) -> Result<GroupStateSnapshot> {
+    let msg = message
+        .strip_prefix("group_id=")
+        .ok_or_else(|| anyhow!("Unexpected show_group_state message: {}", message))?;
+
+    let (group_id, rest) = msg
+        .split_once(", epoch=")
+        .ok_or_else(|| anyhow!("Missing epoch in show_group_state message: {}", message))?;
+
+    let (epoch_str, members_str) = rest
+        .split_once(", members=")
+        .ok_or_else(|| anyhow!("Missing members in show_group_state message: {}", message))?;
+
+    let epoch = epoch_str
+        .parse::<u64>()
+        .with_context(|| format!("Invalid epoch '{}' in '{}'", epoch_str, message))?;
+
+    let mut members: Vec<String> = serde_json::from_str(members_str)
+        .with_context(|| format!("Invalid members list '{}' in '{}'", members_str, message))?;
+
+    members.sort();
+
+    Ok(GroupStateSnapshot {
+        group_id: group_id.to_string(),
+        epoch,
+        members,
+    })
+}
+
+async fn show_group_state(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+) -> Result<GroupStateSnapshot> {
+    let message =
+        send_cmd_expect_ok_fragment(http, worker, &Command::ShowGroupState, "group_id=").await?;
+    parse_group_state_message(&message)
+}
+
+fn expected_group_state(
+    reference: &GroupStateSnapshot,
+    epoch: u64,
+    mut members: Vec<String>,
+) -> ExpectedGroupState {
+    members.sort();
+    ExpectedGroupState {
+        group_id: reference.group_id.clone(),
+        epoch,
+        members,
+    }
+}
+
+fn expected_epoch(expected: &ExpectedReceiveCommitState) -> Option<u64> {
+    match expected {
+        ExpectedReceiveCommitState::Group(state) => Some(state.epoch),
+        ExpectedReceiveCommitState::Removed { expected_epoch } => Some(*expected_epoch),
+    }
+}
+
+async fn receive_commit_reconciled_by_state(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: &ExpectedReceiveCommitState,
+    original_error: &str,
+) -> Result<bool> {
+    match show_group_state(http, worker).await {
+        Ok(snapshot) => match expected {
+            ExpectedReceiveCommitState::Group(expected_state) if expected_state.matches(&snapshot) => {
+                eprintln!(
+                    "receive_commit ambiguous transport error reconciled by epoch check: worker={} expected_epoch={} original_error={}",
+                    worker.id, expected_state.epoch, original_error
+                );
+                Ok(true)
+            }
+            ExpectedReceiveCommitState::Group(expected_state) if snapshot.epoch < expected_state.epoch => {
+                eprintln!(
+                    "[reconcile] receive_commit worker={} is behind after ambiguous transport error: current_epoch={} expected_epoch={}",
+                    worker.id, snapshot.epoch, expected_state.epoch
+                );
+                Ok(false)
+            }
+            ExpectedReceiveCommitState::Group(expected_state) => Err(anyhow!(
+                "receive_commit ambiguous transport error could not be reconciled for worker {}: expected group_id={} epoch={} members={:?}; got group_id={} epoch={} members={:?}; original_error={}",
+                worker.id,
+                expected_state.group_id,
+                expected_state.epoch,
+                expected_state.members,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members,
+                original_error
+            )),
+            ExpectedReceiveCommitState::Removed { expected_epoch } => Err(anyhow!(
+                "receive_commit ambiguous transport error could not be reconciled for removed worker {}: expected removed after epoch {}, but ShowGroupState still returned group_id={} epoch={} members={:?}; original_error={}",
+                worker.id,
+                expected_epoch,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members,
+                original_error
+            )),
+        },
+        Err(err) => {
+            let text = format!("{:#}", err);
+            if matches!(expected, ExpectedReceiveCommitState::Removed { .. })
+                && text.contains("Client is not in a group")
+            {
+                eprintln!(
+                    "receive_commit ambiguous transport error reconciled by removed-state check: worker={} original_error={}",
+                    worker.id, original_error
+                );
+                return Ok(true);
+            }
+
+            Err(anyhow!(
+                "receive_commit ambiguous transport error reconciliation could not query worker {} state: {}; original_error={}",
+                worker.id,
+                text,
+                original_error
+            ))
+        }
+    }
+}
+
+async fn receive_commit_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    ok_fragment: &str,
+    expected: ExpectedReceiveCommitState,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ReceiveCommit;
+    let context = WorkerCommandContext::with_metadata(
+        worker,
+        &command,
+        expected_epoch(&expected),
+        Some(phase),
+    );
+
+    match send_cmd_expect_ok_fragment_with_context(http, worker, &command, ok_fragment, &context)
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            let is_ambiguous = err
+                .downcast_ref::<WorkerCommandError>()
+                .map(WorkerCommandError::is_ambiguous_transport)
+                .unwrap_or(false);
+
+            if !is_ambiguous {
+                return Err(err);
+            }
+
+            let original_error = format!("{:#}", err);
+            if receive_commit_reconciled_by_state(http, worker, &expected, &original_error).await? {
+                return Ok(());
+            }
+
+            eprintln!(
+                "[reconcile] receive_commit retrying same request_id={} worker={} phase={} after behind-state check",
+                context.request_id, worker.id, phase
+            );
+
+            match send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                ok_fragment,
+                &context,
+            )
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(retry_err) => {
+                    let retry_error = format!("{:#}", retry_err);
+                    if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+
+                    Err(anyhow!(
+                        "receive_commit failed after ambiguous transport reconciliation retry: worker={} request_id={} phase={} initial_error={} retry_error={}",
+                        worker.id,
+                        context.request_id,
+                        phase,
+                        original_error,
+                        retry_error
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn expected_receive_commit_state_reached(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: &ExpectedReceiveCommitState,
+) -> Result<bool> {
+    match show_group_state(http, worker).await {
+        Ok(snapshot) => match expected {
+            ExpectedReceiveCommitState::Group(expected_state) => {
+                Ok(expected_state.matches(&snapshot))
+            }
+            ExpectedReceiveCommitState::Removed { expected_epoch } => Err(anyhow!(
+                "worker {} was expected to be removed after epoch {}, but ShowGroupState returned group_id={} epoch={} members={:?}",
+                worker.id,
+                expected_epoch,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members
+            )),
+        },
+        Err(err) => {
+            let text = format!("{:#}", err);
+            if matches!(expected, ExpectedReceiveCommitState::Removed { .. })
+                && text.contains("Client is not in a group")
+            {
+                return Ok(true);
+            }
+
+            Err(anyhow!(
+                "could not query worker {} state after ProcessPending: {}",
+                worker.id,
+                text
+            ))
+        }
+    }
+}
+
+#[allow(dead_code)]
+async fn receive_application_message_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    profile: bool,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ReceiveApplicationMessage { profile };
+    let context = WorkerCommandContext::with_metadata(worker, &command, None, Some(phase));
+
+    match send_cmd_expect_ok_fragment_with_context(
+        http,
+        worker,
+        &command,
+        "application message received:",
+        &context,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let is_ambiguous = err
+                .downcast_ref::<WorkerCommandError>()
+                .map(WorkerCommandError::is_ambiguous_transport)
+                .unwrap_or(false);
+
+            if !is_ambiguous {
+                return Err(err);
+            }
+
+            let original_error = format!("{:#}", err);
+            eprintln!(
+                "[reconcile] receive_application_message retrying same request_id={} worker={} phase={} after ambiguous transport error={}",
+                context.request_id, worker.id, phase, original_error
+            );
+
+            send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                "application message received:",
+                &context,
+            )
+            .await
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "receive_application_message failed after ambiguous transport retry: worker={} request_id={} phase={} initial_error={}",
+                    worker.id, context.request_id, phase, original_error
+                )
+            })
+        }
+    }
+}
+
+async fn process_pending_commit_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: ExpectedReceiveCommitState,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ProcessPending {
+        kinds: Some(vec![PendingKind::Commits]),
+        max_messages: Some(8),
+        expected_epoch: expected_epoch(&expected),
+    };
+    let context = WorkerCommandContext::with_metadata(
+        worker,
+        &command,
+        expected_epoch(&expected),
+        Some(phase),
+    );
+
+    match send_cmd_expect_ok_fragment_with_context(
+        http,
+        worker,
+        &command,
+        "process_pending processed;",
+        &context,
+    )
+    .await
+    {
+        Ok(_) => {
+            if expected_receive_commit_state_reached(http, worker, &expected).await? {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "process_pending completed but worker {} did not reach expected state",
+                    worker.id
+                ))
+            }
+        }
+        Err(err) => {
+            let original_error = format!("{:#}", err);
+            if receive_commit_reconciled_by_state(http, worker, &expected, &original_error).await? {
+                return Ok(());
+            }
+
+            eprintln!(
+                "[reconcile] process_pending retrying same request_id={} worker={} phase={} after failure",
+                context.request_id, worker.id, phase
+            );
+
+            match send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                "process_pending processed;",
+                &context,
+            )
+            .await
+            {
+                Ok(_) => {
+                    if expected_receive_commit_state_reached(http, worker, &expected).await? {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "process_pending retry completed but worker {} did not reach expected state",
+                            worker.id
+                        ))
+                    }
+                }
+                Err(retry_err) => {
+                    let retry_error = format!("{:#}", retry_err);
+                    if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+
+                    Err(anyhow!(
+                        "process_pending failed after reconciliation retry: worker={} request_id={} phase={} initial_error={} retry_error={}",
+                        worker.id,
+                        context.request_id,
+                        phase,
+                        original_error,
+                        retry_error
+                    ))
+                }
+            }
+        }
+    }
+}
+
+async fn ensure_converged(
+    http: &reqwest::Client,
+    active_workers: &[WorkerSpec],
+    expected_active_ids: &[String],
+    max_parallelism: usize,
+) -> Result<GroupStateSnapshot> {
+    if active_workers.is_empty() {
+        return Err(anyhow!("No active workers to verify"));
+    }
+
+    let mut expected_members = expected_active_ids.to_vec();
+    expected_members.sort();
+
+    let states = collect_worker_group_states(http, active_workers, max_parallelism).await?;
+    let (reference_worker, reference) = states
+        .first()
+        .ok_or_else(|| anyhow!("No active workers to verify"))?;
+
+    if reference.members != expected_members {
+        return Err(anyhow!(
+            "Reference worker {} member list mismatch. Expected {:?}, got {:?}",
+            reference_worker.id,
+            expected_members,
+            reference.members
+        ));
+    }
+
+    for (worker, state) in states.iter().skip(1) {
+        if state.group_id != reference.group_id
+            || state.epoch != reference.epoch
+            || state.members != reference.members
+        {
+            return Err(anyhow!(
+                "Convergence mismatch on worker {}. Expected group_id={}, epoch={}, members={:?}; got group_id={}, epoch={}, members={:?}",
+                worker.id,
+                reference.group_id,
+                reference.epoch,
+                reference.members,
+                state.group_id,
+                state.epoch,
+                state.members
+            ));
+        }
+    }
+
+    Ok(reference.clone())
+}
+
+async fn collect_worker_group_states(
+    http: &reqwest::Client,
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+) -> Result<Vec<(WorkerSpec, GroupStateSnapshot)>> {
+    let max_parallelism = max_parallelism.max(1);
+    let collect = fanout_collect_workers(
+        "convergence",
+        workers.len(),
+        "show_group_state",
+        workers,
+        max_parallelism,
+        |worker| async move { show_group_state(http, &worker).await },
+    )
+    .await;
+
+    emit_fanout_metrics(
+        "convergence",
+        workers.len(),
+        "show_group_state",
+        &collect.summary,
+    );
+
+    if !collect.failures.is_empty() {
+        return Err(anyhow!(
+            "convergence ShowGroupState failed_workers={} max_parallelism={} failures=[{}]",
+            collect.failures.len(),
+            max_parallelism,
+            format_fanout_failures(&collect.failures)
+        ));
+    }
+
+    let mut by_id = HashMap::with_capacity(collect.successes.len());
+    for (worker, state) in collect.successes {
+        by_id.insert(worker.id.clone(), (worker, state));
+    }
+
+    let mut ordered = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let state = by_id
+            .remove(&worker.id)
+            .ok_or_else(|| anyhow!("Missing ShowGroupState result for worker {}", worker.id))?;
+        ordered.push(state);
+    }
+
+    Ok(ordered)
+}
+
+fn latency_percentiles(
+    mut latencies: Vec<u128>,
+) -> (Option<u128>, Option<u128>, Option<u128>, Option<u128>) {
+    if latencies.is_empty() {
+        return (None, None, None, None);
+    }
+
+    latencies.sort_unstable();
+    let max = latencies.last().copied();
+
+    let percentile = |pct: usize| -> Option<u128> {
+        let len = latencies.len();
+        let idx = ((len.saturating_sub(1)) * pct).div_ceil(100);
+        latencies.get(idx).copied()
+    };
+
+    (percentile(50), percentile(95), percentile(99), max)
+}
+
+#[allow(dead_code)]
+async fn fanout_workers<F, Fut>(
+    phase: &str,
+    group_size: usize,
+    operation: &str,
+    workers: &[WorkerSpec],
+    fanout: &mut FanoutController,
+    op: F,
+) -> Result<()>
+where
+    F: Fn(WorkerSpec) -> Fut,
+    Fut: Future<Output = Result<()>>,
+{
+    let max_parallelism = fanout.parallelism();
+    let collect =
+        fanout_collect_workers(phase, group_size, operation, workers, max_parallelism, op).await;
+
+    emit_fanout_metrics(phase, group_size, operation, &collect.summary);
+    fanout.record(phase, operation, &collect.summary);
+
+    if collect.failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "fanout phase={} operation={} failed_workers={} max_parallelism={} failures=[{}]",
+        phase,
+        operation,
+        collect.failures.len(),
+        max_parallelism,
+        format_fanout_failures(&collect.failures)
+    ))
+}
+
+#[derive(Debug)]
+struct FanoutFailure {
+    worker: WorkerSpec,
+    error: anyhow::Error,
+}
+
+#[derive(Debug)]
+struct FanoutAttempt<T> {
+    worker: WorkerSpec,
+    latency_ms: u128,
+    result: Result<T>,
+}
+
+#[derive(Debug)]
+struct FanoutCollect<T> {
+    successes: Vec<(WorkerSpec, T)>,
+    failures: Vec<FanoutFailure>,
+    summary: FanoutSummary,
+}
+
+async fn fanout_collect_workers<F, Fut, T>(
+    phase: &str,
+    group_size: usize,
+    operation: &str,
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+    op: F,
+) -> FanoutCollect<T>
+where
+    F: Fn(WorkerSpec) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let started = Instant::now();
+    let max_parallelism = max_parallelism.max(1);
+    let mut request_count = 0usize;
+    let mut retry_pass_count = 0usize;
+    let mut effective_parallelism = 0usize;
+    let mut latencies = Vec::new();
+    let mut successes = Vec::with_capacity(workers.len());
+
+    let first_pass = run_fanout_pass(workers, max_parallelism, &op).await;
+    request_count += first_pass.0.len();
+    effective_parallelism = effective_parallelism.max(first_pass.1);
+
+    let mut retry_workers = Vec::new();
+    for attempt in first_pass.0 {
+        latencies.push((attempt.worker.id.clone(), attempt.latency_ms));
+        match attempt.result {
+            Ok(value) => successes.push((attempt.worker, value)),
+            Err(error) => retry_workers.push(FanoutFailure {
+                worker: attempt.worker,
+                error,
+            }),
+        }
+    }
+
+    for retry_pass in 1..=DEFAULT_FANOUT_RETRY_PASSES {
+        if retry_workers.is_empty() {
+            break;
+        }
+
+        eprintln!(
+            "[fanout-retry] phase={} group_size={} operation={} pass={} retry_workers={}",
+            phase,
+            group_size,
+            operation,
+            retry_pass,
+            retry_workers.len()
+        );
+
+        retry_pass_count += 1;
+        let retry_inputs = retry_workers
+            .iter()
+            .map(|failure| failure.worker.clone())
+            .collect::<Vec<_>>();
+        retry_workers.clear();
+
+        let retry_pass = run_fanout_pass(&retry_inputs, max_parallelism, &op).await;
+        request_count += retry_pass.0.len();
+        effective_parallelism = effective_parallelism.max(retry_pass.1);
+
+        for attempt in retry_pass.0 {
+            latencies.push((attempt.worker.id.clone(), attempt.latency_ms));
+            match attempt.result {
+                Ok(value) => successes.push((attempt.worker, value)),
+                Err(error) => retry_workers.push(FanoutFailure {
+                    worker: attempt.worker,
+                    error,
+                }),
+            }
+        }
+    }
+
+    let failures = retry_workers;
+
+    let latency_values = latencies.iter().map(|(_, ms)| *ms).collect::<Vec<_>>();
+    let (p50, p95, p99, max) = latency_percentiles(latency_values);
+    latencies.sort_by(|left, right| right.1.cmp(&left.1));
+    let slowest_worker_ids = latencies
+        .iter()
+        .take(5)
+        .map(|(worker_id, latency_ms)| format!("{}:{}ms", worker_id, latency_ms))
+        .collect::<Vec<_>>();
+
+    let (timeout_count, connect_error_count) = classify_fanout_failures(&failures);
+    let summary = FanoutSummary {
+        request_count,
+        recipient_count: workers.len(),
+        success_count: successes.len(),
+        failure_count: failures.len(),
+        timeout_count,
+        connect_error_count,
+        max_parallelism,
+        effective_parallelism,
+        retry_pass_count,
+        wall_ms: started.elapsed().as_millis(),
+        latency_p50_ms: p50,
+        latency_p95_ms: p95,
+        latency_p99_ms: p99,
+        latency_max_ms: max,
+        slowest_worker_ids,
+    };
+
+    FanoutCollect {
+        successes,
+        failures,
+        summary,
+    }
+}
+
+async fn run_fanout_pass<F, Fut, T>(
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+    op: &F,
+) -> (Vec<FanoutAttempt<T>>, usize)
+where
+    F: Fn(WorkerSpec) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let mut results = stream::iter(workers.iter().cloned())
+        .map(|worker| {
+            let worker_for_result = worker.clone();
+            let future = op(worker);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+
+            async move {
+                let command_started = Instant::now();
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                update_atomic_max(&max_in_flight, current);
+                let result = future.await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                FanoutAttempt {
+                    worker: worker_for_result,
+                    latency_ms: command_started.elapsed().as_millis(),
+                    result,
+                }
+            }
+        })
+        .buffer_unordered(max_parallelism.max(1));
+
+    let mut attempts = Vec::with_capacity(workers.len());
+    while let Some(attempt) = results.next().await {
+        attempts.push(attempt);
+    }
+
+    (attempts, max_in_flight.load(Ordering::SeqCst))
+}
+
+fn update_atomic_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchFanoutCommand {
+    pub client_id: String,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    pub command: Command,
+    pub expected_epoch: Option<u64>,
+    pub phase: Option<String>,
+    pub profile: Option<bool>,
+}
+
+pub fn build_batch_commands<F>(
+    workers: &[WorkerSpec],
+    mut command_for: F,
+) -> Vec<(String, Vec<BatchFanoutCommand>)>
+where
+    F: FnMut(&WorkerSpec) -> BatchFanoutCommand,
+{
+    let groups = physical_groups(workers.iter());
+    let mut result: Vec<(String, Vec<BatchFanoutCommand>)> = Vec::new();
+    for (physical_id, group) in groups {
+        let cmds: Vec<BatchFanoutCommand> = group
+            .iter()
+            .map(|w| {
+                let mut command = command_for(*w);
+                if command.request_id.is_none() {
+                    command.request_id = Some(batch_command_request_id(*w, &command));
+                }
+                command
+            })
+            .collect();
+        result.push((physical_id, cmds));
+    }
+    result
+}
+
+fn batch_command_request_id(worker: &WorkerSpec, command: &BatchFanoutCommand) -> String {
+    WorkerCommandContext::with_metadata(
+        worker,
+        &command.command,
+        command.expected_epoch,
+        command.phase.as_deref(),
+    )
+    .request_id
+}
+
+async fn batch_fanout_workers(
+    http: &reqwest::Client,
+    phase: &str,
+    group_size: usize,
+    operation: &str,
+    workers: &[WorkerSpec],
+    fanout: &mut FanoutController,
+    commands_by_physical: &[(String, Vec<BatchFanoutCommand>)],
+    expected_by_client: Option<&HashMap<String, ExpectedReceiveCommitState>>,
+) -> Result<()> {
+    let max_parallelism = fanout.parallelism();
+
+    let started = Instant::now();
+    let mut all_successes: Vec<(WorkerSpec, ())> = Vec::new();
+    let mut all_failures: Vec<FanoutFailure> = Vec::new();
+    let mut all_latencies: Vec<(String, u128)> = Vec::new();
+    let mut request_count = 0usize;
+    let mut retry_pass_count = 0usize;
+    let mut total_timeout_count = 0usize;
+    let mut total_connect_error_count = 0usize;
+    let mut effective_parallelism = 0usize;
+
+    let mut retry_commands: Vec<(String, Vec<BatchFanoutCommand>)> =
+        commands_by_physical.iter().cloned().collect();
+
+    for retry_pass in 0..=DEFAULT_FANOUT_RETRY_PASSES {
+        if retry_commands.is_empty() {
+            break;
+        }
+
+        if retry_pass > 0 {
+            eprintln!(
+                "[batch-fanout-retry] phase={} operation={} pass={} retry_physical_workers={}",
+                phase,
+                operation,
+                retry_pass,
+                retry_commands.len()
+            );
+        }
+
+        let pass = batch_fanout_collect_pass(http, workers, max_parallelism, &retry_commands).await;
+
+        request_count += pass.request_count;
+        effective_parallelism = effective_parallelism.max(pass.effective_parallelism);
+        if retry_pass > 0 {
+            retry_pass_count += 1;
+        }
+
+        let mut pass_failures = pass.failures;
+        let mut reconciled_successes = Vec::new();
+        if let Some(expected_by_client) = expected_by_client {
+            let reconciled =
+                reconcile_batch_receive_failures(http, pass_failures, expected_by_client).await;
+            reconciled_successes = reconciled.0;
+            pass_failures = reconciled.1;
+        }
+
+        let (classified_timeout_count, classified_connect_error_count) =
+            classify_fanout_failures(&pass_failures);
+        total_timeout_count += pass.timeout_count.max(classified_timeout_count);
+        total_connect_error_count += pass.connect_error_count.max(classified_connect_error_count);
+
+        let still_failing = retry_batch_commands_for_failures(&retry_commands, &pass_failures);
+        all_latencies.extend(pass.latencies);
+        all_successes.extend(pass.successes);
+        all_successes.extend(reconciled_successes);
+        all_failures = pass_failures;
+        retry_commands = still_failing;
+    }
+
+    let wall_ms = started.elapsed().as_millis();
+    let latency_values = all_latencies.iter().map(|(_, lat)| *lat).collect();
+    let (p50, p95, p99, max_lat) = latency_percentiles(latency_values);
+
+    let mut latencies_with_ids = all_latencies.clone();
+    latencies_with_ids.sort_by(|a, b| b.1.cmp(&a.1));
+    let slowest_worker_ids = latencies_with_ids
+        .iter()
+        .take(5)
+        .map(|(id, lat)| format!("{}:{}ms", id, lat))
+        .collect::<Vec<_>>();
+
+    let summary = FanoutSummary {
+        request_count,
+        recipient_count: workers.len(),
+        success_count: all_successes.len(),
+        failure_count: all_failures.len(),
+        timeout_count: total_timeout_count,
+        connect_error_count: total_connect_error_count,
+        max_parallelism,
+        effective_parallelism,
+        retry_pass_count,
+        wall_ms,
+        latency_p50_ms: p50,
+        latency_p95_ms: p95,
+        latency_p99_ms: p99,
+        latency_max_ms: max_lat,
+        slowest_worker_ids,
+    };
+
+    emit_fanout_metrics(phase, group_size, operation, &summary);
+    fanout.record(phase, operation, &summary);
+
+    if all_failures.is_empty() {
+        return Ok(());
+    }
+
+    Err(anyhow!(
+        "batch_fanout phase={} operation={} failed_workers={} max_parallelism={} failures=[{}]",
+        phase,
+        operation,
+        all_failures.len(),
+        max_parallelism,
+        format_fanout_failures(&all_failures)
+    ))
+}
+
+async fn reconcile_batch_receive_failures(
+    http: &reqwest::Client,
+    failures: Vec<FanoutFailure>,
+    expected_by_client: &HashMap<String, ExpectedReceiveCommitState>,
+) -> (Vec<(WorkerSpec, ())>, Vec<FanoutFailure>) {
+    let mut reconciled_ids = HashSet::new();
+    let mut remaining = Vec::new();
+
+    for failure in failures {
+        let Some(expected) = expected_by_client.get(&failure.worker.id) else {
+            remaining.push(failure);
+            continue;
+        };
+
+        let original_error = format!("{:#}", failure.error);
+        match receive_commit_reconciled_by_state(http, &failure.worker, expected, &original_error)
+            .await
+        {
+            Ok(true) => {
+                reconciled_ids.insert(failure.worker.id.clone());
+                remaining.push(failure);
+            }
+            Ok(false) => remaining.push(failure),
+            Err(err) => {
+                let text = format!("{:#}", err);
+                let error = if text.contains("could not query worker") {
+                    failure.error
+                } else {
+                    anyhow!(
+                        "batch receive reconciliation failed: {}; original_error={}",
+                        text,
+                        original_error
+                    )
+                };
+                remaining.push(FanoutFailure {
+                    worker: failure.worker,
+                    error,
+                });
+            }
+        }
+    }
+
+    let (successes, remaining) =
+        partition_batch_failures_by_reconciled_state(remaining, &reconciled_ids);
+    (successes, remaining)
+}
+
+fn partition_batch_failures_by_reconciled_state(
+    failures: Vec<FanoutFailure>,
+    reconciled_ids: &HashSet<String>,
+) -> (Vec<(WorkerSpec, ())>, Vec<FanoutFailure>) {
+    let mut successes = Vec::new();
+    let mut remaining = Vec::new();
+
+    for failure in failures {
+        if reconciled_ids.contains(&failure.worker.id) {
+            successes.push((failure.worker, ()));
+        } else {
+            remaining.push(failure);
+        }
+    }
+
+    (successes, remaining)
+}
+
+fn retry_batch_commands_for_failures(
+    commands_by_physical: &[(String, Vec<BatchFanoutCommand>)],
+    failures: &[FanoutFailure],
+) -> Vec<(String, Vec<BatchFanoutCommand>)> {
+    let failed_ids: HashSet<&str> = failures
+        .iter()
+        .map(|failure| failure.worker.id.as_str())
+        .collect();
+
+    commands_by_physical
+        .iter()
+        .filter_map(|(physical_id, cmds)| {
+            let retry_cmds = cmds
+                .iter()
+                .filter(|cmd| failed_ids.contains(cmd.client_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>();
+
+            if retry_cmds.is_empty() {
+                None
+            } else {
+                Some((physical_id.clone(), retry_cmds))
+            }
+        })
+        .collect()
+}
+
+struct BatchFanoutCollectPass {
+    successes: Vec<(WorkerSpec, ())>,
+    failures: Vec<FanoutFailure>,
+    latencies: Vec<(String, u128)>,
+    request_count: usize,
+    timeout_count: usize,
+    connect_error_count: usize,
+    effective_parallelism: usize,
+}
+
+struct BatchPhysicalAttempt {
+    physical_id: String,
+    successes: Vec<(WorkerSpec, ())>,
+    failures: Vec<FanoutFailure>,
+    latency_ms: u128,
+    request_count: usize,
+    timeout_count: usize,
+    connect_error_count: usize,
+}
+
+async fn batch_fanout_collect_pass(
+    http: &reqwest::Client,
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+    commands_by_physical: &[(String, Vec<BatchFanoutCommand>)],
+) -> BatchFanoutCollectPass {
+    let mut failures: Vec<FanoutFailure> = Vec::new();
+    let mut successes: Vec<(WorkerSpec, ())> = Vec::new();
+    let mut latencies: Vec<(String, u128)> = Vec::new();
+    let mut request_count = 0usize;
+    let mut timeout_count = 0usize;
+    let mut connect_error_count = 0usize;
+
+    let workers_by_id = Arc::new(
+        workers
+            .iter()
+            .map(|worker| (worker.id.clone(), worker.clone()))
+            .collect::<HashMap<_, _>>(),
+    );
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let mut attempts = stream::iter(commands_by_physical.iter().cloned())
+        .map(|(physical_id, cmds)| {
+            let http = http.clone();
+            let workers_by_id = Arc::clone(&workers_by_id);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+
+            async move {
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                update_atomic_max(&max_in_flight, current);
+                let attempt =
+                    batch_fanout_collect_physical(&http, &workers_by_id, physical_id, cmds).await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+                attempt
+            }
+        })
+        .buffer_unordered(max_parallelism.max(1));
+
+    while let Some(attempt) = attempts.next().await {
+        request_count += attempt.request_count;
+        timeout_count += attempt.timeout_count;
+        connect_error_count += attempt.connect_error_count;
+        latencies.push((attempt.physical_id, attempt.latency_ms));
+        successes.extend(attempt.successes);
+        failures.extend(attempt.failures);
+    }
+
+    BatchFanoutCollectPass {
+        successes,
+        failures,
+        latencies,
+        request_count,
+        timeout_count,
+        connect_error_count,
+        effective_parallelism: max_in_flight.load(Ordering::SeqCst),
+    }
+}
+
+async fn batch_fanout_collect_physical(
+    http: &reqwest::Client,
+    workers_by_id: &HashMap<String, WorkerSpec>,
+    physical_id: String,
+    cmds: Vec<BatchFanoutCommand>,
+) -> BatchPhysicalAttempt {
+    let physical_url = batch_physical_base_url(&physical_id, &cmds, workers_by_id);
+    let batch_url = format!("{}/batch-command", physical_url.trim_end_matches('/'));
+    let logical_count = cmds.len();
+
+    let batch_items: Vec<BatchCommandItem> = cmds
+        .iter()
+        .map(|c| BatchCommandItem {
+            client_id: c.client_id.clone(),
+            request_id: c.request_id.clone(),
+            command: c.command.clone(),
+            expected_epoch: c.expected_epoch,
+            phase: c.phase.clone(),
+            profile: c.profile,
+        })
+        .collect();
+
+    let batch_req = BatchCommandRequest { items: batch_items };
+    let attempt_start = Instant::now();
+    let result = http.post(&batch_url).json(&batch_req).send().await;
+    let latency_ms = attempt_start.elapsed().as_millis();
+
+    let mut failures = Vec::new();
+    let mut successes = Vec::new();
+    let mut timeout_count = 0usize;
+    let mut connect_error_count = 0usize;
+
+    match result {
+        Ok(response) => {
+            if response.status().is_success() {
+                match response.json::<BatchCommandResponse>().await {
+                    Ok(batch_resp) => {
+                        for item_result in &batch_resp.items {
+                            if item_result.response.status == "ok" {
+                                if let Some(w) = workers_by_id.get(&item_result.client_id) {
+                                    successes.push((w.clone(), ()));
+                                }
+                            } else if let Some(w) = workers_by_id.get(&item_result.client_id) {
+                                failures.push(FanoutFailure {
+                                    worker: w.clone(),
+                                    error: anyhow!(
+                                        "client {} batch error: {}",
+                                        item_result.client_id,
+                                        item_result.response.message
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                    Err(err) => {
+                        for c in &cmds {
+                            if let Some(w) = workers_by_id.get(&c.client_id) {
+                                failures.push(FanoutFailure {
+                                    worker: w.clone(),
+                                    error: anyhow!("batch response parse error: {}", err),
+                                });
+                            }
+                        }
+                    }
+                }
+            } else {
+                let status = response.status();
+                let body = response.text().await.unwrap_or_default();
+                for c in &cmds {
+                    if let Some(w) = workers_by_id.get(&c.client_id) {
+                        failures.push(FanoutFailure {
+                            worker: w.clone(),
+                            error: anyhow!("batch HTTP error: {} {}", status, body),
+                        });
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            let err_text = err.to_string();
+            let is_timeout = err_text.contains("timeout")
+                || err_text.contains("timed out")
+                || err_text.contains("deadline");
+            let is_connect = err_text.contains("unreachable")
+                || err_text.contains("connect")
+                || err_text.contains("refused");
+
+            if is_timeout {
+                timeout_count += logical_count;
+            }
+            if is_connect {
+                connect_error_count += logical_count;
+            }
+            for c in &cmds {
+                if let Some(w) = workers_by_id.get(&c.client_id) {
+                    failures.push(FanoutFailure {
+                        worker: w.clone(),
+                        error: anyhow!("batch request error: {}", err),
+                    });
+                }
+            }
+        }
+    }
+
+    BatchPhysicalAttempt {
+        physical_id,
+        successes,
+        failures,
+        latency_ms,
+        request_count: 1,
+        timeout_count,
+        connect_error_count,
+    }
+}
+
+fn batch_physical_base_url(
+    physical_id: &str,
+    cmds: &[BatchFanoutCommand],
+    workers_by_id: &HashMap<String, WorkerSpec>,
+) -> String {
+    if let Some(worker) = cmds
+        .iter()
+        .find_map(|cmd| workers_by_id.get(&cmd.client_id))
+    {
+        if let Some((base, _)) = worker.url.split_once("/client/") {
+            return base.trim_end_matches('/').to_string();
+        }
+
+        return worker.url.trim_end_matches('/').to_string();
+    }
+
+    format!("http://{}:8080", physical_id)
+}
+
+fn classify_fanout_failures(failures: &[FanoutFailure]) -> (usize, usize) {
+    failures
+        .iter()
+        .fold((0usize, 0usize), |(timeouts, connects), failure| {
+            let lower = format!("{:#}", failure.error).to_ascii_lowercase();
+            let is_timeout = lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("deadline has elapsed");
+            let is_connect = lower.contains("host is unreachable")
+                || lower.contains("no route to host")
+                || lower.contains("network is unreachable")
+                || lower.contains("tcp connect")
+                || lower.contains("connect error")
+                || lower.contains("failed to connect")
+                || lower.contains("dns error")
+                || lower.contains("failed to resolve");
+
+            (
+                timeouts + usize::from(is_timeout),
+                connects + usize::from(is_connect),
+            )
+        })
+}
+
+fn format_fanout_failures(failures: &[FanoutFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("{}: {:#}", failure.worker.id, failure.error))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn emit_fanout_metrics(phase: &str, group_size: usize, operation: &str, summary: &FanoutSummary) {
+    emit_network_metrics(NetworkPhaseMetrics {
+        phase: phase.to_string(),
+        group_size,
+        operation: operation.to_string(),
+        request_count: summary.request_count,
+        recipient_count: summary.recipient_count,
+        success_count: summary.success_count,
+        failure_count: summary.failure_count,
+        timeout_count: summary.timeout_count,
+        connect_error_count: summary.connect_error_count,
+        max_parallelism: summary.max_parallelism,
+        effective_parallelism: summary.effective_parallelism,
+        wall_ms: summary.wall_ms,
+        retry_count: 0,
+        retry_sleep_ms: 0,
+        retry_pass_count: summary.retry_pass_count,
+        failures: summary.failure_count,
+        worker_latency_p50_ms: summary.latency_p50_ms,
+        worker_latency_p95_ms: summary.latency_p95_ms,
+        worker_latency_p99_ms: summary.latency_p99_ms,
+        worker_latency_max_ms: summary.latency_max_ms,
+        slowest_worker_ids: summary.slowest_worker_ids.clone(),
+        logical_request_count: summary.recipient_count,
+        physical_request_count: summary.request_count,
+        singleton_request_count: 0,
+        packed_request_count: 0,
+        packed_logical_client_count: 0,
+        profile_enabled_recipient_count: 0,
+    });
+}
+
+fn emit_network_metrics(metrics: NetworkPhaseMetrics) {
+    match serde_json::to_string(&metrics) {
+        Ok(json) => eprintln!("[network-metrics] {}", json),
+        Err(err) => eprintln!("[network-metrics] serialization_error={}", err),
+    }
+}
+
+fn stepped_sizes(min_size: usize, max_size: usize, step_size: usize) -> Vec<usize> {
+    let mut sizes = Vec::new();
+    let mut current = min_size;
+
+    sizes.push(current);
+    while current < max_size {
+        let next = current.saturating_add(step_size);
+        current = next.min(max_size);
+        if sizes.last().copied() != Some(current) {
+            sizes.push(current);
+        }
+    }
+
+    sizes
+}
+
+fn build_plateau_sequence(
+    min_size: usize,
+    max_size: usize,
+    step_size: usize,
+    roundtrips: usize,
+) -> Vec<usize> {
+    let ascent = stepped_sizes(min_size, max_size, step_size);
+    let mut sequence = Vec::new();
+
+    for _ in 0..roundtrips {
+        for &size in &ascent {
+            if sequence.last().copied() != Some(size) {
+                sequence.push(size);
+            }
+        }
+        for &size in ascent.iter().rev().skip(1) {
+            if sequence.last().copied() != Some(size) {
+                sequence.push(size);
+            }
+        }
+    }
+
+    sequence
+}
+
+fn cap_count(raw: usize, cap: usize) -> usize {
+    if cap == 0 {
+        0
+    } else {
+        raw.min(cap)
+    }
+}
+
+fn calculate_batch_size(current_group_size: usize) -> usize {
+    if current_group_size <= SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE {
+        return 1;
+    }
+
+    let max_batch = (current_group_size / 4)
+        .max(1)
+        .min(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
+    thread_rng().gen_range(1..=max_batch)
+}
+
+fn update_ops_for_plateau(
+    size: usize,
+    update_rounds: usize,
+    max_update_samples_per_plateau: usize,
+) -> usize {
+    cap_count(
+        update_rounds.saturating_mul(size),
+        max_update_samples_per_plateau,
+    )
+}
+
+fn app_sends_per_payload_for_plateau(
+    size: usize,
+    app_rounds: usize,
+    max_app_samples_per_payload: usize,
+) -> usize {
+    if size < 2 {
+        0
+    } else {
+        cap_count(app_rounds.saturating_mul(size), max_app_samples_per_payload)
+    }
+}
+
+fn app_ops_for_plateau(
+    size: usize,
+    app_rounds: usize,
+    max_app_samples_per_payload: usize,
+    payload_count: usize,
+) -> usize {
+    app_sends_per_payload_for_plateau(size, app_rounds, max_app_samples_per_payload)
+        .saturating_mul(payload_count)
+}
+
+fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize) -> usize {
+    assert!(member_count > 0, "member_count must be greater than zero");
+    assert!(sample_count > 0, "sample_count must be greater than zero");
+
+    if sample_count >= member_count {
+        return seq_no % member_count;
+    }
+
+    let sample_no = seq_no % sample_count;
+    let one_based_index =
+        ((sample_no + 1) as u128 * member_count as u128 / sample_count as u128) as usize;
+
+    // Pick the right edge of each equal bucket: e.g. 20 / 4 => 5, 10, 15, 20.
+    one_based_index.saturating_sub(1)
+}
+
+fn estimate_total_units(
+    plateau_sequence: &[usize],
+    update_rounds: usize,
+    app_rounds: usize,
+    max_update_samples_per_plateau: usize,
+    max_app_samples_per_payload: usize,
+    payload_count: usize,
+) -> usize {
+    let mut total = 1usize;
+    let mut current_size = 1usize;
+
+    for &target in plateau_sequence {
+        total = total.saturating_add(target.abs_diff(current_size));
+        total = total.saturating_add(update_ops_for_plateau(
+            target,
+            update_rounds,
+            max_update_samples_per_plateau,
+        ));
+        total = total.saturating_add(app_ops_for_plateau(
+            target,
+            app_rounds,
+            max_app_samples_per_payload,
+            payload_count,
+        ));
+        current_size = target;
+    }
+
+    total
+}
+
+fn deterministic_payload(
+    len: usize,
+    plateau_size: usize,
+    payload_size: usize,
+    seq_no: usize,
+    actor_id: &str,
+) -> String {
+    if len == 0 {
+        return String::new();
+    }
+
+    let seed = format!(
+        "plateau={};payload={};seq={};actor={};",
+        plateau_size, payload_size, seq_no, actor_id
+    );
+
+    let mut out = String::with_capacity(len);
+    while out.len() < len {
+        out.push_str(&seed);
+    }
+    out.truncate(len);
+    out
+}
+
+async fn create_group(
+    http: &reqwest::Client,
+    leader: &WorkerSpec,
+    progress: &mut Progress,
+) -> Result<()> {
+    send_cmd_expect_ok_fragment(
+        http,
+        leader,
+        &Command::CreateGroup,
+        "group created and DS group state registered",
+    )
+    .await?;
+    progress.tick("create_group");
+    Ok(())
+}
+
+async fn add_n_members(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    batch_size: usize,
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+) -> Result<()> {
+    let timeout = Duration::from_secs(30);
+
+    if active.is_empty() {
+        return Err(anyhow!(
+            "No active group member available to add new member"
+        ));
+    }
+    if batch_size == 0 {
+        return Err(anyhow!("Cannot add zero members"));
+    }
+    if idle.len() < batch_size {
+        return Err(anyhow!(
+            "Requested add batch of {} members, but only {} idle workers are available",
+            batch_size,
+            idle.len()
+        ));
+    }
+
+    let actor_idx = thread_rng().gen_range(0..active.len());
+    let actor = active[actor_idx].clone();
+
+    let mut joiners = Vec::with_capacity(batch_size);
+    for _ in 0..batch_size {
+        let joiner = idle
+            .pop_front()
+            .ok_or_else(|| anyhow!("No idle worker available to add"))?;
+        joiners.push(joiner);
+    }
+    let joiner_ids: Vec<String> = joiners.iter().map(|joiner| joiner.id.clone()).collect();
+
+    let actor_before = show_group_state(http, &actor).await?;
+    let mut expected_members = actor_before.members.clone();
+    expected_members.extend(joiner_ids.iter().cloned());
+    let expected_after_commit =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
+
+    for joiner in &joiners {
+        let fragment = format!("key package uploaded for {}", joiner.id);
+        send_cmd_expect_ok_fragment(http, joiner, &Command::GenerateKeyPackage, &fragment).await?;
+    }
+
+    send_cmd_expect_ok_fragment(
+        http,
+        &actor,
+        &Command::AddMembers {
+            members: joiner_ids.clone(),
+        },
+        "added locally in one commit",
+    )
+    .await?;
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "add_member.actor_process_pending",
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "add_member.actor_receive_commit",
+        )
+        .await?;
+    }
+
+    for joiner in &joiners {
+        let join_fragment = format!("{} joined from welcome", joiner.id);
+        send_cmd_until_ok(
+            http,
+            joiner,
+            &Command::JoinFromWelcome,
+            &join_fragment,
+            "404 Not Found",
+            timeout,
+        )
+        .await?;
+    }
+
+    let recipients: Vec<WorkerSpec> = active
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| *idx != actor_idx)
+        .map(|(_, worker)| worker.clone())
+        .collect();
+    let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
+    let expected_ep = expected_epoch(&expected_state);
+    let fanout_phase = if process_pending_fanout {
+        "add_member.fanout_process_pending"
+    } else {
+        "add_member.fanout_receive_commit"
+    };
+    let commands_by_physical = build_batch_commands(&recipients, |worker| BatchFanoutCommand {
+        client_id: worker.id.clone(),
+        request_id: None,
+        command: if process_pending_fanout {
+            Command::ProcessPending {
+                kinds: Some(vec![PendingKind::Commits]),
+                max_messages: None,
+                expected_epoch: expected_ep,
+            }
+        } else {
+            Command::ReceiveCommit
+        },
+        expected_epoch: expected_ep,
+        phase: Some(fanout_phase.to_string()),
+        profile: None,
+    });
+    let expected_by_client = recipients
+        .iter()
+        .map(|worker| (worker.id.clone(), expected_state.clone()))
+        .collect::<HashMap<_, _>>();
+    batch_fanout_workers(
+        http,
+        "add_member",
+        active.len(),
+        "receive_commit",
+        &recipients,
+        fanout,
+        &commands_by_physical,
+        Some(&expected_by_client),
+    )
+    .await?;
+
+    active.extend(joiners);
+    progress.tick_units(
+        batch_size,
+        &format!(
+            "add {} member(s) {:?} actor={}",
+            batch_size, joiner_ids, actor.id
+        ),
+    );
+    Ok(())
+}
+
+async fn remove_n_members(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    batch_size: usize,
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+) -> Result<()> {
+    if active.len() <= 1 {
+        return Err(anyhow!("Cannot remove the last remaining member"));
+    }
+    if batch_size == 0 {
+        return Err(anyhow!("Cannot remove zero members"));
+    }
+    if batch_size >= active.len() {
+        return Err(anyhow!(
+            "Requested remove batch of {} members from {} active members; actor self-removal is not supported",
+            batch_size,
+            active.len()
+        ));
+    }
+
+    let mut rng = thread_rng();
+
+    let actor_idx = rng.gen_range(0..active.len());
+    let actor = active[actor_idx].clone();
+
+    // Pick random members to remove, but do not let the actor remove itself.
+    // Self-removal is possible in MLS-style flows, but it complicates this benchmark's bookkeeping.
+    let mut removable_indices: Vec<usize> =
+        (0..active.len()).filter(|idx| *idx != actor_idx).collect();
+    let mut removed = Vec::with_capacity(batch_size);
+    for _ in 0..batch_size {
+        let candidate_pos = rng.gen_range(0..removable_indices.len());
+        let removed_idx = removable_indices.swap_remove(candidate_pos);
+        removed.push(active[removed_idx].clone());
+    }
+    let removed_ids: Vec<String> = removed.iter().map(|worker| worker.id.clone()).collect();
+    let removed_id_set: HashSet<String> = removed_ids.iter().cloned().collect();
+
+    let actor_before = show_group_state(http, &actor).await?;
+    let expected_members = actor_before
+        .members
+        .iter()
+        .filter(|member| !removed_id_set.contains(*member))
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_after_commit =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
+
+    send_cmd_expect_ok_fragment(
+        http,
+        &actor,
+        &Command::RemoveMembers {
+            members: removed_ids.clone(),
+        },
+        "removed locally; group commit published",
+    )
+    .await?;
+
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "remove_member.actor_process_pending",
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "remove_member.actor_receive_commit",
+        )
+        .await?;
+    }
+
+    let recipients: Vec<WorkerSpec> = active
+        .iter()
+        .filter(|worker| worker.id != actor.id)
+        .cloned()
+        .collect();
+    let fanout_phase = if process_pending_fanout {
+        "remove_member.fanout_process_pending"
+    } else {
+        "remove_member.fanout_receive_commit"
+    };
+    let commands_by_physical = build_batch_commands(&recipients, |worker| {
+        let is_removed = removed_id_set.contains(&worker.id);
+        let expected_ep = if is_removed {
+            Some(expected_after_commit.epoch)
+        } else {
+            expected_epoch(&ExpectedReceiveCommitState::Group(
+                expected_after_commit.clone(),
+            ))
+        };
+        BatchFanoutCommand {
+            client_id: worker.id.clone(),
+            request_id: None,
+            command: if process_pending_fanout {
+                Command::ProcessPending {
+                    kinds: Some(vec![PendingKind::Commits]),
+                    max_messages: None,
+                    expected_epoch: expected_ep,
+                }
+            } else {
+                Command::ReceiveCommit
+            },
+            expected_epoch: expected_ep,
+            phase: Some(fanout_phase.to_string()),
+            profile: None,
+        }
+    });
+    let expected_by_client = recipients
+        .iter()
+        .map(|worker| {
+            let expected = if removed_id_set.contains(&worker.id) {
+                ExpectedReceiveCommitState::Removed {
+                    expected_epoch: expected_after_commit.epoch,
+                }
+            } else {
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone())
+            };
+            (worker.id.clone(), expected)
+        })
+        .collect::<HashMap<_, _>>();
+    batch_fanout_workers(
+        http,
+        "remove_member",
+        active.len(),
+        "receive_commit",
+        &recipients,
+        fanout,
+        &commands_by_physical,
+        Some(&expected_by_client),
+    )
+    .await?;
+
+    active.retain(|worker| !removed_id_set.contains(&worker.id));
+    for removed_worker in removed {
+        idle.push_front(removed_worker);
+    }
+
+    progress.tick_units(
+        batch_size,
+        &format!(
+            "remove {} member(s) {:?} actor={}",
+            batch_size, removed_ids, actor.id
+        ),
+    );
+    Ok(())
+}
+
+async fn transition_to_size(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    target_size: usize,
+    fanout: &mut FanoutController,
+    membership_batches: &mut MembershipBatchPlanner,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+) -> Result<()> {
+    while active.len() < target_size {
+        let remaining = target_size - active.len();
+        let max_allowed = remaining.min(idle.len());
+        if max_allowed == 0 {
+            return Err(anyhow!("No idle worker available to add"));
+        }
+        let batch_size = membership_batches.next_batch_size(active.len(), max_allowed);
+        add_n_members(
+            http,
+            active,
+            idle,
+            batch_size,
+            fanout,
+            progress,
+            process_pending_fanout,
+        )
+        .await?;
+    }
+
+    while active.len() > target_size {
+        let remaining = active.len() - target_size;
+        let max_allowed = remaining.min(active.len().saturating_sub(1));
+        if max_allowed == 0 {
+            return Err(anyhow!("Cannot remove the last remaining member"));
+        }
+        let batch_size = membership_batches.next_batch_size(active.len(), max_allowed);
+        remove_n_members(
+            http,
+            active,
+            idle,
+            batch_size,
+            fanout,
+            progress,
+            process_pending_fanout,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
+async fn run_update_phase(
+    http: &reqwest::Client,
+    active: &[WorkerSpec],
+    plateau_size: usize,
+    update_rounds: usize,
+    max_update_samples_per_plateau: usize,
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+) -> Result<()> {
+    let total_updates =
+        update_ops_for_plateau(plateau_size, update_rounds, max_update_samples_per_plateau);
+    if total_updates == 0 {
+        return Ok(());
+    }
+
+    eprintln!(
+        "\n[plateau {}] update phase: {} successful self-update cycles",
+        plateau_size, total_updates
+    );
+
+    for seq_no in 0..total_updates {
+        let actor_idx = sampled_member_index(active.len(), total_updates, seq_no);
+        let actor = &active[actor_idx];
+        let actor_before = show_group_state(http, actor).await?;
+        let expected_after_commit = expected_group_state(
+            &actor_before,
+            actor_before.epoch + 1,
+            actor_before.members.clone(),
+        );
+
+        send_cmd_expect_ok_fragment(
+            http,
+            actor,
+            &Command::SelfUpdate,
+            "self_update commit published to group",
+        )
+        .await?;
+
+        if process_pending_fanout {
+            process_pending_commit_expect(
+                http,
+                actor,
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "update.actor_process_pending",
+            )
+            .await?;
+        } else {
+            receive_commit_expect(
+                http,
+                actor,
+                "own commit accepted from DS",
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "update.actor_receive_commit",
+            )
+            .await?;
+        }
+
+        let recipients: Vec<WorkerSpec> = active
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != actor_idx)
+            .map(|(_, worker)| worker.clone())
+            .collect();
+        let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
+        let expected_ep = expected_epoch(&expected_state);
+        let fanout_phase = if process_pending_fanout {
+            "update.fanout_process_pending"
+        } else {
+            "update.fanout_receive_commit"
+        };
+        let commands_by_physical =
+            build_batch_commands(&recipients, |_worker| BatchFanoutCommand {
+                client_id: _worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                    }
+                } else {
+                    Command::ReceiveCommit
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: None,
+            });
+        let expected_by_client = recipients
+            .iter()
+            .map(|worker| (worker.id.clone(), expected_state.clone()))
+            .collect::<HashMap<_, _>>();
+        batch_fanout_workers(
+            http,
+            "update",
+            plateau_size,
+            "receive_commit",
+            &recipients,
+            fanout,
+            &commands_by_physical,
+            Some(&expected_by_client),
+        )
+        .await?;
+
+        progress.tick(&format!(
+            "plateau {} update {}/{} actor={}",
+            plateau_size,
+            seq_no + 1,
+            total_updates,
+            actor.id
+        ));
+    }
+
+    Ok(())
+}
+
+async fn run_application_phase(
+    http: &reqwest::Client,
+    active: &[WorkerSpec],
+    plateau_size: usize,
+    app_rounds: usize,
+    max_app_samples_per_payload: usize,
+    payload_sizes: &[usize],
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+) -> Result<()> {
+    if active.len() < 2 {
+        eprintln!(
+            "\n[plateau {}] application phase skipped: fewer than 2 active members",
+            plateau_size
+        );
+        return Ok(());
+    }
+
+    let per_payload_count =
+        app_sends_per_payload_for_plateau(plateau_size, app_rounds, max_app_samples_per_payload);
+    if per_payload_count == 0 {
+        return Ok(());
+    }
+
+    for &payload_size in payload_sizes {
+        eprintln!(
+            "\n[plateau {}] application phase: {} successful sends at payload {} B",
+            plateau_size, per_payload_count, payload_size
+        );
+
+        for seq_no in 0..per_payload_count {
+            let actor_idx = sampled_member_index(active.len(), per_payload_count, seq_no);
+            let actor = &active[actor_idx];
+            let payload =
+                deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
+
+            send_cmd_expect_ok_fragment(
+                http,
+                actor,
+                &Command::SendApplicationMessage { message: payload },
+                "application message broadcast to group",
+            )
+            .await?;
+
+            let recipient_indices: Vec<usize> =
+                (0..active.len()).filter(|&j| j != actor_idx).collect();
+
+            let sampled_pos =
+                sampled_member_index(recipient_indices.len(), per_payload_count, seq_no);
+
+            let recipients: Vec<(usize, WorkerSpec)> = recipient_indices
+                .iter()
+                .enumerate()
+                .map(|(pos, recipient_idx)| (pos, active[*recipient_idx].clone()))
+                .collect();
+            let sampled_worker_id = recipients[sampled_pos].1.id.clone();
+            let recipient_workers: Vec<WorkerSpec> =
+                recipients.into_iter().map(|(_, worker)| worker).collect();
+
+            let commands_by_physical =
+                build_batch_commands(&recipient_workers, |worker| BatchFanoutCommand {
+                    client_id: worker.id.clone(),
+                    request_id: None,
+                    command: Command::ReceiveApplicationMessage {
+                        profile: worker.id == sampled_worker_id,
+                    },
+                    expected_epoch: None,
+                    phase: Some("application.fanout_receive_application_message".to_string()),
+                    profile: Some(worker.id == sampled_worker_id),
+                });
+            batch_fanout_workers(
+                http,
+                "application",
+                plateau_size,
+                "receive_application_message",
+                &recipient_workers,
+                fanout,
+                &commands_by_physical,
+                None,
+            )
+            .await?;
+
+            progress.tick(&format!(
+                "plateau {} app payload={} {}/{} actor={}",
+                plateau_size,
+                payload_size,
+                seq_no + 1,
+                per_payload_count,
+                actor.id
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+pub fn aggregate_csv(
+    run_dir: &Path,
+    worker_ids: &[String],
+    provided_layout: &Option<WorkerLayout>,
+) -> Result<()> {
+    let csv_path = run_dir.join("events.csv");
+    let mut wtr = csv::Writer::from_path(&csv_path)?;
+
+    let layout_path = run_dir.join("worker_layout.json");
+    let layout: Option<WorkerLayout> = if let Some(l) = provided_layout {
+        Some(l.clone())
+    } else if layout_path.exists() {
+        fs::read_to_string(&layout_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+    } else {
+        None
+    };
+
+    let profile_enabled_ids: std::collections::HashSet<&str> = if let Some(ref l) = layout {
+        l.clients
+            .iter()
+            .filter(|c| c.profile_enabled)
+            .map(|c| c.client_id.as_str())
+            .collect()
+    } else {
+        worker_ids.iter().map(|s| s.as_str()).collect()
+    };
+
+    let logical_worker_count = layout
+        .as_ref()
+        .map(|l| l.logical_worker_count)
+        .unwrap_or(worker_ids.len());
+    let physical_worker_count = layout
+        .as_ref()
+        .map(|l| l.physical_worker_count)
+        .unwrap_or(worker_ids.len());
+    let singleton_count = layout
+        .as_ref()
+        .map(|l| l.clients.iter().filter(|c| c.profile_enabled).count())
+        .unwrap_or(worker_ids.len());
+    let packed_clients_per_container = layout
+        .as_ref()
+        .map(|l| l.packed_clients_per_container)
+        .unwrap_or(1);
+    let layout_mode = layout
+        .as_ref()
+        .map(|l| l.layout_mode.as_str())
+        .unwrap_or("one-container-per-client");
+
+    // Build per-client metadata lookup from layout clients
+    let mut client_meta: std::collections::HashMap<&str, &WorkerLayoutClient> =
+        std::collections::HashMap::new();
+    if let Some(ref l) = layout {
+        for c in &l.clients {
+            client_meta.insert(c.client_id.as_str(), c);
+        }
+    }
+
+    #[derive(Serialize)]
+    struct CsvRow<'a> {
+        client_id: &'a str,
+        worker_id: &'a str,
+        physical_worker_id: &'a str,
+        container_mode: &'a str,
+        execution_backend: &'a str,
+        device_kind: &'a str,
+        transport: &'a str,
+        access_backend: &'a str,
+        arch: &'a str,
+        rust_target: &'a str,
+        ts_unix_ns: u128,
+        op: String,
+        implementation: String,
+        wall_ns: u128,
+        cpu_thread_ns: Option<u128>,
+        alloc_bytes: Option<u64>,
+        alloc_count: Option<u64>,
+        artifact_size_bytes: Option<usize>,
+        encrypted_group_info_bytes: Option<usize>,
+        encrypted_secrets_count: Option<usize>,
+        group_epoch: Option<u64>,
+        tree_size: Option<u32>,
+        member_count: Option<usize>,
+        invitee_count: Option<isize>,
+        ciphersuite: Option<String>,
+        app_msg_plaintext_bytes: Option<usize>,
+        app_msg_padding_bytes: Option<usize>,
+        app_msg_ciphertext_bytes: Option<usize>,
+        aad_bytes: Option<usize>,
+        pid: u32,
+        thread_id: String,
+        run_id: Option<String>,
+        scenario: Option<String>,
+        node_name: Option<String>,
+        pod_name: Option<String>,
+        logical_worker_count: usize,
+        physical_worker_count: usize,
+        singleton_count: usize,
+        packed_clients_per_container: usize,
+        layout_mode: &'a str,
+    }
+
+    fn non_empty_or<'a>(value: Option<&'a str>, default: &'a str) -> &'a str {
+        match value {
+            Some(value) if !value.is_empty() => value,
+            _ => default,
+        }
+    }
+
+    for worker_id in worker_ids {
+        let path = run_dir.join(format!("client-{worker_id}.jsonl"));
+
+        if !profile_enabled_ids.contains(worker_id.as_str()) {
+            if path.exists() {
+                eprintln!(
+                    "[csv] removing stale profile file for packed client {}: {}",
+                    worker_id,
+                    path.display()
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+
+        if !path.exists() {
+            eprintln!(
+                "[csv] WARNING: profile_enabled client {} JSONL not found: {}",
+                worker_id,
+                path.display()
+            );
+            continue;
+        }
+
+        let meta = client_meta.get(worker_id.as_str()).copied();
+
+        let file = File::open(&path)?;
+        let reader = BufReader::new(file);
+
+        for line in reader.lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+
+            let event: ProfileEvent = serde_json::from_str(&line)
+                .with_context(|| format!("Invalid json in {}", path.display()))?;
+            let physical_worker_id =
+                non_empty_or(meta.map(|m| m.physical_worker_id.as_str()), worker_id);
+
+            let row = CsvRow {
+                client_id: worker_id,
+                worker_id: physical_worker_id,
+                physical_worker_id,
+                container_mode: non_empty_or(meta.map(|m| m.container_mode.as_str()), "singleton"),
+                execution_backend: non_empty_or(
+                    meta.map(|m| m.execution_backend.as_str()),
+                    "docker_container",
+                ),
+                device_kind: non_empty_or(
+                    meta.map(|m| m.device_kind.as_str()),
+                    "scratch_container",
+                ),
+                transport: non_empty_or(meta.map(|m| m.transport.as_str()), "docker_bridge"),
+                access_backend: non_empty_or(meta.map(|m| m.access_backend.as_str()), "docker"),
+                arch: non_empty_or(meta.map(|m| m.arch.as_str()), "x86_64"),
+                rust_target: non_empty_or(
+                    meta.map(|m| m.rust_target.as_str()),
+                    "x86_64-unknown-linux-musl",
+                ),
+                ts_unix_ns: event.ts_unix_ns,
+                op: event.op,
+                implementation: event.implementation,
+                wall_ns: event.wall_ns,
+                cpu_thread_ns: event.cpu_thread_ns,
+                alloc_bytes: event.alloc_bytes,
+                alloc_count: event.alloc_count,
+                artifact_size_bytes: event.artifact_size_bytes,
+                encrypted_group_info_bytes: event.encrypted_group_info_bytes,
+                encrypted_secrets_count: event.encrypted_secrets_count,
+                group_epoch: event.group_epoch,
+                tree_size: event.tree_size,
+                member_count: event.member_count,
+                invitee_count: event.invitee_count,
+                ciphersuite: event.ciphersuite,
+                app_msg_plaintext_bytes: event.app_msg_plaintext_bytes,
+                app_msg_padding_bytes: event.app_msg_padding_bytes,
+                app_msg_ciphertext_bytes: event.app_msg_ciphertext_bytes,
+                aad_bytes: event.aad_bytes,
+                pid: event.pid,
+                thread_id: event.thread_id,
+                run_id: event.run_id,
+                scenario: event.scenario,
+                node_name: event.node_name,
+                pod_name: event.pod_name,
+                logical_worker_count,
+                physical_worker_count,
+                singleton_count,
+                packed_clients_per_container,
+                layout_mode,
+            };
+
+            wtr.serialize(row)?;
+        }
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod validate_run_id_tests {
+    use super::*;
+
+    #[test]
+    fn validate_run_id_accepts_valid() {
+        for rid in &["run-001", "test.123", "bench_2026", "a", "0", "A.B_C"] {
+            assert!(
+                validate_run_id(rid).is_ok(),
+                "Expected '{}' to be valid",
+                rid
+            );
+        }
+    }
+
+    #[test]
+    fn validate_run_id_rejects_empty() {
+        assert!(validate_run_id("").is_err());
+    }
+
+    #[test]
+    fn validate_run_id_rejects_path_traversal() {
+        for rid in &["/", ".", "..", "foo/bar", "../../etc"] {
+            assert!(
+                validate_run_id(rid).is_err(),
+                "Expected '{}' to be rejected",
+                rid
+            );
+        }
+    }
+
+    #[test]
+    fn validate_run_id_rejects_special_chars() {
+        for rid in &["hello world", "foo$bar", "foo|bar", "foo;bar"] {
+            assert!(
+                validate_run_id(rid).is_err(),
+                "Expected '{}' to be rejected",
+                rid
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod membership_batch_tests {
+    use super::*;
+
+    #[test]
+    fn calculate_batch_size_keeps_small_groups_single_member() {
+        for current_group_size in 1..=SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE {
+            for _ in 0..32 {
+                assert_eq!(calculate_batch_size(current_group_size), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn calculate_batch_size_caps_large_group_random_batches() {
+        for current_group_size in [17usize, 24, 32, 64, 256] {
+            let max_batch = (current_group_size / 4).min(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
+
+            for _ in 0..128 {
+                let batch_size = calculate_batch_size(current_group_size);
+                assert!(batch_size >= 1);
+                assert!(batch_size <= max_batch);
+            }
+        }
+    }
+
+    #[test]
+    fn membership_batch_planner_forces_one_single_member_op_per_plateau() {
+        let mut planner = MembershipBatchPlanner::default();
+
+        planner.enter_plateau(32);
+        assert_eq!(planner.next_batch_size(64, 8), 1);
+
+        let followup = planner.next_batch_size(64, 8);
+        assert!((1..=8).contains(&followup));
+
+        planner.enter_plateau(64);
+        assert_eq!(planner.next_batch_size(64, 8), 1);
+    }
+
+    #[test]
+    fn membership_batch_planner_respects_transition_cap() {
+        let mut planner = MembershipBatchPlanner::default();
+
+        planner.enter_plateau(128);
+        assert_eq!(planner.next_batch_size(256, 3), 1);
+
+        for _ in 0..128 {
+            let batch_size = planner.next_batch_size(256, 3);
+            assert!((1..=3).contains(&batch_size));
+        }
+    }
+}
+
+/// Validate a run ID string for safe filesystem usage.
+/// Rejects empty, `/`, `.`, `..`, strings containing `/`, or anything outside `[A-Za-z0-9._-]+`.
+pub fn validate_run_id(run_id: &str) -> Result<()> {
+    if run_id.is_empty() {
+        return Err(anyhow!("Run ID must not be empty"));
+    }
+    if run_id == "/" || run_id == "." || run_id == ".." {
+        return Err(anyhow!("Run ID must not be '{}'", run_id));
+    }
+    if run_id.contains('/') {
+        return Err(anyhow!("Run ID must not contain '/'"));
+    }
+    if !run_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(anyhow!(
+            "Run ID must only contain [A-Za-z0-9._-], got '{}'",
+            run_id
+        ));
+    }
+    Ok(())
+}
+
+fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usize> {
+    if config.min_size == 0 {
+        return Err(anyhow!("--min-size must be at least 1"));
+    }
+    if config.step_size == 0 {
+        return Err(anyhow!("--step-size must be at least 1"));
+    }
+    if config.roundtrips == 0 {
+        return Err(anyhow!("--roundtrips must be at least 1"));
+    }
+    if config.payload_sizes.is_empty() {
+        return Err(anyhow!("At least one payload size is required"));
+    }
+
+    let max_size = config.max_size.unwrap_or(worker_count);
+
+    if max_size == 0 {
+        return Err(anyhow!("--max-size must be at least 1"));
+    }
+    if max_size > worker_count {
+        return Err(anyhow!(
+            "--max-size {} exceeds number of supplied workers {}",
+            max_size,
+            worker_count
+        ));
+    }
+    if config.min_size > max_size {
+        return Err(anyhow!(
+            "--min-size {} cannot exceed --max-size {}",
+            config.min_size,
+            max_size
+        ));
+    }
+
+    Ok(max_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::time::Duration;
+
+    use anyhow::anyhow;
+
+    use crate::worker_api::Command;
+
+    use super::{
+        batch_physical_base_url, build_batch_commands, fanout_workers,
+        partition_batch_failures_by_reconciled_state, retry_batch_commands_for_failures,
+        sampled_member_index, BatchFanoutCommand, FanoutController, FanoutFailure, WorkerSpec,
+        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD, FANOUT_LATENCY_SPIKE_P95_MS,
+    };
+
+    fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
+        (0..sample_count)
+            .map(|seq_no| sampled_member_index(member_count, sample_count, seq_no))
+            .collect()
+    }
+
+    #[test]
+    fn samples_every_member_when_sample_count_covers_group() {
+        assert_eq!(sampled_indices(16, 16), (0..16).collect::<Vec<_>>());
+        assert_eq!(
+            sampled_indices(5, 16),
+            vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0]
+        );
+    }
+
+    #[test]
+    fn samples_equal_bucket_right_edges_when_group_exceeds_sample_count() {
+        assert_eq!(sampled_indices(20, 4), vec![4, 9, 14, 19]);
+        assert_eq!(sampled_indices(100, 4), vec![24, 49, 74, 99]);
+    }
+
+    #[test]
+    fn includes_last_member_when_sampling_large_group() {
+        let indices = sampled_indices(100, 16);
+
+        assert_eq!(indices.last(), Some(&99));
+        assert!(indices.iter().all(|&idx| idx < 100));
+        assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[test]
+    fn build_batch_commands_assigns_request_ids() {
+        let workers = (1..=2)
+            .map(|idx| {
+                WorkerSpec::legacy(format!("{idx:05}"), format!("http://worker-{idx:05}:8080"))
+            })
+            .collect::<Vec<_>>();
+
+        let commands_by_physical = build_batch_commands(&workers, |worker| BatchFanoutCommand {
+            client_id: worker.id.clone(),
+            request_id: None,
+            command: Command::ReceiveCommit,
+            expected_epoch: Some(3),
+            phase: Some("test.phase".to_string()),
+            profile: None,
+        });
+
+        let request_ids = commands_by_physical
+            .iter()
+            .flat_map(|(_, cmds)| cmds.iter())
+            .map(|cmd| cmd.request_id.clone().expect("request id"))
+            .collect::<Vec<_>>();
+        let unique_request_ids = request_ids.iter().collect::<HashSet<_>>();
+
+        assert_eq!(request_ids.len(), workers.len());
+        assert_eq!(unique_request_ids.len(), workers.len());
+    }
+
+    #[test]
+    fn retry_batch_commands_preserves_request_ids_for_failed_clients() {
+        let worker_2 = WorkerSpec::legacy("00002".to_string(), "http://worker-00002:8080".into());
+        let commands_by_physical = vec![(
+            "worker-a".to_string(),
+            vec![
+                BatchFanoutCommand {
+                    client_id: "00001".to_string(),
+                    request_id: Some("rid-1".to_string()),
+                    command: Command::ReceiveCommit,
+                    expected_epoch: Some(7),
+                    phase: Some("test.phase".to_string()),
+                    profile: None,
+                },
+                BatchFanoutCommand {
+                    client_id: "00002".to_string(),
+                    request_id: Some("rid-2".to_string()),
+                    command: Command::ReceiveCommit,
+                    expected_epoch: Some(7),
+                    phase: Some("test.phase".to_string()),
+                    profile: None,
+                },
+            ],
+        )];
+        let failures = vec![FanoutFailure {
+            worker: worker_2,
+            error: anyhow!("synthetic batch failure"),
+        }];
+
+        let retry_commands = retry_batch_commands_for_failures(&commands_by_physical, &failures);
+
+        assert_eq!(retry_commands.len(), 1);
+        assert_eq!(retry_commands[0].1.len(), 1);
+        assert_eq!(retry_commands[0].1[0].client_id, "00002");
+        assert_eq!(retry_commands[0].1[0].request_id.as_deref(), Some("rid-2"));
+    }
+
+    #[test]
+    fn reconciled_batch_failure_is_counted_as_success() {
+        let worker_2 = WorkerSpec::legacy("00002".to_string(), "http://worker-00002:8080".into());
+        let failures = vec![FanoutFailure {
+            worker: worker_2,
+            error: anyhow!("client 00002 batch error: DS GET failed with status 404 Not Found"),
+        }];
+        let reconciled_ids = HashSet::from(["00002".to_string()]);
+
+        let (successes, remaining) =
+            partition_batch_failures_by_reconciled_state(failures, &reconciled_ids);
+
+        assert_eq!(successes.len(), 1);
+        assert_eq!(successes[0].0.id, "00002");
+        assert!(remaining.is_empty());
+    }
+
+    #[test]
+    fn batch_physical_base_url_uses_worker_url() {
+        let local_worker = WorkerSpec::legacy("00001".to_string(), "http://127.0.0.1:19481".into());
+        let layout_worker = WorkerSpec {
+            id: "00002".to_string(),
+            url: "http://worker-00002:8080/client/00002".to_string(),
+            command_url: "http://worker-00002:8080/client/00002".to_string(),
+            health_url: "http://worker-00002:8080/client/00002/health".to_string(),
+            physical_worker_id: "worker-00002".to_string(),
+            container_mode: super::ContainerMode::Singleton,
+            profile_enabled: true,
+        };
+        let workers_by_id = HashMap::from([
+            (local_worker.id.clone(), local_worker),
+            (layout_worker.id.clone(), layout_worker),
+        ]);
+
+        let local_cmd = BatchFanoutCommand {
+            client_id: "00001".to_string(),
+            request_id: Some("rid-1".to_string()),
+            command: Command::ReceiveCommit,
+            expected_epoch: None,
+            phase: None,
+            profile: None,
+        };
+        let layout_cmd = BatchFanoutCommand {
+            client_id: "00002".to_string(),
+            request_id: Some("rid-2".to_string()),
+            command: Command::ReceiveCommit,
+            expected_epoch: None,
+            phase: None,
+            profile: None,
+        };
+
+        assert_eq!(
+            batch_physical_base_url("00001", &[local_cmd], &workers_by_id),
+            "http://127.0.0.1:19481"
+        );
+        assert_eq!(
+            batch_physical_base_url("worker-00002", &[layout_cmd], &workers_by_id),
+            "http://worker-00002:8080"
+        );
+    }
+
+    #[tokio::test]
+    async fn fanout_attempts_all_workers_before_returning_failures() {
+        let workers = (1..=4)
+            .map(|idx| {
+                WorkerSpec::legacy(format!("{idx:05}"), format!("http://worker-{idx:05}:8080"))
+            })
+            .collect::<Vec<_>>();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut fanout = FanoutController::new(
+            4,
+            1,
+            false,
+            DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
+            FANOUT_LATENCY_SPIKE_P95_MS,
+        );
+        let attempts_for_op = attempts.clone();
+
+        let result = fanout_workers(
+            "test",
+            workers.len(),
+            "synthetic",
+            &workers,
+            &mut fanout,
+            move |worker| {
+                let attempts = attempts_for_op.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if worker.id == "00002" {
+                        Err(anyhow!("synthetic transient failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), workers.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_starts_later_workers_when_one_slot_is_slow() {
+        let workers = (1..=4)
+            .map(|idx| {
+                WorkerSpec::legacy(format!("{idx:05}"), format!("http://worker-{idx:05}:8080"))
+            })
+            .collect::<Vec<_>>();
+
+        let slow_finished = Arc::new(AtomicUsize::new(0));
+        let later_started_before_slow_finished = Arc::new(AtomicUsize::new(0));
+        let mut fanout = FanoutController::new(
+            2,
+            1,
+            false,
+            DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
+            FANOUT_LATENCY_SPIKE_P95_MS,
+        );
+
+        let slow_finished_for_op = Arc::clone(&slow_finished);
+        let later_started_for_op = Arc::clone(&later_started_before_slow_finished);
+
+        fanout_workers(
+            "test",
+            workers.len(),
+            "unordered",
+            &workers,
+            &mut fanout,
+            move |worker| {
+                let slow_finished = Arc::clone(&slow_finished_for_op);
+                let later_started = Arc::clone(&later_started_for_op);
+                async move {
+                    match worker.id.as_str() {
+                        "00001" => tokio::time::sleep(Duration::from_millis(10)).await,
+                        "00002" => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            slow_finished.store(1, Ordering::SeqCst);
+                        }
+                        "00003" => {
+                            if slow_finished.load(Ordering::SeqCst) == 0 {
+                                later_started.store(1, Ordering::SeqCst);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("synthetic fanout should succeed");
+
+        assert_eq!(later_started_before_slow_finished.load(Ordering::SeqCst), 1);
+    }
+}
