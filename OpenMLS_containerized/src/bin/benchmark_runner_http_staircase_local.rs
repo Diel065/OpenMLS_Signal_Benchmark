@@ -54,6 +54,9 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "32,256,1024,4096")]
     payload_sizes: Vec<usize>,
 
+    #[arg(long, default_value_t = 1)]
+    scenario_seed: u64,
+
     #[arg(long, default_value = "run-001")]
     run_id: String,
 
@@ -109,6 +112,7 @@ fn main() -> Result<()> {
         base_worker_port: args.base_worker_port,
         run_id: args.run_id.clone(),
         scenario: args.scenario.clone(),
+        scenario_seed: args.scenario_seed,
         output_dir: args.output_dir.clone(),
     })?;
 
@@ -125,6 +129,7 @@ fn main() -> Result<()> {
         max_update_samples_per_plateau: args.max_update_samples_per_plateau,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
         payload_sizes: args.payload_sizes,
+        scenario_seed: args.scenario_seed,
         worker_health_timeout_seconds: 300,
         worker_health_poll_ms: 250,
         max_fanout_parallelism: args.max_fanout_parallelism,
@@ -135,6 +140,7 @@ fn main() -> Result<()> {
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         process_pending_fanout: args.process_pending_fanout,
         profile_only_singletons: false,
+        external_coverage_lane: false,
         no_aggregate: false,
         worker_layout: None,
         run_id: args.run_id,

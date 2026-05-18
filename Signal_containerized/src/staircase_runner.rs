@@ -1272,6 +1272,7 @@ async fn broadcast_message(
     recipients: &[WorkerSpec],
     payload: &str,
     fanout: &mut FanoutController,
+    profiling_recipient_id: Option<&str>,
 ) -> Result<()> {
     let _batch_size = recipients.len();
     let conversation_size = recipients.len() + 1;
@@ -1292,16 +1293,19 @@ async fn broadcast_message(
     }
 
     // Receive at each recipient
-    let commands_by_physical = build_batch_commands(recipients, |worker| BatchFanoutCommand {
-        participant_id: worker.id.clone(),
-        request_id: None,
-        command: Command::DecryptMessage {
-            sender: sender.id.clone(),
-            profile: false,
-            conversation_size: Some(conversation_size),
-        },
-        phase: Some("application.fanout_receive_message".to_string()),
-        profile: None,
+    let commands_by_physical = build_batch_commands(recipients, |worker| {
+        let is_profiled = profiling_recipient_id == Some(worker.id.as_str());
+        BatchFanoutCommand {
+            participant_id: worker.id.clone(),
+            request_id: None,
+            command: Command::DecryptMessage {
+                sender: sender.id.clone(),
+                profile: is_profiled,
+                conversation_size: Some(conversation_size),
+            },
+            phase: Some("application.fanout_receive_message".to_string()),
+            profile: is_profiled.then_some(true),
+        }
     });
 
     batch_fanout_workers(
@@ -1519,21 +1523,19 @@ async fn run_application_phase(
             plateau_size, per_payload_count, payload_size
         );
 
-        let profiled_actor_indices: Vec<usize> = active
+        let mut profiled_indices: Vec<usize> = active
             .iter()
             .enumerate()
             .filter_map(|(idx, worker)| worker.profile_enabled.then_some(idx))
             .collect();
-        let actor_indices: Vec<usize> = if profiled_actor_indices.is_empty() {
-            (0..active.len()).collect()
-        } else {
-            profiled_actor_indices
-        };
+        if profiled_indices.is_empty() {
+            profiled_indices = (0..active.len()).collect();
+        }
 
         for seq_no in 0..per_payload_count {
             let actor_selection_idx =
-                sampled_participant_index(actor_indices.len(), per_payload_count, seq_no);
-            let actor_idx = actor_indices[actor_selection_idx];
+                sampled_participant_index(profiled_indices.len(), per_payload_count, seq_no);
+            let actor_idx = profiled_indices[actor_selection_idx];
             let actor = &active[actor_idx];
             let payload =
                 deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
@@ -1545,7 +1547,31 @@ async fn run_application_phase(
                 .map(|&i| active[i].clone())
                 .collect();
 
-            broadcast_message(http, actor, &recipient_workers, &payload, fanout).await?;
+            let profiling_recipient_id = if profiled_indices.len() > 1 {
+                let profiled_recipient_indices: Vec<usize> = profiled_indices
+                    .iter()
+                    .copied()
+                    .filter(|&i| i != actor_idx)
+                    .collect();
+                let sampled_pos = sampled_participant_index(
+                    profiled_recipient_indices.len(),
+                    per_payload_count,
+                    seq_no,
+                );
+                Some(active[profiled_recipient_indices[sampled_pos]].id.as_str())
+            } else {
+                None
+            };
+
+            broadcast_message(
+                http,
+                actor,
+                &recipient_workers,
+                &payload,
+                fanout,
+                profiling_recipient_id,
+            )
+            .await?;
 
             progress.tick(&format!(
                 "plateau {} app payload={} {}/{} actor={} recipients={}",

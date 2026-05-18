@@ -38,7 +38,7 @@ impl MlsGroup {
         }
 
         #[cfg(feature = "profiling-json")]
-        let scope = ProfileScope::start("application_message_create", "openmls");
+        let scope = ProfileScope::start("application_message_create_protocol", "openmls");
 
         #[cfg(feature = "profiling-json")]
         let aad_len = self.aad.len();
@@ -59,12 +59,11 @@ impl MlsGroup {
         let ciphersuite = format!("{:?}", self.ciphersuite());
 
         #[cfg(feature = "profiling-json")]
-        let mut measured_result: Option<Result<(MlsMessageOut, Option<usize>), CreateMessageError>> =
-            None;
+        let mut measured_result: Option<Result<MlsMessageOut, CreateMessageError>> = None;
 
         #[cfg(feature = "profiling-json")]
         let allocation_info = measure(|| {
-            measured_result = Some((|| -> Result<(MlsMessageOut, Option<usize>), CreateMessageError> {
+            measured_result = Some((|| -> Result<MlsMessageOut, CreateMessageError> {
                 let authenticated_content = AuthenticatedContent::new_application(
                     self.own_leaf_index(),
                     &self.aad,
@@ -77,40 +76,61 @@ impl MlsGroup {
                     // We know the application message is wellformed and we have the key material of the current epoch
                     .map_err(|_| LibraryError::custom("Malformed plaintext"))?;
 
-                let ciphertext_size_bytes = ciphertext
-                    .tls_serialize_detached()
-                    .map(|v| v.len())
-                    .ok();
-
                 self.reset_aad();
-                Ok((
-                    MlsMessageOut::from_private_message(ciphertext, self.version()),
-                    ciphertext_size_bytes,
+                Ok(MlsMessageOut::from_private_message(
+                    ciphertext,
+                    self.version(),
                 ))
             })());
         });
 
         #[cfg(feature = "profiling-json")]
         {
-            let (message_out, ciphertext_size_bytes) =
+            let message_out =
                 measured_result.expect("allocation_counter measure closure did not run")?;
 
-            let artifact_size_bytes = message_out
-                .tls_serialize_detached()
-                .map(|v| v.len())
-                .ok();
+            let mut protocol_event = scope.map(|scope| {
+                let mut event = scope.finish();
+                event.group_epoch = Some(group_epoch);
+                event.tree_size = Some(tree_size);
+                event.member_count = Some(member_count);
+                event.ciphersuite = Some(ciphersuite.clone());
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.app_msg_plaintext_bytes = Some(plaintext_len);
+                event.aad_bytes = Some(aad_len);
+                event
+            });
 
-            if let Some(scope) = scope {
+            let serialize_scope =
+                ProfileScope::start("application_message_create_serialize", "openmls");
+            let mut serialized_len: Option<Option<usize>> = None;
+            let serialize_allocation_info = measure(|| {
+                serialized_len = Some(
+                    message_out
+                        .tls_serialize_detached()
+                        .ok()
+                    .map(|bytes| bytes.len()),
+                );
+            });
+
+            if let Some(event) = protocol_event.as_mut() {
+                event.artifact_size_bytes = serialized_len.flatten();
+                event.app_msg_ciphertext_bytes = event.artifact_size_bytes;
+                emit_event(event);
+            }
+
+            if let Some(scope) = serialize_scope {
                 let mut event = scope.finish();
                 event.group_epoch = Some(group_epoch);
                 event.tree_size = Some(tree_size);
                 event.member_count = Some(member_count);
                 event.ciphersuite = Some(ciphersuite);
-                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                event.alloc_count = Some(allocation_info.count_total as u64);
-                event.artifact_size_bytes = artifact_size_bytes;
+                event.alloc_bytes = Some(serialize_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(serialize_allocation_info.count_total as u64);
+                event.artifact_size_bytes = serialized_len.flatten();
                 event.app_msg_plaintext_bytes = Some(plaintext_len);
-                event.app_msg_ciphertext_bytes = ciphertext_size_bytes;
+                event.app_msg_ciphertext_bytes = event.artifact_size_bytes;
                 event.aad_bytes = Some(aad_len);
                 emit_event(&event);
             }

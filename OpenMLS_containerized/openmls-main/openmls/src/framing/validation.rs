@@ -401,6 +401,11 @@ impl ApplicationMessage {
         Self { bytes }
     }
 
+    /// Returns the inner message bytes.
+    pub fn as_slice(&self) -> &[u8] {
+        &self.bytes
+    }
+
     /// Returns the inner bytes and consumes the [`ApplicationMessage`].
     pub fn into_bytes(self) -> Vec<u8> {
         self.bytes

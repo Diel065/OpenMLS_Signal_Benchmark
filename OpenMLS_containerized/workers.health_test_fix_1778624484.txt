@@ -1,0 +1,16 @@
+00001=http://worker-00001:8080
+00002=http://worker-00002:8080
+00003=http://worker-00003:8080
+00004=http://worker-00004:8080
+00005=http://worker-00005:8080
+00006=http://worker-00006:8080
+00007=http://worker-00007:8080
+00008=http://worker-00008:8080
+00009=http://worker-00009:8080
+00010=http://worker-00010:8080
+00011=http://worker-00011:8080
+00012=http://worker-00012:8080
+00013=http://worker-00013:8080
+00014=http://worker-00014:8080
+00015=http://worker-00015:8080
+00016=http://worker-00016:8080

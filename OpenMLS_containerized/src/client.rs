@@ -323,26 +323,14 @@ impl Client {
         welcome_bytes: &[u8],
         ratchet_tree_bytes: &[u8],
     ) -> Result<()> {
-        let welcome_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
-            .map_err(|_| anyhow!("Could not deserialize Welcome message"))?;
-
-        let welcome = match welcome_in.extract() {
-            MlsMessageBodyIn::Welcome(welcome) => welcome,
-            _ => return Err(anyhow!("Expected Welcome message")),
-        };
-
-        let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(ratchet_tree_bytes)
-            .map_err(|_| anyhow!("Could not deserialize ratchet tree"))?;
-
         let join_config = MlsGroupJoinConfig::default();
 
-        let group = StagedWelcome::new_from_welcome(
+        let group = MlsGroup::join_from_welcome_bytes_profiled(
             &self.crypto,
             &join_config,
-            welcome,
-            Some(ratchet_tree),
-        )?
-        .into_group(&self.crypto)?;
+            welcome_bytes,
+            ratchet_tree_bytes,
+        )?;
 
         self.group = Some(group);
         Ok(())
@@ -373,14 +361,8 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-        let mls_message_in = MlsMessageIn::tls_deserialize_exact(message_bytes)
-            .map_err(|_| anyhow!("Could not deserialize incoming MLS message"))?;
-
-        let protocol_message = mls_message_in
-            .try_into_protocol_message()
-            .map_err(|_| anyhow!("Expected a protocol message"))?;
-
-        let processed_message = group.process_message(&self.crypto, protocol_message, profile)?;
+        let processed_message =
+            group.process_message_from_bytes_profiled(&self.crypto, message_bytes, profile)?;
 
         match processed_message.into_content() {
             ProcessedMessageContent::ApplicationMessage(application_message) => {

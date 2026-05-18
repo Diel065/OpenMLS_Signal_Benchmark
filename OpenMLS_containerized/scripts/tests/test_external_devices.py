@@ -20,6 +20,8 @@ from external_devices import (
     validate_run_id,
     load_devices_config,
     DeviceConfig,
+    create_backend,
+    SshDeviceBackend,
     build_external_device_layout_entry,
 )
 
@@ -185,6 +187,53 @@ def test_config_defaults():
     print("PASS: config defaults work correctly")
 
 
+def test_ssh_password_config_defaults_to_password_backend(tmp_path: Path):
+    yaml_content = """
+devices:
+  - id: pi-test
+    enabled: true
+    kind: raspberry_pi_5
+    connection:
+      type: ssh
+      host: "192.168.178.33"
+      user: "diel"
+      password: "secret"
+    transport:
+      type: wifi_lan
+      device_ip: "192.168.178.33"
+      host_ip: "192.168.178.21"
+      worker_port: 8080
+    target:
+      arch: "aarch64"
+      rust_target: "aarch64-unknown-linux-musl"
+      binary: "target/aarch64-unknown-linux-musl/minsize/worker"
+    worker:
+      id: "raspi5-00001"
+      mode: "singleton"
+      remote_binary: "/home/diel/openmls-benchmark/bin/worker"
+      remote_results_root: "/home/diel/openmls-benchmark/results/openmls"
+      remote_tmp: "/home/diel/openmls-benchmark/tmp"
+    metadata:
+      execution_backend: "real_device"
+      device_kind: "raspberry_pi_5"
+      transport: "wifi_lan"
+      access_backend: "ssh"
+"""
+    config_file = tmp_path / "ssh-devices.yaml"
+    config_file.write_text(yaml_content, encoding="utf-8")
+
+    configs = load_devices_config(config_file)
+    assert len(configs) == 1
+    assert configs[0].connection["password"] == "secret"
+    assert configs[0].worker["remote_results_root"].startswith("/home/diel/")
+
+    backend = create_backend(configs[0])
+    assert isinstance(backend, SshDeviceBackend)
+    assert backend.password == "secret"
+    assert "-i" not in backend._ssh_base()
+    print("PASS: SSH password device config selects password-capable SSH backend")
+
+
 def main() -> int:
     import shutil
 
@@ -198,6 +247,7 @@ def main() -> int:
             ("load_devices_config", lambda: test_load_devices_config(tmp_dir)),
             ("build_external_device_layout_entry", lambda: test_build_external_device_layout_entry()),
             ("config defaults", lambda: test_config_defaults()),
+            ("ssh password config", lambda: test_ssh_password_config_defaults_to_password_backend(tmp_dir)),
         ]
 
         passed = 0

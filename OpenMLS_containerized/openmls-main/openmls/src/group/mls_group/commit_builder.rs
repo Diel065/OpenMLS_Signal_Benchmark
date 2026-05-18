@@ -59,7 +59,7 @@ use super::{
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, ProfileEvent, ProfileScope};
 
 #[derive(Debug)]
 struct ExternalCommitInfo {
@@ -75,16 +75,48 @@ struct GroupInfoConfig {
     other_extensions: Vec<Extension>,
 }
 
-///#[cfg(feature = "profiling-json")]
-///#[derive(Debug)]
-///struct CommitProfilingData {
-///    op: &'static str,
-///    group_epoch: u64,
-///    tree_size: u32,
-///    invitee_count: usize,
-///    ciphersuite: String,
-///    artifact_size_bytes: Option<usize>,
-///}
+#[cfg(feature = "profiling-json")]
+#[derive(Debug)]
+struct CommitProfilingData {
+    group_epoch: u64,
+    tree_size: u32,
+    invitee_count: isize,
+    member_count: usize,
+    ciphersuite: String,
+    protocol_event: Option<ProfileEvent>,
+}
+
+#[cfg(feature = "profiling-json")]
+fn emit_commit_serialize_event(
+    message: &MlsMessageOut,
+    profiling: &CommitProfilingData,
+) -> Option<usize> {
+    let scope = ProfileScope::start("commit_create_serialize", "openmls");
+    let mut serialized_len: Option<Option<usize>> = None;
+    let allocation_info = measure(|| {
+        serialized_len = Some(
+            message
+                .tls_serialize_detached()
+                .ok()
+                .map(|bytes| bytes.len()),
+        );
+    });
+
+    if let Some(scope) = scope {
+        let mut event = scope.finish();
+        event.group_epoch = Some(profiling.group_epoch);
+        event.tree_size = Some(profiling.tree_size);
+        event.member_count = Some(profiling.member_count);
+        event.invitee_count = Some(profiling.invitee_count);
+        event.ciphersuite = Some(profiling.ciphersuite.clone());
+        event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+        event.alloc_count = Some(allocation_info.count_total as u64);
+        event.artifact_size_bytes = serialized_len.flatten();
+        emit_event(&event);
+    }
+
+    serialized_len.flatten()
+}
 
 /// This stage is for populating the builder.
 #[derive(Debug)]
@@ -136,6 +168,8 @@ pub struct Complete {
     result: CreateCommitResult,
     // Only for external commits
     original_wire_format_policy: Option<WireFormatPolicy>,
+    #[cfg(feature = "profiling-json")]
+    profiling: Option<CommitProfilingData>,
 }
 
 /// The [`CommitBuilder`] is used to easily and dynamically build commit messages.
@@ -472,7 +506,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
         let (mut cur_stage, builder) = self.take_stage();
 
         #[cfg(feature = "profiling-json")]
-        let commit_scope = ProfileScope::start("commit_create", "openmls");
+        let commit_scope = ProfileScope::start("commit_create_protocol", "openmls");
 
         let build_commit = || -> Result<
             (
@@ -552,11 +586,11 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             }
 
             let final_commit_op = if add_count > 0 {
-                "add_commit_create"
+                "commit_create_protocol_add"
             } else if remove_count > 0 {
-                "remove_commit_create"
+                "commit_create_protocol_remove"
             } else {
-                "update_commit_create"
+                "commit_create_protocol_update"
             };
 
             let invitee_count = add_count as isize - remove_count as isize;
@@ -805,11 +839,6 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             // Set the confirmation tag
             authenticated_content.set_confirmation_tag(confirmation_tag.clone());
 
-            let commit_artifact_size_bytes = authenticated_content
-                .tls_serialize_detached()
-                .map(|v| v.len())
-                .ok();
-
             diff.update_interim_transcript_hash(ciphersuite, crypto, confirmation_tag.clone())?;
 
             // If there are invitations, we need to build a welcome
@@ -838,7 +867,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 let welcome_option = needs_welcome
                     .then(|| -> Result<_, CreateCommitError> {
                         #[cfg(feature = "profiling-json")]
-                        let welcome_scope = ProfileScope::start("welcome_create_total", "openmls");
+                        let welcome_scope = ProfileScope::start("welcome_create_protocol", "openmls");
 
                         #[cfg(feature = "profiling-json")]
                         let invitee_count = apply_proposals_values.invitation_list.len() as isize;
@@ -916,13 +945,8 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             measured_result.expect("allocation_counter measure closure did not run")?;
 
                         #[cfg(feature = "profiling-json")]
-                        if let Some(scope) = welcome_scope {
+                        let mut welcome_protocol_event = welcome_scope.map(|scope| {
                             let mut event = scope.finish();
-
-                            event.artifact_size_bytes =
-                                tls_codec::Serialize::tls_serialize_detached(&welcome)
-                                    .map(|v| v.len())
-                                    .ok();
 
                             event.encrypted_group_info_bytes = Some(encrypted_group_info_bytes);
                             event.encrypted_secrets_count = Some(encrypted_secrets_count);
@@ -936,7 +960,46 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                             event.alloc_count = Some(allocation_info.count_total as u64);
 
-                            emit_event(&event);
+                            event
+                        });
+
+                        #[cfg(feature = "profiling-json")]
+                        {
+                            let serialize_scope =
+                                ProfileScope::start("welcome_create_serialize", "openmls");
+                            let mut serialized_len: Option<Option<usize>> = None;
+                            let serialize_allocation_info = measure(|| {
+                                serialized_len = Some(
+                                    tls_codec::Serialize::tls_serialize_detached(&welcome)
+                                        .ok()
+                                        .map(|bytes| bytes.len()),
+                                );
+                            });
+
+                            if let Some(scope) = serialize_scope {
+                                let mut event = scope.finish();
+                                event.artifact_size_bytes = serialized_len.flatten();
+                                event.welcome_bytes = serialized_len.flatten();
+                                event.encrypted_group_info_bytes =
+                                    Some(encrypted_group_info_bytes);
+                                event.encrypted_secrets_count = Some(encrypted_secrets_count);
+                                event.invitee_count = Some(invitee_count);
+                                event.group_epoch = Some(group_epoch);
+                                event.tree_size = Some(tree_size);
+                                event.member_count = Some(member_count_after);
+                                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                                event.alloc_bytes =
+                                    Some(serialize_allocation_info.bytes_total as u64);
+                                event.alloc_count =
+                                    Some(serialize_allocation_info.count_total as u64);
+                                emit_event(&event);
+                            }
+
+                            if let Some(event) = welcome_protocol_event.as_mut() {
+                                event.artifact_size_bytes = serialized_len.flatten();
+                                event.welcome_bytes = serialized_len.flatten();
+                                emit_event(event);
+                            }
                         }
 
                         #[cfg(feature = "profiling-json")]
@@ -1062,6 +1125,15 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         .external_commit_info
                         .as_ref()
                         .map(|info| info.wire_format_policy),
+                    #[cfg(feature = "profiling-json")]
+                    profiling: Some(CommitProfilingData {
+                        group_epoch: final_group_epoch,
+                        tree_size: final_tree_size,
+                        invitee_count,
+                        member_count: member_count_before,
+                        ciphersuite: final_ciphersuite.clone(),
+                        protocol_event: None,
+                    }),
                 }),
                 final_commit_op,
                 final_group_epoch,
@@ -1069,7 +1141,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 final_ciphersuite,
                 invitee_count,
                 member_count_before,
-                commit_artifact_size_bytes,
+                None,
             ))
         };
 
@@ -1096,7 +1168,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             });
 
             let (
-                result_builder,
+                mut result_builder,
                 final_commit_op,
                 final_group_epoch,
                 final_tree_size,
@@ -1117,7 +1189,11 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 event.artifact_size_bytes = commit_artifact_size_bytes;
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
-                emit_event(&event);
+                if let Some(profiling) = result_builder.stage.profiling.as_mut() {
+                    profiling.protocol_event = Some(event);
+                } else {
+                    emit_event(&event);
+                }
             }
 
             Ok(result_builder)
@@ -1192,6 +1268,8 @@ impl CommitBuilder<'_, Complete, &mut MlsGroup> {
             Complete {
                 result: create_commit_result,
                 original_wire_format_policy: _,
+                #[cfg(feature = "profiling-json")]
+                profiling,
             },
             ..
         } = self;
@@ -1215,6 +1293,17 @@ impl CommitBuilder<'_, Complete, &mut MlsGroup> {
         // Note that this performs writes to the storage, so we should do that here, rather than
         // when working with the result.
         let mls_message = group.content_to_mls_message(create_commit_result.commit, provider)?;
+
+        #[cfg(feature = "profiling-json")]
+        if let Some(mut profiling) = profiling {
+            let commit_artifact_size_bytes =
+                emit_commit_serialize_event(&mls_message, &profiling);
+
+            if let Some(mut event) = profiling.protocol_event.take() {
+                event.artifact_size_bytes = commit_artifact_size_bytes;
+                emit_event(&event);
+            }
+        }
 
         Ok(CommitMessageBundle {
             version: group.version(),

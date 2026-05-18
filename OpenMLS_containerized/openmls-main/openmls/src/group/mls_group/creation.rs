@@ -4,7 +4,9 @@ use openmls_traits::{crypto::OpenMlsCrypto, storage::StorageProvider as StorageP
 use super::{builder::MlsGroupBuilder, *};
 use crate::{
     credentials::CredentialWithKey,
+    error::LibraryError,
     extensions::Extensions,
+    framing::message_in::{MlsMessageBodyIn, MlsMessageIn},
     group::{
         commit_builder::external_commits::ExternalCommitBuilder,
         errors::{ExportSecretError, ExternalCommitError, WelcomeError},
@@ -27,6 +29,11 @@ use crate::{
 
 #[cfg(doc)]
 use crate::key_packages::KeyPackage;
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{emit_event, ProfileScope};
+use tls_codec::Deserialize as _;
 
 impl MlsGroup {
     // === Group creation ===
@@ -73,6 +80,146 @@ impl MlsGroup {
                 credential_with_key,
                 Some(mls_group_create_config.clone()),
             )
+    }
+
+    /// Deserialize a Welcome and ratchet tree, then join the group. Profiling
+    /// builds separate events for input deserialization and protocol work.
+    pub fn join_from_welcome_bytes_profiled<Provider: OpenMlsProvider>(
+        provider: &Provider,
+        mls_group_config: &MlsGroupJoinConfig,
+        welcome_bytes: &[u8],
+        ratchet_tree_bytes: &[u8],
+    ) -> Result<Self, WelcomeError<Provider::StorageError>> {
+        #[cfg(feature = "profiling-json")]
+        let (welcome, mut welcome_deserialize_event) = {
+            let scope = ProfileScope::start("join_from_welcome_deserialize_welcome", "openmls");
+            let mut measured_result: Option<Result<MlsMessageIn, tls_codec::Error>> = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(MlsMessageIn::tls_deserialize_exact(welcome_bytes));
+            });
+            let deserialize_event = scope.map(|scope| scope.finish());
+            let welcome_in = measured_result
+                .expect("allocation_counter measure closure did not run")
+                .map_err(|_| WelcomeError::MalformedWelcomeMessage)?;
+            let welcome = match welcome_in.extract() {
+                MlsMessageBodyIn::Welcome(welcome) => welcome,
+                _ => return Err(WelcomeError::NotAWelcomeMessage),
+            };
+
+            let deserialize_event = deserialize_event.map(|mut event| {
+                event.artifact_size_bytes = Some(welcome_bytes.len());
+                event.welcome_bytes = Some(welcome_bytes.len());
+                event.ciphersuite = Some(format!("{:?}", welcome.ciphersuite()));
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event
+            });
+
+            (welcome, deserialize_event)
+        };
+
+        #[cfg(not(feature = "profiling-json"))]
+        let welcome = {
+            let welcome_in = MlsMessageIn::tls_deserialize_exact(welcome_bytes)
+                .map_err(|_| WelcomeError::MalformedWelcomeMessage)?;
+            match welcome_in.extract() {
+                MlsMessageBodyIn::Welcome(welcome) => welcome,
+                _ => return Err(WelcomeError::NotAWelcomeMessage),
+            }
+        };
+
+        #[cfg(feature = "profiling-json")]
+        let (ratchet_tree, mut ratchet_tree_deserialize_event) = {
+            let scope =
+                ProfileScope::start("join_from_welcome_deserialize_ratchet_tree", "openmls");
+            let mut measured_result: Option<Result<RatchetTreeIn, tls_codec::Error>> = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(RatchetTreeIn::tls_deserialize_exact(ratchet_tree_bytes));
+            });
+            let deserialize_event = scope.map(|scope| scope.finish());
+            let ratchet_tree = measured_result
+                .expect("allocation_counter measure closure did not run")
+                .map_err(LibraryError::missing_bound_check)?;
+
+            let deserialize_event = deserialize_event.map(|mut event| {
+                event.artifact_size_bytes = Some(ratchet_tree_bytes.len());
+                event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
+                event.ciphersuite = Some(format!("{:?}", welcome.ciphersuite()));
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event
+            });
+
+            (ratchet_tree, deserialize_event)
+        };
+
+        #[cfg(not(feature = "profiling-json"))]
+        let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(ratchet_tree_bytes)
+            .map_err(LibraryError::missing_bound_check)?;
+
+        #[cfg(feature = "profiling-json")]
+        {
+            let scope = ProfileScope::start("join_from_welcome_protocol", "openmls");
+            let mut measured_result: Option<Result<Self, WelcomeError<Provider::StorageError>>> =
+                None;
+            let allocation_info = measure(|| {
+                measured_result = Some((|| {
+                    StagedWelcome::new_from_welcome(
+                        provider,
+                        mls_group_config,
+                        welcome,
+                        Some(ratchet_tree),
+                    )?
+                    .into_group(provider)
+                })());
+            });
+
+            let group = measured_result
+                .expect("allocation_counter measure closure did not run")?;
+
+            if let Some(scope) = scope {
+                let mut event = scope.finish();
+                event.group_epoch = Some(group.context().epoch().as_u64());
+                event.tree_size = Some(group.treesync().tree_size().u32());
+                event.member_count = Some(group.members().count());
+                event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
+                event.artifact_size_bytes = Some(welcome_bytes.len() + ratchet_tree_bytes.len());
+                event.welcome_bytes = Some(welcome_bytes.len());
+                event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
+                event.welcome_plus_ratchet_tree_bytes =
+                    Some(welcome_bytes.len() + ratchet_tree_bytes.len());
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                emit_event(&event);
+            }
+
+            if let Some(event) = welcome_deserialize_event.as_mut() {
+                event.group_epoch = Some(group.context().epoch().as_u64());
+                event.tree_size = Some(group.treesync().tree_size().u32());
+                event.member_count = Some(group.members().count());
+                emit_event(event);
+            }
+
+            if let Some(event) = ratchet_tree_deserialize_event.as_mut() {
+                event.group_epoch = Some(group.context().epoch().as_u64());
+                event.tree_size = Some(group.treesync().tree_size().u32());
+                event.member_count = Some(group.members().count());
+                emit_event(event);
+            }
+
+            Ok(group)
+        }
+
+        #[cfg(not(feature = "profiling-json"))]
+        {
+            StagedWelcome::new_from_welcome(
+                provider,
+                mls_group_config,
+                welcome,
+                Some(ratchet_tree),
+            )?
+            .into_group(provider)
+        }
     }
 
     /// Join an existing group through an External Commit.

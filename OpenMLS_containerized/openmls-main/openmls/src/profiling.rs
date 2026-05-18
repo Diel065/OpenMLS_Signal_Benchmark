@@ -52,14 +52,32 @@ fn env_or_none(key: &str) -> Option<String> {
     std::env::var(key).ok().filter(|s| !s.is_empty())
 }
 
+fn env_u64_or_none(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+fn measurement_class_for_op(op: &str) -> &'static str {
+    if op.ends_with("_protocol") || op.contains("_protocol_") {
+        "protocol"
+    } else if op.ends_with("_serialize") {
+        "serialize"
+    } else if op.contains("_deserialize") {
+        "deserialize"
+    } else {
+        "other"
+    }
+}
+
 pub(crate) fn profiling_enabled() -> bool {
     writer().is_some()
 }
 
 #[derive(Serialize, Debug)]
 pub(crate) struct ProfileEvent {
+    pub profile_schema_version: u32,
     pub ts_unix_ns: u128,
     pub op: String,
+    pub measurement_class: String,
     pub implementation: String,
 
     pub wall_ns: u128,
@@ -69,6 +87,9 @@ pub(crate) struct ProfileEvent {
     pub alloc_count: Option<u64>,
 
     pub artifact_size_bytes: Option<usize>,
+    pub welcome_bytes: Option<usize>,
+    pub ratchet_tree_bytes: Option<usize>,
+    pub welcome_plus_ratchet_tree_bytes: Option<usize>,
     pub encrypted_group_info_bytes: Option<usize>,
     pub encrypted_secrets_count: Option<usize>,
 
@@ -88,6 +109,7 @@ pub(crate) struct ProfileEvent {
 
     pub run_id: Option<String>,
     pub scenario: Option<String>,
+    pub scenario_seed: Option<u64>,
     pub node_name: Option<String>,
     pub pod_name: Option<String>,
 }
@@ -137,7 +159,9 @@ impl ProfileScope {
         let cpu_thread_ns = self.cpu_start.map(|start| start.elapsed().as_nanos());
 
         ProfileEvent {
+            profile_schema_version: 2,
             ts_unix_ns: unix_timestamp_ns(),
+            measurement_class: measurement_class_for_op(&self.op).to_string(),
             op: self.op,
             implementation: self.implementation,
 
@@ -148,6 +172,9 @@ impl ProfileScope {
             alloc_count: None,
 
             artifact_size_bytes: None,
+            welcome_bytes: None,
+            ratchet_tree_bytes: None,
+            welcome_plus_ratchet_tree_bytes: None,
             encrypted_group_info_bytes: None,
             encrypted_secrets_count: None,
 
@@ -167,6 +194,7 @@ impl ProfileScope {
 
             run_id: env_or_none("OPENMLS_PROFILE_RUN_ID"),
             scenario: env_or_none("OPENMLS_PROFILE_SCENARIO"),
+            scenario_seed: env_u64_or_none("OPENMLS_PROFILE_SCENARIO_SEED"),
             node_name: env_or_none("OPENMLS_PROFILE_NODE"),
             pod_name: env_or_none("OPENMLS_PROFILE_POD"),
         }

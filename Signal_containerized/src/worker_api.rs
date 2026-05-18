@@ -5,6 +5,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use cpu_time::ThreadTime;
 use libsignal_core::DeviceId;
 use libsignal_protocol::kem;
 use libsignal_protocol::{
@@ -132,6 +133,9 @@ impl CommandResponse {
 
 #[derive(Debug, Clone, Default)]
 pub struct CommandMetrics {
+    pub cpu_thread_ns: Option<u128>,
+    pub alloc_bytes: Option<u64>,
+    pub alloc_count: Option<u64>,
     pub artifact_size_bytes: Option<usize>,
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
@@ -144,12 +148,22 @@ pub struct CommandMetrics {
 
 impl CommandMetrics {
     fn merge_message(&mut self, other: &CommandMetrics) {
-        self.artifact_size_bytes = add_options(self.artifact_size_bytes, other.artifact_size_bytes);
-        self.prekey_bundle_count = add_options(self.prekey_bundle_count, other.prekey_bundle_count);
-        self.session_count = add_options(self.session_count, other.session_count);
-        self.ratchet_step_count = add_options(self.ratchet_step_count, other.ratchet_step_count);
-        self.ciphertext_bytes = add_options(self.ciphertext_bytes, other.ciphertext_bytes);
-        self.plaintext_bytes = add_options(self.plaintext_bytes, other.plaintext_bytes);
+        self.merge_profile(other);
+        self.artifact_size_bytes =
+            add_usize_options(self.artifact_size_bytes, other.artifact_size_bytes);
+        self.prekey_bundle_count =
+            add_usize_options(self.prekey_bundle_count, other.prekey_bundle_count);
+        self.session_count = add_usize_options(self.session_count, other.session_count);
+        self.ratchet_step_count =
+            add_usize_options(self.ratchet_step_count, other.ratchet_step_count);
+        self.ciphertext_bytes = add_usize_options(self.ciphertext_bytes, other.ciphertext_bytes);
+        self.plaintext_bytes = add_usize_options(self.plaintext_bytes, other.plaintext_bytes);
+    }
+
+    fn merge_profile(&mut self, other: &CommandMetrics) {
+        self.cpu_thread_ns = add_u128_options(self.cpu_thread_ns, other.cpu_thread_ns);
+        self.alloc_bytes = add_u64_options(self.alloc_bytes, other.alloc_bytes);
+        self.alloc_count = add_u64_options(self.alloc_count, other.alloc_count);
     }
 }
 
@@ -172,13 +186,52 @@ impl CommandOutcome {
     }
 }
 
-fn add_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+fn add_u128_options(a: Option<u128>, b: Option<u128>) -> Option<u128> {
     match (a, b) {
         (Some(a), Some(b)) => Some(a.saturating_add(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
         (None, None) => None,
     }
+}
+
+fn add_u64_options(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn add_usize_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(a.saturating_add(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
+    let cpu_start = ThreadTime::now();
+    let mut result = None;
+    let allocation_info = allocation_counter::measure(|| {
+        result = Some(run());
+    });
+
+    let cpu_thread_ns = cpu_start.elapsed().as_nanos();
+    let result = result.expect("allocation_counter measure closure did not run");
+
+    (
+        result,
+        CommandMetrics {
+            cpu_thread_ns: Some(cpu_thread_ns),
+            alloc_bytes: Some(allocation_info.bytes_total),
+            alloc_count: Some(allocation_info.count_total),
+            ..Default::default()
+        },
+    )
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -770,7 +823,7 @@ fn ciphertext_from_bytes(bytes: &[u8]) -> Result<libsignal_protocol::CiphertextM
 async fn receive_message_delivery(
     participant: &mut SignalParticipant,
     relay_url: &str,
-    _profile: bool,
+    profile: bool,
     conversation_size: usize,
 ) -> Result<CommandOutcome> {
     let delivery = relay_get_pending_message(relay_url, &participant.name).await?;
@@ -795,6 +848,7 @@ async fn receive_message_delivery(
                     delivery.id, delivery.conversation_id, delivery.sender
                 ),
                 CommandMetrics {
+                    artifact_size_bytes: Some(message_bytes.len()),
                     conversation_size: Some(conversation_size),
                     ciphertext_bytes: Some(message_bytes.len()),
                     ..Default::default()
@@ -803,41 +857,45 @@ async fn receive_message_delivery(
         }
     };
 
-    match participant.decrypt_message(&sender_address, &ciphertext) {
+    let (decrypt_result, mut profile_metrics) = if profile {
+        measure_profile(|| participant.decrypt_message(&sender_address, &ciphertext))
+    } else {
+        let result = participant.decrypt_message(&sender_address, &ciphertext);
+        (result, CommandMetrics::default())
+    };
+
+    match decrypt_result {
         Ok(plaintext) => {
             relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
             let text = String::from_utf8_lossy(&plaintext).to_string();
             let plaintext_len = plaintext.len();
+            profile_metrics.artifact_size_bytes = Some(message_bytes.len());
+            profile_metrics.conversation_size = Some(conversation_size);
+            profile_metrics.session_count = Some(1);
+            profile_metrics.ratchet_step_count = Some(1);
+            profile_metrics.ciphertext_bytes = Some(message_bytes.len());
+            profile_metrics.plaintext_bytes = Some(plaintext_len);
             Ok(CommandOutcome::new(
                 format!(
                     "pairwise message received: {}; message_id={} conversation={} sender={}",
                     text, delivery.id, delivery.conversation_id, delivery.sender
                 ),
-                CommandMetrics {
-                    artifact_size_bytes: Some(message_bytes.len()),
-                    conversation_size: Some(conversation_size),
-                    session_count: Some(1),
-                    ratchet_step_count: Some(1),
-                    ciphertext_bytes: Some(message_bytes.len()),
-                    plaintext_bytes: Some(plaintext_len),
-                    ..Default::default()
-                },
+                profile_metrics,
             ))
         }
         Err(err) => {
             let text = format!("{:#}", err);
             if looks_like_duplicate_receive(&text) {
                 relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
+                profile_metrics.artifact_size_bytes = Some(message_bytes.len());
+                profile_metrics.conversation_size = Some(conversation_size);
+                profile_metrics.ciphertext_bytes = Some(message_bytes.len());
                 return Ok(CommandOutcome::new(
                     format!(
                         "pairwise message already processed: message_id={} conversation={} sender={}",
                         delivery.id, delivery.conversation_id, delivery.sender
                     ),
-                    CommandMetrics {
-                        conversation_size: Some(conversation_size),
-                        ciphertext_bytes: Some(message_bytes.len()),
-                        ..Default::default()
-                    },
+                    profile_metrics,
                 ));
             }
 
@@ -909,7 +967,9 @@ pub async fn handle_command(
         )),
 
         Command::GeneratePrekeyBundle => {
-            let bundles = participant.generate_prekey_bundles()?;
+            let (bundles, mut profile_metrics) =
+                measure_profile(|| participant.generate_prekey_bundles());
+            let bundles = bundles?;
             let first = bundles
                 .first()
                 .ok_or_else(|| anyhow!("no prekey bundles generated"))?;
@@ -962,24 +1022,23 @@ pub async fn handle_command(
                     "prekey bundle generated and published for {}; bundles={}",
                     participant.name, bundle_count
                 ),
-                CommandMetrics {
-                    artifact_size_bytes: Some(artifact_size_bytes),
-                    prekey_bundle_count: Some(bundle_count),
-                    participant_count: Some(1),
-                    ..Default::default()
+                {
+                    profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
+                    profile_metrics.prekey_bundle_count = Some(bundle_count);
+                    profile_metrics.participant_count = Some(1);
+                    profile_metrics
                 },
             ))
         }
 
         Command::PublishPrekeyBundle => {
-            participant.store_own_prekeys()?;
+            let (result, mut profile_metrics) = measure_profile(|| participant.store_own_prekeys());
+            result?;
+            profile_metrics.prekey_bundle_count = Some(participant.remaining_prekeys() + 1);
+            profile_metrics.participant_count = Some(1);
             Ok(CommandOutcome::new(
                 format!("prekeys stored locally for {}", participant.name),
-                CommandMetrics {
-                    prekey_bundle_count: Some(participant.remaining_prekeys() + 1),
-                    participant_count: Some(1),
-                    ..Default::default()
-                },
+                profile_metrics,
             ))
         }
 
@@ -987,6 +1046,8 @@ pub async fn handle_command(
             let mut established = 0usize;
             let mut existing = 0usize;
             let mut fetched = 0usize;
+            let mut artifact_size_bytes = 0usize;
+            let mut profile_metrics = CommandMetrics::default();
 
             for peer in &participants {
                 let peer_address = libsignal_core::ProtocolAddress::new(
@@ -994,14 +1055,21 @@ pub async fn handle_command(
                     DeviceId::new(1).expect("valid device id"),
                 );
 
-                if participant.has_session_with(&peer_address) {
+                let (has_session, has_session_metrics) =
+                    measure_profile(|| participant.has_session_with(&peer_address));
+                profile_metrics.merge_profile(&has_session_metrics);
+                if has_session {
                     existing += 1;
                     continue;
                 }
 
                 let path = format!("/prekey-bundle/{peer}");
+                let bundle_bytes =
+                    kr_get_bytes(kr_url, &path, "fetch_prekey_bundle", &participant.name).await?;
+                artifact_size_bytes = artifact_size_bytes.saturating_add(bundle_bytes.len());
                 let bundle_storable: PrekeyBundleStorable =
-                    kr_get_json(kr_url, &path, "fetch_prekey_bundle", &participant.name).await?;
+                    serde_json::from_slice(&bundle_bytes)
+                        .with_context(|| format!("decode fetched prekey bundle for {peer}"))?;
                 fetched += 1;
 
                 let prekey_public = match (
@@ -1062,7 +1130,11 @@ pub async fn handle_command(
                     identity_key,
                 )?;
 
-                participant.establish_session_from_bundle(&peer_address, &bundle)?;
+                let (result, establish_metrics) = measure_profile(|| {
+                    participant.establish_session_from_bundle(&peer_address, &bundle)
+                });
+                result?;
+                profile_metrics.merge_profile(&establish_metrics);
                 let consume_path = format!("/prekey-bundle/{}/consume", peer);
                 kr_post_empty(kr_url, &consume_path, "consume_prekey", &participant.name)
                     .await
@@ -1077,13 +1149,16 @@ pub async fn handle_command(
                     existing,
                     participants.len()
                 ),
-                CommandMetrics {
-                    participant_count: Some(participants.len().saturating_add(1)),
-                    conversation_size: Some(participants.len().saturating_add(1)),
-                    prekey_bundle_count: Some(fetched),
-                    session_count: Some(established.saturating_add(existing)),
-                    ratchet_step_count: Some(established),
-                    ..Default::default()
+                {
+                    profile_metrics.participant_count = Some(participants.len().saturating_add(1));
+                    profile_metrics.conversation_size = Some(participants.len().saturating_add(1));
+                    profile_metrics.prekey_bundle_count = Some(fetched);
+                    profile_metrics.session_count = Some(established.saturating_add(existing));
+                    profile_metrics.ratchet_step_count = Some(established);
+                    if artifact_size_bytes > 0 {
+                        profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
+                    }
+                    profile_metrics
                 },
             ))
         }
@@ -1101,7 +1176,9 @@ pub async fn handle_command(
                 DeviceId::new(1).expect("valid device id"),
             );
 
-            let ciphertext = participant.encrypt_message(&recipient_address, &plaintext)?;
+            let (ciphertext, mut profile_metrics) =
+                measure_profile(|| participant.encrypt_message(&recipient_address, &plaintext));
+            let ciphertext = ciphertext?;
             let ciphertext_bytes = ciphertext.serialize().to_vec();
             let ciphertext_len = ciphertext_bytes.len();
 
@@ -1117,27 +1194,27 @@ pub async fn handle_command(
 
             Ok(CommandOutcome::new(
                 format!("pairwise message encrypted and sent to {}", recipient),
-                CommandMetrics {
-                    artifact_size_bytes: Some(ciphertext_len),
-                    conversation_size: Some(conversation_size),
-                    session_count: Some(1),
-                    ratchet_step_count: Some(1),
-                    ciphertext_bytes: Some(ciphertext_len),
-                    plaintext_bytes: Some(plaintext_bytes),
-                    ..Default::default()
+                {
+                    profile_metrics.artifact_size_bytes = Some(ciphertext_len);
+                    profile_metrics.conversation_size = Some(conversation_size);
+                    profile_metrics.session_count = Some(1);
+                    profile_metrics.ratchet_step_count = Some(1);
+                    profile_metrics.ciphertext_bytes = Some(ciphertext_len);
+                    profile_metrics.plaintext_bytes = Some(plaintext_bytes);
+                    profile_metrics
                 },
             ))
         }
 
         Command::DecryptMessage {
             sender: _,
-            profile: _,
+            profile,
             conversation_size,
         } => {
             receive_message_delivery(
                 participant,
                 relay_url,
-                false,
+                profile,
                 conversation_size.unwrap_or(2),
             )
             .await

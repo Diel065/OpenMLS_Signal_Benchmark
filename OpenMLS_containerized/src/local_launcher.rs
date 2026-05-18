@@ -17,6 +17,7 @@ pub struct LocalLaunchConfig {
     pub base_worker_port: u16,
     pub run_id: String,
     pub scenario: String,
+    pub scenario_seed: u64,
     pub output_dir: String,
 }
 
@@ -131,6 +132,10 @@ pub fn launch_local_stack(config: &LocalLaunchConfig) -> Result<LocalDeployment>
             .env("OPENMLS_PROFILE_PATH", profile_path.as_os_str())
             .env("OPENMLS_PROFILE_RUN_ID", &config.run_id)
             .env("OPENMLS_PROFILE_SCENARIO", &config.scenario)
+            .env(
+                "OPENMLS_PROFILE_SCENARIO_SEED",
+                config.scenario_seed.to_string(),
+            )
             .stdout(Stdio::from(worker_log))
             .stderr(Stdio::from(worker_log_err))
             .spawn()

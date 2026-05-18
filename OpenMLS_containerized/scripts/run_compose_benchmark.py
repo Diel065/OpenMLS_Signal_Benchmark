@@ -4,8 +4,11 @@ from __future__ import annotations
 import os
 import argparse
 import datetime as dt
+import glob
+import hashlib
 import json
 import math
+import platform
 import re
 import shutil
 import shlex
@@ -30,6 +33,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
     p.add_argument("--run-id", default=None, help="Optional explicit run id")
     p.add_argument("--scenario", default="http-staircase-compose", help="Scenario label")
+    p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed")
     p.add_argument("--output-dir", default="benchmark_output", help="Base output directory")
 
     p.add_argument("--min-size", type=int, default=2)
@@ -336,6 +340,14 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=True,
         help="Only profile singleton measured clients (default: true)",
+    )
+    p.add_argument(
+        "--external-coverage-lane",
+        action="store_true",
+        help=(
+            "Guarantee active external devices are sampled as application, update, "
+            "add/welcome, and remove actors while keeping packed clients unprofiled."
+        ),
     )
     p.add_argument(
         "--packed-worker-internal-parallelism",
@@ -1261,7 +1273,9 @@ def launch_external_devices(
 
         expected_arch = dev_config.target.get("arch")
         if expected_arch:
-            arch = backend.shell("uname -m", check=False).stdout.strip()
+            arch_output = backend.shell("uname -m", check=False).stdout
+            arch_lines = [line.strip() for line in arch_output.splitlines() if line.strip()]
+            arch = arch_lines[-1] if arch_lines else ""
             if arch != expected_arch:
                 raise RuntimeError(
                     f"Device {dev_id} architecture mismatch: "
@@ -1327,6 +1341,7 @@ def launch_external_devices(
             listen_addr=listen_addr,
             run_id=run_id,
             scenario=args.scenario,
+            scenario_seed=args.scenario_seed,
             profile_path_template=profile_template,
             remote_results_root=remote_results_root,
             remote_tmp=remote_tmp,
@@ -1481,16 +1496,46 @@ def run_standalone_aggregation(
 ) -> int:
     """Run the Rust aggregate_profiles binary."""
     root = repo_root()
-    # Prefer compiled binary if available; fall back to cargo run
-    binary = root / "target" / "debug" / "aggregate_profiles"
-    release_binary = root / "target" / "release" / "aggregate_profiles"
-    if release_binary.exists():
-        binary = release_binary
-
-    if binary.exists():
-        cmd = [str(binary)]
+    aggregate_binary = os.environ.get("OPENMLS_AGGREGATE_PROFILES_BINARY")
+    if aggregate_binary:
+        cmd = [aggregate_binary]
     else:
-        cmd = ["cargo", "run", "--bin", "aggregate_profiles", "--"]
+        source_paths = [
+            root / "Cargo.lock",
+            root / "Cargo.toml",
+            root / "src" / "bin" / "aggregate_profiles.rs",
+            root / "src" / "lib.rs",
+            root / "src" / "staircase_runner.rs",
+        ]
+        source_mtime = max(
+            (p.stat().st_mtime for p in source_paths if p.exists()),
+            default=0.0,
+        )
+        candidate_binaries = [
+            root / "target" / "release" / "aggregate_profiles",
+            root / "target" / "debug" / "aggregate_profiles",
+        ]
+        fresh_binary = next(
+            (
+                p
+                for p in candidate_binaries
+                if p.exists() and p.stat().st_mtime >= source_mtime
+            ),
+            None,
+        )
+        if fresh_binary:
+            cmd = [str(fresh_binary)]
+        else:
+            cargo = os.environ.get("CARGO") or shutil.which("cargo")
+            if not cargo:
+                print(
+                    "[aggregate] cargo not found on PATH and no fresh aggregate_profiles "
+                    "binary is available. If this was launched with sudo, run the benchmark "
+                    "without sudo, preserve PATH/CARGO, or set OPENMLS_AGGREGATE_PROFILES_BINARY.",
+                    flush=True,
+                )
+                return 127
+            cmd = [cargo, "run", "--bin", "aggregate_profiles", "--"]
 
     cmd += ["--run-dir", str(run_dir)]
     if layout_file:
@@ -1499,12 +1544,175 @@ def run_standalone_aggregation(
         cmd += ["--workers-file", str(workers_file)]
 
     print(f"[aggregate] running standalone aggregation", flush=True)
-    result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+    try:
+        result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
+    except FileNotFoundError as exc:
+        print(f"[aggregate] failed to start aggregation command {cmd[0]!r}: {exc}", flush=True)
+        return 127
     if result.returncode != 0:
         print(f"[aggregate] aggregation failed (exit={result.returncode}): {result.stderr}", flush=True)
     else:
         print(f"[aggregate] aggregation complete: {result.stdout.strip()}", flush=True)
     return result.returncode
+
+
+def command_stdout(cmd: list[str], cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+    return (result.stdout or result.stderr).strip()
+
+
+def sha256_file(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def collect_external_device_build_metadata(root: Path, args: argparse.Namespace) -> list[dict]:
+    if not args.enable_external_devices or not args.devices_file:
+        return []
+
+    devices_file = Path(args.devices_file)
+    if not devices_file.is_absolute():
+        devices_file = root / devices_file
+
+    try:
+        from external_devices import load_devices_config
+
+        configs = load_devices_config(devices_file)
+    except Exception as exc:
+        return [{"metadata_error": f"{type(exc).__name__}: {exc}"}]
+
+    enabled = [c for c in configs if c.enabled]
+    if args.external_device_ids:
+        enabled = [c for c in enabled if c.id in args.external_device_ids]
+
+    devices = []
+    for config in enabled:
+        configured_binary = Path(config.target.get("binary", ""))
+        local_binary = (
+            configured_binary
+            if configured_binary.is_absolute()
+            else root / configured_binary
+        )
+        devices.append({
+            "id": config.id,
+            "worker_id": config.worker.get("id", config.id),
+            "kind": config.kind,
+            "device_kind": config.metadata.get("device_kind", config.kind),
+            "transport": config.metadata.get("transport", config.transport.get("type", "")),
+            "access_backend": config.metadata.get("access_backend", config.connection.get("type", "")),
+            "rust_target": config.target.get("rust_target", ""),
+            "binary_path": str(local_binary),
+            "binary_sha256": sha256_file(local_binary),
+            "remote_binary": config.worker.get("remote_binary", ""),
+            "remote_results_root": config.worker.get("remote_results_root", ""),
+        })
+    return devices
+
+
+def read_text_file(path: str) -> str | None:
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def collect_cpu_metadata() -> dict:
+    governors = sorted({
+        value
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
+        if (value := read_text_file(path))
+    })
+    freqs = [
+        int(value)
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")
+        if (value := read_text_file(path)) and value.isdigit()
+    ]
+    return {
+        "model_name": next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in (read_text_file("/proc/cpuinfo") or "").splitlines()
+                if line.lower().startswith("model name")
+            ),
+            None,
+        ),
+        "scaling_governors": governors,
+        "scaling_cur_freq_khz_min": min(freqs) if freqs else None,
+        "scaling_cur_freq_khz_max": max(freqs) if freqs else None,
+    }
+
+
+def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
+    external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
+    metadata = {
+        "profile_schema_version": 2,
+        "run_id": run_id,
+        "scenario": scenario,
+        "scenario_seed": args.scenario_seed,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "benchmark_profile": {
+            "workers": args.workers,
+            "min_size": args.min_size,
+            "max_size": args.max_size if args.max_size is not None else args.workers,
+            "step_size": args.step_size,
+            "roundtrips": args.roundtrips,
+            "update_rounds": args.update_rounds,
+            "max_update_samples_per_plateau": args.max_update_samples_per_plateau,
+            "app_rounds": args.app_rounds,
+            "max_app_samples_per_payload": args.max_app_samples_per_payload,
+            "payload_sizes": args.payload_sizes,
+            "worker_layout_mode": args.worker_layout_mode,
+            "process_pending_fanout": args.process_pending_fanout,
+            "profile_only_singletons": args.profile_only_singletons,
+            "external_coverage_lane": args.external_coverage_lane,
+            "randomized_payload_order": True,
+            "randomized_external_actor_position": True,
+        },
+        "host": {
+            "platform": platform.platform(),
+            "uname": command_stdout(["uname", "-a"]),
+            "cpu": collect_cpu_metadata(),
+        },
+        "git": {
+            "benchmark_commit": command_stdout(["git", "rev-parse", "HEAD"], cwd=root),
+            "benchmark_dirty_short": command_stdout(["git", "status", "--short"], cwd=root),
+            "openmls_commit": command_stdout(["git", "-C", str(root / "openmls-main"), "rev-parse", "HEAD"]),
+            "openmls_dirty_short": command_stdout(["git", "-C", str(root / "openmls-main"), "status", "--short"]),
+        },
+        "docker": {
+            "version": command_stdout(["docker", "version", "--format", "{{json .}}"]),
+            "info": command_stdout(["docker", "info", "--format", "{{json .}}"]),
+        },
+        "external_device_build": {
+            "enabled": args.enable_external_devices,
+            "device_ids": args.external_device_ids,
+            "default_binary_path": str(external_binary),
+            "default_binary_sha256": sha256_file(external_binary),
+            "profile": "minsize",
+            "rust_target": "armv7-unknown-linux-musleabihf",
+            "devices": collect_external_device_build_metadata(root, args),
+        },
+    }
+    (run_dir / "benchmark_run_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def main() -> int:
@@ -1608,6 +1816,7 @@ def main() -> int:
     if args.wipe_run_dir:
         safe_wipe_run_dir(run_dir, output_root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    write_benchmark_metadata(run_dir, root, args, run_id, scenario)
 
     project_name = sanitize_project_name(run_id)
 
@@ -1662,6 +1871,8 @@ def main() -> int:
             run_id,
             "--scenario",
             scenario,
+            "--scenario-seed",
+            str(args.scenario_seed),
             "--output-dir",
             output_dir_name,
             "--compose-out",
@@ -1947,11 +2158,14 @@ def main() -> int:
                 *(["--process-pending-fanout"] if args.process_pending_fanout else []),
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
+                *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--run-id",
                 run_id,
                 "--scenario",
                 scenario,
+                "--scenario-seed",
+                str(args.scenario_seed),
                 "--output-dir",
                 "/results",
             ]
@@ -2005,11 +2219,14 @@ def main() -> int:
                 *(["--process-pending-fanout"] if args.process_pending_fanout else []),
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
+                *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--run-id",
                 run_id,
                 "--scenario",
                 scenario,
+                "--scenario-seed",
+                str(args.scenario_seed),
                 "--output-dir",
                 output_dir_name,
             ]

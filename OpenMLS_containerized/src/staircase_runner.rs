@@ -14,7 +14,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::stream::{self, StreamExt};
-use rand::{thread_rng, Rng};
+use rand::{rngs::StdRng, seq::SliceRandom, thread_rng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
 use crate::http_retry::{
@@ -59,6 +59,7 @@ pub struct StaircaseConfig {
     pub max_update_samples_per_plateau: usize,
     pub max_app_samples_per_payload: usize,
     pub payload_sizes: Vec<usize>,
+    pub scenario_seed: u64,
     pub run_id: String,
     pub scenario: String,
     pub output_dir: String,
@@ -72,6 +73,7 @@ pub struct StaircaseConfig {
     pub http_pool_max_idle_per_host: usize,
     pub process_pending_fanout: bool,
     pub profile_only_singletons: bool,
+    pub external_coverage_lane: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
 }
@@ -92,6 +94,7 @@ pub struct WorkerSpec {
     pub physical_worker_id: String,
     pub container_mode: ContainerMode,
     pub profile_enabled: bool,
+    pub device_kind: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +181,7 @@ impl WorkerSpec {
             physical_worker_id: id,
             container_mode: ContainerMode::Singleton,
             profile_enabled: true,
+            device_kind: String::new(),
         }
     }
 }
@@ -211,6 +215,7 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
                 physical_worker_id: c.physical_worker_id.clone(),
                 container_mode,
                 profile_enabled: c.profile_enabled,
+                device_kind: c.device_kind.clone(),
             }
         })
         .collect()
@@ -218,6 +223,65 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
 
 pub fn measured_active_clients(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+fn spread_profile_enabled_singletons_in_idle(idle: VecDeque<WorkerSpec>) -> VecDeque<WorkerSpec> {
+    let mut external_devices = Vec::new();
+    let mut profiled_singletons = Vec::new();
+    let mut other_workers = Vec::new();
+
+    for worker in idle {
+        if is_external_device(&worker) {
+            external_devices.push(worker);
+        } else if worker.profile_enabled && worker.container_mode == ContainerMode::Singleton {
+            profiled_singletons.push(worker);
+        } else {
+            other_workers.push(worker);
+        }
+    }
+
+    if profiled_singletons.is_empty() || other_workers.is_empty() {
+        return external_devices
+            .into_iter()
+            .chain(profiled_singletons)
+            .chain(other_workers)
+            .collect();
+    }
+
+    let total_slots = profiled_singletons.len() + other_workers.len();
+    let mut profile_slot = vec![false; total_slots];
+    let mut previous_slot = 0usize;
+
+    for i in 0..profiled_singletons.len() {
+        let mut slot = ((i + 1) * total_slots) / (profiled_singletons.len() + 1);
+        if slot <= previous_slot && i > 0 {
+            slot = previous_slot + 1;
+        }
+        slot = slot.min(total_slots - 1);
+        while profile_slot[slot] && slot + 1 < total_slots {
+            slot += 1;
+        }
+        profile_slot[slot] = true;
+        previous_slot = slot;
+    }
+
+    let mut profiled_iter = profiled_singletons.into_iter();
+    let mut other_iter = other_workers.into_iter();
+    let mut spread = VecDeque::with_capacity(external_devices.len() + total_slots);
+
+    spread.extend(external_devices);
+    for is_profile_slot in profile_slot {
+        if is_profile_slot {
+            if let Some(worker) = profiled_iter.next() {
+                spread.push_back(worker);
+            }
+        } else if let Some(worker) = other_iter.next() {
+            spread.push_back(worker);
+        }
+    }
+    spread.extend(profiled_iter);
+    spread.extend(other_iter);
+    spread
 }
 
 pub fn physical_groups<'a>(
@@ -279,14 +343,24 @@ pub struct NetworkPhaseMetrics {
 
 #[derive(Debug, Deserialize, Serialize)]
 struct ProfileEvent {
+    #[serde(default)]
+    profile_schema_version: Option<u32>,
     ts_unix_ns: u128,
     op: String,
+    #[serde(default)]
+    measurement_class: Option<String>,
     implementation: String,
     wall_ns: u128,
     cpu_thread_ns: Option<u128>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     artifact_size_bytes: Option<usize>,
+    #[serde(default)]
+    welcome_bytes: Option<usize>,
+    #[serde(default)]
+    ratchet_tree_bytes: Option<usize>,
+    #[serde(default)]
+    welcome_plus_ratchet_tree_bytes: Option<usize>,
     encrypted_group_info_bytes: Option<usize>,
     encrypted_secrets_count: Option<usize>,
     group_epoch: Option<u64>,
@@ -302,6 +376,8 @@ struct ProfileEvent {
     thread_id: String,
     run_id: Option<String>,
     scenario: Option<String>,
+    #[serde(default)]
+    scenario_seed: Option<u64>,
     node_name: Option<String>,
     pod_name: Option<String>,
 }
@@ -690,23 +766,42 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         config.max_update_samples_per_plateau,
         config.max_app_samples_per_payload,
         config.payload_sizes.len(),
+        config
+            .workers
+            .iter()
+            .filter(|worker| is_external_device(worker))
+            .count(),
+        config.external_coverage_lane,
     );
 
     eprintln!(
-        "Scenario plan: plateaus={:?}, payload_sizes={:?}, update_cap={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateaus={:?}, payload_sizes={:?}, scenario_seed={}, update_cap={}, app_cap={}, total_units≈{}",
         plateau_sequence,
         config.payload_sizes,
+        config.scenario_seed,
         config.max_update_samples_per_plateau,
         config.max_app_samples_per_payload,
         total_units
     );
 
+    let mut scenario_rng = StdRng::seed_from_u64(config.scenario_seed);
     let mut progress = Progress::new(total_units);
     progress.render("starting");
 
     let leader = config.workers[0].clone();
     let mut active = vec![leader.clone()];
     let mut idle: VecDeque<WorkerSpec> = config.workers.iter().skip(1).cloned().collect();
+    if config.profile_only_singletons {
+        idle = spread_profile_enabled_singletons_in_idle(idle);
+        eprintln!(
+            "[sampling] spread profile-enabled singleton joiners across idle queue; packed clients remain unprofiled"
+        );
+    }
+    if config.external_coverage_lane {
+        eprintln!(
+            "[sampling] external coverage lane enabled; active external devices are protected from random removal and scheduled as app/update/add/remove actors"
+        );
+    }
     let mut membership_batches = MembershipBatchPlanner::default();
 
     create_group(&http, &leader, &mut progress).await?;
@@ -736,6 +831,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &mut membership_batches,
             &mut progress,
             config.process_pending_fanout,
+            config.external_coverage_lane,
+            &mut scenario_rng,
         )
         .await?;
 
@@ -755,6 +852,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &mut fanout,
             &mut progress,
             config.process_pending_fanout,
+            config.external_coverage_lane,
+            &mut scenario_rng,
         )
         .await?;
 
@@ -774,6 +873,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &config.payload_sizes,
             &mut fanout,
             &mut progress,
+            config.external_coverage_lane,
+            &mut scenario_rng,
         )
         .await?;
 
@@ -2824,6 +2925,28 @@ fn app_ops_for_plateau(
         .saturating_mul(payload_count)
 }
 
+fn is_external_device(worker: &WorkerSpec) -> bool {
+    !worker.device_kind.is_empty()
+}
+
+fn active_external_indices(active: &[WorkerSpec]) -> Vec<usize> {
+    active
+        .iter()
+        .enumerate()
+        .filter(|(_, worker)| is_external_device(worker))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
+fn active_profiled_non_external_indices(active: &[WorkerSpec]) -> Vec<usize> {
+    active
+        .iter()
+        .enumerate()
+        .filter(|(_, worker)| worker.profile_enabled && !is_external_device(worker))
+        .map(|(idx, _)| idx)
+        .collect()
+}
+
 fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize) -> usize {
     assert!(member_count > 0, "member_count must be greater than zero");
     assert!(sample_count > 0, "sample_count must be greater than zero");
@@ -2847,23 +2970,52 @@ fn estimate_total_units(
     max_update_samples_per_plateau: usize,
     max_app_samples_per_payload: usize,
     payload_count: usize,
+    external_device_count: usize,
+    external_coverage_lane: bool,
 ) -> usize {
     let mut total = 1usize;
     let mut current_size = 1usize;
 
     for &target in plateau_sequence {
         total = total.saturating_add(target.abs_diff(current_size));
-        total = total.saturating_add(update_ops_for_plateau(
-            target,
-            update_rounds,
-            max_update_samples_per_plateau,
-        ));
-        total = total.saturating_add(app_ops_for_plateau(
+        let mut update_ops =
+            update_ops_for_plateau(target, update_rounds, max_update_samples_per_plateau);
+        let mut app_ops = app_ops_for_plateau(
             target,
             app_rounds,
             max_app_samples_per_payload,
             payload_count,
-        ));
+        );
+
+        if external_device_count > 0 && target >= 2 {
+            let estimated_active_external = external_device_count.min(target.saturating_sub(1));
+            let has_non_external = target > estimated_active_external;
+
+            if external_coverage_lane {
+                let required_update_ops = estimated_active_external + usize::from(has_non_external);
+                update_ops = update_ops.max(required_update_ops);
+
+                let base_app_per_payload = app_sends_per_payload_for_plateau(
+                    target,
+                    app_rounds,
+                    max_app_samples_per_payload,
+                );
+                let required_app_per_payload =
+                    estimated_active_external + usize::from(has_non_external);
+                app_ops =
+                    app_ops.max(base_app_per_payload.max(required_app_per_payload) * payload_count);
+            } else if app_sends_per_payload_for_plateau(
+                target,
+                app_rounds,
+                max_app_samples_per_payload,
+            ) == 1
+            {
+                total = total.saturating_add(payload_count);
+            }
+        }
+
+        total = total.saturating_add(update_ops);
+        total = total.saturating_add(app_ops);
         current_size = target;
     }
 
@@ -2918,6 +3070,8 @@ async fn add_n_members(
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
+    forced_actor_id: Option<&str>,
+    rng: &mut StdRng,
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
 
@@ -2937,7 +3091,9 @@ async fn add_n_members(
         ));
     }
 
-    let actor_idx = thread_rng().gen_range(0..active.len());
+    let actor_idx = forced_actor_id
+        .and_then(|actor_id| active.iter().position(|worker| worker.id == actor_id))
+        .unwrap_or_else(|| rng.gen_range(0..active.len()));
     let actor = active[actor_idx].clone();
 
     let mut joiners = Vec::with_capacity(batch_size);
@@ -3028,7 +3184,7 @@ async fn add_n_members(
         },
         expected_epoch: expected_ep,
         phase: Some(fanout_phase.to_string()),
-        profile: None,
+        profile: is_external_device(worker).then_some(true),
     });
     let expected_by_client = recipients
         .iter()
@@ -3065,6 +3221,9 @@ async fn remove_n_members(
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
+    forced_actor_id: Option<&str>,
+    protect_external_members: bool,
+    rng: &mut StdRng,
 ) -> Result<()> {
     if active.len() <= 1 {
         return Err(anyhow!("Cannot remove the last remaining member"));
@@ -3080,15 +3239,21 @@ async fn remove_n_members(
         ));
     }
 
-    let mut rng = thread_rng();
-
-    let actor_idx = rng.gen_range(0..active.len());
+    let actor_idx = forced_actor_id
+        .and_then(|actor_id| active.iter().position(|worker| worker.id == actor_id))
+        .unwrap_or_else(|| rng.gen_range(0..active.len()));
     let actor = active[actor_idx].clone();
 
     // Pick random members to remove, but do not let the actor remove itself.
     // Self-removal is possible in MLS-style flows, but it complicates this benchmark's bookkeeping.
-    let mut removable_indices: Vec<usize> =
-        (0..active.len()).filter(|idx| *idx != actor_idx).collect();
+    let mut removable_indices: Vec<usize> = (0..active.len())
+        .filter(|idx| {
+            *idx != actor_idx && (!protect_external_members || !is_external_device(&active[*idx]))
+        })
+        .collect();
+    if removable_indices.len() < batch_size {
+        removable_indices = (0..active.len()).filter(|idx| *idx != actor_idx).collect();
+    }
     let mut removed = Vec::with_capacity(batch_size);
     for _ in 0..batch_size {
         let candidate_pos = rng.gen_range(0..removable_indices.len());
@@ -3170,7 +3335,7 @@ async fn remove_n_members(
             },
             expected_epoch: expected_ep,
             phase: Some(fanout_phase.to_string()),
-            profile: None,
+            profile: is_external_device(worker).then_some(true),
         }
     });
     let expected_by_client = recipients
@@ -3222,14 +3387,34 @@ async fn transition_to_size(
     membership_batches: &mut MembershipBatchPlanner,
     progress: &mut Progress,
     process_pending_fanout: bool,
+    external_coverage_lane: bool,
+    rng: &mut StdRng,
 ) -> Result<()> {
+    let mut external_add_actor_ids = if external_coverage_lane {
+        active
+            .iter()
+            .filter(|worker| is_external_device(worker))
+            .map(|worker| worker.id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
     while active.len() < target_size {
         let remaining = target_size - active.len();
         let max_allowed = remaining.min(idle.len());
         if max_allowed == 0 {
             return Err(anyhow!("No idle worker available to add"));
         }
-        let batch_size = membership_batches.next_batch_size(active.len(), max_allowed);
+        let forced_actor_id = external_add_actor_ids
+            .iter()
+            .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
+            .map(|pos| external_add_actor_ids.remove(pos));
+        let batch_size = if forced_actor_id.is_some() {
+            1
+        } else {
+            membership_batches.next_batch_size(active.len(), max_allowed)
+        };
         add_n_members(
             http,
             active,
@@ -3238,9 +3423,21 @@ async fn transition_to_size(
             fanout,
             progress,
             process_pending_fanout,
+            forced_actor_id.as_deref(),
+            rng,
         )
         .await?;
     }
+
+    let mut external_remove_actor_ids = if external_coverage_lane {
+        active
+            .iter()
+            .filter(|worker| is_external_device(worker))
+            .map(|worker| worker.id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
 
     while active.len() > target_size {
         let remaining = active.len() - target_size;
@@ -3248,7 +3445,15 @@ async fn transition_to_size(
         if max_allowed == 0 {
             return Err(anyhow!("Cannot remove the last remaining member"));
         }
-        let batch_size = membership_batches.next_batch_size(active.len(), max_allowed);
+        let forced_actor_id = external_remove_actor_ids
+            .iter()
+            .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
+            .map(|pos| external_remove_actor_ids.remove(pos));
+        let batch_size = if forced_actor_id.is_some() {
+            1
+        } else {
+            membership_batches.next_batch_size(active.len(), max_allowed)
+        };
         remove_n_members(
             http,
             active,
@@ -3257,6 +3462,9 @@ async fn transition_to_size(
             fanout,
             progress,
             process_pending_fanout,
+            forced_actor_id.as_deref(),
+            external_coverage_lane,
+            rng,
         )
         .await?;
     }
@@ -3273,9 +3481,39 @@ async fn run_update_phase(
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
+    external_coverage_lane: bool,
+    rng: &mut StdRng,
 ) -> Result<()> {
-    let total_updates =
+    let base_updates =
         update_ops_for_plateau(plateau_size, update_rounds, max_update_samples_per_plateau);
+    let profiled_indices: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.profile_enabled)
+        .map(|(i, _)| i)
+        .collect();
+
+    if profiled_indices.is_empty() {
+        eprintln!(
+            "\n[plateau {}] update phase skipped: no profile-enabled members",
+            plateau_size
+        );
+        return Ok(());
+    }
+
+    let required_actor_indices = if external_coverage_lane {
+        let mut required = active_external_indices(active);
+        let non_external_profiled_indices = active_profiled_non_external_indices(active);
+        if !non_external_profiled_indices.is_empty() {
+            let sampled_pos = rng.gen_range(0..non_external_profiled_indices.len());
+            required.push(non_external_profiled_indices[sampled_pos]);
+        }
+        required
+    } else {
+        Vec::new()
+    };
+
+    let total_updates = base_updates.max(required_actor_indices.len());
     if total_updates == 0 {
         return Ok(());
     }
@@ -3285,8 +3523,25 @@ async fn run_update_phase(
         plateau_size, total_updates
     );
 
+    let external_actor_pos = (!external_coverage_lane)
+        .then(|| {
+            profiled_indices
+                .iter()
+                .position(|&i| is_external_device(&active[i]))
+        })
+        .flatten();
+    let external_actor_seq = external_actor_pos.map(|_| rng.gen_range(0..total_updates));
+
     for seq_no in 0..total_updates {
-        let actor_idx = sampled_member_index(active.len(), total_updates, seq_no);
+        let actor_idx = if let Some(required_actor_idx) = required_actor_indices.get(seq_no) {
+            *required_actor_idx
+        } else {
+            let profiled_actor_idx = match (external_actor_pos, external_actor_seq) {
+                (Some(ext), Some(ext_seq)) if seq_no == ext_seq => ext,
+                _ => sampled_member_index(profiled_indices.len(), total_updates, seq_no),
+            };
+            profiled_indices[profiled_actor_idx]
+        };
         let actor = &active[actor_idx];
         let actor_before = show_group_state(http, actor).await?;
         let expected_after_commit = expected_group_state(
@@ -3335,23 +3590,22 @@ async fn run_update_phase(
         } else {
             "update.fanout_receive_commit"
         };
-        let commands_by_physical =
-            build_batch_commands(&recipients, |_worker| BatchFanoutCommand {
-                client_id: _worker.id.clone(),
-                request_id: None,
-                command: if process_pending_fanout {
-                    Command::ProcessPending {
-                        kinds: Some(vec![PendingKind::Commits]),
-                        max_messages: None,
-                        expected_epoch: expected_ep,
-                    }
-                } else {
-                    Command::ReceiveCommit
-                },
-                expected_epoch: expected_ep,
-                phase: Some(fanout_phase.to_string()),
-                profile: None,
-            });
+        let commands_by_physical = build_batch_commands(&recipients, |worker| BatchFanoutCommand {
+            client_id: worker.id.clone(),
+            request_id: None,
+            command: if process_pending_fanout {
+                Command::ProcessPending {
+                    kinds: Some(vec![PendingKind::Commits]),
+                    max_messages: None,
+                    expected_epoch: expected_ep,
+                }
+            } else {
+                Command::ReceiveCommit
+            },
+            expected_epoch: expected_ep,
+            phase: Some(fanout_phase.to_string()),
+            profile: is_external_device(worker).then_some(true),
+        });
         let expected_by_client = recipients
             .iter()
             .map(|worker| (worker.id.clone(), expected_state.clone()))
@@ -3389,6 +3643,8 @@ async fn run_application_phase(
     payload_sizes: &[usize],
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    external_coverage_lane: bool,
+    rng: &mut StdRng,
 ) -> Result<()> {
     if active.len() < 2 {
         eprintln!(
@@ -3404,14 +3660,93 @@ async fn run_application_phase(
         return Ok(());
     }
 
-    for &payload_size in payload_sizes {
+    let profiled_indices: Vec<usize> = active
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.profile_enabled)
+        .map(|(i, _)| i)
+        .collect();
+
+    if profiled_indices.is_empty() {
+        eprintln!(
+            "\n[plateau {}] application phase skipped: no profile-enabled members",
+            plateau_size
+        );
+        return Ok(());
+    }
+
+    let external_actor_pos = profiled_indices
+        .iter()
+        .position(|&i| is_external_device(&active[i]));
+
+    let mut randomized_payload_sizes = payload_sizes.to_vec();
+    randomized_payload_sizes.shuffle(rng);
+
+    for &payload_size in &randomized_payload_sizes {
+        let non_external_profiled_indices: Vec<usize> = profiled_indices
+            .iter()
+            .copied()
+            .filter(|&i| !is_external_device(&active[i]))
+            .collect();
+        let required_actor_indices = if external_coverage_lane {
+            let mut required = active_external_indices(active);
+            if !non_external_profiled_indices.is_empty() {
+                let sampled_pos = rng.gen_range(0..non_external_profiled_indices.len());
+                required.push(non_external_profiled_indices[sampled_pos]);
+            }
+            required
+        } else {
+            Vec::new()
+        };
+        let force_external_receive_sample = !external_coverage_lane
+            && external_actor_pos.is_some()
+            && !non_external_profiled_indices.is_empty();
+        let planned_per_payload_count = if external_coverage_lane {
+            per_payload_count.max(required_actor_indices.len())
+        } else {
+            per_payload_count + usize::from(force_external_receive_sample && per_payload_count == 1)
+        };
         eprintln!(
             "\n[plateau {}] application phase: {} successful sends at payload {} B",
-            plateau_size, per_payload_count, payload_size
+            plateau_size, planned_per_payload_count, payload_size
         );
 
-        for seq_no in 0..per_payload_count {
-            let actor_idx = sampled_member_index(active.len(), per_payload_count, seq_no);
+        let external_actor_seq = if external_coverage_lane {
+            None
+        } else {
+            external_actor_pos.map(|_| rng.gen_range(0..planned_per_payload_count))
+        };
+        let forced_non_external_actor_seq =
+            if force_external_receive_sample && planned_per_payload_count > 1 {
+                external_actor_seq.map(|seq| (seq + 1) % planned_per_payload_count)
+            } else {
+                None
+            };
+
+        for seq_no in 0..planned_per_payload_count {
+            let actor_idx = if let Some(required_actor_idx) = required_actor_indices.get(seq_no) {
+                *required_actor_idx
+            } else {
+                match (external_actor_pos, external_actor_seq) {
+                    (Some(ext), Some(ext_seq)) if seq_no == ext_seq => profiled_indices[ext],
+                    _ if forced_non_external_actor_seq == Some(seq_no) => {
+                        let sampled_pos = sampled_member_index(
+                            non_external_profiled_indices.len(),
+                            planned_per_payload_count,
+                            seq_no,
+                        );
+                        non_external_profiled_indices[sampled_pos]
+                    }
+                    _ => {
+                        let profiled_actor_idx = sampled_member_index(
+                            profiled_indices.len(),
+                            planned_per_payload_count,
+                            seq_no,
+                        );
+                        profiled_indices[profiled_actor_idx]
+                    }
+                }
+            };
             let actor = &active[actor_idx];
             let payload =
                 deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
@@ -3427,29 +3762,41 @@ async fn run_application_phase(
             let recipient_indices: Vec<usize> =
                 (0..active.len()).filter(|&j| j != actor_idx).collect();
 
-            let sampled_pos =
-                sampled_member_index(recipient_indices.len(), per_payload_count, seq_no);
-
-            let recipients: Vec<(usize, WorkerSpec)> = recipient_indices
+            let profiled_recipient_indices: Vec<usize> = profiled_indices
                 .iter()
-                .enumerate()
-                .map(|(pos, recipient_idx)| (pos, active[*recipient_idx].clone()))
+                .copied()
+                .filter(|&i| i != actor_idx)
                 .collect();
-            let sampled_worker_id = recipients[sampled_pos].1.id.clone();
-            let recipient_workers: Vec<WorkerSpec> =
-                recipients.into_iter().map(|(_, worker)| worker).collect();
 
-            let commands_by_physical =
-                build_batch_commands(&recipient_workers, |worker| BatchFanoutCommand {
+            let sampled_worker_id = if profiled_recipient_indices.is_empty() {
+                String::new()
+            } else {
+                let sampled_pos = sampled_member_index(
+                    profiled_recipient_indices.len(),
+                    planned_per_payload_count,
+                    seq_no,
+                );
+                active[profiled_recipient_indices[sampled_pos]].id.clone()
+            };
+
+            let recipient_workers: Vec<WorkerSpec> = recipient_indices
+                .iter()
+                .map(|recipient_idx| active[*recipient_idx].clone())
+                .collect();
+
+            let commands_by_physical = build_batch_commands(&recipient_workers, |worker| {
+                let should_profile = worker.id == sampled_worker_id || is_external_device(worker);
+                BatchFanoutCommand {
                     client_id: worker.id.clone(),
                     request_id: None,
                     command: Command::ReceiveApplicationMessage {
-                        profile: worker.id == sampled_worker_id,
+                        profile: should_profile,
                     },
                     expected_epoch: None,
                     phase: Some("application.fanout_receive_application_message".to_string()),
-                    profile: Some(worker.id == sampled_worker_id),
-                });
+                    profile: should_profile.then_some(true),
+                }
+            });
             batch_fanout_workers(
                 http,
                 "application",
@@ -3467,7 +3814,7 @@ async fn run_application_phase(
                 plateau_size,
                 payload_size,
                 seq_no + 1,
-                per_payload_count,
+                planned_per_payload_count,
                 actor.id
             ));
         }
@@ -3535,6 +3882,21 @@ pub fn aggregate_csv(
         }
     }
 
+    let mut aggregate_worker_ids: Vec<String> = Vec::new();
+    let mut aggregate_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(ref l) = layout {
+        for client in &l.clients {
+            if client.profile_enabled && aggregate_seen.insert(client.client_id.clone()) {
+                aggregate_worker_ids.push(client.client_id.clone());
+            }
+        }
+    }
+    for worker_id in worker_ids {
+        if aggregate_seen.insert(worker_id.clone()) {
+            aggregate_worker_ids.push(worker_id.clone());
+        }
+    }
+
     #[derive(Serialize)]
     struct CsvRow<'a> {
         client_id: &'a str,
@@ -3547,14 +3909,19 @@ pub fn aggregate_csv(
         access_backend: &'a str,
         arch: &'a str,
         rust_target: &'a str,
+        profile_schema_version: Option<u32>,
         ts_unix_ns: u128,
         op: String,
+        measurement_class: Option<String>,
         implementation: String,
         wall_ns: u128,
         cpu_thread_ns: Option<u128>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
         artifact_size_bytes: Option<usize>,
+        welcome_bytes: Option<usize>,
+        ratchet_tree_bytes: Option<usize>,
+        welcome_plus_ratchet_tree_bytes: Option<usize>,
         encrypted_group_info_bytes: Option<usize>,
         encrypted_secrets_count: Option<usize>,
         group_epoch: Option<u64>,
@@ -3570,6 +3937,7 @@ pub fn aggregate_csv(
         thread_id: String,
         run_id: Option<String>,
         scenario: Option<String>,
+        scenario_seed: Option<u64>,
         node_name: Option<String>,
         pod_name: Option<String>,
         logical_worker_count: usize,
@@ -3586,7 +3954,7 @@ pub fn aggregate_csv(
         }
     }
 
-    for worker_id in worker_ids {
+    for worker_id in &aggregate_worker_ids {
         let path = run_dir.join(format!("client-{worker_id}.jsonl"));
 
         if !profile_enabled_ids.contains(worker_id.as_str()) {
@@ -3646,14 +4014,19 @@ pub fn aggregate_csv(
                     meta.map(|m| m.rust_target.as_str()),
                     "x86_64-unknown-linux-musl",
                 ),
+                profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
+                measurement_class: event.measurement_class,
                 implementation: event.implementation,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
                 artifact_size_bytes: event.artifact_size_bytes,
+                welcome_bytes: event.welcome_bytes,
+                ratchet_tree_bytes: event.ratchet_tree_bytes,
+                welcome_plus_ratchet_tree_bytes: event.welcome_plus_ratchet_tree_bytes,
                 encrypted_group_info_bytes: event.encrypted_group_info_bytes,
                 encrypted_secrets_count: event.encrypted_secrets_count,
                 group_epoch: event.group_epoch,
@@ -3669,6 +4042,7 @@ pub fn aggregate_csv(
                 thread_id: event.thread_id,
                 run_id: event.run_id,
                 scenario: event.scenario,
+                scenario_seed: event.scenario_seed,
                 node_name: event.node_name,
                 pod_name: event.pod_name,
                 logical_worker_count,
@@ -3987,6 +4361,7 @@ mod tests {
             physical_worker_id: "worker-00002".to_string(),
             container_mode: super::ContainerMode::Singleton,
             profile_enabled: true,
+            device_kind: String::new(),
         };
         let workers_by_id = HashMap::from([
             (local_worker.id.clone(), local_worker),

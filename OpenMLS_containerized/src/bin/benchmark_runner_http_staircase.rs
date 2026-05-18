@@ -63,6 +63,9 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "32,256,1024,4096")]
     payload_sizes: Vec<usize>,
 
+    #[arg(long, default_value_t = 1)]
+    scenario_seed: u64,
+
     #[arg(long, default_value = "run-001")]
     run_id: String,
 
@@ -104,6 +107,10 @@ struct Args {
 
     #[arg(long, action = ArgAction::SetTrue)]
     profile_only_singletons: bool,
+
+    /// Guarantee active external devices are sampled as app/update/add/remove actors.
+    #[arg(long, action = ArgAction::SetTrue)]
+    external_coverage_lane: bool,
 
     #[arg(long, action = ArgAction::SetTrue)]
     no_aggregate: bool,
@@ -195,6 +202,7 @@ fn main() -> Result<()> {
         max_update_samples_per_plateau: args.max_update_samples_per_plateau,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
         payload_sizes: args.payload_sizes,
+        scenario_seed: args.scenario_seed,
         run_id: args.run_id,
         scenario: args.scenario,
         output_dir: args.output_dir,
@@ -208,6 +216,7 @@ fn main() -> Result<()> {
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         process_pending_fanout: args.process_pending_fanout,
         profile_only_singletons: args.profile_only_singletons,
+        external_coverage_lane: args.external_coverage_lane,
         no_aggregate: args.no_aggregate,
         worker_layout,
     })

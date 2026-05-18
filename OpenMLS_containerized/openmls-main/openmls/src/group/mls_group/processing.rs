@@ -6,6 +6,8 @@ use errors::{CommitToPendingProposalsError, MergePendingCommitError};
 use openmls_traits::{crypto::OpenMlsCrypto, signatures::Signer, storage::StorageProvider as _};
 
 use crate::{
+    error::LibraryError,
+    framing::message_in::MlsMessageIn,
     framing::mls_content::FramedContentBody,
     group::{errors::MergeCommitError, StageCommitError, ValidationError},
     messages::group_info::GroupInfo,
@@ -29,6 +31,7 @@ use super::{errors::ProcessMessageError, *};
 use allocation_counter::measure;
 #[cfg(feature = "profiling-json")]
 use crate::profiling::{emit_event, ProfileScope};
+use tls_codec::Deserialize as _;
 
 #[cfg(feature = "extensions-draft-08")]
 /// Keeps the old dictionary as well as the values that are being overwritten
@@ -113,57 +116,51 @@ impl<'a> AppDataDictionaryUpdater<'a> {
 
 impl MlsGroup {
     #[cfg(feature = "profiling-json")]
-    fn profile_application_message_receive(
-        &self,
-        plaintext: &[u8],
-        aad_len: usize,
-    ) -> ApplicationMessage {
-        let scope = ProfileScope::start("application_message_receive", "openmls");
-
-        let plaintext_len = plaintext.len();
+    fn profile_application_message_receive_protocol<Provider: OpenMlsProvider>(
+        &mut self,
+        provider: &Provider,
+        message: ProtocolMessage,
+        artifact_size_bytes: Option<usize>,
+    ) -> Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>> {
         let group_epoch = self.context().epoch().as_u64();
         let tree_size = self.treesync().tree_size().u32();
         let member_count = self.members().count();
         let ciphersuite = format!("{:?}", self.ciphersuite());
 
-        let mut measured_result: Option<ApplicationMessage> = None;
+        let scope = ProfileScope::start("application_message_receive_protocol", "openmls");
+        let mut measured_result: Option<
+            Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>>,
+        > = None;
 
         let allocation_info = measure(|| {
-            measured_result = Some(ApplicationMessage::new(plaintext.to_vec()));
+            measured_result = Some(self.process_message(provider, message, false));
         });
 
-        let application_message =
-            measured_result.expect("allocation_counter measure closure did not run");
+        let processed_message =
+            measured_result.expect("allocation_counter measure closure did not run")?;
 
         if let Some(scope) = scope {
-            let mut event = scope.finish();
-            event.group_epoch = Some(group_epoch);
-            event.tree_size = Some(tree_size);
-            event.member_count = Some(member_count);
-            event.ciphersuite = Some(ciphersuite);
-            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-            event.alloc_count = Some(allocation_info.count_total as u64);
-            event.app_msg_plaintext_bytes = Some(plaintext_len);
-            event.aad_bytes = Some(aad_len);
-            emit_event(&event);
+            if let ProcessedMessageContent::ApplicationMessage(application_message) =
+                processed_message.content()
+            {
+                let mut event = scope.finish();
+                event.group_epoch = Some(group_epoch);
+                event.tree_size = Some(tree_size);
+                event.member_count = Some(member_count);
+                event.ciphersuite = Some(ciphersuite);
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.artifact_size_bytes = artifact_size_bytes;
+                event.app_msg_plaintext_bytes = Some(application_message.as_slice().len());
+                event.aad_bytes = Some(processed_message.aad().len());
+                emit_event(&event);
+            }
         }
 
-        application_message
+        Ok(processed_message)
     }
 
-    fn application_message_receive_no_profile(
-        &self,
-        plaintext: &[u8],
-    ) -> ApplicationMessage {
-        ApplicationMessage::new(plaintext.to_vec())
-    }
-
-    #[cfg(not(feature = "profiling-json"))]
-    fn profile_application_message_receive(
-        &self,
-        plaintext: &[u8],
-        _aad_len: usize,
-    ) -> ApplicationMessage {
+    fn application_message_receive_no_profile(&self, plaintext: &[u8]) -> ApplicationMessage {
         ApplicationMessage::new(plaintext.to_vec())
     }
 
@@ -182,6 +179,13 @@ impl MlsGroup {
         message: impl Into<ProtocolMessage>,
         profile_application_receive: bool,
     ) -> Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>> {
+        let message = message.into();
+
+        #[cfg(feature = "profiling-json")]
+        if profile_application_receive {
+            return self.profile_application_message_receive_protocol(provider, message, None);
+        }
+
         let unverified_message = self.unprotect_message(provider, message)?;
 
         // Check if the commit contains AppDataUpdate proposals - if so, the caller
@@ -197,6 +201,63 @@ impl MlsGroup {
             }
         }
         self.process_unverified_message(provider, unverified_message, profile_application_receive)
+    }
+
+    /// Deserialize and process an incoming MLS message while keeping the
+    /// deserialization and protocol work in separate profiling events.
+    pub fn process_message_from_bytes_profiled<Provider: OpenMlsProvider>(
+        &mut self,
+        provider: &Provider,
+        message_bytes: &[u8],
+        profile_application_receive: bool,
+    ) -> Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>> {
+        #[cfg(feature = "profiling-json")]
+        let mls_message_in = if profile_application_receive {
+            let scope = ProfileScope::start("application_message_receive_deserialize", "openmls");
+            let mut measured_result: Option<Result<MlsMessageIn, tls_codec::Error>> = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(MlsMessageIn::tls_deserialize_exact(message_bytes));
+            });
+            let deserialize_event = scope.map(|scope| scope.finish());
+            let mls_message_in = measured_result
+                .expect("allocation_counter measure closure did not run")
+                .map_err(LibraryError::missing_bound_check)?;
+
+            if let Some(mut event) = deserialize_event {
+                event.group_epoch = Some(self.context().epoch().as_u64());
+                event.tree_size = Some(self.treesync().tree_size().u32());
+                event.member_count = Some(self.members().count());
+                event.ciphersuite = Some(format!("{:?}", self.ciphersuite()));
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.artifact_size_bytes = Some(message_bytes.len());
+                emit_event(&event);
+            }
+
+            mls_message_in
+        } else {
+            MlsMessageIn::tls_deserialize_exact(message_bytes)
+                .map_err(LibraryError::missing_bound_check)?
+        };
+
+        #[cfg(not(feature = "profiling-json"))]
+        let mls_message_in = MlsMessageIn::tls_deserialize_exact(message_bytes)
+            .map_err(LibraryError::missing_bound_check)?;
+
+        let protocol_message = mls_message_in
+            .try_into_protocol_message()
+            .map_err(|_| LibraryError::custom("Expected a protocol message"))?;
+
+        #[cfg(feature = "profiling-json")]
+        if profile_application_receive {
+            return self.profile_application_message_receive_protocol(
+                provider,
+                protocol_message,
+                Some(message_bytes.len()),
+            );
+        }
+
+        self.process_message(provider, protocol_message, profile_application_receive)
     }
 
     #[cfg(feature = "extensions-draft-08")]
@@ -533,9 +594,8 @@ impl MlsGroup {
 
         let content = match content.content() {
             FramedContentBody::Application(application_message) => {
-                let processed = self.profile_application_message_receive(
+                let processed = self.application_message_receive_no_profile(
                     application_message.as_slice(),
-                    authenticated_data.len(),
                 );
                 ProcessedMessageContent::ApplicationMessage(processed)
             }
@@ -593,9 +653,8 @@ impl MlsGroup {
         let content = match content.content() {
             FramedContentBody::Application(application_message) => {
                 let processed = if profile_application_receive {
-                    self.profile_application_message_receive(
+                    self.application_message_receive_no_profile(
                         application_message.as_slice(),
-                        authenticated_data.len(),
                     )
                 } else {
                     self.application_message_receive_no_profile(

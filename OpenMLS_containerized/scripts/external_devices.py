@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import subprocess
@@ -8,7 +9,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional
 
 
@@ -39,6 +40,7 @@ class WorkerLaunch:
     listen_addr: str
     run_id: str
     scenario: str
+    scenario_seed: int
     profile_path_template: str
     remote_results_root: str
     remote_tmp: str
@@ -222,13 +224,15 @@ class AdbDeviceBackend(DeviceBackend):
         self._adb(["pull", remote, str(local)])
 
     def _do_wipe(self, safe_run_id: str) -> None:
+        remote_results_root = self.config.worker.get("remote_results_root", "/results/openmls")
+        remote_tmp = self.config.worker.get("remote_tmp", "/tmp/openmls-benchmark")
         cmds = (
             f"set -e; "
             f"killall worker 2>/dev/null || pkill worker 2>/dev/null || true; "
-            f"rm -rf /results/openmls/{shlex.quote(safe_run_id)}; "
-            f"mkdir -p /results/openmls/{shlex.quote(safe_run_id)}; "
-            f"rm -rf /tmp/openmls-benchmark; "
-            f"mkdir -p /tmp/openmls-benchmark"
+            f"rm -rf {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"mkdir -p {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"rm -rf {shlex.quote(remote_tmp)}; "
+            f"mkdir -p {shlex.quote(remote_tmp)}"
         )
         self._adb(["shell", cmds])
 
@@ -248,6 +252,7 @@ class AdbDeviceBackend(DeviceBackend):
                 "OPENMLS_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
                 "OPENMLS_PROFILE_RUN_ID": launch.run_id,
                 "OPENMLS_PROFILE_SCENARIO": launch.scenario,
+                "OPENMLS_PROFILE_SCENARIO_SEED": str(launch.scenario_seed),
             }
             if launch.node_name:
                 env["OPENMLS_PROFILE_NODE"] = launch.node_name
@@ -305,18 +310,117 @@ class SshDeviceBackend(DeviceBackend):
         self.host = config.connection.get("host", "")
         self.user = config.connection.get("user", "root")
         self.identity_file = config.connection.get("identity_file", "")
+        self.password = str(config.connection.get("password", ""))
+        password_env = config.connection.get("password_env", "")
+        if not self.password and password_env:
+            self.password = os.environ.get(password_env, "")
 
     def _ssh_base(self) -> list[str]:
         cmd = ["ssh"]
         if self.identity_file:
-            cmd += ["-i", self.identity_file]
+            cmd += ["-i", str(Path(self.identity_file).expanduser())]
         cmd += ["-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
+                "-o", "BatchMode=no",
                 "-o", "ConnectTimeout=10",
                 f"{self.user}@{self.host}"]
         return cmd
 
-    def _ssh(self, command: str, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
-        cmd = self._ssh_base() + [command]
+    def _run_password_command(
+        self,
+        cmd: list[str],
+        *,
+        check: bool,
+        timeout: int,
+    ) -> subprocess.CompletedProcess:
+        try:
+            import pexpect
+        except ImportError as exc:
+            raise RuntimeError(
+                "Password-based SSH requires the Python 'pexpect' package. "
+                "Install pexpect, configure connection.identity_file, or use an SSH agent."
+            ) from exc
+
+        child = pexpect.spawn(cmd[0], cmd[1:], encoding="utf-8", timeout=timeout)
+        output_parts: list[str] = []
+        password_prompts = 0
+
+        try:
+            while True:
+                idx = child.expect([
+                    r"(?i)are you sure you want to continue connecting",
+                    r"(?i)(?:password|passphrase).*:",
+                    pexpect.EOF,
+                    pexpect.TIMEOUT,
+                ])
+                before = child.before or ""
+
+                if idx == 0:
+                    child.sendline("yes")
+                elif idx == 1:
+                    password_prompts += 1
+                    if password_prompts > 4:
+                        child.close(force=True)
+                        output = "".join(output_parts)
+                        result = subprocess.CompletedProcess(cmd, 255, output, output)
+                        if check:
+                            raise subprocess.CalledProcessError(
+                                result.returncode,
+                                cmd,
+                                output=result.stdout,
+                                stderr=result.stderr,
+                            )
+                        return result
+                    child.sendline(self.password)
+                elif idx == 2:
+                    output_parts.append(before)
+                    break
+                else:
+                    child.close(force=True)
+                    output_parts.append(before)
+                    output = "".join(output_parts)
+                    if check:
+                        raise subprocess.TimeoutExpired(cmd, timeout, output=output)
+                    return subprocess.CompletedProcess(cmd, 124, output, output)
+        finally:
+            if child.isalive():
+                child.close(force=True)
+            else:
+                child.close()
+
+        output = "".join(output_parts)
+        if child.exitstatus is not None:
+            returncode = int(child.exitstatus)
+        elif child.signalstatus is not None:
+            returncode = 128 + int(child.signalstatus)
+        else:
+            returncode = 1
+
+        result = subprocess.CompletedProcess(
+            cmd,
+            returncode,
+            output,
+            output if returncode != 0 else "",
+        )
+        if check and returncode != 0:
+            raise subprocess.CalledProcessError(
+                returncode,
+                cmd,
+                output=result.stdout,
+                stderr=result.stderr,
+            )
+        return result
+
+    def _run_command(
+        self,
+        cmd: list[str],
+        *,
+        check: bool = True,
+        timeout: int = 60,
+    ) -> subprocess.CompletedProcess:
+        if self.password:
+            return self._run_password_command(cmd, check=check, timeout=timeout)
         return subprocess.run(
             cmd,
             capture_output=True,
@@ -324,6 +428,10 @@ class SshDeviceBackend(DeviceBackend):
             check=check,
             timeout=timeout,
         )
+
+    def _ssh(self, command: str, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
+        cmd = self._ssh_base() + [command]
+        return self._run_command(cmd, check=check, timeout=timeout)
 
     def check_reachable(self) -> None:
         result = self._ssh("hostname; whoami; uname -a; uname -m", check=False)
@@ -341,43 +449,49 @@ class SshDeviceBackend(DeviceBackend):
         if recursive:
             cmd.append("-r")
         if self.identity_file:
-            cmd += ["-i", self.identity_file]
+            cmd += ["-i", str(Path(self.identity_file).expanduser())]
         cmd += ["-o", "StrictHostKeyChecking=no",
+                "-o", "UserKnownHostsFile=/dev/null",
+                "-o", "LogLevel=ERROR",
+                "-o", "BatchMode=no",
                 "-o", "ConnectTimeout=10"]
         cmd += [src, dst]
         return cmd
 
     def push(self, local: Path, remote: str) -> None:
         remote_scp = f"{self.user}@{self.host}:{remote}"
-        subprocess.run(
-            self._scp_cmd(str(local), remote_scp),
-            check=True,
-            timeout=120,
-        )
+        self._run_command(self._scp_cmd(str(local), remote_scp), check=True, timeout=120)
 
     def pull(self, remote: str, local: Path) -> None:
         local.parent.mkdir(parents=True, exist_ok=True)
         remote_scp = f"{self.user}@{self.host}:{remote}"
-        subprocess.run(
+        self._run_command(
             self._scp_cmd(remote_scp, str(local), recursive=True),
             check=True,
             timeout=120,
         )
 
     def _do_wipe(self, safe_run_id: str) -> None:
+        remote_results_root = self.config.worker.get("remote_results_root", "/results/openmls")
+        remote_tmp = self.config.worker.get("remote_tmp", "/tmp/openmls-benchmark")
         cmds = (
             f"set -e; "
             f"killall worker 2>/dev/null || pkill worker 2>/dev/null || true; "
-            f"rm -rf /results/openmls/{shlex.quote(safe_run_id)}; "
-            f"mkdir -p /results/openmls/{shlex.quote(safe_run_id)}; "
-            f"rm -rf /tmp/openmls-benchmark; "
-            f"mkdir -p /tmp/openmls-benchmark"
+            f"rm -rf {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"mkdir -p {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"rm -rf {shlex.quote(remote_tmp)}; "
+            f"mkdir -p {shlex.quote(remote_tmp)}"
         )
         self._ssh(cmds)
 
     def install_worker(self, local_binary: Path, remote_binary: str) -> None:
+        remote_parent = str(PurePosixPath(remote_binary).parent)
+        self._ssh(f"mkdir -p {shlex.quote(remote_parent)}")
         self.push(local_binary, remote_binary)
         self._ssh(f"chmod +x {shlex.quote(remote_binary)}")
+
+    def set_epoch_seconds(self, epoch_seconds: int) -> None:
+        self.shell(f"sudo -S date -u -s @{int(epoch_seconds)}", check=True)
 
     def start_worker(self, launch: WorkerLaunch) -> None:
         profile_flag = ""
@@ -391,6 +505,7 @@ class SshDeviceBackend(DeviceBackend):
                 "OPENMLS_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
                 "OPENMLS_PROFILE_RUN_ID": launch.run_id,
                 "OPENMLS_PROFILE_SCENARIO": launch.scenario,
+                "OPENMLS_PROFILE_SCENARIO_SEED": str(launch.scenario_seed),
             }
             if launch.node_name:
                 env["OPENMLS_PROFILE_NODE"] = launch.node_name
