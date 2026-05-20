@@ -3,15 +3,20 @@ from __future__ import annotations
 
 import os
 import argparse
+import csv
 import datetime as dt
+import glob
+import hashlib
 import json
 import math
+import platform
 import re
 import shutil
 import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -20,6 +25,7 @@ from pathlib import Path
 from typing import Optional
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -337,6 +343,47 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Internal parallelism for packed worker containers",
     )
+    p.add_argument(
+        "--singleton-cpus",
+        default=None,
+        help=(
+            "Docker CPU envelope for all containerized singleton workers, e.g. 0.25. "
+            "Unset means no singleton CPU limit."
+        ),
+    )
+    p.add_argument(
+        "--singleton-memory",
+        default=None,
+        help=(
+            "Docker memory envelope for all containerized singleton workers, e.g. 128m. "
+            "Unset means no singleton memory limit."
+        ),
+    )
+    p.add_argument(
+        "--singleton-memory-swap",
+        default=None,
+        help=(
+            "Docker memory+swap envelope for singleton workers. "
+            "If --singleton-memory is set and this is omitted, it defaults to the memory value."
+        ),
+    )
+    p.add_argument(
+        "--singleton-pids-limit",
+        type=int,
+        default=None,
+        help="Optional Docker pids_limit for all containerized singleton workers.",
+    )
+    p.add_argument(
+        "--resource-monitor-interval-ms",
+        type=int,
+        default=500,
+        help="Resource-monitor sample interval for constrained singleton containers.",
+    )
+    p.add_argument(
+        "--no-resource-monitor",
+        action="store_true",
+        help="Disable resource_samples.jsonl/resource_summary.csv collection.",
+    )
 
     # External device flags
     p.add_argument(
@@ -407,6 +454,123 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError(
             f"Run ID must only contain [A-Za-z0-9._-], got '{run_id}'"
         )
+
+
+def parse_memory_bytes(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    raw = value.strip()
+    if not raw:
+        raise SystemExit("memory limits must not be empty")
+
+    match = MEMORY_RE.match(raw)
+    if not match:
+        raise SystemExit(
+            f"Unsupported memory limit '{value}'. Use a Docker-style value such as 64m, 128m, or 1g."
+        )
+
+    number = float(match.group("value"))
+    unit = (match.group("unit") or "b").lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+    }
+    if unit not in multipliers:
+        raise SystemExit(f"Unsupported memory unit in '{value}'. Use b, k, m, g, or t.")
+
+    bytes_value = int(number * multipliers[unit])
+    if bytes_value <= 0:
+        raise SystemExit("memory limits must be greater than zero")
+    return bytes_value
+
+
+def normalize_resource_args(args: argparse.Namespace) -> None:
+    if args.singleton_cpus is not None:
+        raw = str(args.singleton_cpus).strip()
+        if not raw:
+            raise SystemExit("--singleton-cpus must not be empty")
+        try:
+            cpus = float(raw)
+        except ValueError as exc:
+            raise SystemExit("--singleton-cpus must be a positive number") from exc
+        if not math.isfinite(cpus) or cpus <= 0:
+            raise SystemExit("--singleton-cpus must be a positive number")
+        args.singleton_cpus = raw
+        args.singleton_cpus_float = cpus
+    else:
+        args.singleton_cpus_float = None
+
+    if args.singleton_memory is not None:
+        args.singleton_memory = str(args.singleton_memory).strip()
+        args.singleton_memory_bytes = parse_memory_bytes(args.singleton_memory)
+    else:
+        args.singleton_memory_bytes = None
+
+    args.singleton_memory_swap_defaulted = False
+    if args.singleton_memory_swap is not None:
+        if args.singleton_memory is None:
+            raise SystemExit("--singleton-memory-swap may only be set with --singleton-memory")
+        args.singleton_memory_swap = str(args.singleton_memory_swap).strip()
+        args.singleton_memory_swap_bytes = parse_memory_bytes(args.singleton_memory_swap)
+    elif args.singleton_memory is not None:
+        args.singleton_memory_swap = args.singleton_memory
+        args.singleton_memory_swap_bytes = args.singleton_memory_bytes
+        args.singleton_memory_swap_defaulted = True
+    else:
+        args.singleton_memory_swap_bytes = None
+
+    if args.singleton_pids_limit is not None and args.singleton_pids_limit < 1:
+        raise SystemExit("--singleton-pids-limit must be >= 1")
+
+
+def singleton_resource_envelope(args: argparse.Namespace) -> dict:
+    enabled = any(
+        value is not None
+        for value in (
+            args.singleton_cpus_float,
+            args.singleton_memory,
+            args.singleton_memory_swap,
+            args.singleton_pids_limit,
+        )
+    )
+    profile_parts = []
+    if args.singleton_cpus is not None:
+        profile_parts.append(f"cpus-{args.singleton_cpus}")
+    if args.singleton_memory is not None:
+        profile_parts.append(f"memory-{args.singleton_memory}")
+    if args.singleton_memory_swap is not None:
+        profile_parts.append(f"swap-{args.singleton_memory_swap}")
+    if args.singleton_pids_limit is not None:
+        profile_parts.append(f"pids-{args.singleton_pids_limit}")
+    resource_profile = (
+        "singleton-resource-envelope_" + "_".join(profile_parts)
+        if profile_parts
+        else ""
+    )
+    return {
+        "enabled": enabled,
+        "cpus": args.singleton_cpus_float,
+        "memory": args.singleton_memory,
+        "memory_bytes": args.singleton_memory_bytes,
+        "memory_swap": args.singleton_memory_swap,
+        "memory_swap_bytes": args.singleton_memory_swap_bytes,
+        "memory_swap_defaulted_to_memory": args.singleton_memory_swap_defaulted,
+        "pids_limit": args.singleton_pids_limit,
+        "applies_to": "all_containerized_singletons",
+        "resource_profile": resource_profile,
+        "scientific_interpretation": (
+            "host-specific reproducible resource envelope; not exact hardware emulation"
+        ),
+    }
 
 
 def output_root_for(root: Path, output_dir_name: str) -> Path:
@@ -1069,6 +1233,692 @@ def physical_worker_services(
     return [s for s in services if s.startswith("worker-") and s not in ("worker-00000",)]
 
 
+class ResourceLimitVerificationError(RuntimeError):
+    pass
+
+
+def write_run_outcome(
+    run_dir: Path,
+    outcome_class: str,
+    evidence: dict | None = None,
+) -> None:
+    payload = {
+        "outcome_class": outcome_class,
+        "written_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "evidence": evidence or {},
+    }
+    (run_dir / "benchmark_outcome.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
+def docker_inspect_one(
+    root: Path,
+    container_id: str,
+    env: dict[str, str] | None,
+) -> dict | None:
+    result = subprocess.run(
+        ["docker", "inspect", container_id],
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not parsed:
+        return None
+    return parsed[0]
+
+
+def containerized_singletons_from_layout(layout: dict) -> list[dict]:
+    singletons: list[dict] = []
+    for entry in layout.get("physical_workers", []):
+        if entry.get("container_mode") != "singleton":
+            continue
+        if entry.get("execution_backend") == "real_device":
+            continue
+        singletons.append(entry)
+    return singletons
+
+
+def has_configured_resource_limit(entry: dict) -> bool:
+    return any(
+        entry.get(key) is not None
+        for key in (
+            "resource_limit_cpus",
+            "resource_limit_memory_bytes",
+            "resource_limit_memory_swap_bytes",
+            "resource_limit_pids",
+        )
+    )
+
+
+def expected_singleton_limit_targets(layout: dict) -> list[dict]:
+    targets: list[dict] = []
+    for entry in containerized_singletons_from_layout(layout):
+        has_limit = any(
+            entry.get(key) is not None
+            for key in (
+                "resource_limit_cpus",
+                "resource_limit_memory_bytes",
+                "resource_limit_memory_swap_bytes",
+                "resource_limit_pids",
+            )
+        )
+        if has_limit:
+            targets.append(entry)
+    return targets
+
+
+def observed_cpu_limit(host_config: dict) -> float | None:
+    nano_cpus = int(host_config.get("NanoCpus") or 0)
+    if nano_cpus > 0:
+        return nano_cpus / 1_000_000_000.0
+
+    quota = int(host_config.get("CpuQuota") or 0)
+    period = int(host_config.get("CpuPeriod") or 0)
+    if quota > 0 and period > 0:
+        return quota / period
+
+    return None
+
+
+def verify_resource_limits(
+    *,
+    root: Path,
+    compose_file: Path,
+    run_dir: Path,
+    layout_path: Path,
+    args: argparse.Namespace,
+    compose_env: dict[str, str] | None,
+) -> list[dict]:
+    envelope = singleton_resource_envelope(args)
+    artifact_path = run_dir / "resource_limits_verified.json"
+
+    if not envelope["enabled"]:
+        artifact_path.write_text(
+            json.dumps(
+                {
+                    "enabled": False,
+                    "aggregate_status": "disabled",
+                    "singleton_resource_envelope": envelope,
+                    "targets": [],
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+            encoding="utf-8",
+        )
+        return []
+
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    containerized_singletons = containerized_singletons_from_layout(layout)
+    targets = expected_singleton_limit_targets(layout)
+    records = []
+    failures = []
+
+    if not targets:
+        failures.append("resource envelope was enabled but no constrained singleton workers were found in worker_layout.json")
+    missing_limit_metadata = [
+        entry.get("physical_worker_id", "<unknown>")
+        for entry in containerized_singletons
+        if not has_configured_resource_limit(entry)
+    ]
+    if missing_limit_metadata:
+        failures.append(
+            "resource envelope was enabled but these containerized singletons have no limit metadata: "
+            + ", ".join(missing_limit_metadata[:20])
+        )
+
+    for target in targets:
+        service = target["physical_worker_id"]
+        container_id = compose_container_id(root, compose_file, service, compose_env)
+        expected = {
+            "cpus": target.get("resource_limit_cpus"),
+            "memory_bytes": target.get("resource_limit_memory_bytes"),
+            "memory_swap_bytes": target.get("resource_limit_memory_swap_bytes"),
+            "pids_limit": target.get("resource_limit_pids"),
+            "resource_profile": target.get("resource_profile", ""),
+        }
+        observed: dict = {"container_id": container_id}
+        checks: dict[str, bool] = {}
+        messages: list[str] = []
+
+        if not container_id:
+            messages.append("container id not found via docker compose ps")
+            record = {
+                "physical_worker_id": service,
+                "expected": expected,
+                "observed": observed,
+                "checks": checks,
+                "status": "fail",
+                "messages": messages,
+            }
+            records.append(record)
+            failures.append(f"{service}: container id not found")
+            continue
+
+        inspect = docker_inspect_one(root, container_id, compose_env)
+        if not inspect:
+            messages.append("docker inspect did not return container metadata")
+            record = {
+                "physical_worker_id": service,
+                "expected": expected,
+                "observed": observed,
+                "checks": checks,
+                "status": "fail",
+                "messages": messages,
+            }
+            records.append(record)
+            failures.append(f"{service}: docker inspect unavailable")
+            continue
+
+        host_config = inspect.get("HostConfig") or {}
+        observed.update({
+            "memory": host_config.get("Memory"),
+            "memory_swap": host_config.get("MemorySwap"),
+            "nano_cpus": host_config.get("NanoCpus"),
+            "cpu_quota": host_config.get("CpuQuota"),
+            "cpu_period": host_config.get("CpuPeriod"),
+            "effective_cpus": observed_cpu_limit(host_config),
+            "pids_limit": host_config.get("PidsLimit"),
+        })
+
+        if expected["memory_bytes"] is not None:
+            checks["memory"] = int(host_config.get("Memory") or 0) == int(expected["memory_bytes"])
+            if not checks["memory"]:
+                messages.append(
+                    f"memory expected {expected['memory_bytes']} observed {host_config.get('Memory')}"
+                )
+
+        if expected["memory_swap_bytes"] is not None:
+            checks["memory_swap"] = int(host_config.get("MemorySwap") or 0) == int(expected["memory_swap_bytes"])
+            if not checks["memory_swap"]:
+                messages.append(
+                    f"memory_swap expected {expected['memory_swap_bytes']} observed {host_config.get('MemorySwap')}"
+                )
+
+        if expected["cpus"] is not None:
+            observed_cpus = observed["effective_cpus"]
+            tolerance = max(0.001, float(expected["cpus"]) * 0.005)
+            checks["cpus"] = (
+                observed_cpus is not None
+                and abs(float(observed_cpus) - float(expected["cpus"])) <= tolerance
+            )
+            if not checks["cpus"]:
+                messages.append(
+                    f"cpus expected {expected['cpus']} observed {observed_cpus}"
+                )
+
+        if expected["pids_limit"] is not None:
+            checks["pids_limit"] = int(host_config.get("PidsLimit") or 0) == int(expected["pids_limit"])
+            if not checks["pids_limit"]:
+                messages.append(
+                    f"pids_limit expected {expected['pids_limit']} observed {host_config.get('PidsLimit')}"
+                )
+
+        status = "pass" if checks and all(checks.values()) else "fail"
+        if not checks:
+            status = "fail"
+            messages.append("no configured checks were evaluated")
+        if status != "pass":
+            failures.append(f"{service}: " + "; ".join(messages))
+
+        records.append({
+            "physical_worker_id": service,
+            "container_id": container_id,
+            "expected": expected,
+            "observed": observed,
+            "checks": checks,
+            "status": status,
+            "messages": messages,
+        })
+
+    aggregate_status = "pass" if not failures else "fail"
+    artifact = {
+        "enabled": True,
+        "aggregate_status": aggregate_status,
+        "singleton_resource_envelope": envelope,
+        "targets": records,
+        "failure_count": len(failures),
+        "failures": failures,
+    }
+    artifact_path.write_text(
+        json.dumps(artifact, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+    if failures:
+        write_run_outcome(
+            run_dir,
+            "invalid_resource_envelope",
+            {
+                "resource_limits_verified": str(artifact_path),
+                "failures": failures,
+            },
+        )
+        raise ResourceLimitVerificationError(
+            "Docker did not apply the configured singleton resource envelope: "
+            + "; ".join(failures[:5])
+        )
+
+    print(
+        f"[resources] verified Docker resource limits for {len(records)} singleton container(s)",
+        flush=True,
+    )
+    return records
+
+
+def read_key_value_file(path: Path) -> dict[str, int]:
+    values: dict[str, int] = {}
+    try:
+        for raw in path.read_text(encoding="utf-8").splitlines():
+            parts = raw.split()
+            if len(parts) == 2:
+                try:
+                    values[parts[0]] = int(parts[1])
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return values
+
+
+def read_cgroup_scalar(path: Path) -> int | str | None:
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if raw == "max":
+        return raw
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def cgroup_paths_for_pid(pid: int) -> dict[str, Path]:
+    paths: dict[str, Path] = {}
+    try:
+        lines = Path(f"/proc/{pid}/cgroup").read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return paths
+
+    for line in lines:
+        parts = line.split(":", 2)
+        if len(parts) != 3:
+            continue
+        _, controllers, rel_path = parts
+        rel_path = rel_path.lstrip("/")
+        if not controllers:
+            unified = Path("/sys/fs/cgroup") / rel_path
+            paths.setdefault("unified", unified)
+            paths.setdefault("cpu", unified)
+            paths.setdefault("memory", unified)
+            paths.setdefault("pids", unified)
+            continue
+
+        for controller in controllers.split(","):
+            controller_path = Path("/sys/fs/cgroup") / controller / rel_path
+            paths.setdefault(controller, controller_path)
+            if controller.startswith("cpu"):
+                paths.setdefault("cpu", controller_path)
+            if controller == "memory":
+                paths.setdefault("memory", controller_path)
+            if controller == "pids":
+                paths.setdefault("pids", controller_path)
+
+    return paths
+
+
+class ResourceMonitor:
+    def __init__(
+        self,
+        *,
+        root: Path,
+        run_dir: Path,
+        run_id: str,
+        targets: list[dict],
+        interval_ms: int,
+        compose_env: dict[str, str] | None,
+    ):
+        self.root = root
+        self.run_dir = run_dir
+        self.run_id = run_id
+        self.interval_seconds = interval_ms / 1000.0
+        self.compose_env = compose_env
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.samples_path = run_dir / "resource_samples.jsonl"
+        self.summary_path = run_dir / "resource_summary.csv"
+        self.warning_path = run_dir / "resource_monitor_warnings.txt"
+        self.warnings: list[str] = []
+        self.targets = [self._build_target(record) for record in targets]
+        self.summary: dict[str, dict] = {
+            target["physical_worker_id"]: {
+                "physical_worker_id": target["physical_worker_id"],
+                "container_id": target["container_id"],
+                "resource_limit_cpus": target["resource_limit_cpus"],
+                "resource_limit_memory_bytes": target["resource_limit_memory_bytes"],
+                "samples": 0,
+                "max_memory_current": None,
+                "last_memory_current": None,
+                "memory_events_low": None,
+                "memory_events_high": None,
+                "memory_events_max": None,
+                "memory_events_oom": None,
+                "memory_events_oom_kill": None,
+                "cpu_usage_usec_first": None,
+                "cpu_usage_usec_last": None,
+                "cpu_nr_throttled_first": None,
+                "cpu_nr_throttled_last": None,
+                "cpu_throttled_usec_first": None,
+                "cpu_throttled_usec_last": None,
+                "pids_current_max": None,
+                "last_container_status": "",
+                "last_container_exit_code": None,
+                "last_container_oom_killed": None,
+            }
+            for target in self.targets
+        }
+
+    def _build_target(self, record: dict) -> dict:
+        expected = record.get("expected") or {}
+        container_id = record.get("container_id")
+        inspect = docker_inspect_one(self.root, container_id, self.compose_env) if container_id else None
+        state = (inspect or {}).get("State") or {}
+        pid = int(state.get("Pid") or 0)
+        cgroups = cgroup_paths_for_pid(pid) if pid > 0 else {}
+        return {
+            "physical_worker_id": record.get("physical_worker_id", ""),
+            "container_id": container_id,
+            "resource_limit_cpus": expected.get("cpus"),
+            "resource_limit_memory_bytes": expected.get("memory_bytes"),
+            "resource_profile": expected.get("resource_profile", ""),
+            "pid": pid,
+            "cgroups": cgroups,
+            "state": {
+                "status": state.get("Status", ""),
+                "running": state.get("Running"),
+                "exit_code": state.get("ExitCode"),
+                "oom_killed": state.get("OOMKilled"),
+            },
+            "last_state_refresh": 0.0,
+        }
+
+    def start(self) -> None:
+        if not self.targets:
+            return
+        self.thread = threading.Thread(target=self._run, name="resource-monitor", daemon=True)
+        self.thread.start()
+        print(
+            f"[resources] monitoring {len(self.targets)} constrained singleton container(s) "
+            f"every {self.interval_seconds:.3f}s",
+            flush=True,
+        )
+
+    def stop(self) -> Path | None:
+        if not self.thread:
+            return None
+        self.stop_event.set()
+        self.thread.join(timeout=max(5.0, self.interval_seconds * 4))
+        if self.thread.is_alive():
+            self.warnings.append("resource monitor thread did not stop before timeout")
+        self._write_summary()
+        if self.warnings:
+            self.warning_path.write_text("\n".join(self.warnings) + "\n", encoding="utf-8")
+        return self.summary_path
+
+    def _run(self) -> None:
+        self.samples_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.samples_path.open("a", encoding="utf-8") as out:
+            while not self.stop_event.is_set():
+                started = time.time()
+                timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+                for target in self.targets:
+                    try:
+                        sample = self._sample_target(target, timestamp)
+                        out.write(json.dumps(sample, sort_keys=True) + "\n")
+                        self._update_summary(sample)
+                    except Exception as exc:
+                        message = (
+                            f"{timestamp} {target.get('physical_worker_id', '<unknown>')}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                        self.warnings.append(message)
+                out.flush()
+                elapsed = time.time() - started
+                remaining = max(0.0, self.interval_seconds - elapsed)
+                self.stop_event.wait(remaining)
+
+    def _refresh_state(self, target: dict, now: float) -> None:
+        if now - float(target.get("last_state_refresh") or 0.0) < max(1.0, self.interval_seconds * 4):
+            return
+        container_id = target.get("container_id")
+        inspect = docker_inspect_one(self.root, container_id, self.compose_env) if container_id else None
+        state = (inspect or {}).get("State") or {}
+        pid = int(state.get("Pid") or 0)
+        target["pid"] = pid
+        if pid > 0 and not target.get("cgroups"):
+            target["cgroups"] = cgroup_paths_for_pid(pid)
+        target["state"] = {
+            "status": state.get("Status", ""),
+            "running": state.get("Running"),
+            "exit_code": state.get("ExitCode"),
+            "oom_killed": state.get("OOMKilled"),
+        }
+        target["last_state_refresh"] = now
+
+    def _sample_target(self, target: dict, timestamp: str) -> dict:
+        now = time.time()
+        self._refresh_state(target, now)
+        cgroups = target.get("cgroups") or {}
+        memory_path = cgroups.get("memory") or cgroups.get("unified")
+        cpu_path = cgroups.get("cpu") or cgroups.get("unified")
+        pids_path = cgroups.get("pids") or cgroups.get("unified")
+
+        memory_events = read_key_value_file(memory_path / "memory.events") if memory_path else {}
+        cpu_stat = read_key_value_file(cpu_path / "cpu.stat") if cpu_path else {}
+        state = target.get("state") or {}
+
+        sample = {
+            "timestamp": timestamp,
+            "timestamp_unix_ns": time.time_ns(),
+            "run_id": self.run_id,
+            "physical_worker_id": target.get("physical_worker_id"),
+            "container_id": target.get("container_id"),
+            "resource_limit_cpus": target.get("resource_limit_cpus"),
+            "resource_limit_memory_bytes": target.get("resource_limit_memory_bytes"),
+            "resource_profile": target.get("resource_profile", ""),
+            "memory.current": read_cgroup_scalar(memory_path / "memory.current") if memory_path else None,
+            "memory.max": read_cgroup_scalar(memory_path / "memory.max") if memory_path else None,
+            "memory.events.low": memory_events.get("low"),
+            "memory.events.high": memory_events.get("high"),
+            "memory.events.max": memory_events.get("max"),
+            "memory.events.oom": memory_events.get("oom"),
+            "memory.events.oom_kill": memory_events.get("oom_kill"),
+            "cpu.stat.usage_usec": cpu_stat.get("usage_usec"),
+            "cpu.stat.user_usec": cpu_stat.get("user_usec"),
+            "cpu.stat.system_usec": cpu_stat.get("system_usec"),
+            "cpu.stat.nr_periods": cpu_stat.get("nr_periods"),
+            "cpu.stat.nr_throttled": cpu_stat.get("nr_throttled"),
+            "cpu.stat.throttled_usec": cpu_stat.get("throttled_usec"),
+            "pids.current": read_cgroup_scalar(pids_path / "pids.current") if pids_path else None,
+            "container.status": state.get("status"),
+            "container.running": state.get("running"),
+            "container.exit_code": state.get("exit_code"),
+            "container.oom_killed": state.get("oom_killed"),
+        }
+        return sample
+
+    def _update_summary(self, sample: dict) -> None:
+        physical_id = sample.get("physical_worker_id")
+        if physical_id not in self.summary:
+            return
+        row = self.summary[physical_id]
+        row["samples"] += 1
+
+        memory_current = sample.get("memory.current")
+        if isinstance(memory_current, int):
+            row["last_memory_current"] = memory_current
+            current_max = row["max_memory_current"]
+            row["max_memory_current"] = (
+                memory_current
+                if current_max is None
+                else max(int(current_max), memory_current)
+            )
+
+        for key in ("low", "high", "max", "oom", "oom_kill"):
+            sample_key = f"memory.events.{key}"
+            value = sample.get(sample_key)
+            if value is not None:
+                row[f"memory_events_{key}"] = value
+
+        for summary_key, sample_key in (
+            ("cpu_usage_usec", "cpu.stat.usage_usec"),
+            ("cpu_nr_throttled", "cpu.stat.nr_throttled"),
+            ("cpu_throttled_usec", "cpu.stat.throttled_usec"),
+        ):
+            value = sample.get(sample_key)
+            if value is None:
+                continue
+            first_key = f"{summary_key}_first"
+            last_key = f"{summary_key}_last"
+            if row[first_key] is None:
+                row[first_key] = value
+            row[last_key] = value
+
+        pids_current = sample.get("pids.current")
+        if isinstance(pids_current, int):
+            current_max = row["pids_current_max"]
+            row["pids_current_max"] = (
+                pids_current
+                if current_max is None
+                else max(int(current_max), pids_current)
+            )
+
+        row["last_container_status"] = sample.get("container.status") or ""
+        row["last_container_exit_code"] = sample.get("container.exit_code")
+        row["last_container_oom_killed"] = sample.get("container.oom_killed")
+
+    def _write_summary(self) -> None:
+        fieldnames = [
+            "physical_worker_id",
+            "container_id",
+            "resource_limit_cpus",
+            "resource_limit_memory_bytes",
+            "samples",
+            "max_memory_current",
+            "last_memory_current",
+            "memory_events_low",
+            "memory_events_high",
+            "memory_events_max",
+            "memory_events_oom",
+            "memory_events_oom_kill",
+            "cpu_usage_usec_delta",
+            "cpu_nr_throttled_delta",
+            "cpu_throttled_usec_delta",
+            "pids_current_max",
+            "last_container_status",
+            "last_container_exit_code",
+            "last_container_oom_killed",
+        ]
+        with self.summary_path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            for raw in self.summary.values():
+                row = dict(raw)
+                row["cpu_usage_usec_delta"] = delta(
+                    row.pop("cpu_usage_usec_first"),
+                    row.pop("cpu_usage_usec_last"),
+                )
+                row["cpu_nr_throttled_delta"] = delta(
+                    row.pop("cpu_nr_throttled_first"),
+                    row.pop("cpu_nr_throttled_last"),
+                )
+                row["cpu_throttled_usec_delta"] = delta(
+                    row.pop("cpu_throttled_usec_first"),
+                    row.pop("cpu_throttled_usec_last"),
+                )
+                writer.writerow({key: row.get(key) for key in fieldnames})
+
+
+def delta(first: int | None, last: int | None) -> int | None:
+    if first is None or last is None:
+        return None
+    return int(last) - int(first)
+
+
+def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
+    summary_path = run_dir / "resource_summary.csv"
+    evidence: dict = {"resource_summary": str(summary_path) if summary_path.exists() else None}
+    if not summary_path.exists():
+        return "infrastructure_failure", evidence
+
+    try:
+        rows = list(csv.DictReader(summary_path.open("r", encoding="utf-8")))
+    except OSError as exc:
+        evidence["summary_error"] = str(exc)
+        return "infrastructure_failure", evidence
+
+    oom_rows = [
+        row for row in rows
+        if str(row.get("last_container_oom_killed", "")).lower() == "true"
+        or int_or_zero(row.get("memory_events_oom_kill")) > 0
+    ]
+    if oom_rows:
+        evidence["oom_workers"] = [row.get("physical_worker_id") for row in oom_rows]
+        return "hard_upper_bound_oom_kill", evidence
+
+    exited_rows = [
+        row for row in rows
+        if row.get("last_container_status") == "exited"
+        or int_or_zero(row.get("last_container_exit_code")) not in (0, None)
+    ]
+    if exited_rows:
+        evidence["exited_workers"] = [row.get("physical_worker_id") for row in exited_rows]
+        return "hard_upper_bound_container_exit", evidence
+
+    throttled_rows = [
+        row for row in rows
+        if int_or_zero(row.get("cpu_nr_throttled_delta")) > 0
+        or int_or_zero(row.get("cpu_throttled_usec_delta")) > 0
+    ]
+    if throttled_rows:
+        evidence["cpu_throttled_workers"] = [row.get("physical_worker_id") for row in throttled_rows[:20]]
+        return "resource_pressure_cpu_throttled", evidence
+
+    memory_pressure_rows = [
+        row for row in rows
+        if int_or_zero(row.get("memory_events_high")) > 0
+        or int_or_zero(row.get("memory_events_max")) > 0
+        or int_or_zero(row.get("memory_events_oom")) > 0
+    ]
+    if memory_pressure_rows:
+        evidence["memory_pressure_workers"] = [row.get("physical_worker_id") for row in memory_pressure_rows[:20]]
+        return "resource_pressure_memory", evidence
+
+    return "infrastructure_failure", evidence
+
+
+def int_or_zero(value) -> int:
+    try:
+        if value in (None, ""):
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+
 def chunks(items: list[str], size: int):
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -1219,6 +2069,8 @@ def launch_external_devices(
         validate_run_id as py_validate_run_id,
         WorkerLaunch,
         build_external_device_layout_entry,
+        build_worker_url_candidates,
+        wait_for_first_healthy_url,
     )
 
     devices_file = Path(args.devices_file)
@@ -1330,10 +2182,10 @@ def launch_external_devices(
         backend.start_worker(launch)
 
         # Health check
-        worker_url = f"http://{device_ip}:{worker_port}"
-        print(f"[device] {dev_id}: waiting for health on {worker_url}/health...", flush=True)
+        worker_urls = build_worker_url_candidates(dev_config, device_ip, worker_port)
+        print(f"[device] {dev_id}: waiting for health on {', '.join(worker_urls)}...", flush=True)
         try:
-            backend.wait_health(f"{worker_url}/health", timeout_s=60)
+            worker_url = wait_for_first_healthy_url(worker_urls, timeout_s=60)
         except Exception as e:
             log = backend.shell(
                 f"cat {shlex.quote(remote_tmp)}/worker.log 2>/dev/null || true",
@@ -1342,7 +2194,8 @@ def launch_external_devices(
             ps = backend.shell("ps | grep '[w]orker' || true", check=False).stdout.strip()
             backend.stop_worker()
             details = [
-                f"External worker {dev_id} did not become healthy at {worker_url}/health.",
+                f"External worker {dev_id} did not become healthy.",
+                f"Tried URLs: {', '.join(worker_urls)}",
                 f"Remote binary: {remote_binary}",
             ]
             if ps:
@@ -1360,6 +2213,7 @@ def launch_external_devices(
             kr_port=kr_port,
             relay_port=relay_port,
             run_id=run_id,
+            worker_url=worker_url,
         )
 
         layout_clients.append(client_entry)
@@ -1500,6 +2354,159 @@ def run_standalone_aggregation(
     return result.returncode
 
 
+
+def command_stdout(cmd: list[str], cwd: Path | None = None) -> str:
+    try:
+        result = subprocess.run(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception as exc:
+        return f"<unavailable: {exc}>"
+    return (result.stdout or result.stderr).strip()
+
+
+def sha256_file(path: Path) -> str | None:
+    if not path.exists() or not path.is_file():
+        return None
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def collect_external_device_build_metadata(root: Path, args: argparse.Namespace) -> list[dict]:
+    if not args.enable_external_devices or not args.devices_file:
+        return []
+
+    devices_file = Path(args.devices_file)
+    if not devices_file.is_absolute():
+        devices_file = root / devices_file
+
+    try:
+        from external_devices import load_devices_config
+
+        configs = load_devices_config(devices_file)
+    except Exception as exc:
+        return [{"metadata_error": f"{type(exc).__name__}: {exc}"}]
+
+    enabled = [c for c in configs if c.enabled]
+    if args.external_device_ids:
+        enabled = [c for c in enabled if c.id in args.external_device_ids]
+
+    devices = []
+    for config in enabled:
+        configured_binary = Path(config.target.get("binary", ""))
+        local_binary = (
+            configured_binary
+            if configured_binary.is_absolute()
+            else root / configured_binary
+        )
+        devices.append({
+            "id": config.id,
+            "worker_id": config.worker.get("id", config.id),
+            "kind": config.kind,
+            "device_kind": config.metadata.get("device_kind", config.kind),
+            "transport": config.metadata.get("transport", config.transport.get("type", "")),
+            "access_backend": config.metadata.get("access_backend", config.connection.get("type", "")),
+            "rust_target": config.target.get("rust_target", ""),
+            "binary_path": str(local_binary),
+            "binary_sha256": sha256_file(local_binary),
+            "remote_binary": config.worker.get("remote_binary", ""),
+            "remote_results_root": config.worker.get("remote_results_root", ""),
+        })
+    return devices
+
+
+def read_text_file(path: str) -> str | None:
+    try:
+        text = Path(path).read_text(encoding="utf-8").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+def collect_cpu_metadata() -> dict:
+    governors = sorted({
+        value
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor")
+        if (value := read_text_file(path))
+    })
+    freqs = [
+        int(value)
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq")
+        if (value := read_text_file(path)) and value.isdigit()
+    ]
+    return {
+        "model_name": next(
+            (
+                line.split(":", 1)[1].strip()
+                for line in (read_text_file("/proc/cpuinfo") or "").splitlines()
+                if line.lower().startswith("model name")
+            ),
+            None,
+        ),
+        "scaling_governors": governors,
+        "scaling_cur_freq_khz_min": min(freqs) if freqs else None,
+        "scaling_cur_freq_khz_max": max(freqs) if freqs else None,
+    }
+
+
+def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
+    external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
+    metadata = {
+        "profile_schema_version": 2,
+        "run_id": run_id,
+        "scenario": scenario,
+        "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "benchmark_profile": {
+            "workers": args.workers,
+            "min_size": args.min_size,
+            "max_size": args.max_size if args.max_size is not None else args.workers,
+            "step_size": args.step_size,
+            "roundtrips": args.roundtrips,
+            "app_rounds": args.app_rounds,
+            "max_app_samples_per_payload": args.max_app_samples_per_payload,
+            "payload_sizes": args.payload_sizes,
+            "worker_layout_mode": args.worker_layout_mode,
+            "singleton_resource_envelope": singleton_resource_envelope(args),
+            "profile_only_singletons": args.profile_only_singletons,
+        },
+        "host": {
+            "platform": platform.platform(),
+            "uname": command_stdout(["uname", "-a"]),
+            "cpu": collect_cpu_metadata(),
+        },
+        "git": {
+            "benchmark_commit": command_stdout(["git", "rev-parse", "HEAD"], cwd=root),
+            "benchmark_dirty_short": command_stdout(["git", "status", "--short"], cwd=root),
+            "libsignal_commit": command_stdout(["git", "-C", str(root / "libsignal-main"), "rev-parse", "HEAD"]),
+            "libsignal_dirty_short": command_stdout(["git", "-C", str(root / "libsignal-main"), "status", "--short"]),
+        },
+        "docker": {
+            "version": command_stdout(["docker", "version", "--format", "{{json .}}"]),
+            "info": command_stdout(["docker", "info", "--format", "{{json .}}"]),
+        },
+        "external_device_build": {
+            "enabled": args.enable_external_devices,
+            "device_ids": args.external_device_ids,
+            "default_binary_path": str(external_binary),
+            "default_binary_sha256": sha256_file(external_binary),
+            "profile": "minsize",
+            "rust_target": "armv7-unknown-linux-musleabihf",
+            "devices": collect_external_device_build_metadata(root, args),
+        },
+    }
+    (run_dir / "benchmark_run_metadata.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
 def main() -> int:
     args = build_parser().parse_args()
     root = repo_root()
@@ -1585,6 +2592,11 @@ def main() -> int:
     if args.packed_worker_internal_parallelism < 1:
         raise SystemExit("--packed-worker-internal-parallelism must be >= 1")
 
+    if args.resource_monitor_interval_ms < 1:
+        raise SystemExit("--resource-monitor-interval-ms must be >= 1")
+
+    normalize_resource_args(args)
+
     if args.enable_external_devices and not args.devices_file:
         raise SystemExit("--enable-external-devices requires --devices-file")
 
@@ -1601,6 +2613,7 @@ def main() -> int:
     if args.wipe_run_dir:
         safe_wipe_run_dir(run_dir, output_root, run_id)
     run_dir.mkdir(parents=True, exist_ok=True)
+    write_benchmark_metadata(run_dir, root, args, run_id, scenario)
 
     project_name = sanitize_project_name(run_id)
 
@@ -1619,6 +2632,8 @@ def main() -> int:
     compose_up = False
     failure_seen = False
     external_device_stop_required = False
+    resource_monitor: ResourceMonitor | None = None
+    resource_monitor_stopped = False
 
     compose_env = build_compose_env(args)
 
@@ -1690,6 +2705,15 @@ def main() -> int:
             "--packed-worker-internal-parallelism",
             str(args.packed_worker_internal_parallelism),
         ]
+
+        if args.singleton_cpus is not None:
+            generator_cmd += ["--singleton-cpus", args.singleton_cpus]
+        if args.singleton_memory is not None:
+            generator_cmd += ["--singleton-memory", args.singleton_memory]
+        if args.singleton_memory_swap is not None:
+            generator_cmd += ["--singleton-memory-swap", args.singleton_memory_swap]
+        if args.singleton_pids_limit is not None:
+            generator_cmd += ["--singleton-pids-limit", str(args.singleton_pids_limit)]
 
         if args.runner_in_docker:
             generator_cmd.append("--include-runner")
@@ -1784,6 +2808,27 @@ def main() -> int:
                 flush=True,
             )
             time.sleep(args.post_startup_settle_seconds)
+
+        resource_targets = verify_resource_limits(
+            root=root,
+            compose_file=compose_tmp,
+            run_dir=run_dir,
+            layout_path=run_dir / "worker_layout.json",
+            args=args,
+            compose_env=compose_env,
+        )
+        if resource_targets and not args.no_resource_monitor:
+            resource_monitor = ResourceMonitor(
+                root=root,
+                run_dir=run_dir,
+                run_id=run_id,
+                targets=resource_targets,
+                interval_ms=args.resource_monitor_interval_ms,
+                compose_env=compose_env,
+            )
+            resource_monitor.start()
+        elif resource_targets:
+            print("[resources] resource monitor disabled by --no-resource-monitor", flush=True)
 
         print(f"[health] waiting for kr on http://127.0.0.1:{args.kr_port}/health", flush=True)
         wait_for_health(
@@ -2011,8 +3056,15 @@ def main() -> int:
             env=compose_env,
         )
 
+        if resource_monitor and not resource_monitor_stopped:
+            resource_monitor.stop()
+            resource_monitor_stopped = True
+
         if exit_code != 0:
             failure_seen = True
+            outcome_class, evidence = classify_failure_from_resource_summary(run_dir)
+            evidence["runner_exit_code"] = exit_code
+            write_run_outcome(run_dir, outcome_class, evidence)
             collect_failure_diagnostics(
                 root=root,
                 compose_file=compose_tmp,
@@ -2051,6 +3103,15 @@ def main() -> int:
             external_device_stop_required = False
 
         write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
+        write_run_outcome(
+            run_dir,
+            "success",
+            {
+                "resource_summary": str(run_dir / "resource_summary.csv")
+                if (run_dir / "resource_summary.csv").exists()
+                else None,
+            },
+        )
 
         print("")
         print(f"Run complete: {run_id}")
@@ -2059,6 +3120,11 @@ def main() -> int:
 
     except Exception as e:
         failure_seen = True
+        if not (run_dir / "benchmark_outcome.json").exists():
+            if isinstance(e, ResourceLimitVerificationError):
+                write_run_outcome(run_dir, "invalid_resource_envelope", {"error": str(e)})
+            else:
+                write_run_outcome(run_dir, "infrastructure_failure", {"error": str(e)})
         print(
             f"[error] benchmark orchestration failed before cleanup: "
             f"{type(e).__name__}: {e}",
@@ -2068,6 +3134,13 @@ def main() -> int:
         raise
 
     finally:
+        if resource_monitor and not resource_monitor_stopped:
+            try:
+                resource_monitor.stop()
+                resource_monitor_stopped = True
+            except Exception as exc:
+                print(f"[resources] monitor stop failed (non-fatal): {exc}", flush=True)
+
         if external_device_stop_required:
             stop_external_device_workers(args, root)
 

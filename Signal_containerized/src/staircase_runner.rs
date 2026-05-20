@@ -120,6 +120,20 @@ pub struct WorkerLayoutPhysicalWorker {
     pub base_url: String,
     pub profile_enabled_client_ids: Vec<String>,
     #[serde(default)]
+    pub resource_limit_cpus: Option<f64>,
+    #[serde(default)]
+    pub resource_limit_memory: Option<String>,
+    #[serde(default)]
+    pub resource_limit_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_limit_memory_swap: Option<String>,
+    #[serde(default)]
+    pub resource_limit_memory_swap_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_limit_pids: Option<u64>,
+    #[serde(default)]
+    pub resource_profile: String,
+    #[serde(default)]
     pub execution_backend: String,
     #[serde(default)]
     pub device_kind: String,
@@ -2174,9 +2188,14 @@ pub fn aggregate_csv(
 
     let mut client_meta: std::collections::HashMap<&str, &WorkerLayoutClient> =
         std::collections::HashMap::new();
+    let mut physical_meta: std::collections::HashMap<&str, &WorkerLayoutPhysicalWorker> =
+        std::collections::HashMap::new();
     if let Some(ref l) = provided_layout {
         for c in &l.clients {
             client_meta.insert(c.client_id.as_str(), c);
+        }
+        for p in &l.physical_workers {
+            physical_meta.insert(p.physical_worker_id.as_str(), p);
         }
     }
 
@@ -2218,6 +2237,7 @@ pub fn aggregate_csv(
                 .with_context(|| format!("Invalid json in {}", path.display()))?;
             let physical_worker_id =
                 non_empty_or(meta.map(|m| m.physical_worker_id.as_str()), worker_id);
+            let phys = physical_meta.get(physical_worker_id).copied();
 
             #[derive(Serialize)]
             struct CsvRow<'a> {
@@ -2230,9 +2250,23 @@ pub fn aggregate_csv(
                 access_backend: &'a str,
                 arch: &'a str,
                 rust_target: &'a str,
+                profile_schema_version: u32,
                 ts_unix_ns: u128,
                 op: String,
+                protocol_stack: String,
                 implementation: String,
+                measurement_class: String,
+                participant_device_id: Option<u32>,
+                role: Option<String>,
+                peer_id: Option<String>,
+                peer_device_id: Option<u32>,
+                peer_count: Option<usize>,
+                event_family: String,
+                event_subtype: String,
+                event_side: Option<String>,
+                direction: Option<String>,
+                phase: Option<String>,
+                success: bool,
                 wall_ns: u128,
                 cpu_thread_ns: Option<u128>,
                 alloc_bytes: Option<u64>,
@@ -2256,6 +2290,13 @@ pub fn aggregate_csv(
                 singleton_count: usize,
                 packed_clients_per_container: usize,
                 layout_mode: &'a str,
+                resource_limit_cpus: Option<f64>,
+                resource_limit_memory: Option<&'a str>,
+                resource_limit_memory_bytes: Option<u64>,
+                resource_limit_memory_swap: Option<&'a str>,
+                resource_limit_memory_swap_bytes: Option<u64>,
+                resource_limit_pids: Option<u64>,
+                resource_profile: &'a str,
             }
 
             let row = CsvRow {
@@ -2277,9 +2318,23 @@ pub fn aggregate_csv(
                     meta.map(|m| m.rust_target.as_str()),
                     "x86_64-unknown-linux-musl",
                 ),
+                profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
+                protocol_stack: event.protocol_stack,
                 implementation: event.implementation,
+                measurement_class: event.measurement_class,
+                participant_device_id: event.participant_device_id,
+                role: event.role,
+                peer_id: event.peer_id,
+                peer_device_id: event.peer_device_id,
+                peer_count: event.peer_count,
+                event_family: event.event_family,
+                event_subtype: event.event_subtype,
+                event_side: event.event_side,
+                direction: event.direction,
+                phase: event.phase,
+                success: event.success,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
                 alloc_bytes: event.alloc_bytes,
@@ -2303,6 +2358,15 @@ pub fn aggregate_csv(
                 singleton_count,
                 packed_clients_per_container,
                 layout_mode,
+                resource_limit_cpus: phys.and_then(|m| m.resource_limit_cpus),
+                resource_limit_memory: phys.and_then(|m| m.resource_limit_memory.as_deref()),
+                resource_limit_memory_bytes: phys.and_then(|m| m.resource_limit_memory_bytes),
+                resource_limit_memory_swap: phys
+                    .and_then(|m| m.resource_limit_memory_swap.as_deref()),
+                resource_limit_memory_swap_bytes: phys
+                    .and_then(|m| m.resource_limit_memory_swap_bytes),
+                resource_limit_pids: phys.and_then(|m| m.resource_limit_pids),
+                resource_profile: non_empty_or(phys.map(|m| m.resource_profile.as_str()), ""),
             };
 
             wtr.serialize(row)?;

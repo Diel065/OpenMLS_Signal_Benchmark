@@ -5,7 +5,11 @@ import argparse
 import json
 import math
 import random
+import re
 from pathlib import Path
+
+
+MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -106,6 +110,36 @@ def build_parser() -> argparse.ArgumentParser:
         default=4,
         help="Internal parallelism for packed worker containers",
     )
+    p.add_argument(
+        "--singleton-cpus",
+        default=None,
+        help=(
+            "Docker CPU envelope for every singleton worker service, e.g. 0.25. "
+            "Unset means singleton containers are unconstrained."
+        ),
+    )
+    p.add_argument(
+        "--singleton-memory",
+        default=None,
+        help=(
+            "Docker memory envelope for every singleton worker service, e.g. 128m. "
+            "Unset means no memory limit."
+        ),
+    )
+    p.add_argument(
+        "--singleton-memory-swap",
+        default=None,
+        help=(
+            "Docker memory+swap envelope for singleton worker services. "
+            "If singleton memory is set and this is omitted, it defaults to the memory value."
+        ),
+    )
+    p.add_argument(
+        "--singleton-pids-limit",
+        type=int,
+        default=None,
+        help="Optional Docker pids_limit for every singleton worker service.",
+    )
 
     return p
 
@@ -164,6 +198,128 @@ def validate_args(args: argparse.Namespace) -> None:
             raise SystemExit("--packed-clients-per-container must be at least 1")
         if args.packed_worker_internal_parallelism < 1:
             raise SystemExit("--packed-worker-internal-parallelism must be at least 1")
+
+    normalize_resource_args(args)
+
+
+def parse_memory_bytes(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    raw = value.strip()
+    if not raw:
+        raise SystemExit("memory limits must not be empty")
+
+    match = MEMORY_RE.match(raw)
+    if not match:
+        raise SystemExit(
+            f"Unsupported memory limit '{value}'. Use a Docker-style value such as 64m, 128m, or 1g."
+        )
+
+    number = float(match.group("value"))
+    unit = (match.group("unit") or "b").lower()
+    multipliers = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 ** 2,
+        "mb": 1024 ** 2,
+        "g": 1024 ** 3,
+        "gb": 1024 ** 3,
+        "t": 1024 ** 4,
+        "tb": 1024 ** 4,
+    }
+    if unit not in multipliers:
+        raise SystemExit(f"Unsupported memory unit in '{value}'. Use b, k, m, g, or t.")
+
+    bytes_value = int(number * multipliers[unit])
+    if bytes_value <= 0:
+        raise SystemExit("memory limits must be greater than zero")
+    return bytes_value
+
+
+def normalize_resource_args(args: argparse.Namespace) -> None:
+    if args.singleton_cpus is not None:
+        raw = str(args.singleton_cpus).strip()
+        if not raw:
+            raise SystemExit("--singleton-cpus must not be empty")
+        try:
+            cpus = float(raw)
+        except ValueError as exc:
+            raise SystemExit("--singleton-cpus must be a positive number") from exc
+        if not math.isfinite(cpus) or cpus <= 0:
+            raise SystemExit("--singleton-cpus must be a positive number")
+        args.singleton_cpus = raw
+        args.singleton_cpus_float = cpus
+    else:
+        args.singleton_cpus_float = None
+
+    if args.singleton_memory is not None:
+        args.singleton_memory = str(args.singleton_memory).strip()
+        args.singleton_memory_bytes = parse_memory_bytes(args.singleton_memory)
+    else:
+        args.singleton_memory_bytes = None
+
+    args.singleton_memory_swap_defaulted = False
+    if args.singleton_memory_swap is not None:
+        if args.singleton_memory is None:
+            raise SystemExit("--singleton-memory-swap may only be set with --singleton-memory")
+        args.singleton_memory_swap = str(args.singleton_memory_swap).strip()
+        args.singleton_memory_swap_bytes = parse_memory_bytes(args.singleton_memory_swap)
+    elif args.singleton_memory is not None:
+        args.singleton_memory_swap = args.singleton_memory
+        args.singleton_memory_swap_bytes = args.singleton_memory_bytes
+        args.singleton_memory_swap_defaulted = True
+    else:
+        args.singleton_memory_swap_bytes = None
+
+    if args.singleton_pids_limit is not None and args.singleton_pids_limit < 1:
+        raise SystemExit("--singleton-pids-limit must be >= 1")
+
+
+def resource_profile_for(args: argparse.Namespace) -> str:
+    parts = []
+    singleton_cpus = getattr(args, "singleton_cpus", None)
+    singleton_memory = getattr(args, "singleton_memory", None)
+    singleton_memory_swap = getattr(args, "singleton_memory_swap", None)
+    singleton_pids_limit = getattr(args, "singleton_pids_limit", None)
+    if singleton_cpus is not None:
+        parts.append(f"cpus-{singleton_cpus}")
+    if singleton_memory is not None:
+        parts.append(f"memory-{singleton_memory}")
+    if singleton_memory_swap is not None:
+        parts.append(f"swap-{singleton_memory_swap}")
+    if singleton_pids_limit is not None:
+        parts.append(f"pids-{singleton_pids_limit}")
+    if not parts:
+        return ""
+    return "singleton-resource-envelope_" + "_".join(parts)
+
+
+def singleton_resource_limits(args: argparse.Namespace) -> dict:
+    profile = resource_profile_for(args)
+    return {
+        "resource_limit_cpus": getattr(args, "singleton_cpus_float", None),
+        "resource_limit_memory": getattr(args, "singleton_memory", None),
+        "resource_limit_memory_bytes": getattr(args, "singleton_memory_bytes", None),
+        "resource_limit_memory_swap": getattr(args, "singleton_memory_swap", None),
+        "resource_limit_memory_swap_bytes": getattr(args, "singleton_memory_swap_bytes", None),
+        "resource_limit_pids": getattr(args, "singleton_pids_limit", None),
+        "resource_profile": profile,
+    }
+
+
+def empty_resource_limits() -> dict:
+    return {
+        "resource_limit_cpus": None,
+        "resource_limit_memory": None,
+        "resource_limit_memory_bytes": None,
+        "resource_limit_memory_swap": None,
+        "resource_limit_memory_swap_bytes": None,
+        "resource_limit_pids": None,
+        "resource_profile": "",
+    }
 
 
 # ── Hybrid layout calculation ──────────────────────────────────────────
@@ -265,21 +421,25 @@ class PhysicalWorkerEntry:
         client_ids: list[str],
         base_url: str,
         profile_enabled_client_ids: list[str],
+        resource_limits: dict | None = None,
     ):
         self.physical_worker_id = physical_worker_id
         self.container_mode = container_mode
         self.client_ids = client_ids
         self.base_url = base_url
         self.profile_enabled_client_ids = profile_enabled_client_ids
+        self.resource_limits = resource_limits or empty_resource_limits()
 
     def to_dict(self) -> dict:
-        return {
+        data = {
             "physical_worker_id": self.physical_worker_id,
             "container_mode": self.container_mode,
             "client_ids": self.client_ids,
             "base_url": self.base_url,
             "profile_enabled_client_ids": self.profile_enabled_client_ids,
         }
+        data.update(self.resource_limits)
+        return data
 
 
 def build_hybrid_layout(
@@ -291,6 +451,7 @@ def build_hybrid_layout(
     singleton_set = set(singleton_ids)
     clients: list[ClientLayoutEntry] = []
     physical_workers: list[PhysicalWorkerEntry] = []
+    configured_singleton_limits = singleton_resource_limits(args)
 
     singleton_counter = 0
     for cid in singleton_ids:
@@ -310,6 +471,7 @@ def build_hybrid_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
+            resource_limits=configured_singleton_limits,
         ))
         singleton_counter += 1
 
@@ -336,6 +498,7 @@ def build_hybrid_layout(
             client_ids=pack_clients,
             base_url=base_url,
             profile_enabled_client_ids=[],
+            resource_limits=empty_resource_limits(),
         ))
         pack_idx += 1
 
@@ -347,6 +510,7 @@ def build_legacy_layout(
 ) -> tuple[list[ClientLayoutEntry], list[PhysicalWorkerEntry]]:
     clients: list[ClientLayoutEntry] = []
     physical_workers: list[PhysicalWorkerEntry] = []
+    configured_singleton_limits = singleton_resource_limits(args)
 
     for i in range(1, args.workers + 1):
         cid = worker_id(i)
@@ -366,6 +530,7 @@ def build_legacy_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
+            resource_limits=configured_singleton_limits,
         ))
 
     return clients, physical_workers
@@ -376,6 +541,16 @@ def generate_worker_layout_json(
     clients: list[ClientLayoutEntry],
     physical_workers: list[PhysicalWorkerEntry],
 ) -> dict:
+    singleton_limits = singleton_resource_limits(args)
+    envelope_enabled = any(
+        singleton_limits[key] is not None
+        for key in (
+            "resource_limit_cpus",
+            "resource_limit_memory",
+            "resource_limit_memory_swap",
+            "resource_limit_pids",
+        )
+    )
     return {
         "version": 1,
         "logical_worker_count": args.workers,
@@ -386,6 +561,23 @@ def generate_worker_layout_json(
         "packed_clients_per_container": args.packed_clients_per_container,
         "singleton_selection_seed": args.singleton_selection_seed,
         "profile_policy": "singletons_only" if args.worker_layout_mode == "hybrid" else "all",
+        "singleton_resource_envelope": {
+            "enabled": envelope_enabled,
+            "applies_to": "all_containerized_singletons",
+            "scientific_interpretation": (
+                "host-specific reproducible resource envelope; not exact hardware emulation"
+            ),
+            "cpus": singleton_limits["resource_limit_cpus"],
+            "memory": singleton_limits["resource_limit_memory"],
+            "memory_bytes": singleton_limits["resource_limit_memory_bytes"],
+            "memory_swap": singleton_limits["resource_limit_memory_swap"],
+            "memory_swap_bytes": singleton_limits["resource_limit_memory_swap_bytes"],
+            "memory_swap_defaulted_to_memory": getattr(
+                args, "singleton_memory_swap_defaulted", False
+            ),
+            "pids_limit": singleton_limits["resource_limit_pids"],
+            "resource_profile": singleton_limits["resource_profile"],
+        },
         "clients": [c.to_dict() for c in clients],
         "physical_workers": [pw.to_dict() for pw in physical_workers],
     }
@@ -668,6 +860,16 @@ def generate_compose_text(
         lines.append("")
         lines.append(f"  {pw.physical_worker_id}:")
         lines.append("    <<: *worker-common")
+        if pw.container_mode == "singleton":
+            limits = pw.resource_limits
+            if limits.get("resource_limit_cpus") is not None:
+                lines.append(f'    cpus: "{args.singleton_cpus}"')
+            if limits.get("resource_limit_memory") is not None:
+                lines.append(f'    mem_limit: "{limits["resource_limit_memory"]}"')
+            if limits.get("resource_limit_memory_swap") is not None:
+                lines.append(f'    memswap_limit: "{limits["resource_limit_memory_swap"]}"')
+            if limits.get("resource_limit_pids") is not None:
+                lines.append(f'    pids_limit: {limits["resource_limit_pids"]}')
         lines.append("    command:")
         lines.append('      - "--name"')
         lines.append(f'      - "{pw.physical_worker_id}"')

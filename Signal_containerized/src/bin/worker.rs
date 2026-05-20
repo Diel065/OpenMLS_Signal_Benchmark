@@ -353,6 +353,144 @@ async fn send_to_participant_actor(
     (rid, response)
 }
 
+#[derive(Debug, Clone)]
+struct SignalEventContext {
+    measurement_class: &'static str,
+    event_family: &'static str,
+    event_subtype: &'static str,
+    event_side: Option<&'static str>,
+    direction: Option<&'static str>,
+    role: Option<&'static str>,
+    peer_id: Option<String>,
+    peer_device_id: Option<u32>,
+    peer_count: Option<usize>,
+    phase: Option<String>,
+}
+
+fn signal_event_context(
+    command: &Command,
+    participant_id: &str,
+    phase: Option<&str>,
+) -> SignalEventContext {
+    let mut ctx = match command {
+        Command::RegisterParticipant => SignalEventContext {
+            measurement_class: "lifecycle",
+            event_family: "identity_bootstrap",
+            event_subtype: "register_participant",
+            event_side: Some("local"),
+            direction: None,
+            role: Some("self"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
+        Command::PublishPrekeyBundle => SignalEventContext {
+            measurement_class: "protocol_key_material",
+            event_family: "identity_and_prekey_preparation",
+            event_subtype: "store_identity_signed_kyber_and_one_time_prekeys",
+            event_side: Some("local"),
+            direction: None,
+            role: Some("device_owner"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
+        Command::GeneratePrekeyBundle => SignalEventContext {
+            measurement_class: "protocol_plus_repository_io",
+            event_family: "prekey_publication",
+            event_subtype: "generate_and_publish_pq_prekey_bundle",
+            event_side: Some("publisher"),
+            direction: Some("outbound"),
+            role: Some("prekey_publisher"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
+        Command::EstablishSessions { participants } => SignalEventContext {
+            measurement_class: "protocol_plus_repository_io",
+            event_family: "session_establishment",
+            event_subtype: "initiator_processes_pq_prekey_bundle",
+            event_side: Some("initiator"),
+            direction: Some("outbound"),
+            role: Some("initiator"),
+            peer_id: (participants.len() == 1).then(|| participants[0].clone()),
+            peer_device_id: (participants.len() == 1).then_some(1),
+            peer_count: Some(participants.len()),
+            phase: None,
+        },
+        Command::EncryptMessage { recipient, .. } => SignalEventContext {
+            measurement_class: "protocol_plus_relay_io",
+            event_family: "message_protection",
+            event_subtype: "encrypt_signal_message",
+            event_side: Some("send"),
+            direction: Some("outbound"),
+            role: Some("sender"),
+            peer_id: Some(recipient.clone()),
+            peer_device_id: Some(1),
+            peer_count: Some(1),
+            phase: None,
+        },
+        Command::DecryptMessage { sender, .. } => SignalEventContext {
+            measurement_class: "protocol_plus_relay_io",
+            event_family: "message_recovery",
+            event_subtype: "decrypt_signal_message",
+            event_side: Some("receive"),
+            direction: Some("inbound"),
+            role: Some("recipient"),
+            peer_id: Some(sender.clone()),
+            peer_device_id: Some(1),
+            peer_count: Some(1),
+            phase: None,
+        },
+        Command::ProcessPending { .. } => SignalEventContext {
+            measurement_class: "wrapper_relay_drain",
+            event_family: "message_recovery_helper",
+            event_subtype: "process_pending_relay_messages",
+            event_side: Some("receive"),
+            direction: Some("inbound"),
+            role: Some("recipient"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
+        Command::ShowParticipantState => SignalEventContext {
+            measurement_class: "state_inspection",
+            event_family: "participant_state",
+            event_subtype: "show_participant_state",
+            event_side: Some("local"),
+            direction: None,
+            role: Some("self"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
+        Command::RemoveParticipants { participants } => SignalEventContext {
+            measurement_class: "lifecycle",
+            event_family: "participant_lifecycle",
+            event_subtype: "deactivate_participants",
+            event_side: Some("local"),
+            direction: None,
+            role: Some("notifier"),
+            peer_id: (participants.len() == 1).then(|| participants[0].clone()),
+            peer_device_id: (participants.len() == 1).then_some(1),
+            peer_count: Some(participants.len()),
+            phase: None,
+        },
+    };
+
+    ctx.phase = phase.map(ToOwned::to_owned);
+    if ctx.peer_id.as_deref() == Some(participant_id) {
+        ctx.peer_id = None;
+        ctx.peer_device_id = None;
+    }
+    ctx
+}
+
 async fn participant_command_actor(
     participant_id: String,
     physical_worker_id: String,
@@ -405,6 +543,11 @@ async fn participant_command_actor(
             );
         }
 
+        let event_context = signal_event_context(
+            &envelope.command,
+            &participant_id,
+            envelope.phase.as_deref(),
+        );
         let result =
             handle_command(&mut slot.participant, &kr_url, &relay_url, envelope.command).await;
 
@@ -429,9 +572,24 @@ async fn participant_command_actor(
             {
                 let metrics = metrics.unwrap_or_default();
                 let event = SignalProfileEvent {
+                    profile_schema_version: 2,
                     ts_unix_ns: start_unix_ms * 1_000_000,
                     op: command_name.to_string(),
+                    protocol_stack: "signal".to_string(),
                     implementation: "libsignal".to_string(),
+                    measurement_class: event_context.measurement_class.to_string(),
+                    participant_id: Some(participant_id.clone()),
+                    participant_device_id: Some(1),
+                    role: event_context.role.map(ToOwned::to_owned),
+                    peer_id: event_context.peer_id.clone(),
+                    peer_device_id: event_context.peer_device_id,
+                    peer_count: event_context.peer_count,
+                    event_family: event_context.event_family.to_string(),
+                    event_subtype: event_context.event_subtype.to_string(),
+                    event_side: event_context.event_side.map(ToOwned::to_owned),
+                    direction: event_context.direction.map(ToOwned::to_owned),
+                    phase: event_context.phase.clone(),
+                    success: response.status == "ok",
                     wall_ns,
                     cpu_thread_ns: metrics.cpu_thread_ns,
                     alloc_bytes: metrics.alloc_bytes,

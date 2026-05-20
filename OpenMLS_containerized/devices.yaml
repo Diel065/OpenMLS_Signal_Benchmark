@@ -6,12 +6,17 @@ devices:
     connection:
       type: adb
       serial: "242d5fe430c7c951"
+      server_socket_candidates:
+        - "local"
+        - "tcp:100.71.112.120:15037"
 
     transport:
       type: usb_rndis
       device_ip: "172.32.0.93"
       host_ip: "172.32.0.98"
       worker_port: 8080
+      worker_url_candidates:
+        - "http://100.71.112.120:18081"
 
     target:
       arch: "armv7l"
@@ -41,12 +46,17 @@ devices:
       host: "192.168.178.33"
       user: "diel"
       password: "diel"
+      host_candidates:
+        - host: "100.71.112.120"
+          port: 10022
 
     transport:
       type: wifi_lan
       device_ip: "192.168.178.33"
       host_ip: "192.168.178.21"
       worker_port: 8080
+      worker_url_candidates:
+        - "http://100.71.112.120:18080"
 
     target:
       arch: "aarch64"

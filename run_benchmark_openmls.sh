@@ -10,8 +10,8 @@
 # without hunting for variables.
 #
 # Usage:
-#   chmod +x run_benchmark_alternating.sh
-#   sudo bash run_benchmark_alternating.sh
+#   chmod +x run_benchmark_openmls.sh
+#   sudo bash run_benchmark_openmls.sh
 #
 # Run from the repository root (parent of *_containerized/).
 # Requires docker, python3 with pyyaml, and the Rust musl target.
@@ -35,7 +35,8 @@ cleanup_docker() {
 
 echo "============================================================"
 echo " OpenMLS benchmark suite  —  $DATE_TAG"
-echo " 10 × OpenMLS  =  10 runs total"
+echo " 10 × OpenMLS constrained singleton runs total"
+echo " singleton resource envelope: cpus=0.25 memory=128m swap=128m"
 echo "============================================================"
 echo ""
 
@@ -55,19 +56,25 @@ run_openmls() {
   echo ""
   echo "========== [OpenMLS iteration $ITER / 10]  run-id: $RUN_ID =========="
   echo "  scenario_seed=$SCENARIO_SEED  singleton_selection_seed=$SINGLETON_SELECTION_SEED"
+  echo "  singleton_resource_envelope=cpus=0.25,memory=128m,memory_swap=128m"
   echo ""
 
   cd "$SCRIPT_DIR/OpenMLS_containerized"
 
   OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   .venv/bin/python scripts/run_compose_benchmark.py \
-    --workers 1024 \
+    --workers 1250 \
     --scenario-seed "$SCENARIO_SEED" \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
+    --output-dir benchmark_output \
     --worker-layout-mode hybrid \
     --singleton-min-count 12 \
     --singleton-fraction 0.0625 \
     --singleton-selection-strategy evenly-spaced \
+    --singleton-cpus 0.25 \
+    --singleton-memory 256m \
+    --singleton-memory-swap 256m \
+    --resource-monitor-interval-ms 250 \
     --packed-clients-per-container 48 \
     --packed-worker-internal-parallelism 16 \
     --bridge-count 4 \
@@ -100,7 +107,7 @@ run_openmls() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 1024 \
+    --max-size 1250 \
     --step-size 64 \
     --roundtrips 1 \
     --update-rounds 2 \

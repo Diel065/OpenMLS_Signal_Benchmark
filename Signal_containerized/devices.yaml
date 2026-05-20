@@ -6,12 +6,17 @@ devices:
     connection:
       type: adb
       serial: "242d5fe430c7c951"
+      server_socket_candidates:
+        - "local"
+        - "tcp:100.71.112.120:15037"
 
     transport:
       type: usb_rndis
       device_ip: "172.32.0.93"
       host_ip: "172.32.0.98"
       worker_port: 8080
+      worker_url_candidates:
+        - "http://100.71.112.120:18081"
 
     target:
       arch: "armv7l"
@@ -33,35 +38,40 @@ devices:
       access_backend: "adb"
 
   - id: raspberry-pi-01
-    enabled: false
-    kind: raspberry_pi
+    enabled: true
+    kind: raspberry_pi_5
 
     connection:
       type: ssh
-      host: "192.168.50.20"
-      user: "pi"
-      identity_file: "~/.ssh/raspi_benchmark"
+      host: "192.168.178.33"
+      user: "diel"
+      password: "diel"
+      host_candidates:
+        - host: "100.71.112.120"
+          port: 10022
 
     transport:
-      type: ethernet
-      device_ip: "192.168.50.20"
-      host_ip: "192.168.50.1"
+      type: wifi_lan
+      device_ip: "192.168.178.33"
+      host_ip: "192.168.178.21"
       worker_port: 8080
+      worker_url_candidates:
+        - "http://100.71.112.120:18080"
 
     target:
       arch: "aarch64"
-      rust_target: "aarch64-unknown-linux-gnu"
-      binary: "target/aarch64-unknown-linux-gnu/release/worker"
+      rust_target: "aarch64-unknown-linux-musl"
+      binary: "target/aarch64-unknown-linux-musl/minsize/worker"
 
     worker:
-      id: "raspi-00001"
+      id: "raspi5-00001"
       mode: "singleton"
-      remote_binary: "/opt/signal-benchmark/bin/worker"
-      remote_results_root: "/results/signal"
-      remote_tmp: "/tmp/signal-benchmark"
+      remote_binary: "/home/diel/signal-benchmark/bin/worker"
+      remote_results_root: "/home/diel/signal-benchmark/results/signal"
+      remote_tmp: "/home/diel/signal-benchmark/tmp"
 
     metadata:
       execution_backend: "real_device"
-      device_kind: "raspberry_pi"
-      transport: "ethernet"
+      device_kind: "raspberry_pi_5"
+      transport: "wifi_lan"
       access_backend: "ssh"

@@ -127,6 +127,20 @@ pub struct WorkerLayoutPhysicalWorker {
     pub base_url: String,
     pub profile_enabled_client_ids: Vec<String>,
     #[serde(default)]
+    pub resource_limit_cpus: Option<f64>,
+    #[serde(default)]
+    pub resource_limit_memory: Option<String>,
+    #[serde(default)]
+    pub resource_limit_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_limit_memory_swap: Option<String>,
+    #[serde(default)]
+    pub resource_limit_memory_swap_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_limit_pids: Option<u64>,
+    #[serde(default)]
+    pub resource_profile: String,
+    #[serde(default)]
     pub execution_backend: String,
     #[serde(default)]
     pub device_kind: String,
@@ -352,8 +366,16 @@ struct ProfileEvent {
     implementation: String,
     wall_ns: u128,
     cpu_thread_ns: Option<u128>,
+    #[serde(default)]
+    cpu_envelope_utilization: Option<f64>,
+    #[serde(default)]
+    cpu_throttled_time_ratio: Option<f64>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
+    #[serde(default)]
+    ram_rss_delta_bytes: Option<i64>,
+    #[serde(default)]
+    ram_rss_utilization: Option<f64>,
     artifact_size_bytes: Option<usize>,
     #[serde(default)]
     welcome_bytes: Option<usize>,
@@ -3876,9 +3898,14 @@ pub fn aggregate_csv(
     // Build per-client metadata lookup from layout clients
     let mut client_meta: std::collections::HashMap<&str, &WorkerLayoutClient> =
         std::collections::HashMap::new();
+    let mut physical_meta: std::collections::HashMap<&str, &WorkerLayoutPhysicalWorker> =
+        std::collections::HashMap::new();
     if let Some(ref l) = layout {
         for c in &l.clients {
             client_meta.insert(c.client_id.as_str(), c);
+        }
+        for pw in &l.physical_workers {
+            physical_meta.insert(pw.physical_worker_id.as_str(), pw);
         }
     }
 
@@ -3916,8 +3943,12 @@ pub fn aggregate_csv(
         implementation: String,
         wall_ns: u128,
         cpu_thread_ns: Option<u128>,
+        cpu_envelope_utilization: Option<f64>,
+        cpu_throttled_time_ratio: Option<f64>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
+        ram_rss_delta_bytes: Option<i64>,
+        ram_rss_utilization: Option<f64>,
         artifact_size_bytes: Option<usize>,
         welcome_bytes: Option<usize>,
         ratchet_tree_bytes: Option<usize>,
@@ -3945,6 +3976,13 @@ pub fn aggregate_csv(
         singleton_count: usize,
         packed_clients_per_container: usize,
         layout_mode: &'a str,
+        resource_limit_cpus: Option<f64>,
+        resource_limit_memory: Option<&'a str>,
+        resource_limit_memory_bytes: Option<u64>,
+        resource_limit_memory_swap: Option<&'a str>,
+        resource_limit_memory_swap_bytes: Option<u64>,
+        resource_limit_pids: Option<u64>,
+        resource_profile: &'a str,
     }
 
     fn non_empty_or<'a>(value: Option<&'a str>, default: &'a str) -> &'a str {
@@ -3993,6 +4031,7 @@ pub fn aggregate_csv(
                 .with_context(|| format!("Invalid json in {}", path.display()))?;
             let physical_worker_id =
                 non_empty_or(meta.map(|m| m.physical_worker_id.as_str()), worker_id);
+            let phys = physical_meta.get(physical_worker_id).copied();
 
             let row = CsvRow {
                 client_id: worker_id,
@@ -4021,8 +4060,12 @@ pub fn aggregate_csv(
                 implementation: event.implementation,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
+                cpu_envelope_utilization: event.cpu_envelope_utilization,
+                cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
+                ram_rss_delta_bytes: event.ram_rss_delta_bytes,
+                ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
                 welcome_bytes: event.welcome_bytes,
                 ratchet_tree_bytes: event.ratchet_tree_bytes,
@@ -4050,6 +4093,15 @@ pub fn aggregate_csv(
                 singleton_count,
                 packed_clients_per_container,
                 layout_mode,
+                resource_limit_cpus: phys.and_then(|m| m.resource_limit_cpus),
+                resource_limit_memory: phys.and_then(|m| m.resource_limit_memory.as_deref()),
+                resource_limit_memory_bytes: phys.and_then(|m| m.resource_limit_memory_bytes),
+                resource_limit_memory_swap: phys
+                    .and_then(|m| m.resource_limit_memory_swap.as_deref()),
+                resource_limit_memory_swap_bytes: phys
+                    .and_then(|m| m.resource_limit_memory_swap_bytes),
+                resource_limit_pids: phys.and_then(|m| m.resource_limit_pids),
+                resource_profile: non_empty_or(phys.map(|m| m.resource_profile.as_str()), ""),
             };
 
             wtr.serialize(row)?;
@@ -4154,6 +4206,119 @@ mod membership_batch_tests {
             let batch_size = planner.next_batch_size(256, 3);
             assert!((1..=3).contains(&batch_size));
         }
+    }
+}
+
+#[cfg(test)]
+mod aggregate_csv_resource_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_csv_appends_resource_limit_columns_from_layout() {
+        let unique = format!(
+            "openmls-aggregate-resource-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let layout = serde_json::json!({
+            "version": 1,
+            "logical_worker_count": 1,
+            "physical_worker_count": 1,
+            "layout_mode": "one-container-per-client",
+            "profile_policy": "all",
+            "clients": [{
+                "client_id": "00001",
+                "physical_worker_id": "worker-00001",
+                "container_mode": "singleton",
+                "profile_enabled": true,
+                "command_url": "http://worker-00001:8080/client/00001",
+                "health_url": "http://worker-00001:8080/client/00001/health"
+            }],
+            "physical_workers": [{
+                "physical_worker_id": "worker-00001",
+                "container_mode": "singleton",
+                "client_ids": ["00001"],
+                "base_url": "http://worker-00001:8080",
+                "profile_enabled_client_ids": ["00001"],
+                "resource_limit_cpus": 0.25,
+                "resource_limit_memory": "128m",
+                "resource_limit_memory_bytes": 134217728,
+                "resource_limit_memory_swap": "128m",
+                "resource_limit_memory_swap_bytes": 134217728,
+                "resource_limit_pids": 128,
+                "resource_profile": "singleton-resource-envelope_cpus-0.25_memory-128m"
+            }]
+        });
+        std::fs::write(
+            run_dir.join("worker_layout.json"),
+            serde_json::to_string_pretty(&layout).expect("layout json"),
+        )
+        .expect("write layout");
+
+        let event = serde_json::json!({
+            "profile_schema_version": 3,
+            "ts_unix_ns": 1u128,
+            "op": "create_group",
+            "implementation": "openmls",
+            "wall_ns": 10u128,
+            "cpu_thread_ns": 9u128,
+            "cpu_envelope_utilization": 0.9,
+            "cpu_throttled_time_ratio": 0.1,
+            "alloc_bytes": 42u64,
+            "alloc_count": 3u64,
+            "ram_rss_delta_bytes": 4096i64,
+            "ram_rss_utilization": 0.25,
+            "pid": 123,
+            "thread_id": "test-thread",
+            "run_id": "test-run",
+            "scenario": "unit-test",
+            "scenario_seed": 1u64
+        });
+        std::fs::write(
+            run_dir.join("client-00001.jsonl"),
+            serde_json::to_string(&event).expect("event json") + "\n",
+        )
+        .expect("write jsonl");
+
+        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+
+        let mut reader = csv::Reader::from_path(run_dir.join("events.csv")).expect("open csv");
+        let headers = reader.headers().expect("headers").clone();
+        let record = reader
+            .records()
+            .next()
+            .expect("one row")
+            .expect("valid row");
+        let value = |name: &str| {
+            let idx = headers
+                .iter()
+                .position(|header| header == name)
+                .expect("header exists");
+            record.get(idx).expect("value").to_string()
+        };
+
+        assert_eq!(value("resource_limit_cpus"), "0.25");
+        assert_eq!(value("resource_limit_memory"), "128m");
+        assert_eq!(value("resource_limit_memory_bytes"), "134217728");
+        assert_eq!(value("resource_limit_memory_swap"), "128m");
+        assert_eq!(value("resource_limit_memory_swap_bytes"), "134217728");
+        assert_eq!(value("resource_limit_pids"), "128");
+        assert_eq!(
+            value("resource_profile"),
+            "singleton-resource-envelope_cpus-0.25_memory-128m"
+        );
+        assert_eq!(value("cpu_envelope_utilization"), "0.9");
+        assert_eq!(value("cpu_throttled_time_ratio"), "0.1");
+        assert_eq!(value("ram_rss_delta_bytes"), "4096");
+        assert_eq!(value("ram_rss_utilization"), "0.25");
+
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 }
 

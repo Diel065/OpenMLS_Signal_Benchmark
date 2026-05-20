@@ -147,11 +147,17 @@ def test_build_external_device_layout_entry():
     assert client_entry["access_backend"] == "adb"
     assert client_entry["arch"] == "armv7l"
     assert client_entry["rust_target"] == "armv7-unknown-linux-musleabihf"
+    assert client_entry["resource_limit_cpus"] is None
+    assert client_entry["resource_limit_memory_bytes"] is None
+    assert client_entry["resource_profile"] == ""
 
     # Check physical worker entry
     assert phys_entry["physical_worker_id"] == "test-board-01"
     assert phys_entry["execution_backend"] == "real_device"
     assert phys_entry["device_kind"] == "test_board"
+    assert phys_entry["resource_limit_cpus"] is None
+    assert phys_entry["resource_limit_memory_bytes"] is None
+    assert phys_entry["resource_profile"] == ""
 
     print("PASS: build_external_device_layout_entry generates correct metadata")
 
