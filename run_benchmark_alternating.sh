@@ -6,22 +6,17 @@
 # Each benchmark waits for the previous one to finish and then tears down
 # containers before starting the next benchmark.
 #
-# OpenMLS mirrors the current 1250-worker constrained run profile used by
-# run_benchmark_openmls.sh and the recent OpenMLS benchmark_output runs.
-# Signal uses the largest current successful Signal resource-schema profile
-# found under Signal_containerized/benchmark_output, with both external devices.
-#
 # VM runs: start setup_external_device_benchmark_bridges.sh on the laptop first.
 # The devices.yaml host_ip/worker_url_candidates values are expected to point at
 # the laptop-side bridges that forward service ports to the VM.
 #
 # Usage:
 #   chmod +x run_benchmark_alternating.sh
-#   sudo bash run_benchmark_alternating.sh
+#   bash run_benchmark_alternating.sh
 #
 # Run from the repository root (parent of *_containerized/).
-# Requires Docker, the project Python environments with pyyaml, configured
-# external-device access, and prebuilt external worker binaries.
+# Requires Docker, the project Python environments with pyyaml and pexpect,
+# configured external-device access, and prebuilt external worker binaries.
 
 set -euo pipefail
 
@@ -102,10 +97,81 @@ cleanup_docker() {
 
 trap cleanup_docker EXIT
 
+# ------------------------------------------------------------------
+# Virtual environment setup
+# ------------------------------------------------------------------
+ensure_venv() {
+  local stack_dir="$1"
+  local req="$stack_dir/requirements.txt"
+
+  if [ ! -f "$req" ]; then
+    echo "[setup] WARNING: no requirements.txt at $req, skipping"
+    return
+  fi
+
+  if [ ! -d "$stack_dir/.venv" ]; then
+    echo "[setup] Creating .venv in $stack_dir ..."
+    python3 -m venv "$stack_dir/.venv"
+  fi
+
+  echo "[setup] Updating .venv in $stack_dir ..."
+  "$stack_dir/.venv/bin/pip" install -q -r "$req" 2>/dev/null || \
+    "$stack_dir/.venv/bin/pip" install --break-system-packages -q -r "$req"
+}
+
+# ------------------------------------------------------------------
+# Device reachability checks
+# ------------------------------------------------------------------
+ping_luckfox() {
+  local serial="${LUCKFOX_SERIAL:-242d5fe430c7c951}"
+  echo "[ping] Checking Luckfox Pico Plus (ADB serial: $serial) ..."
+  if adb -s "$serial" shell echo OK 2>/dev/null; then
+    echo "[ping] Luckfox Pico Plus reachable"
+    return 0
+  else
+    echo "[ping] WARNING: Luckfox Pico Plus not reachable via ADB" >&2
+    return 1
+  fi
+}
+
+ping_raspberry_pi() {
+  local host="${RASPBERRY_PI_HOST:-192.168.178.33}"
+  local user="${RASPBERRY_PI_USER:-diel}"
+  echo "[ping] Checking Raspberry Pi 5 (SSH $user@$host) ..."
+  if ssh -o ConnectTimeout=5 -o BatchMode=yes "$user@$host" echo OK 2>/dev/null; then
+    echo "[ping] Raspberry Pi 5 reachable"
+    return 0
+  else
+    echo "[ping] Attempting interactive SSH to Raspberry Pi 5 (password may be required) ..."
+    if ssh -o ConnectTimeout=10 "$user@$host" echo OK; then
+      echo "[ping] Raspberry Pi 5 reachable"
+      return 0
+    fi
+    echo "[ping] WARNING: Raspberry Pi 5 not reachable via SSH" >&2
+    return 1
+  fi
+}
+
+ping_devices() {
+  echo ""
+  echo "===== Checking external device connectivity ====="
+  ping_luckfox || true
+  ping_raspberry_pi || true
+  echo "================================================="
+  echo ""
+}
+
+# ------------------------------------------------------------------
+# Pre-flight: venvs and device connectivity
+# ------------------------------------------------------------------
+ensure_venv "$SCRIPT_DIR/OpenMLS_containerized"
+ensure_venv "$SCRIPT_DIR/Signal_containerized"
+ping_devices
+
 echo "============================================================"
 echo " Alternating benchmark suite - $DATE_TAG"
-echo " OpenMLS: 10 x 1250 workers, Pico + Raspberry Pi, 0.25 CPU / 256m singletons"
-echo " Signal : 10 x 600 workers, Pico + Raspberry Pi, 0.5 CPU / 256m / pids=256 singletons"
+echo " OpenMLS: 3 x 256 workers, Pico + Raspberry Pi, 0.25 CPU / 256m singletons"
+echo " Signal : 3 x 256 workers, Pico + Raspberry Pi, 0.5 CPU / 256m / pids=256 singletons"
 echo "============================================================"
 echo ""
 echo "VM mode reminder: keep setup_external_device_benchmark_bridges.sh running on the laptop."
@@ -129,7 +195,7 @@ run_openmls() {
   PYTHON_BIN="$(python_for "$SCRIPT_DIR/OpenMLS_containerized")"
 
   echo ""
-  echo "========== [OpenMLS iteration $ITER / 10] run-id: $RUN_ID =========="
+  echo "========== [OpenMLS iteration $ITER / 3] run-id: $RUN_ID =========="
   echo "  scenario_seed=$SCENARIO_SEED singleton_selection_seed=$SINGLETON_SELECTION_SEED"
   echo "  singleton_resource_envelope=cpus=0.25,memory=256m,memory_swap=256m"
   echo "  external_devices=luckfox-pico-plus-01,raspberry-pi-01"
@@ -139,7 +205,9 @@ run_openmls() {
 
   OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 750 \
+    --workers 256 \
+    --ds-port 3001 \
+    --relay-port 4001 \
     --scenario-seed "$SCENARIO_SEED" \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
     --output-dir benchmark_output \
@@ -155,6 +223,7 @@ run_openmls() {
     --packed-worker-internal-parallelism 16 \
     --bridge-count 4 \
     --build-images \
+    --build-external-binaries \
     --force-cleanup-mls-ports \
     --runner-in-docker \
     --ds-delivery-mode group-log \
@@ -183,7 +252,7 @@ run_openmls() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 750 \
+    --max-size 256 \
     --step-size 25 \
     --roundtrips 2 \
     --update-rounds 2 \
@@ -219,7 +288,7 @@ run_signal() {
   PYTHON_BIN="$(python_for "$SCRIPT_DIR/Signal_containerized")"
 
   echo ""
-  echo "========== [Signal iteration $ITER / 10] run-id: $RUN_ID =========="
+  echo "========== [Signal iteration $ITER / 3] run-id: $RUN_ID =========="
   echo "  singleton_selection_seed=$SINGLETON_SELECTION_SEED"
   echo "  singleton_resource_envelope=cpus=0.5,memory=256m,memory_swap=256m,pids=256"
   echo "  external_devices=luckfox-pico-plus-01,raspberry-pi-01"
@@ -229,7 +298,9 @@ run_signal() {
 
   SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 750 \
+    --workers 256 \
+    --kr-port 3001 \
+    --relay-port 4001 \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
     --output-dir benchmark_output \
     --worker-layout-mode hybrid \
@@ -245,6 +316,7 @@ run_signal() {
     --packed-worker-internal-parallelism 16 \
     --bridge-count 4 \
     --build-images \
+    --build-external-binaries \
     --force-cleanup-signal-ports \
     --runner-in-docker \
     --fanout-adaptive \
@@ -271,7 +343,7 @@ run_signal() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 750 \
+    --max-size 256 \
     --step-size 25 \
     --roundtrips 2 \
     --app-rounds 2 \
@@ -292,17 +364,17 @@ run_signal() {
 }
 
 # ==================================================================
-# Main loop: 10 iterations alternating OpenMLS / Signal
+# Main loop: 3 iterations alternating OpenMLS / Signal
 # ==================================================================
 
 cleanup_docker
 
-for I in $(seq 1 10); do
+for I in $(seq 1 3); do
   run_openmls "$I"
   run_signal "$I"
 done
 
 echo ""
 echo "============================================================"
-echo " All 20 runs complete ($DATE_TAG)"
+echo " All 6 runs complete ($DATE_TAG)"
 echo "============================================================"
