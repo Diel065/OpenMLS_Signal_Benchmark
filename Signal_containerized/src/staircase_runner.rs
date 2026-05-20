@@ -1262,20 +1262,67 @@ async fn establish_sessions(
     existing_participants: &[WorkerSpec],
     _fanout: &mut FanoutController,
 ) -> Result<()> {
-    let peer_ids: Vec<String> = existing_participants.iter().map(|p| p.id.clone()).collect();
-    if peer_ids.is_empty() {
+    if existing_participants.is_empty() {
         return Ok(());
     }
 
-    send_cmd_expect_ok_fragment(
-        http,
-        actor,
-        &Command::EstablishSessions {
-            participants: peer_ids,
-        },
-        "session establishment",
-    )
-    .await?;
+    for peer in existing_participants {
+        let establish_command = Command::EstablishSessions {
+            participants: vec![peer.id.clone()],
+        };
+        let establish_context = WorkerCommandContext::with_metadata(
+            actor,
+            &establish_command,
+            Some("handshake.initiator_process_bundle"),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            actor,
+            &establish_command,
+            "session establishment",
+            &establish_context,
+        )
+        .await?;
+
+        let initial_message = format!("signal-initial-handshake:{}->{}", actor.id, peer.id);
+        let encrypt_command = Command::EncryptMessage {
+            recipient: peer.id.clone(),
+            message: initial_message,
+            conversation_size: Some(2),
+        };
+        let encrypt_context = WorkerCommandContext::with_metadata(
+            actor,
+            &encrypt_command,
+            Some("handshake.initial_message_encrypt"),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            actor,
+            &encrypt_command,
+            "encrypted and sent",
+            &encrypt_context,
+        )
+        .await?;
+
+        let decrypt_command = Command::DecryptMessage {
+            sender: actor.id.clone(),
+            profile: true,
+            conversation_size: Some(2),
+        };
+        let decrypt_context = WorkerCommandContext::with_metadata(
+            peer,
+            &decrypt_command,
+            Some("handshake.initial_message_decrypt"),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            peer,
+            &decrypt_command,
+            "pairwise message received",
+            &decrypt_context,
+        )
+        .await?;
+    }
 
     Ok(())
 }
@@ -1395,16 +1442,7 @@ async fn enroll_participants(
 
     // Also establish sessions from existing participants to the new ones.
     for existing in &existing_ids {
-        let new_ids: Vec<String> = enrollments.iter().map(|p| p.id.clone()).collect();
-        send_cmd_expect_ok_fragment(
-            http,
-            existing,
-            &Command::EstablishSessions {
-                participants: new_ids.clone(),
-            },
-            "session establishment",
-        )
-        .await?;
+        establish_sessions(http, existing, &enrollments, fanout).await?;
     }
 
     active.extend(enrollments);
@@ -2241,7 +2279,7 @@ pub fn aggregate_csv(
 
             #[derive(Serialize)]
             struct CsvRow<'a> {
-                participant_id: &'a str,
+                participant_id: String,
                 physical_worker_id: &'a str,
                 container_mode: &'a str,
                 execution_backend: &'a str,
@@ -2253,24 +2291,31 @@ pub fn aggregate_csv(
                 profile_schema_version: u32,
                 ts_unix_ns: u128,
                 op: String,
+                span_layer: String,
                 protocol_stack: String,
                 implementation: String,
                 measurement_class: String,
+                event_family: String,
+                event_subtype: String,
+                success: bool,
+                error_class: Option<String>,
                 participant_device_id: Option<u32>,
                 role: Option<String>,
                 peer_id: Option<String>,
                 peer_device_id: Option<u32>,
+                pair_id: Option<String>,
                 peer_count: Option<usize>,
-                event_family: String,
-                event_subtype: String,
                 event_side: Option<String>,
                 direction: Option<String>,
                 phase: Option<String>,
-                success: bool,
                 wall_ns: u128,
                 cpu_thread_ns: Option<u128>,
+                cpu_envelope_utilization: Option<f64>,
+                cpu_throttled_time_ratio: Option<f64>,
                 alloc_bytes: Option<u64>,
                 alloc_count: Option<u64>,
+                ram_rss_delta_bytes: Option<i64>,
+                ram_rss_utilization: Option<f64>,
                 artifact_size_bytes: Option<usize>,
                 participant_count: Option<usize>,
                 conversation_size: Option<usize>,
@@ -2279,10 +2324,35 @@ pub fn aggregate_csv(
                 ratchet_step_count: Option<usize>,
                 ciphertext_bytes: Option<usize>,
                 plaintext_bytes: Option<usize>,
+                handshake_protocol: Option<String>,
+                handshake_side: Option<String>,
+                classical_one_time_prekey_present: Option<bool>,
+                classical_one_time_prekey_id: Option<u32>,
+                signed_prekey_id: Option<u32>,
+                pq_prekey_id: Option<u32>,
+                pq_prekey_type: Option<String>,
+                pq_prekey_signature_present: Option<bool>,
+                ciphertext_message_type: Option<String>,
+                message_counter: Option<u32>,
+                previous_counter: Option<u32>,
+                sender_ratchet_key_fingerprint: Option<String>,
+                receiver_chain_matched: Option<bool>,
+                dh_ratchet_performed: Option<bool>,
+                root_chain_updated: Option<bool>,
+                send_chain_index_before: Option<u32>,
+                send_chain_index_after: Option<u32>,
+                receive_chain_index_before: Option<u32>,
+                receive_chain_index_after: Option<u32>,
+                skipped_message_keys_used: Option<u32>,
+                skipped_message_keys_stored: Option<u32>,
+                spqr_step_performed: Option<bool>,
+                ratchet_progression_kind: Option<String>,
+                ratchet_progression_value: Option<u64>,
                 pid: u32,
                 thread_id: String,
                 run_id: Option<String>,
                 scenario: Option<String>,
+                scenario_seed: Option<u64>,
                 node_name: Option<String>,
                 pod_name: Option<String>,
                 logical_worker_count: usize,
@@ -2300,7 +2370,10 @@ pub fn aggregate_csv(
             }
 
             let row = CsvRow {
-                participant_id: worker_id,
+                participant_id: event
+                    .participant_id
+                    .clone()
+                    .unwrap_or_else(|| worker_id.to_string()),
                 physical_worker_id,
                 container_mode: non_empty_or(meta.map(|m| m.container_mode.as_str()), "singleton"),
                 execution_backend: non_empty_or(
@@ -2321,24 +2394,31 @@ pub fn aggregate_csv(
                 profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
+                span_layer: event.span_layer,
                 protocol_stack: event.protocol_stack,
                 implementation: event.implementation,
                 measurement_class: event.measurement_class,
+                event_family: event.event_family,
+                event_subtype: event.event_subtype,
+                success: event.success,
+                error_class: event.error_class,
                 participant_device_id: event.participant_device_id,
                 role: event.role,
                 peer_id: event.peer_id,
                 peer_device_id: event.peer_device_id,
+                pair_id: event.pair_id,
                 peer_count: event.peer_count,
-                event_family: event.event_family,
-                event_subtype: event.event_subtype,
                 event_side: event.event_side,
                 direction: event.direction,
                 phase: event.phase,
-                success: event.success,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
+                cpu_envelope_utilization: event.cpu_envelope_utilization,
+                cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
+                ram_rss_delta_bytes: event.ram_rss_delta_bytes,
+                ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
                 participant_count: event.participant_count,
                 conversation_size: event.conversation_size,
@@ -2347,10 +2427,35 @@ pub fn aggregate_csv(
                 ratchet_step_count: event.ratchet_step_count,
                 ciphertext_bytes: event.ciphertext_bytes,
                 plaintext_bytes: event.plaintext_bytes,
+                handshake_protocol: event.handshake_protocol,
+                handshake_side: event.handshake_side,
+                classical_one_time_prekey_present: event.classical_one_time_prekey_present,
+                classical_one_time_prekey_id: event.classical_one_time_prekey_id,
+                signed_prekey_id: event.signed_prekey_id,
+                pq_prekey_id: event.pq_prekey_id,
+                pq_prekey_type: event.pq_prekey_type,
+                pq_prekey_signature_present: event.pq_prekey_signature_present,
+                ciphertext_message_type: event.ciphertext_message_type,
+                message_counter: event.message_counter,
+                previous_counter: event.previous_counter,
+                sender_ratchet_key_fingerprint: event.sender_ratchet_key_fingerprint,
+                receiver_chain_matched: event.receiver_chain_matched,
+                dh_ratchet_performed: event.dh_ratchet_performed,
+                root_chain_updated: event.root_chain_updated,
+                send_chain_index_before: event.send_chain_index_before,
+                send_chain_index_after: event.send_chain_index_after,
+                receive_chain_index_before: event.receive_chain_index_before,
+                receive_chain_index_after: event.receive_chain_index_after,
+                skipped_message_keys_used: event.skipped_message_keys_used,
+                skipped_message_keys_stored: event.skipped_message_keys_stored,
+                spqr_step_performed: event.spqr_step_performed,
+                ratchet_progression_kind: event.ratchet_progression_kind,
+                ratchet_progression_value: event.ratchet_progression_value,
                 pid: event.pid,
                 thread_id: event.thread_id,
                 run_id: event.run_id,
                 scenario: event.scenario,
+                scenario_seed: event.scenario_seed,
                 node_name: event.node_name,
                 pod_name: event.pod_name,
                 logical_worker_count,

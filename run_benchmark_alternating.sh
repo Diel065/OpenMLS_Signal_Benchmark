@@ -139,7 +139,7 @@ run_openmls() {
 
   OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 1250 \
+    --workers 750 \
     --scenario-seed "$SCENARIO_SEED" \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
     --output-dir benchmark_output \
@@ -183,14 +183,14 @@ run_openmls() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 1250 \
-    --step-size 64 \
-    --roundtrips 1 \
+    --max-size 750 \
+    --step-size 25 \
+    --roundtrips 2 \
     --update-rounds 2 \
     --app-rounds 2 \
     --max-update-samples-per-plateau 2 \
     --max-app-samples-per-payload 2 \
-    --payload-sizes 32 \
+    --payload-sizes 32,256,1024 \
     --devices-file devices.yaml \
     --enable-external-devices \
     --external-device luckfox-pico-plus-01 \
@@ -229,7 +229,7 @@ run_signal() {
 
   SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 600 \
+    --workers 750 \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
     --output-dir benchmark_output \
     --worker-layout-mode hybrid \
@@ -271,12 +271,12 @@ run_signal() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 600 \
-    --step-size 299 \
-    --roundtrips 1 \
-    --app-rounds 1 \
-    --max-app-samples-per-payload 1 \
-    --payload-sizes 32 \
+    --max-size 750 \
+    --step-size 25 \
+    --roundtrips 2 \
+    --app-rounds 2 \
+    --max-app-samples-per-payload 2 \
+    --payload-sizes 32,256,1024 \
     --devices-file devices.yaml \
     --enable-external-devices \
     --external-device luckfox-pico-plus-01 \

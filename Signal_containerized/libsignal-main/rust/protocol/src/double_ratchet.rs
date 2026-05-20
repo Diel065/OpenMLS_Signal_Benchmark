@@ -14,6 +14,7 @@
 
 use rand::{CryptoRng, Rng};
 
+use crate::profiling::{self, SpanMetadata};
 use crate::proto::storage::{SessionStructure, session_structure};
 use crate::ratchet::{ChainKey, MessageKeyGenerator, RootKey};
 use crate::state::InvalidSessionError;
@@ -273,51 +274,60 @@ impl RatchetState {
         their_ephemeral: &PublicKey,
         csprng: &mut R,
     ) -> Result<ChainKey> {
-        let sender_private_key = self
-            .sender_chain
-            .as_ref()
-            .ok_or(InvalidSessionError("missing sender chain"))?
-            .ratchet_key
-            .private_key;
+        profiling::measure_result_with(
+            "signal_ratchet_dh_step",
+            SpanMetadata {
+                dh_ratchet_performed: Some(true),
+                root_chain_updated: Some(true),
+                sender_ratchet_key_fingerprint: Some(hex::encode(their_ephemeral.public_key_bytes())),
+                ..Default::default()
+            },
+            || {
+                let sender_private_key = self
+                    .sender_chain
+                    .as_ref()
+                    .ok_or(InvalidSessionError("missing sender chain"))?
+                    .ratchet_key
+                    .private_key;
 
-        // Receiving half-step: root_key + DH(our_sender, their_ephemeral)
-        let current_root_key = self.take_root_key();
-        let (new_root_key, receiver_chain_key) =
-            current_root_key.create_chain(their_ephemeral, &sender_private_key)?;
+                let current_root_key = self.take_root_key();
+                let (new_root_key, receiver_chain_key) =
+                    current_root_key.create_chain(their_ephemeral, &sender_private_key)?;
 
-        // Sending half-step: new_root_key + DH(new_ephemeral, their_ephemeral)
-        let new_sender_key = KeyPair::generate(csprng);
-        let (final_root_key, sender_chain_key) =
-            new_root_key.create_chain(their_ephemeral, &new_sender_key.private_key)?;
+                let new_sender_key = KeyPair::generate(csprng);
+                let (final_root_key, sender_chain_key) =
+                    new_root_key.create_chain(their_ephemeral, &new_sender_key.private_key)?;
 
-        // Record the previous sender chain counter before we replace it.
-        let current_index = self
-            .sender_chain
-            .as_ref()
-            .expect("checked above")
-            .chain_key
-            .index();
-        self.previous_counter = current_index.saturating_sub(1);
+                let current_index = self
+                    .sender_chain
+                    .as_ref()
+                    .expect("checked above")
+                    .chain_key
+                    .index();
+                self.previous_counter = current_index.saturating_sub(1);
 
-        self.root_key = final_root_key;
+                self.root_key = final_root_key;
 
-        self.receiver_chains.push(session_structure::Chain {
-            sender_ratchet_key: their_ephemeral.serialize().to_vec(),
-            sender_ratchet_key_private: vec![],
-            chain_key: Some(receiver_chain_key.to_pb()),
-            message_keys: vec![],
-        });
-        while self.receiver_chains.len() > consts::MAX_RECEIVER_CHAINS {
-            self.receiver_chains.remove(0);
-        }
+                self.receiver_chains.push(session_structure::Chain {
+                    sender_ratchet_key: their_ephemeral.serialize().to_vec(),
+                    sender_ratchet_key_private: vec![],
+                    chain_key: Some(receiver_chain_key.to_pb()),
+                    message_keys: vec![],
+                });
+                while self.receiver_chains.len() > consts::MAX_RECEIVER_CHAINS {
+                    self.receiver_chains.remove(0);
+                }
 
-        self.sender_chain = Some(SenderChain {
-            ratchet_key: new_sender_key,
-            chain_key: sender_chain_key,
-        });
+                self.sender_chain = Some(SenderChain {
+                    ratchet_key: new_sender_key,
+                    chain_key: sender_chain_key,
+                });
 
-        Ok(receiver_chain_key)
+                Ok(receiver_chain_key)
+            },
+        )
     }
+
 
     fn take_skipped_key(
         &mut self,

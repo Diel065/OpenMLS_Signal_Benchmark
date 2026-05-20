@@ -7,6 +7,7 @@ use std::time::SystemTime;
 
 use rand::{CryptoRng, Rng};
 
+use crate::profiling::{self, SpanMetadata};
 use crate::protocol::CIPHERTEXT_MESSAGE_PRE_KYBER_VERSION;
 use crate::ratchet::{AliceSignalProtocolParameters, BobSignalProtocolParameters};
 use crate::state::GenericSignedPreKey;
@@ -187,89 +188,130 @@ pub async fn process_prekey_bundle<R: Rng + CryptoRng>(
     now: SystemTime,
     mut csprng: &mut R,
 ) -> Result<()> {
-    let their_identity_key = bundle.identity_key()?;
+    let bundle_prekey_id = bundle.pre_key_id().ok().flatten();
+    let bundle_signed_prekey_id = bundle.signed_pre_key_id().ok();
+    let bundle_kyber_prekey_id = bundle.kyber_pre_key_id().ok();
+    let bundle_metadata = SpanMetadata {
+        handshake_protocol: Some("pqxdh"),
+        handshake_side: Some("initiator"),
+        classical_one_time_prekey_present: Some(bundle_prekey_id.is_some()),
+        classical_one_time_prekey_id: bundle_prekey_id.map(Into::into),
+        signed_prekey_id: bundle_signed_prekey_id.map(Into::into),
+        pq_prekey_id: bundle_kyber_prekey_id.map(Into::into),
+        pq_prekey_type: Some(if bundle_prekey_id.is_some() {
+            "one_time"
+        } else {
+            "last_resort"
+        }),
+        pq_prekey_signature_present: bundle.kyber_pre_key_signature().ok().map(|s| !s.is_empty()),
+        ..Default::default()
+    };
 
-    if !identity_store
-        .is_trusted_identity(remote_address, their_identity_key, Direction::Sending)
-        .await?
-    {
-        return Err(SignalProtocolError::UntrustedIdentity(
-            remote_address.clone(),
-        ));
-    }
+    profiling::measure_async_result_with(
+        "pqxdh_initiator_process_bundle_protocol",
+        bundle_metadata,
+        async {
+            let their_identity_key = bundle.identity_key()?;
 
-    if !their_identity_key.public_key().verify_signature(
-        &bundle.signed_pre_key_public()?.serialize(),
-        bundle.signed_pre_key_signature()?,
-    ) {
-        return Err(SignalProtocolError::SignatureValidationFailed);
-    }
+            if !identity_store
+                .is_trusted_identity(remote_address, their_identity_key, Direction::Sending)
+                .await?
+            {
+                return Err(SignalProtocolError::UntrustedIdentity(remote_address.clone()));
+            }
 
-    if !their_identity_key.public_key().verify_signature(
-        &bundle.kyber_pre_key_public()?.serialize(),
-        bundle.kyber_pre_key_signature()?,
-    ) {
-        return Err(SignalProtocolError::SignatureValidationFailed);
-    }
+            profiling::measure_result("pqxdh_initiator_verify_signed_prekey", || {
+                if !their_identity_key.public_key().verify_signature(
+                    &bundle.signed_pre_key_public()?.serialize(),
+                    bundle.signed_pre_key_signature()?,
+                ) {
+                    return Err(SignalProtocolError::SignatureValidationFailed);
+                }
+                Ok(())
+            })?;
 
-    let mut session_record = session_store
-        .load_session(remote_address)
-        .await?
-        .unwrap_or_else(SessionRecord::new_fresh);
+            profiling::measure_result("pqxdh_initiator_verify_kyber_prekey", || {
+                if !their_identity_key.public_key().verify_signature(
+                    &bundle.kyber_pre_key_public()?.serialize(),
+                    bundle.kyber_pre_key_signature()?,
+                ) {
+                    return Err(SignalProtocolError::SignatureValidationFailed);
+                }
+                Ok(())
+            })?;
 
-    let our_base_key_pair = KeyPair::generate(&mut csprng);
-    let their_signed_prekey = bundle.signed_pre_key_public()?;
-    let their_kyber_prekey = bundle.kyber_pre_key_public()?;
+            let mut session_record = profiling::measure_async_result(
+                "pqxdh_initiator_load_session",
+                async { session_store.load_session(remote_address).await },
+            )
+            .await?
+            .unwrap_or_else(SessionRecord::new_fresh);
 
-    let their_one_time_prekey_id = bundle.pre_key_id()?;
+            let our_base_key_pair = profiling::measure_result(
+                "pqxdh_initiator_generate_base_key",
+                || Ok::<_, SignalProtocolError>(KeyPair::generate(&mut csprng)),
+            )?;
+            let their_signed_prekey = bundle.signed_pre_key_public()?;
+            let their_kyber_prekey = bundle.kyber_pre_key_public()?;
 
-    let our_identity_key_pair = identity_store.get_identity_key_pair().await?;
+            let their_one_time_prekey_id = bundle.pre_key_id()?;
+            let our_identity_key_pair = identity_store.get_identity_key_pair().await?;
 
-    let mut parameters = AliceSignalProtocolParameters::new(
-        our_identity_key_pair,
-        our_base_key_pair,
-        *their_identity_key,
-        their_signed_prekey,
-        their_signed_prekey,
-        their_kyber_prekey.clone(),
-        our_identity_key_pair.identity_key().is_same_account(
-            local_address,
-            their_identity_key,
-            remote_address,
-        ),
-    );
-    if let Some(key) = bundle.pre_key_public()? {
-        parameters.set_their_one_time_pre_key(key);
-    }
+            let mut session = profiling::measure_result(
+                "pqxdh_initiator_key_agreement_and_ratchet_init",
+                || {
+                    let mut parameters = AliceSignalProtocolParameters::new(
+                        our_identity_key_pair,
+                        our_base_key_pair,
+                        *their_identity_key,
+                        their_signed_prekey,
+                        their_signed_prekey,
+                        their_kyber_prekey.clone(),
+                        our_identity_key_pair.identity_key().is_same_account(
+                            local_address,
+                            their_identity_key,
+                            remote_address,
+                        ),
+                    );
+                    if let Some(key) = bundle.pre_key_public()? {
+                        parameters.set_their_one_time_pre_key(key);
+                    }
 
-    let mut session = ratchet::initialize_alice_session(&parameters, csprng)?;
+                    ratchet::initialize_alice_session(&parameters, csprng)
+                },
+            )?;
 
-    log::info!(
-        "set_unacknowledged_pre_key_message for: {} with preKeyId: {}",
-        remote_address,
-        their_one_time_prekey_id.map_or_else(|| "<none>".to_string(), |id| id.to_string())
-    );
+            log::info!(
+                "set_unacknowledged_pre_key_message for: {} with preKeyId: {}",
+                remote_address,
+                their_one_time_prekey_id.map_or_else(|| "<none>".to_string(), |id| id.to_string())
+            );
 
-    session.set_unacknowledged_pre_key_message(
-        their_one_time_prekey_id,
-        bundle.signed_pre_key_id()?,
-        &our_base_key_pair.public_key,
-        now,
-    );
-    session.set_unacknowledged_kyber_pre_key_id(bundle.kyber_pre_key_id()?);
+            session.set_unacknowledged_pre_key_message(
+                their_one_time_prekey_id,
+                bundle.signed_pre_key_id()?,
+                &our_base_key_pair.public_key,
+                now,
+            );
+            session.set_unacknowledged_kyber_pre_key_id(bundle.kyber_pre_key_id()?);
 
-    session.set_local_registration_id(identity_store.get_local_registration_id().await?);
-    session.set_remote_registration_id(bundle.registration_id()?);
+            session.set_local_registration_id(identity_store.get_local_registration_id().await?);
+            session.set_remote_registration_id(bundle.registration_id()?);
 
-    identity_store
-        .save_identity(remote_address, their_identity_key)
-        .await?;
+            identity_store
+                .save_identity(remote_address, their_identity_key)
+                .await?;
 
-    session_record.promote_state(session);
+            session_record.promote_state(session);
 
-    session_store
-        .store_session(remote_address, &session_record)
-        .await?;
+            profiling::measure_async_result(
+                "pqxdh_initiator_store_session",
+                async { session_store.store_session(remote_address, &session_record).await },
+            )
+            .await?;
 
-    Ok(())
+            Ok(())
+        },
+    )
+    .await
 }

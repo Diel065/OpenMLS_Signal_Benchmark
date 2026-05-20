@@ -825,6 +825,7 @@ async fn receive_message_delivery(
     relay_url: &str,
     profile: bool,
     conversation_size: usize,
+    phase: Option<&str>,
 ) -> Result<CommandOutcome> {
     let delivery = relay_get_pending_message(relay_url, &participant.name).await?;
     let message_bytes = hex::decode(&delivery.message_hex).with_context(|| {
@@ -858,9 +859,9 @@ async fn receive_message_delivery(
     };
 
     let (decrypt_result, mut profile_metrics) = if profile {
-        measure_profile(|| participant.decrypt_message(&sender_address, &ciphertext))
+        measure_profile(|| participant.decrypt_message(&sender_address, &ciphertext, phase))
     } else {
-        let result = participant.decrypt_message(&sender_address, &ciphertext);
+        let result = participant.decrypt_message(&sender_address, &ciphertext, phase);
         (result, CommandMetrics::default())
     };
 
@@ -872,7 +873,6 @@ async fn receive_message_delivery(
             profile_metrics.artifact_size_bytes = Some(message_bytes.len());
             profile_metrics.conversation_size = Some(conversation_size);
             profile_metrics.session_count = Some(1);
-            profile_metrics.ratchet_step_count = Some(1);
             profile_metrics.ciphertext_bytes = Some(message_bytes.len());
             profile_metrics.plaintext_bytes = Some(plaintext_len);
             Ok(CommandOutcome::new(
@@ -917,7 +917,7 @@ async fn process_pending(
     let mut errors = Vec::new();
 
     while remaining > 0 {
-        match receive_message_delivery(participant, relay_url, false, 2).await {
+        match receive_message_delivery(participant, relay_url, false, 2, None).await {
             Ok(outcome) => {
                 messages_processed += 1;
                 metrics.merge_message(&outcome.metrics);
@@ -956,6 +956,7 @@ pub async fn handle_command(
     kr_url: &str,
     relay_url: &str,
     command: Command,
+    phase: Option<&str>,
 ) -> Result<CommandOutcome> {
     match command {
         Command::RegisterParticipant => Ok(CommandOutcome::new(
@@ -975,15 +976,29 @@ pub async fn handle_command(
                 .ok_or_else(|| anyhow!("no prekey bundles generated"))?;
             let mut one_time_prekeys = Vec::new();
             let mut signed_prekey_fallback = false;
+            let mut last_resort_pq_prekey_id = None;
+            let mut last_resort_pq_prekey_public = None;
+            let mut last_resort_pq_prekey_signature = None;
             for bundle in &bundles {
+                let pq_prekey_id: u32 = bundle.kyber_pre_key_id()?.into();
+                let pq_prekey_public = bundle.kyber_pre_key_public()?.serialize().to_vec();
+                let pq_prekey_signature = bundle.kyber_pre_key_signature()?.to_vec();
                 match (bundle.pre_key_id()?, bundle.pre_key_public()?) {
                     (Some(prekey_id), Some(prekey_public)) => {
                         one_time_prekeys.push(OneTimePrekeyStorable {
                             prekey_id: prekey_id.into(),
                             prekey_public: prekey_public.serialize().to_vec(),
+                            pq_prekey_id,
+                            pq_prekey_public,
+                            pq_prekey_signature,
                         });
                     }
-                    (None, None) => signed_prekey_fallback = true,
+                    (None, None) => {
+                        signed_prekey_fallback = true;
+                        last_resort_pq_prekey_id = Some(pq_prekey_id);
+                        last_resort_pq_prekey_public = Some(pq_prekey_public);
+                        last_resort_pq_prekey_signature = Some(pq_prekey_signature);
+                    }
                     (Some(id), None) => {
                         return Err(anyhow!("prekey_id {} was present without public key", id));
                     }
@@ -999,9 +1014,12 @@ pub async fn handle_command(
                 signed_prekey_public: first.signed_pre_key_public()?.serialize().to_vec(),
                 signed_prekey_signature: first.signed_pre_key_signature()?.to_vec(),
                 identity_key_public: first.identity_key()?.public_key().serialize().to_vec(),
-                kyber_prekey_id: first.kyber_pre_key_id()?.into(),
-                kyber_prekey_public: first.kyber_pre_key_public()?.serialize().to_vec(),
-                kyber_prekey_signature: first.kyber_pre_key_signature()?.to_vec(),
+                last_resort_pq_prekey_id: last_resort_pq_prekey_id
+                    .ok_or_else(|| anyhow!("no last-resort PQ prekey bundle generated"))?,
+                last_resort_pq_prekey_public: last_resort_pq_prekey_public
+                    .ok_or_else(|| anyhow!("no last-resort PQ prekey public key generated"))?,
+                last_resort_pq_prekey_signature: last_resort_pq_prekey_signature
+                    .ok_or_else(|| anyhow!("no last-resort PQ prekey signature generated"))?,
                 one_time_prekeys,
                 signed_prekey_fallback,
             };
@@ -1131,7 +1149,7 @@ pub async fn handle_command(
                 )?;
 
                 let (result, establish_metrics) = measure_profile(|| {
-                    participant.establish_session_from_bundle(&peer_address, &bundle)
+                    participant.establish_session_from_bundle(&peer_address, &bundle, phase)
                 });
                 result?;
                 profile_metrics.merge_profile(&establish_metrics);
@@ -1154,7 +1172,6 @@ pub async fn handle_command(
                     profile_metrics.conversation_size = Some(participants.len().saturating_add(1));
                     profile_metrics.prekey_bundle_count = Some(fetched);
                     profile_metrics.session_count = Some(established.saturating_add(existing));
-                    profile_metrics.ratchet_step_count = Some(established);
                     if artifact_size_bytes > 0 {
                         profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
                     }
@@ -1176,8 +1193,9 @@ pub async fn handle_command(
                 DeviceId::new(1).expect("valid device id"),
             );
 
-            let (ciphertext, mut profile_metrics) =
-                measure_profile(|| participant.encrypt_message(&recipient_address, &plaintext));
+            let (ciphertext, mut profile_metrics) = measure_profile(|| {
+                participant.encrypt_message(&recipient_address, &plaintext, phase)
+            });
             let ciphertext = ciphertext?;
             let ciphertext_bytes = ciphertext.serialize().to_vec();
             let ciphertext_len = ciphertext_bytes.len();
@@ -1198,7 +1216,6 @@ pub async fn handle_command(
                     profile_metrics.artifact_size_bytes = Some(ciphertext_len);
                     profile_metrics.conversation_size = Some(conversation_size);
                     profile_metrics.session_count = Some(1);
-                    profile_metrics.ratchet_step_count = Some(1);
                     profile_metrics.ciphertext_bytes = Some(ciphertext_len);
                     profile_metrics.plaintext_bytes = Some(plaintext_bytes);
                     profile_metrics
@@ -1216,6 +1233,7 @@ pub async fn handle_command(
                 relay_url,
                 profile,
                 conversation_size.unwrap_or(2),
+                phase,
             )
             .await
         }

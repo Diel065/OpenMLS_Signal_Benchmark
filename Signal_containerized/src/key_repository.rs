@@ -9,8 +9,11 @@ use crate::service_metrics::ServiceMetrics;
 pub struct PrekeyBundleStorable {
     pub registration_id: u32,
     pub device_id: u32,
+    pub bundle_id: String,
     pub prekey_id: Option<u32>,
     pub prekey_public: Option<Vec<u8>>,
+    pub classical_one_time_prekey_present: bool,
+    pub classical_one_time_prekey_id: Option<u32>,
     pub signed_prekey_id: u32,
     pub signed_prekey_public: Vec<u8>,
     pub signed_prekey_signature: Vec<u8>,
@@ -18,12 +21,18 @@ pub struct PrekeyBundleStorable {
     pub kyber_prekey_id: u32,
     pub kyber_prekey_public: Vec<u8>,
     pub kyber_prekey_signature: Vec<u8>,
+    pub pq_prekey_id: u32,
+    pub pq_prekey_type: String,
+    pub pq_prekey_signature_present: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OneTimePrekeyStorable {
     pub prekey_id: u32,
     pub prekey_public: Vec<u8>,
+    pub pq_prekey_id: u32,
+    pub pq_prekey_public: Vec<u8>,
+    pub pq_prekey_signature: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -34,48 +43,95 @@ pub struct PrekeyBundleBatchStorable {
     pub signed_prekey_public: Vec<u8>,
     pub signed_prekey_signature: Vec<u8>,
     pub identity_key_public: Vec<u8>,
-    pub kyber_prekey_id: u32,
-    pub kyber_prekey_public: Vec<u8>,
-    pub kyber_prekey_signature: Vec<u8>,
+    pub last_resort_pq_prekey_id: u32,
+    pub last_resort_pq_prekey_public: Vec<u8>,
+    pub last_resort_pq_prekey_signature: Vec<u8>,
     pub one_time_prekeys: Vec<OneTimePrekeyStorable>,
     pub signed_prekey_fallback: bool,
 }
 
 impl PrekeyBundleBatchStorable {
+    fn bundle_id(
+        device_id: u32,
+        signed_prekey_id: u32,
+        classical_prekey_id: Option<u32>,
+        pq_prekey_id: u32,
+        pq_type: &str,
+    ) -> String {
+        format!(
+            "device{}-spk{}-classical{}-pq{}-{}",
+            device_id,
+            signed_prekey_id,
+            classical_prekey_id
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            pq_prekey_id,
+            pq_type
+        )
+    }
+
     fn expand(self) -> Vec<PrekeyBundleStorable> {
         let mut bundles = Vec::with_capacity(
             self.one_time_prekeys.len() + usize::from(self.signed_prekey_fallback),
         );
+        let fallback_bundle_id = self.signed_prekey_fallback.then(|| {
+            Self::bundle_id(
+                self.device_id,
+                self.signed_prekey_id,
+                None,
+                self.last_resort_pq_prekey_id,
+                "last_resort",
+            )
+        });
 
         for prekey in self.one_time_prekeys {
+            let bundle_id = Self::bundle_id(
+                self.device_id,
+                self.signed_prekey_id,
+                Some(prekey.prekey_id),
+                prekey.pq_prekey_id,
+                "one_time",
+            );
             bundles.push(PrekeyBundleStorable {
                 registration_id: self.registration_id,
                 device_id: self.device_id,
+                bundle_id,
                 prekey_id: Some(prekey.prekey_id),
                 prekey_public: Some(prekey.prekey_public),
+                classical_one_time_prekey_present: true,
+                classical_one_time_prekey_id: Some(prekey.prekey_id),
                 signed_prekey_id: self.signed_prekey_id,
                 signed_prekey_public: self.signed_prekey_public.clone(),
                 signed_prekey_signature: self.signed_prekey_signature.clone(),
                 identity_key_public: self.identity_key_public.clone(),
-                kyber_prekey_id: self.kyber_prekey_id,
-                kyber_prekey_public: self.kyber_prekey_public.clone(),
-                kyber_prekey_signature: self.kyber_prekey_signature.clone(),
+                kyber_prekey_id: prekey.pq_prekey_id,
+                kyber_prekey_public: prekey.pq_prekey_public,
+                kyber_prekey_signature: prekey.pq_prekey_signature.clone(),
+                pq_prekey_id: prekey.pq_prekey_id,
+                pq_prekey_type: "one_time".to_string(),
+                pq_prekey_signature_present: !prekey.pq_prekey_signature.is_empty(),
             });
         }
 
-        if self.signed_prekey_fallback {
+        if let Some(bundle_id) = fallback_bundle_id {
             bundles.push(PrekeyBundleStorable {
                 registration_id: self.registration_id,
                 device_id: self.device_id,
+                bundle_id,
                 prekey_id: None,
                 prekey_public: None,
+                classical_one_time_prekey_present: false,
+                classical_one_time_prekey_id: None,
                 signed_prekey_id: self.signed_prekey_id,
                 signed_prekey_public: self.signed_prekey_public,
                 signed_prekey_signature: self.signed_prekey_signature,
                 identity_key_public: self.identity_key_public,
-                kyber_prekey_id: self.kyber_prekey_id,
-                kyber_prekey_public: self.kyber_prekey_public,
-                kyber_prekey_signature: self.kyber_prekey_signature,
+                kyber_prekey_id: self.last_resort_pq_prekey_id,
+                kyber_prekey_public: self.last_resort_pq_prekey_public,
+                kyber_prekey_signature: self.last_resort_pq_prekey_signature.clone(),
+                pq_prekey_id: self.last_resort_pq_prekey_id,
+                pq_prekey_type: "last_resort".to_string(),
+                pq_prekey_signature_present: !self.last_resort_pq_prekey_signature.is_empty(),
             });
         }
 
@@ -138,8 +194,9 @@ impl KeyRepository {
             let Some(front) = queue.front() else {
                 return false;
             };
-            let consumed = front.prekey_id.is_some();
-            if queue.len() > 1 || consumed {
+            let consumed =
+                front.classical_one_time_prekey_present || front.pq_prekey_type == "one_time";
+            if consumed {
                 queue.pop_front();
             }
             consumed

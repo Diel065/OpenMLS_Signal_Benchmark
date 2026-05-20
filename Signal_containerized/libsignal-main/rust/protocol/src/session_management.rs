@@ -26,6 +26,7 @@ use libsignal_core::try_scoped;
 use rand::{CryptoRng, Rng};
 
 use crate::consts::MAX_UNACKNOWLEDGED_SESSION_AGE;
+use crate::profiling::{self, SpanMetadata};
 use crate::state::{InvalidSessionError, SessionState};
 use crate::triple_ratchet::{OutgoingTripleRatchet, TripleRatchet};
 use crate::{
@@ -50,99 +51,102 @@ pub async fn message_encrypt<R: Rng + CryptoRng>(
     now: SystemTime,
     csprng: &mut R,
 ) -> Result<CiphertextMessage> {
-    let mut session_record = session_store
-        .load_session(remote_address)
-        .await?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
-    let session_state = session_record
-        .session_state_mut()
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+    profiling::measure_async_result_with(
+        "signal_message_encrypt_protocol",
+        SpanMetadata {
+            plaintext_bytes: Some(ptext.len()),
+            ..Default::default()
+        },
+        async {
+            let mut session_record = session_store
+                .load_session(remote_address)
+                .await?
+                .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+            let session_state = session_record
+                .session_state_mut()
+                .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
-    let mut session = OutgoingTripleRatchet::from_session_state(session_state).map_err(|e| {
-        log::error!("session state corrupt for {remote_address}: {e}");
-        e
-    })?;
+            let mut session = OutgoingTripleRatchet::from_session_state(session_state).map_err(|e| {
+                log::error!("session state corrupt for {remote_address}: {e}");
+                e
+            })?;
 
-    let their_identity_key = session_state
-        .remote_identity_key()?
-        .expect("session was valid; must have remote identity key");
+            let their_identity_key = session_state
+                .remote_identity_key()?
+                .expect("session was valid; must have remote identity key");
 
-    // Pre-key wrapping — session management concern.
-    let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
-        let timestamp_as_unix_time = items
-            .timestamp()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if items.timestamp() + MAX_UNACKNOWLEDGED_SESSION_AGE < now {
-            log::warn!(
-                "stale unacknowledged session for {remote_address} (created at {timestamp_as_unix_time})"
-            );
-            return Err(SignalProtocolError::SessionNotFound(remote_address.clone()));
-        }
+            let message = if let Some(items) = session_state.unacknowledged_pre_key_message_items()? {
+                let timestamp_as_unix_time = items
+                    .timestamp()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                if items.timestamp() + MAX_UNACKNOWLEDGED_SESSION_AGE < now {
+                    log::warn!(
+                        "stale unacknowledged session for {remote_address} (created at {timestamp_as_unix_time})"
+                    );
+                    return Err(SignalProtocolError::SessionNotFound(remote_address.clone()));
+                }
 
-        let local_registration_id = session_state.local_registration_id();
+                let local_registration_id = session_state.local_registration_id();
 
-        log::info!(
-            "Building PreKeyWhisperMessage for: {} with preKeyId: {} (session created at {})",
-            remote_address,
-            items
-                .pre_key_id()
-                .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
-            timestamp_as_unix_time,
-        );
+                log::info!(
+                    "Building PreKeyWhisperMessage for: {} with preKeyId: {} (session created at {})",
+                    remote_address,
+                    items
+                        .pre_key_id()
+                        .map_or_else(|| "<none>".to_string(), |id| id.to_string()),
+                    timestamp_as_unix_time,
+                );
 
-        let kyber_payload = items
-            .kyber_pre_key_id()
-            .zip(items.kyber_ciphertext())
-            .map(|(id, ciphertext)| KyberPayload::new(id, ciphertext.into()));
-        let signal_message = session.encrypt(ptext, Some(local_address), remote_address, csprng)?;
+                let kyber_payload = items
+                    .kyber_pre_key_id()
+                    .zip(items.kyber_ciphertext())
+                    .map(|(id, ciphertext)| KyberPayload::new(id, ciphertext.into()));
+                let signal_message = session.encrypt(ptext, Some(local_address), remote_address, csprng)?;
 
-        CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
-            session.session_version(),
-            local_registration_id,
-            items.pre_key_id(),
-            items.signed_pre_key_id(),
-            kyber_payload,
-            *items.base_key(),
-            *session.local_identity_key(),
-            signal_message,
-        )?)
-    } else {
-        let signal_message = session.encrypt(ptext, None, remote_address, csprng)?;
-        CiphertextMessage::SignalMessage(signal_message)
-    };
+                CiphertextMessage::PreKeySignalMessage(PreKeySignalMessage::new(
+                    session.session_version(),
+                    local_registration_id,
+                    items.pre_key_id(),
+                    items.signed_pre_key_id(),
+                    kyber_payload,
+                    *items.base_key(),
+                    *session.local_identity_key(),
+                    signal_message,
+                )?)
+            } else {
+                let signal_message = session.encrypt(ptext, None, remote_address, csprng)?;
+                CiphertextMessage::SignalMessage(signal_message)
+            };
 
-    // In clients, `is_trusted_identity` for the Sending direction checks
-    // whether the session's identity key matches the stored key AND whether the
-    // user has approved it (safety number changes, verification status). This
-    // prevents sending to a contact whose identity has changed without user
-    // acknowledgment.
-    if !identity_store
-        .is_trusted_identity(remote_address, &their_identity_key, Direction::Sending)
-        .await?
-    {
-        log::warn!(
-            "Identity key {} is not trusted for remote address {}",
-            hex::encode(their_identity_key.public_key().public_key_bytes()),
-            remote_address,
-        );
-        return Err(SignalProtocolError::UntrustedIdentity(
-            remote_address.clone(),
-        ));
-    }
+            if !identity_store
+                .is_trusted_identity(remote_address, &their_identity_key, Direction::Sending)
+                .await?
+            {
+                log::warn!(
+                    "Identity key {} is not trusted for remote address {}",
+                    hex::encode(their_identity_key.public_key().public_key_bytes()),
+                    remote_address,
+                );
+                return Err(SignalProtocolError::UntrustedIdentity(remote_address.clone()));
+            }
 
-    identity_store
-        .save_identity(remote_address, &their_identity_key)
-        .await?;
+            identity_store
+                .save_identity(remote_address, &their_identity_key)
+                .await?;
 
-    // Commit and save session state changes.
-    session.apply_to_session_state(session_state);
+            session.apply_to_session_state(session_state);
 
-    session_store
-        .store_session(remote_address, &session_record)
-        .await?;
-    Ok(message)
+            profiling::measure_async_result(
+                "signal_message_encrypt_store_session",
+                async { session_store.store_session(remote_address, &session_record).await },
+            )
+            .await?;
+            Ok(message)
+        },
+    )
+    .await
 }
 
 /// Decrypt a [`CiphertextMessage`] from `remote_address`.
@@ -210,79 +214,140 @@ pub async fn message_decrypt_prekey<R: Rng + CryptoRng>(
     kyber_pre_key_store: &mut dyn KyberPreKeyStore,
     csprng: &mut R,
 ) -> Result<Vec<u8>> {
-    let mut session_record = session_store
-        .load_session(remote_address)
-        .await?
-        .unwrap_or_else(SessionRecord::new_fresh);
+    let classical_one_time_prekey_id = ciphertext.pre_key_id();
+    let pq_prekey_id = ciphertext.kyber_pre_key_id();
+    profiling::measure_async_result_with(
+        "pqxdh_responder_receive_prekey_message_protocol",
+        SpanMetadata {
+            handshake_protocol: Some("pqxdh"),
+            handshake_side: Some("responder"),
+            ciphertext_message_type: Some("PreKeySignalMessage"),
+            message_counter: Some(ciphertext.message().counter()),
+            previous_counter: Some(ciphertext.message().previous_counter()),
+            sender_ratchet_key_fingerprint: Some(hex::encode(
+                ciphertext.message().sender_ratchet_key().public_key_bytes(),
+            )),
+            classical_one_time_prekey_present: Some(classical_one_time_prekey_id.is_some()),
+            classical_one_time_prekey_id: classical_one_time_prekey_id.map(Into::into),
+            signed_prekey_id: Some(ciphertext.signed_pre_key_id().into()),
+            pq_prekey_id: pq_prekey_id.map(Into::into),
+            pq_prekey_type: pq_prekey_id.map(|_| {
+                if classical_one_time_prekey_id.is_some() {
+                    "one_time"
+                } else {
+                    "last_resort"
+                }
+            }),
+            ..Default::default()
+        },
+        async {
+            let mut session_record = session_store
+                .load_session(remote_address)
+                .await?
+                .unwrap_or_else(SessionRecord::new_fresh);
 
-    // Make sure we log the session state if we fail to process the pre-key.
-    let process_prekey_result = session::process_prekey(
-        ciphertext,
-        remote_address,
-        local_address,
-        &mut session_record,
-        identity_store,
-        pre_key_store,
-        signed_pre_key_store,
-        kyber_pre_key_store,
-    )
-    .await;
+            let process_prekey_result = profiling::measure_async_result(
+                "pqxdh_responder_process_prekey_protocol",
+                async {
+                    session::process_prekey(
+                        ciphertext,
+                        remote_address,
+                        local_address,
+                        &mut session_record,
+                        identity_store,
+                        pre_key_store,
+                        signed_pre_key_store,
+                        kyber_pre_key_store,
+                    )
+                    .await
+                },
+            )
+            .await;
 
-    let (pre_key_used, identity_to_save) = match process_prekey_result {
-        Ok(result) => result,
-        Err(e) => {
-            let errs = [e];
-            log::error!(
-                "{}",
-                format_decryption_failure_log(
-                    remote_address,
-                    &errs,
-                    &session_record,
-                    ciphertext.message()
-                )?
-            );
-            let [e] = errs;
-            return Err(e);
-        }
-    };
+            let (pre_key_used, identity_to_save) = match process_prekey_result {
+                Ok(result) => result,
+                Err(e) => {
+                    let errs = [e];
+                    log::error!(
+                        "{}",
+                        format_decryption_failure_log(
+                            remote_address,
+                            &errs,
+                            &session_record,
+                            ciphertext.message()
+                        )?
+                    );
+                    let [e] = errs;
+                    return Err(e);
+                }
+            };
 
-    let ptext = try_decrypt_from_record(
-        &mut session_record,
-        remote_address,
-        local_address,
-        ciphertext.message(),
-        CiphertextMessageType::PreKey,
-        csprng,
-    )?;
+            let ptext = profiling::measure_result_with(
+                "pqxdh_responder_decrypt_initial_signal_message",
+                SpanMetadata {
+                    ciphertext_message_type: Some("PreKeySignalMessage"),
+                    message_counter: Some(ciphertext.message().counter()),
+                    previous_counter: Some(ciphertext.message().previous_counter()),
+                    sender_ratchet_key_fingerprint: Some(hex::encode(
+                        ciphertext.message().sender_ratchet_key().public_key_bytes(),
+                    )),
+                    ..Default::default()
+                },
+                || {
+                    try_decrypt_from_record(
+                        &mut session_record,
+                        remote_address,
+                        local_address,
+                        ciphertext.message(),
+                        CiphertextMessageType::PreKey,
+                        csprng,
+                    )
+                },
+            )?;
 
-    identity_store
-        .save_identity(
-            identity_to_save.remote_address,
-            identity_to_save.their_identity_key,
-        )
-        .await?;
-
-    if let Some(pre_key_used) = pre_key_used {
-        if let Some(kyber_pre_key_id) = pre_key_used.kyber_pre_key_id {
-            kyber_pre_key_store
-                .mark_kyber_pre_key_used(
-                    kyber_pre_key_id,
-                    pre_key_used.signed_ec_pre_key_id,
-                    ciphertext.base_key(),
+            identity_store
+                .save_identity(
+                    identity_to_save.remote_address,
+                    identity_to_save.their_identity_key,
                 )
                 .await?;
-        }
 
-        if let Some(pre_key_id) = pre_key_used.one_time_ec_pre_key_id {
-            pre_key_store.remove_pre_key(pre_key_id).await?;
-        }
-    }
+            if let Some(pre_key_used) = pre_key_used {
+                if let Some(kyber_pre_key_id) = pre_key_used.kyber_pre_key_id {
+                    profiling::measure_async_result(
+                        "pqxdh_responder_mark_kyber_prekey_used",
+                        async {
+                            kyber_pre_key_store
+                                .mark_kyber_pre_key_used(
+                                    kyber_pre_key_id,
+                                    pre_key_used.signed_ec_pre_key_id,
+                                    ciphertext.base_key(),
+                                )
+                                .await
+                        },
+                    )
+                    .await?;
+                }
 
-    session_store
-        .store_session(remote_address, &session_record)
-        .await?;
+                if let Some(pre_key_id) = pre_key_used.one_time_ec_pre_key_id {
+                    profiling::measure_async_result(
+                        "pqxdh_responder_remove_classical_one_time_prekey",
+                        async { pre_key_store.remove_pre_key(pre_key_id).await },
+                    )
+                    .await?;
+                }
+            }
 
-    Ok(ptext)
+            profiling::measure_async_result(
+                "pqxdh_responder_store_session",
+                async { session_store.store_session(remote_address, &session_record).await },
+            )
+            .await?;
+
+            Ok(ptext)
+        },
+    )
+    .await
 }
 
 /// Decrypt a [`SignalMessage`] from `remote_address`.
@@ -297,51 +362,65 @@ pub async fn message_decrypt_signal<R: Rng + CryptoRng>(
     identity_store: &mut dyn IdentityKeyStore,
     csprng: &mut R,
 ) -> Result<Vec<u8>> {
-    let mut session_record = session_store
-        .load_session(remote_address)
-        .await?
-        .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
+    profiling::measure_async_result_with(
+        "signal_message_decrypt_protocol",
+        SpanMetadata {
+            ciphertext_message_type: Some("SignalMessage"),
+            message_counter: Some(ciphertext.counter()),
+            previous_counter: Some(ciphertext.previous_counter()),
+            sender_ratchet_key_fingerprint: Some(hex::encode(
+                ciphertext.sender_ratchet_key().public_key_bytes(),
+            )),
+            ..Default::default()
+        },
+        async {
+            let mut session_record = session_store
+                .load_session(remote_address)
+                .await?
+                .ok_or_else(|| SignalProtocolError::SessionNotFound(remote_address.clone()))?;
 
-    let ptext = try_decrypt_from_record(
-        &mut session_record,
-        remote_address,
-        local_address,
-        ciphertext,
-        CiphertextMessageType::Whisper,
-        csprng,
-    )?;
+            let ptext = try_decrypt_from_record(
+                &mut session_record,
+                remote_address,
+                local_address,
+                ciphertext,
+                CiphertextMessageType::Whisper,
+                csprng,
+            )?;
 
-    // Why are we performing this check after decryption instead of before?
-    let their_identity_key = session_record
-        .session_state()
-        .expect("successfully decrypted; must have a current state")
-        .remote_identity_key()
-        .expect("successfully decrypted; must have a remote identity key")
-        .expect("successfully decrypted; must have a remote identity key");
+            let their_identity_key = session_record
+                .session_state()
+                .expect("successfully decrypted; must have a current state")
+                .remote_identity_key()
+                .expect("successfully decrypted; must have a remote identity key")
+                .expect("successfully decrypted; must have a remote identity key");
 
-    if !identity_store
-        .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
-        .await?
-    {
-        log::warn!(
-            "Identity key {} is not trusted for remote address {}",
-            hex::encode(their_identity_key.public_key().public_key_bytes()),
-            remote_address,
-        );
-        return Err(SignalProtocolError::UntrustedIdentity(
-            remote_address.clone(),
-        ));
-    }
+            if !identity_store
+                .is_trusted_identity(remote_address, &their_identity_key, Direction::Receiving)
+                .await?
+            {
+                log::warn!(
+                    "Identity key {} is not trusted for remote address {}",
+                    hex::encode(their_identity_key.public_key().public_key_bytes()),
+                    remote_address,
+                );
+                return Err(SignalProtocolError::UntrustedIdentity(remote_address.clone()));
+            }
 
-    identity_store
-        .save_identity(remote_address, &their_identity_key)
-        .await?;
+            identity_store
+                .save_identity(remote_address, &their_identity_key)
+                .await?;
 
-    session_store
-        .store_session(remote_address, &session_record)
-        .await?;
+            profiling::measure_async_result(
+                "signal_message_decrypt_store_session",
+                async { session_store.store_session(remote_address, &session_record).await },
+            )
+            .await?;
 
-    Ok(ptext)
+            Ok(ptext)
+        },
+    )
+    .await
 }
 
 // ── Session management (Sesame) ──────────────────────────────────────────────
@@ -398,14 +477,32 @@ pub(crate) fn try_decrypt_from_record<R: Rng + CryptoRng>(
             log_failure("Current", &current_state, &e);
             errs.push(e);
         } else {
-            match try_decrypt_with_state(
-                &mut current_state,
-                remote_address,
-                local_address,
-                ciphertext,
-                original_message_type,
-                CurrentOrPrevious::Current,
-                csprng,
+            match profiling::measure_result_with(
+                "signal_message_decrypt_current_session_attempt",
+                SpanMetadata {
+                    ciphertext_message_type: Some(match original_message_type {
+                        CiphertextMessageType::PreKey => "PreKeySignalMessage",
+                        CiphertextMessageType::Whisper => "SignalMessage",
+                        CiphertextMessageType::SenderKey | CiphertextMessageType::Plaintext => "Unknown",
+                    }),
+                    message_counter: Some(ciphertext.counter()),
+                    previous_counter: Some(ciphertext.previous_counter()),
+                    sender_ratchet_key_fingerprint: Some(hex::encode(
+                        ciphertext.sender_ratchet_key().public_key_bytes(),
+                    )),
+                    ..Default::default()
+                },
+                || {
+                    try_decrypt_with_state(
+                        &mut current_state,
+                        remote_address,
+                        local_address,
+                        ciphertext,
+                        original_message_type,
+                        CurrentOrPrevious::Current,
+                        csprng,
+                    )
+                },
             ) {
                 Ok(ptext) => {
                     log::info!(
@@ -480,14 +577,28 @@ pub(crate) fn try_decrypt_from_record<R: Rng + CryptoRng>(
             continue;
         }
 
-        match try_decrypt_with_state(
-            &mut previous,
-            remote_address,
-            local_address,
-            ciphertext,
-            original_message_type,
-            CurrentOrPrevious::Previous,
-            csprng,
+        match profiling::measure_result_with(
+            "signal_message_decrypt_previous_session_attempt",
+            SpanMetadata {
+                ciphertext_message_type: Some("SignalMessage"),
+                message_counter: Some(ciphertext.counter()),
+                previous_counter: Some(ciphertext.previous_counter()),
+                sender_ratchet_key_fingerprint: Some(hex::encode(
+                    ciphertext.sender_ratchet_key().public_key_bytes(),
+                )),
+                ..Default::default()
+            },
+            || {
+                try_decrypt_with_state(
+                    &mut previous,
+                    remote_address,
+                    local_address,
+                    ciphertext,
+                    original_message_type,
+                    CurrentOrPrevious::Previous,
+                    csprng,
+                )
+            },
         ) {
             Ok(ptext) => {
                 log::info!(

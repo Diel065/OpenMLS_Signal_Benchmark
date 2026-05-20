@@ -5,6 +5,7 @@ use anyhow::{Context, Result};
 use libsignal_core::DeviceId;
 use libsignal_core::ProtocolAddress;
 use libsignal_protocol::kem;
+use libsignal_protocol::profiling::{with_profile_context, ProfileContext};
 use libsignal_protocol::GenericSignedPreKey;
 use libsignal_protocol::Timestamp;
 use libsignal_protocol::{
@@ -30,10 +31,12 @@ pub struct SignalParticipant {
     registration_id: u32,
     signed_prekey_id: SignedPreKeyId,
     signed_prekey_record: SignedPreKeyRecord,
-    kyber_prekey_id: KyberPreKeyId,
-    kyber_prekey_record: KyberPreKeyRecord,
+    last_resort_pq_prekey_id: KyberPreKeyId,
+    last_resort_pq_prekey_record: KyberPreKeyRecord,
     one_time_prekey_ids: Vec<PreKeyId>,
     one_time_prekey_records: Vec<PreKeyRecord>,
+    one_time_pq_prekey_ids: Vec<KyberPreKeyId>,
+    one_time_pq_prekey_records: Vec<KyberPreKeyRecord>,
     csprng: StdRng,
 }
 
@@ -43,6 +46,16 @@ fn new_csprng() -> StdRng {
         .try_fill_bytes(seed.as_mut())
         .expect("OsRng entropy");
     StdRng::from_seed(seed)
+}
+
+fn pair_id(left_name: &str, left_device: u32, right_name: &str, right_device: u32) -> String {
+    let left = format!("{}:{}", left_name, left_device);
+    let right = format!("{}:{}", right_name, right_device);
+    if left <= right {
+        format!("{}|{}", left, right)
+    } else {
+        format!("{}|{}", right, left)
+    }
 }
 
 fn block_on_protocol<F: Future>(future: F) -> F::Output {
@@ -57,7 +70,62 @@ fn block_on_protocol<F: Future>(future: F) -> F::Output {
     }
 }
 
+fn current_timestamp() -> Result<Timestamp> {
+    Ok(Timestamp::from_epoch_millis(
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .context("system time")?
+            .as_millis() as u64,
+    ))
+}
+
+fn generate_kyber_prekey_record(
+    prekey_id: KyberPreKeyId,
+    identity_key_pair: &IdentityKeyPair,
+    csprng: &mut StdRng,
+) -> Result<KyberPreKeyRecord> {
+    let key_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, csprng);
+    let public_key = key_pair.public_key.serialize();
+    let signature = identity_key_pair
+        .private_key()
+        .calculate_signature(&public_key, csprng)?;
+    Ok(KyberPreKeyRecord::new(
+        prekey_id,
+        current_timestamp()?,
+        &key_pair,
+        &signature,
+    ))
+}
+
 impl SignalParticipant {
+    fn profile_context(
+        &self,
+        remote_address: &ProtocolAddress,
+        role: &str,
+        direction: &str,
+        phase: &str,
+        conversation_size: Option<usize>,
+    ) -> ProfileContext {
+        let local_device_id: u32 = self.address.device_id().into();
+        let remote_device_id: u32 = remote_address.device_id().into();
+        ProfileContext {
+            participant_id: Some(self.address.name().to_string()),
+            participant_device_id: Some(local_device_id),
+            peer_id: Some(remote_address.name().to_string()),
+            peer_device_id: Some(remote_device_id),
+            pair_id: Some(pair_id(
+                self.address.name(),
+                local_device_id,
+                remote_address.name(),
+                remote_device_id,
+            )),
+            role: Some(role.to_string()),
+            direction: Some(direction.to_string()),
+            phase: Some(phase.to_string()),
+            conversation_size,
+        }
+    }
+
     pub fn new(name: &str) -> Result<Self> {
         let device_id = DeviceId::new(DEVICE_ID).expect("DEVICE_ID is valid");
         let address = ProtocolAddress::new(name.to_string(), device_id);
@@ -74,35 +142,12 @@ impl SignalParticipant {
             .calculate_signature(&msg, &mut csprng)?;
         let signed_prekey_record = SignedPreKeyRecord::new(
             signed_prekey_id,
-            Timestamp::from_epoch_millis(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .context("system time")?
-                    .as_millis() as u64,
-            ),
+            current_timestamp()?,
             &signed_prekey,
             &signed_prekey_signature,
         );
 
         let store = InMemSignalProtocolStore::new(identity_key_pair, registration_id)?;
-
-        let kyber_prekey_id = KyberPreKeyId::from(1u32);
-        let kyber_key_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut csprng);
-        let kyber_msg = kyber_key_pair.public_key.serialize();
-        let kyber_signature = identity_key_pair
-            .private_key()
-            .calculate_signature(&kyber_msg, &mut csprng)?;
-        let kyber_prekey_record = KyberPreKeyRecord::new(
-            kyber_prekey_id,
-            Timestamp::from_epoch_millis(
-                SystemTime::now()
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .context("system time")?
-                    .as_millis() as u64,
-            ),
-            &kyber_key_pair,
-            &kyber_signature,
-        );
 
         let one_time_prekey_count = std::env::var("SIGNAL_ONE_TIME_PREKEY_COUNT")
             .ok()
@@ -112,13 +157,27 @@ impl SignalParticipant {
 
         let mut one_time_prekey_ids = Vec::new();
         let mut one_time_prekey_records = Vec::new();
+        let mut one_time_pq_prekey_ids = Vec::new();
+        let mut one_time_pq_prekey_records = Vec::new();
         for i in 1..=one_time_prekey_count {
             let prekey_id = PreKeyId::from(i);
             let key_pair = libsignal_core::curve::KeyPair::generate(&mut csprng);
             let record = PreKeyRecord::new(prekey_id, &key_pair);
             one_time_prekey_ids.push(prekey_id);
             one_time_prekey_records.push(record);
+
+            let pq_prekey_id = KyberPreKeyId::from(i);
+            let pq_record =
+                generate_kyber_prekey_record(pq_prekey_id, &identity_key_pair, &mut csprng)?;
+            one_time_pq_prekey_ids.push(pq_prekey_id);
+            one_time_pq_prekey_records.push(pq_record);
         }
+        let last_resort_pq_prekey_id = KyberPreKeyId::from(one_time_prekey_count + 1);
+        let last_resort_pq_prekey_record = generate_kyber_prekey_record(
+            last_resort_pq_prekey_id,
+            &identity_key_pair,
+            &mut csprng,
+        )?;
 
         Ok(Self {
             name: name.to_string(),
@@ -128,10 +187,12 @@ impl SignalParticipant {
             registration_id,
             signed_prekey_id,
             signed_prekey_record,
-            kyber_prekey_id,
-            kyber_prekey_record,
+            last_resort_pq_prekey_id,
+            last_resort_pq_prekey_record,
             one_time_prekey_ids,
             one_time_prekey_records,
+            one_time_pq_prekey_ids,
+            one_time_pq_prekey_records,
             csprng,
         })
     }
@@ -143,14 +204,13 @@ impl SignalParticipant {
         let signed_prekey = self.signed_prekey_record.public_key()?;
         let signed_prekey_signature = self.signed_prekey_record.signature()?.to_vec();
         let registration_id = self.registration_id;
-        let kyber_prekey_public = self.kyber_prekey_record.public_key()?;
-        let kyber_signature = self.kyber_prekey_record.signature()?.to_vec();
-
-        for (prekey_id, prekey_record) in self
+        for (((prekey_id, prekey_record), pq_prekey_id), pq_record) in self
             .one_time_prekey_ids
             .iter()
             .copied()
             .zip(self.one_time_prekey_records.iter())
+            .zip(self.one_time_pq_prekey_ids.iter().copied())
+            .zip(self.one_time_pq_prekey_records.iter())
         {
             bundles.push(PreKeyBundle::new(
                 registration_id,
@@ -159,9 +219,9 @@ impl SignalParticipant {
                 self.signed_prekey_id,
                 signed_prekey,
                 signed_prekey_signature.clone(),
-                self.kyber_prekey_id,
-                kyber_prekey_public.clone(),
-                kyber_signature.clone(),
+                pq_prekey_id,
+                pq_record.public_key()?,
+                pq_record.signature()?.to_vec(),
                 IdentityKey::new(identity_public),
             )?);
         }
@@ -173,9 +233,9 @@ impl SignalParticipant {
             self.signed_prekey_id,
             signed_prekey,
             signed_prekey_signature,
-            self.kyber_prekey_id,
-            kyber_prekey_public,
-            kyber_signature,
+            self.last_resort_pq_prekey_id,
+            self.last_resort_pq_prekey_record.public_key()?,
+            self.last_resort_pq_prekey_record.signature()?.to_vec(),
             IdentityKey::new(identity_public),
         )?);
 
@@ -199,6 +259,10 @@ impl SignalParticipant {
             self.one_time_prekey_ids.remove(0);
             self.one_time_prekey_records.remove(0);
         }
+        if !self.one_time_pq_prekey_ids.is_empty() {
+            self.one_time_pq_prekey_ids.remove(0);
+            self.one_time_pq_prekey_records.remove(0);
+        }
     }
 
     pub fn store_own_prekeys(&mut self) -> Result<()> {
@@ -218,9 +282,23 @@ impl SignalParticipant {
                 .signed_pre_key_store
                 .save_signed_pre_key(self.signed_prekey_id, &self.signed_prekey_record)
                 .await?;
+            for (pq_prekey_id, record) in self
+                .one_time_pq_prekey_ids
+                .iter()
+                .copied()
+                .zip(self.one_time_pq_prekey_records.iter())
+            {
+                self.store
+                    .kyber_pre_key_store
+                    .save_kyber_pre_key(pq_prekey_id, record)
+                    .await?;
+            }
             self.store
                 .kyber_pre_key_store
-                .save_kyber_pre_key(self.kyber_prekey_id, &self.kyber_prekey_record)
+                .save_kyber_pre_key(
+                    self.last_resort_pq_prekey_id,
+                    &self.last_resort_pq_prekey_record,
+                )
                 .await?;
             Ok(())
         })
@@ -230,18 +308,28 @@ impl SignalParticipant {
         &mut self,
         remote_address: &ProtocolAddress,
         bundle: &PreKeyBundle,
+        phase: Option<&str>,
     ) -> Result<()> {
-        block_on_protocol(async {
-            process_prekey_bundle(
-                remote_address,
-                &self.address,
-                &mut self.store.session_store,
-                &mut self.store.identity_store,
-                bundle,
-                SystemTime::now(),
-                &mut self.csprng,
-            )
-            .await
+        let context = self.profile_context(
+            remote_address,
+            "initiator",
+            "outbound",
+            phase.unwrap_or("handshake.process_bundle"),
+            None,
+        );
+        with_profile_context(context, || {
+            block_on_protocol(async {
+                process_prekey_bundle(
+                    remote_address,
+                    &self.address,
+                    &mut self.store.session_store,
+                    &mut self.store.identity_store,
+                    bundle,
+                    SystemTime::now(),
+                    &mut self.csprng,
+                )
+                .await
+            })
         })?;
 
         Ok(())
@@ -251,18 +339,28 @@ impl SignalParticipant {
         &mut self,
         remote_address: &ProtocolAddress,
         plaintext: &[u8],
+        phase: Option<&str>,
     ) -> Result<CiphertextMessage> {
-        let msg = block_on_protocol(async {
-            message_encrypt(
-                plaintext,
-                remote_address,
-                &self.address,
-                &mut self.store.session_store,
-                &mut self.store.identity_store,
-                SystemTime::now(),
-                &mut self.csprng,
-            )
-            .await
+        let context = self.profile_context(
+            remote_address,
+            "sender",
+            "outbound",
+            phase.unwrap_or("message.encrypt"),
+            None,
+        );
+        let msg = with_profile_context(context, || {
+            block_on_protocol(async {
+                message_encrypt(
+                    plaintext,
+                    remote_address,
+                    &self.address,
+                    &mut self.store.session_store,
+                    &mut self.store.identity_store,
+                    SystemTime::now(),
+                    &mut self.csprng,
+                )
+                .await
+            })
         })?;
 
         Ok(msg)
@@ -272,20 +370,30 @@ impl SignalParticipant {
         &mut self,
         remote_address: &ProtocolAddress,
         ciphertext: &CiphertextMessage,
+        phase: Option<&str>,
     ) -> Result<Vec<u8>> {
-        let plaintext = block_on_protocol(async {
-            message_decrypt(
-                ciphertext,
-                remote_address,
-                &self.address,
-                &mut self.store.session_store,
-                &mut self.store.identity_store,
-                &mut self.store.pre_key_store,
-                &self.store.signed_pre_key_store,
-                &mut self.store.kyber_pre_key_store,
-                &mut self.csprng,
-            )
-            .await
+        let context = self.profile_context(
+            remote_address,
+            "recipient",
+            "inbound",
+            phase.unwrap_or("message.decrypt"),
+            None,
+        );
+        let plaintext = with_profile_context(context, || {
+            block_on_protocol(async {
+                message_decrypt(
+                    ciphertext,
+                    remote_address,
+                    &self.address,
+                    &mut self.store.session_store,
+                    &mut self.store.identity_store,
+                    &mut self.store.pre_key_store,
+                    &self.store.signed_pre_key_store,
+                    &mut self.store.kyber_pre_key_store,
+                    &mut self.csprng,
+                )
+                .await
+            })
         })?;
 
         Ok(plaintext)
@@ -304,7 +412,9 @@ impl SignalParticipant {
     }
 
     pub fn remaining_prekeys(&self) -> usize {
-        self.one_time_prekey_ids.len()
+        self.one_time_prekey_ids
+            .len()
+            .min(self.one_time_pq_prekey_ids.len())
     }
 
     pub fn private_key(&self) -> &libsignal_core::curve::PrivateKey {

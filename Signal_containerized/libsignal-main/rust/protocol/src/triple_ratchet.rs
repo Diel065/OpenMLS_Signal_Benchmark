@@ -16,6 +16,7 @@
 use rand::{CryptoRng, Rng};
 
 use crate::double_ratchet::RatchetState;
+use crate::profiling::{self, SpanMetadata};
 use crate::ratchet::ChainKey;
 use crate::session_management::CurrentOrPrevious;
 use crate::state::SessionState;
@@ -94,24 +95,42 @@ impl OutgoingTripleRatchet {
             state: new_pqr_state,
             key: pqr_key,
             msg: pqr_msg,
-        } = spqr::send(&self.pqr_state, csprng).map_err(|e| {
-            SignalProtocolError::InvalidState(
-                "encrypt",
-                format!("post-quantum ratchet send error: {e}"),
-            )
-        })?;
+        } = profiling::measure_result_with(
+            "signal_ratchet_spqr_send",
+            SpanMetadata {
+                spqr_step_performed: Some(true),
+                ..Default::default()
+            },
+            || {
+                spqr::send(&self.pqr_state, csprng).map_err(|e| {
+                    SignalProtocolError::InvalidState(
+                        "encrypt",
+                        format!("post-quantum ratchet send error: {e}"),
+                    )
+                })
+            },
+        )?;
 
         let message_keys = self.sender_chain_key.message_keys().generate_keys(pqr_key);
 
-        let ctext = signal_crypto::aes_256_cbc_encrypt(
-            plaintext,
-            message_keys.cipher_key(),
-            message_keys.iv(),
-        )
-        .map_err(|_| {
-            log::error!("session state corrupt for {remote_address}");
-            SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
-        })?;
+        let ctext = profiling::measure_result_with(
+            "signal_message_aead_encrypt",
+            SpanMetadata {
+                plaintext_bytes: Some(plaintext.len()),
+                ..Default::default()
+            },
+            || {
+                signal_crypto::aes_256_cbc_encrypt(
+                    plaintext,
+                    message_keys.cipher_key(),
+                    message_keys.iv(),
+                )
+                .map_err(|_| {
+                    log::error!("session state corrupt for {remote_address}");
+                    SignalProtocolError::InvalidSessionStructure("invalid sender chain message keys")
+                })
+            },
+        )?;
 
         let addresses = local_address.map(|addr| (addr, remote_address));
 
@@ -128,7 +147,18 @@ impl OutgoingTripleRatchet {
             &pqr_msg,
         )?;
 
-        self.sender_chain_key = self.sender_chain_key.next_chain_key();
+        let send_chain_index_before = self.sender_chain_key.index();
+        self.sender_chain_key = profiling::measure_result_with(
+            "signal_ratchet_send_chain_advance",
+            SpanMetadata {
+                send_chain_index_before: Some(send_chain_index_before),
+                send_chain_index_after: Some(send_chain_index_before.saturating_add(1)),
+                ratchet_progression_kind: Some("send_chain_index"),
+                ratchet_progression_value: Some(send_chain_index_before.saturating_add(1).into()),
+                ..Default::default()
+            },
+            || Ok::<_, SignalProtocolError>(self.sender_chain_key.next_chain_key()),
+        )?;
         self.pqr_state = new_pqr_state;
 
         Ok(message)
@@ -224,34 +254,78 @@ impl TripleRatchet {
         // DR: ensure we have a receiver chain, then consume the message key
         let their_ephemeral = ciphertext.sender_ratchet_key();
         let counter = ciphertext.counter();
-        let chain_key = self
-            .ratchet
-            .ensure_receiver_chain(their_ephemeral, csprng)?;
-        let message_key_gen = self.ratchet.consume_message_key(
-            their_ephemeral,
-            chain_key,
-            counter,
-            original_message_type,
-            &sender_address.to_string(),
+        let chain_key = profiling::measure_result_with(
+            "signal_ratchet_receive_ensure_chain",
+            SpanMetadata {
+                ciphertext_message_type: Some(match original_message_type {
+                    CiphertextMessageType::PreKey => "PreKeySignalMessage",
+                    CiphertextMessageType::Whisper => "SignalMessage",
+                    CiphertextMessageType::SenderKey | CiphertextMessageType::Plaintext => "Unknown",
+                }),
+                message_counter: Some(counter),
+                previous_counter: Some(ciphertext.previous_counter()),
+                sender_ratchet_key_fingerprint: Some(hex::encode(their_ephemeral.public_key_bytes())),
+                ..Default::default()
+            },
+            || self.ratchet.ensure_receiver_chain(their_ephemeral, csprng),
+        )?;
+        let receive_chain_index_before = chain_key.index();
+        let message_key_gen = profiling::measure_result_with(
+            "signal_ratchet_receive_chain_advance",
+            SpanMetadata {
+                ciphertext_message_type: Some(match original_message_type {
+                    CiphertextMessageType::PreKey => "PreKeySignalMessage",
+                    CiphertextMessageType::Whisper => "SignalMessage",
+                    CiphertextMessageType::SenderKey | CiphertextMessageType::Plaintext => "Unknown",
+                }),
+                message_counter: Some(counter),
+                previous_counter: Some(ciphertext.previous_counter()),
+                sender_ratchet_key_fingerprint: Some(hex::encode(their_ephemeral.public_key_bytes())),
+                receive_chain_index_before: Some(receive_chain_index_before),
+                receive_chain_index_after: Some(counter.saturating_add(1)),
+                skipped_message_keys_used: Some(if receive_chain_index_before > counter { 1 } else { 0 }),
+                skipped_message_keys_stored: Some(counter.saturating_sub(receive_chain_index_before)),
+                ratchet_progression_kind: Some("receive_chain_index"),
+                ratchet_progression_value: Some(counter.saturating_add(1).into()),
+                ..Default::default()
+            },
+            || {
+                self.ratchet.consume_message_key(
+                    their_ephemeral,
+                    chain_key,
+                    counter,
+                    original_message_type,
+                    &sender_address.to_string(),
+                )
+            },
         )?;
 
         // SPQR recv — compute key but don't commit state yet
         let spqr::Recv {
             state: new_pqr_state,
             key: pqr_key,
-        } = spqr::recv(&self.pqr_state, ciphertext.pq_ratchet()).map_err(|e| match e {
-            spqr::Error::StateDecode => SignalProtocolError::InvalidState(
-                "decrypt",
-                format!("post-quantum ratchet error: {e}"),
-            ),
-            _ => {
-                log::info!("post-quantum ratchet error in decrypt: {e}");
-                SignalProtocolError::InvalidMessage(
-                    original_message_type,
-                    "post-quantum ratchet error",
-                )
-            }
-        })?;
+        } = profiling::measure_result_with(
+            "signal_ratchet_spqr_recv",
+            SpanMetadata {
+                spqr_step_performed: Some(true),
+                ..Default::default()
+            },
+            || {
+                spqr::recv(&self.pqr_state, ciphertext.pq_ratchet()).map_err(|e| match e {
+                    spqr::Error::StateDecode => SignalProtocolError::InvalidState(
+                        "decrypt",
+                        format!("post-quantum ratchet error: {e}"),
+                    ),
+                    _ => {
+                        log::info!("post-quantum ratchet error in decrypt: {e}");
+                        SignalProtocolError::InvalidMessage(
+                            original_message_type,
+                            "post-quantum ratchet error",
+                        )
+                    }
+                })
+            },
+        )?;
 
         // Derive final message keys by mixing DR chain key with SPQR key
         let message_keys = message_key_gen.generate_keys(pqr_key);
@@ -272,10 +346,19 @@ impl TripleRatchet {
         }
 
         // AES-CBC decrypt
-        let ptext = match signal_crypto::aes_256_cbc_decrypt(
-            ciphertext.body(),
-            message_keys.cipher_key(),
-            message_keys.iv(),
+        let ptext = match profiling::measure_result_with(
+            "signal_message_aead_decrypt",
+            SpanMetadata {
+                ciphertext_bytes: Some(ciphertext.body().len()),
+                ..Default::default()
+            },
+            || {
+                signal_crypto::aes_256_cbc_decrypt(
+                    ciphertext.body(),
+                    message_keys.cipher_key(),
+                    message_keys.iv(),
+                )
+            },
         ) {
             Ok(ptext) => ptext,
             Err(signal_crypto::DecryptionError::BadKeyOrIv) => {

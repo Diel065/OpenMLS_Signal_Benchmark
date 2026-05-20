@@ -274,6 +274,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Build Docker images before running the benchmark",
     )
     p.add_argument(
+        "--build-external-binaries",
+        action="store_true",
+        help="Cross-compile worker binaries for external devices via cargo --profile minsize",
+    )
+    p.add_argument(
         "--keep-stack-up",
         action="store_true",
         help="Do not run docker compose down at the end",
@@ -2172,6 +2177,7 @@ def launch_external_devices(
             listen_addr=listen_addr,
             run_id=run_id,
             scenario=args.scenario,
+            scenario_seed=args.singleton_selection_seed,
             profile_path_template=profile_template,
             remote_results_root=remote_results_root,
             remote_tmp=remote_tmp,
@@ -2460,9 +2466,10 @@ def collect_cpu_metadata() -> dict:
 def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
     external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
     metadata = {
-        "profile_schema_version": 2,
+        "profile_schema_version": 3,
         "run_id": run_id,
         "scenario": scenario,
+        "scenario_seed": args.singleton_selection_seed,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "benchmark_profile": {
             "workers": args.workers,
@@ -2660,6 +2667,40 @@ def main() -> int:
                 ["docker", "build", "--target", "runner-runtime", "-t", "signal-runner", "."],
                 cwd=root,
             )
+
+        if args.build_external_binaries:
+            devices_file = Path(args.devices_file) if args.devices_file else root / "devices.yaml"
+            if not devices_file.is_absolute():
+                devices_file = root / devices_file
+            if not devices_file.exists():
+                raise RuntimeError(f"Devices file not found: {devices_file}")
+            from external_devices import load_devices_config
+            configs = load_devices_config(devices_file)
+            enabled = [c for c in configs if c.enabled]
+            if args.external_device_ids:
+                enabled = [c for c in enabled if c.id in args.external_device_ids]
+            built = []
+            for config in enabled:
+                rust_target = config.target.get("rust_target")
+                if not rust_target:
+                    print(f"[build] WARNING: device '{config.id}' has no rust_target, skipping")
+                    continue
+                print(f"[build] Cross-compiling worker for device '{config.id}' ({rust_target}) ...")
+                build_env = {
+                    **os.environ,
+                    "RUSTFLAGS": "-C linker=rust-lld",
+                    "CC_aarch64_unknown_linux_musl": "aarch64-linux-gnu-gcc",
+                }
+                run_cmd(
+                    ["cargo", "build", "--profile", "minsize", "--target", rust_target, "--bin", "worker"],
+                    cwd=root,
+                    env=build_env,
+                )
+                built.append(config.id)
+            if built:
+                print(f"[build] Built external worker binaries for: {', '.join(built)}")
+            else:
+                print("[build] No external device binaries were built")
 
         generator_cmd = [
             sys.executable,

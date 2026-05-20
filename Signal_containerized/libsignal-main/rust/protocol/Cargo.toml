@@ -41,12 +41,15 @@ prost = { workspace = true }
 rand = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 sha2 = { workspace = true }
 spqr = { workspace = true }
 subtle = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
 zerocopy = { workspace = true, features = ["derive"] }
+cpu-time = "1.0"
+allocation-counter = "0.8.1"
 
 [features]
 kyber768 = ["libcrux-ml-kem/kyber", "libcrux-ml-kem/mlkem768"]

@@ -35,6 +35,7 @@ pub mod kem;
 pub mod pqxdh;
 mod proto;
 mod protocol;
+pub mod profiling;
 mod ratchet;
 mod sealed_sender;
 mod sender_keys;

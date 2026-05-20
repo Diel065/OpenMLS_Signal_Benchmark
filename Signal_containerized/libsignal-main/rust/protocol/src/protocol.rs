@@ -143,6 +143,11 @@ impl SignalMessage {
     }
 
     #[inline]
+    pub fn previous_counter(&self) -> u32 {
+        self.previous_counter
+    }
+
+    #[inline]
     pub fn pq_ratchet(&self) -> &spqr::SerializedMessage {
         &self.pq_ratchet
     }

@@ -40,6 +40,7 @@ class WorkerLaunch:
     listen_addr: str
     run_id: str
     scenario: str
+    scenario_seed: int
     profile_path_template: str
     remote_results_root: str
     remote_tmp: str
@@ -348,6 +349,7 @@ class AdbDeviceBackend(DeviceBackend):
                 "SIGNAL_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
                 "SIGNAL_PROFILE_RUN_ID": launch.run_id,
                 "SIGNAL_PROFILE_SCENARIO": launch.scenario,
+                "SIGNAL_PROFILE_SCENARIO_SEED": str(launch.scenario_seed),
             }
             if launch.node_name:
                 env["SIGNAL_PROFILE_NODE"] = launch.node_name
@@ -654,6 +656,7 @@ class SshDeviceBackend(DeviceBackend):
                 "SIGNAL_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
                 "SIGNAL_PROFILE_RUN_ID": launch.run_id,
                 "SIGNAL_PROFILE_SCENARIO": launch.scenario,
+                "SIGNAL_PROFILE_SCENARIO_SEED": str(launch.scenario_seed),
             }
             if launch.node_name:
                 env["SIGNAL_PROFILE_NODE"] = launch.node_name

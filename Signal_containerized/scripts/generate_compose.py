@@ -810,6 +810,7 @@ def generate_compose_text(
     lines.append("  environment:")
     lines.append(f"    SIGNAL_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    SIGNAL_PROFILE_SCENARIO: {args.scenario}")
+    lines.append(f"    SIGNAL_PROFILE_SCENARIO_SEED: {args.singleton_selection_seed}")
     lines.append("    SIGNAL_DEBUG_LOGS: ${SIGNAL_DEBUG_LOGS:-}")
     lines.append("    SIGNAL_WORKER_DEBUG_IDS: ${SIGNAL_WORKER_DEBUG_IDS:-}")
     lines.append("    SIGNAL_WORKER_COMMAND_QUEUE_CAPACITY: ${SIGNAL_WORKER_COMMAND_QUEUE_CAPACITY:-}")
@@ -898,6 +899,7 @@ def generate_compose_text(
         lines.append("    environment:")
         lines.append(f"      SIGNAL_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      SIGNAL_PROFILE_SCENARIO: {args.scenario}")
+        lines.append(f"      SIGNAL_PROFILE_SCENARIO_SEED: {args.singleton_selection_seed}")
 
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
             profile_csv = ",".join(pw.profile_enabled_client_ids)

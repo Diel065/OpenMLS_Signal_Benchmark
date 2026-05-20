@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use axum::{
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
             get(get_one_time_prekeys_consumed),
         )
         .route("/prekey-bundle/{participant}", delete(remove_participant))
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
     println!("[KR] Listening on http://{}", addr);
