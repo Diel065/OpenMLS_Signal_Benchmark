@@ -6,7 +6,7 @@ use clap::ArgAction;
 
 use mls_playground::staircase_runner::{
     parse_worker_layout, parse_worker_specs, run_staircase_benchmark, workers_from_layout,
-    StaircaseConfig,
+    PayloadSizes, StaircaseConfig, StepSize,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -38,8 +38,8 @@ struct Args {
     #[arg(long)]
     max_size: Option<usize>,
 
-    #[arg(long, default_value_t = 1)]
-    step_size: usize,
+    #[arg(long, default_value = "1")]
+    step_size: StepSize,
 
     #[arg(long, default_value_t = 1)]
     roundtrips: usize,
@@ -60,8 +60,8 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     max_app_samples_per_payload: usize,
 
-    #[arg(long, value_delimiter = ',', default_value = "32,256,1024,4096")]
-    payload_sizes: Vec<usize>,
+    #[arg(long, default_value = "32,256,1024,4096")]
+    payload_sizes: PayloadSizes,
 
     #[arg(long, default_value_t = 1)]
     scenario_seed: u64,

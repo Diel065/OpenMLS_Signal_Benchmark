@@ -20,6 +20,36 @@ pub struct SignalProfileEvent {
     #[serde(default)]
     pub error_class: Option<String>,
     #[serde(default)]
+    pub runner_event_kind: Option<String>,
+    #[serde(default)]
+    pub failed_worker_id: Option<String>,
+    #[serde(default)]
+    pub failed_physical_worker_id: Option<String>,
+    #[serde(default)]
+    pub failure_detail: Option<String>,
+    #[serde(default)]
+    pub failure_evidence_source: Option<String>,
+    #[serde(default)]
+    pub failure_evidence_detail: Option<String>,
+    #[serde(default)]
+    pub failure_action: Option<String>,
+    #[serde(default)]
+    pub reassigned_to_worker_id: Option<String>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
     pub participant_id: Option<String>,
     #[serde(default)]
     pub participant_device_id: Option<u32>,
@@ -57,6 +87,14 @@ pub struct SignalProfileEvent {
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
     pub prekey_bundle_count: Option<usize>,
+    #[serde(default)]
+    pub prekey_stock_before: Option<usize>,
+    #[serde(default)]
+    pub prekey_stock_after: Option<usize>,
+    #[serde(default)]
+    pub prekey_refill_count: Option<usize>,
+    #[serde(default)]
+    pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
     pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
@@ -142,6 +180,21 @@ pub struct SignalCsvRow<'a> {
     pub event_subtype: String,
     pub success: bool,
     pub error_class: Option<String>,
+    pub runner_event_kind: Option<String>,
+    pub failed_worker_id: Option<String>,
+    pub failed_physical_worker_id: Option<String>,
+    pub failure_detail: Option<String>,
+    pub failure_evidence_source: Option<String>,
+    pub failure_evidence_detail: Option<String>,
+    pub failure_action: Option<String>,
+    pub reassigned_to_worker_id: Option<String>,
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
     pub participant_id: Option<String>,
     pub participant_device_id: Option<u32>,
     pub role: Option<String>,
@@ -164,6 +217,10 @@ pub struct SignalCsvRow<'a> {
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
     pub prekey_bundle_count: Option<usize>,
+    pub prekey_stock_before: Option<usize>,
+    pub prekey_stock_after: Option<usize>,
+    pub prekey_refill_count: Option<usize>,
+    pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
     pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,

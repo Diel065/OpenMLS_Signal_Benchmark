@@ -84,7 +84,7 @@ leaves one Docker worker idle. `--enable-external-devices` requires
 
 The Signal benchmark is a pairwise fan-out benchmark. Each application send encrypts one pairwise Signal message per recipient and publishes those messages through the relay. It is not a Sender Keys group messaging benchmark unless a future runner explicitly switches to Sender Keys and labels those rows separately.
 
-Current session establishment uses PQXDH. Classical X3DH-only handshakes are not faked; rows should be filtered with `handshake_protocol=pqxdh` when studying setup cost. The key repository now distinguishes classical one-time prekeys, signed classical prekeys, one-time signed PQ prekeys, and the signed PQ last-resort prekey. The server hands out one-time classical and one-time PQ material first, then falls back to no classical one-time prekey plus the PQ last-resort prekey.
+Current session establishment uses PQXDH. Classical X3DH-only handshakes are not faked; rows should be filtered with `handshake_protocol=pqxdh` when studying setup cost. The key repository distinguishes classical one-time prekeys, signed classical prekeys, one-time signed PQ prekeys, and the signed PQ last-resort prekey. Each recipient device uploads a small initial stock for itself. The server hands out one-time classical and one-time PQ material first, then falls back to no classical one-time prekey plus the PQ last-resort prekey. After a recipient accepts an inbound initial session, its worker performs its own low-watermark stock check and uploads a measured OPK refill batch when its published stock is low; the runner does not pre-generate key material for the future staircase size.
 
 Scientific protocol rows are emitted from `libsignal-main` with `profile_schema_version=3`, `span_layer=libsignal_main`, and `measurement_class=protocol`. Wrapper rows are emitted by the benchmark worker with `span_layer=benchmark_wrapper` and `measurement_class=wrapper`; they include queueing, HTTP, relay, serialization, repository, and command bookkeeping and must not be compared to OpenMLS library-internal spans.
 
@@ -92,6 +92,7 @@ Protocol event names:
 
 - `pqxdh_initiator_process_bundle_protocol`: initiator processes a fetched PQXDH prekey bundle inside libsignal.
 - `pqxdh_responder_receive_prekey_message_protocol`: responder processes the first `PreKeySignalMessage` and establishes its session.
+- `signal_update_opks_generate_protocol`: recipient generates its own OPK/PQ-OPK publication batch through the libsignal profiling layer for initial upload or low-watermark refill.
 - `signal_message_encrypt_protocol`: libsignal message encryption entry point.
 - `signal_message_decrypt_protocol`: libsignal ordinary `SignalMessage` decrypt entry point.
 - `signal_ratchet_send_chain_advance`: send-chain key advancement.
@@ -100,7 +101,7 @@ Protocol event names:
 - `signal_ratchet_spqr_send` and `signal_ratchet_spqr_recv`: SPQR ratchet work on send and receive.
 - `signal_message_aead_encrypt` and `signal_message_aead_decrypt`: AEAD protection/recovery for message payloads.
 
-Non-protocol wrapper/helper event names include `participant_register_lifecycle`, `prekey_store_local_material`, `prekey_publish_bundle_batch_repository_io`, `session_establish_pair_wrapper`, `pairwise_fanout_send_wrapper`, `pairwise_fanout_receive_wrapper`, `relay_drain_wrapper`, `participant_state_inspection_wrapper`, and `participant_remove_lifecycle`. Treat these as operational rows, not cryptographic protocol costs.
+Non-protocol wrapper/helper event names include `participant_register_lifecycle`, `prekey_store_local_material`, `prekey_publish_bundle_batch_repository_io`, `prekey_update_opks_repository_io`, `session_establish_pair_wrapper`, `pairwise_fanout_send_wrapper`, `pairwise_fanout_receive_wrapper`, `relay_drain_wrapper`, `participant_state_inspection_wrapper`, and `participant_remove_lifecycle`. Treat these as operational rows, not cryptographic protocol costs.
 
 To filter scientific rows from `events.csv`, require:
 
@@ -134,6 +135,8 @@ The deprecated `ratchet_step_count` column is retained only for old-schema compa
 ## Prekey And Ciphertext Metadata
 
 PQXDH rows expose `classical_one_time_prekey_present`, `classical_one_time_prekey_id`, `signed_prekey_id`, `pq_prekey_id`, `pq_prekey_type`, and `pq_prekey_signature_present`. `pq_prekey_type=one_time` and `pq_prekey_type=last_resort` are separate paths and must not be pooled unless the analysis explicitly intends to combine them.
+
+OPK stock rows expose `prekey_stock_before`, `prekey_stock_after`, `prekey_refill_count`, and `prekey_refill_trigger`. The default recipient policy is an initial stock of 16, refill batches of 16, and a low watermark of 4. Docker workers can override that policy with `SIGNAL_INITIAL_ONE_TIME_PREKEY_COUNT`, `SIGNAL_ONE_TIME_PREKEY_REFILL_COUNT`, and `SIGNAL_ONE_TIME_PREKEY_LOW_WATERMARK`.
 
 Initial session setup is explicit: the initiator processes a bundle, encrypts a deterministic initial message, and the responder decrypts that `PreKeySignalMessage`. Later application messages should appear as ordinary `SignalMessage` rows.
 

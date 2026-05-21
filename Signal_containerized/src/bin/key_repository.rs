@@ -12,7 +12,7 @@ use axum::{
 
 use signal_benchmark::debug::debug_logs_enabled;
 use signal_benchmark::key_repository::{
-    KeyRepository, PrekeyBundleBatchStorable, PrekeyBundleStorable,
+    KeyRepository, PrekeyBundleBatchStorable, PrekeyBundleStorable, PrekeyStock,
 };
 
 type SharedKr = Arc<KeyRepository>;
@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
             "/prekey-bundle/{participant}/consumed",
             get(get_one_time_prekeys_consumed),
         )
+        .route("/prekey-bundle/{participant}/stock", get(get_prekey_stock))
         .route("/prekey-bundle/{participant}", delete(remove_participant))
         .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
@@ -154,6 +155,16 @@ async fn get_one_time_prekeys_consumed(
     let count = state.one_time_prekeys_consumed(&participant);
     metrics.finish(false);
     Json(serde_json::json!({ "participant": participant, "consumed": count }))
+}
+
+async fn get_prekey_stock(
+    State(state): State<SharedKr>,
+    Path(participant): Path<String>,
+) -> Json<PrekeyStock> {
+    let metrics = state.metrics().start("get_prekey_stock");
+    let stock = state.prekey_stock(&participant);
+    metrics.finish(false);
+    Json(stock)
 }
 
 async fn remove_participant(

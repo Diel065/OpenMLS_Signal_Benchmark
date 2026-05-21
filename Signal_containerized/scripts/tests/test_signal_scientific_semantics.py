@@ -62,6 +62,10 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "ram_rss_delta_bytes",
         "ram_rss_utilization",
         "artifact_size_bytes",
+        "prekey_stock_before",
+        "prekey_stock_after",
+        "prekey_refill_count",
+        "prekey_refill_trigger",
         "plaintext_bytes",
         "ciphertext_bytes",
         "handshake_protocol",
@@ -115,6 +119,7 @@ def test_required_protocol_event_names_are_inside_libsignal() -> None:
         read(path)
         for path in [
             "Signal_containerized/libsignal-main/rust/protocol/src/session.rs",
+            "Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs",
             "Signal_containerized/libsignal-main/rust/protocol/src/session_management.rs",
             "Signal_containerized/libsignal-main/rust/protocol/src/triple_ratchet.rs",
             "Signal_containerized/libsignal-main/rust/protocol/src/double_ratchet.rs",
@@ -123,6 +128,7 @@ def test_required_protocol_event_names_are_inside_libsignal() -> None:
     required_events = [
         "pqxdh_initiator_process_bundle_protocol",
         "pqxdh_responder_receive_prekey_message_protocol",
+        "signal_update_opks_generate_protocol",
         "signal_message_encrypt_protocol",
         "signal_message_decrypt_protocol",
         "signal_ratchet_send_chain_advance",
@@ -168,7 +174,8 @@ def test_pqxdh_prekey_paths_are_distinguishable() -> None:
     key_repo = read("Signal_containerized/src/key_repository.rs")
     session = read("Signal_containerized/libsignal-main/rust/protocol/src/session.rs")
     session_management = read("Signal_containerized/libsignal-main/rust/protocol/src/session_management.rs")
-    assert "one_time_pq_prekey_records" in participant
+    assert "generate_replenishment_prekey_bundles" in participant
+    assert "generate_kyber_prekey_record" in participant
     assert "last_resort_pq_prekey_record" in participant
     assert 'pq_prekey_type: "one_time".to_string()' in key_repo
     assert 'pq_prekey_type: "last_resort".to_string()' in key_repo
@@ -187,6 +194,20 @@ def test_initial_and_ordinary_message_paths_are_separate() -> None:
     assert 'ciphertext_message_type: Some("SignalMessage")' in session_management
     assert "pqxdh_responder_receive_prekey_message_protocol" in session_management
     assert "signal_message_decrypt_protocol" in session_management
+
+
+def test_opk_stock_is_recipient_owned_and_dynamic() -> None:
+    participant = read("Signal_containerized/src/signal_participant.rs")
+    worker_api = read("Signal_containerized/src/worker_api.rs")
+    runner = read("Signal_containerized/src/staircase_runner.rs")
+    key_repo = read("Signal_containerized/src/key_repository.rs")
+    assert "DEFAULT_ONE_TIME_PREKEY_COUNT" not in participant
+    assert "SIGNAL_INITIAL_ONE_TIME_PREKEY_COUNT" in participant
+    assert "generate_replenishment_prekey_bundles" in participant
+    assert "UpdateOneTimePrekeys" in worker_api
+    assert "published_prekey_stock" in worker_api
+    assert "prekey.maintenance_after_handshake" in runner
+    assert "prekey_stock" in key_repo
 
 
 def test_synthetic_ratchet_counts_are_not_emitted() -> None:
@@ -227,6 +248,7 @@ def main() -> int:
         test_protocol_rows_have_required_identity_and_metrics_fields,
         test_pqxdh_prekey_paths_are_distinguishable,
         test_initial_and_ordinary_message_paths_are_separate,
+        test_opk_stock_is_recipient_owned_and_dynamic,
         test_synthetic_ratchet_counts_are_not_emitted,
         test_pairwise_fanout_is_not_labeled_sender_keys,
     ]

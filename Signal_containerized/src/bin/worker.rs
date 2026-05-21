@@ -409,6 +409,18 @@ fn signal_event_context(
             peer_count: None,
             phase: None,
         },
+        Command::UpdateOneTimePrekeys => SignalEventContext {
+            measurement_class: "wrapper",
+            event_family: "prekey_maintenance",
+            event_subtype: "prekey_update_opks_repository_io",
+            event_side: Some("publisher"),
+            direction: Some("outbound"),
+            role: Some("prekey_publisher"),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: None,
+            phase: None,
+        },
         Command::EstablishSessions { participants } => SignalEventContext {
             measurement_class: "wrapper",
             event_family: "session_establishment",
@@ -611,6 +623,10 @@ async fn participant_command_actor(
                     participant_count: metrics.participant_count,
                     conversation_size: metrics.conversation_size,
                     prekey_bundle_count: metrics.prekey_bundle_count,
+                    prekey_stock_before: metrics.prekey_stock_before,
+                    prekey_stock_after: metrics.prekey_stock_after,
+                    prekey_refill_count: metrics.prekey_refill_count,
+                    prekey_refill_trigger: metrics.prekey_refill_trigger,
                     session_count: metrics.session_count,
                     ratchet_step_count: metrics.ratchet_step_count,
                     ciphertext_bytes: metrics.ciphertext_bytes,
@@ -648,6 +664,7 @@ async fn participant_command_actor(
                     node_name: env_nonempty("SIGNAL_PROFILE_NODE")
                         .or_else(|| Some(physical_worker_id.clone())),
                     pod_name: env_nonempty("HOSTNAME").or_else(|| Some(physical_worker_id.clone())),
+                    ..SignalProfileEvent::default()
                 };
                 if let Ok(json_line) = serde_json::to_string(&event) {
                     let _ = std::io::Write::write(&mut file, json_line.as_bytes());

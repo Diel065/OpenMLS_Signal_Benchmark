@@ -9,7 +9,7 @@ use cpu_time::ThreadTime;
 use libsignal_core::DeviceId;
 use libsignal_protocol::kem;
 use libsignal_protocol::{
-    KyberPreKeyId, PreKeyId, PreKeySignalMessage, SignalMessage, SignedPreKeyId,
+    KyberPreKeyId, PreKeyBundle, PreKeyId, PreKeySignalMessage, SignalMessage, SignedPreKeyId,
 };
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
@@ -19,7 +19,7 @@ use crate::http_retry::{
     retry_transient_http_async, RetryDecision,
 };
 use crate::key_repository::{
-    OneTimePrekeyStorable, PrekeyBundleBatchStorable, PrekeyBundleStorable,
+    OneTimePrekeyStorable, PrekeyBundleBatchStorable, PrekeyBundleStorable, PrekeyStock,
 };
 use crate::signal_participant::SignalParticipant;
 
@@ -29,6 +29,7 @@ pub enum Command {
     RegisterParticipant,
     GeneratePrekeyBundle,
     PublishPrekeyBundle,
+    UpdateOneTimePrekeys,
     EstablishSessions {
         participants: Vec<String>,
     },
@@ -59,6 +60,7 @@ impl Command {
             Command::RegisterParticipant => "RegisterParticipant",
             Command::GeneratePrekeyBundle => "GeneratePrekeyBundle",
             Command::PublishPrekeyBundle => "PublishPrekeyBundle",
+            Command::UpdateOneTimePrekeys => "UpdateOneTimePrekeys",
             Command::EstablishSessions { .. } => "EstablishSessions",
             Command::EncryptMessage { .. } => "EncryptMessage",
             Command::DecryptMessage { .. } => "DecryptMessage",
@@ -74,6 +76,7 @@ impl Command {
             Command::RegisterParticipant
                 | Command::GeneratePrekeyBundle
                 | Command::PublishPrekeyBundle
+                | Command::UpdateOneTimePrekeys
                 | Command::EstablishSessions { .. }
                 | Command::EncryptMessage { .. }
                 | Command::DecryptMessage { .. }
@@ -140,6 +143,10 @@ pub struct CommandMetrics {
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
     pub prekey_bundle_count: Option<usize>,
+    pub prekey_stock_before: Option<usize>,
+    pub prekey_stock_after: Option<usize>,
+    pub prekey_refill_count: Option<usize>,
+    pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
     pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
@@ -951,6 +958,73 @@ async fn process_pending(
     }
 }
 
+fn prekey_bundle_batch(bundles: &[PreKeyBundle]) -> Result<PrekeyBundleBatchStorable> {
+    let first = bundles
+        .first()
+        .ok_or_else(|| anyhow!("no prekey bundles generated"))?;
+    let mut one_time_prekeys = Vec::new();
+    let mut signed_prekey_fallback = false;
+    let mut last_resort_pq_prekey_id = None;
+    let mut last_resort_pq_prekey_public = None;
+    let mut last_resort_pq_prekey_signature = None;
+
+    for bundle in bundles {
+        let pq_prekey_id: u32 = bundle.kyber_pre_key_id()?.into();
+        let pq_prekey_public = bundle.kyber_pre_key_public()?.serialize().to_vec();
+        let pq_prekey_signature = bundle.kyber_pre_key_signature()?.to_vec();
+        match (bundle.pre_key_id()?, bundle.pre_key_public()?) {
+            (Some(prekey_id), Some(prekey_public)) => {
+                one_time_prekeys.push(OneTimePrekeyStorable {
+                    prekey_id: prekey_id.into(),
+                    prekey_public: prekey_public.serialize().to_vec(),
+                    pq_prekey_id,
+                    pq_prekey_public,
+                    pq_prekey_signature,
+                });
+            }
+            (None, None) => {
+                signed_prekey_fallback = true;
+                last_resort_pq_prekey_id = Some(pq_prekey_id);
+                last_resort_pq_prekey_public = Some(pq_prekey_public);
+                last_resort_pq_prekey_signature = Some(pq_prekey_signature);
+            }
+            (Some(id), None) => {
+                return Err(anyhow!("prekey_id {} was present without public key", id));
+            }
+            (None, Some(_)) => {
+                return Err(anyhow!("prekey public key was present without id"));
+            }
+        }
+    }
+
+    Ok(PrekeyBundleBatchStorable {
+        registration_id: first.registration_id()?,
+        device_id: first.device_id()?.into(),
+        signed_prekey_id: first.signed_pre_key_id()?.into(),
+        signed_prekey_public: first.signed_pre_key_public()?.serialize().to_vec(),
+        signed_prekey_signature: first.signed_pre_key_signature()?.to_vec(),
+        identity_key_public: first.identity_key()?.public_key().serialize().to_vec(),
+        last_resort_pq_prekey_id: last_resort_pq_prekey_id
+            .ok_or_else(|| anyhow!("no last-resort PQ prekey bundle generated"))?,
+        last_resort_pq_prekey_public: last_resort_pq_prekey_public
+            .ok_or_else(|| anyhow!("no last-resort PQ prekey public key generated"))?,
+        last_resort_pq_prekey_signature: last_resort_pq_prekey_signature
+            .ok_or_else(|| anyhow!("no last-resort PQ prekey signature generated"))?,
+        one_time_prekeys,
+        signed_prekey_fallback,
+    })
+}
+
+async fn published_prekey_stock(kr_url: &str, participant_id: &str) -> Result<PrekeyStock> {
+    kr_get_json(
+        kr_url,
+        &format!("/prekey-bundle/{participant_id}/stock"),
+        "prekey_stock",
+        participant_id,
+    )
+    .await
+}
+
 pub async fn handle_command(
     participant: &mut SignalParticipant,
     kr_url: &str,
@@ -971,61 +1045,12 @@ pub async fn handle_command(
             let (bundles, mut profile_metrics) =
                 measure_profile(|| participant.generate_prekey_bundles());
             let bundles = bundles?;
-            let first = bundles
-                .first()
-                .ok_or_else(|| anyhow!("no prekey bundles generated"))?;
-            let mut one_time_prekeys = Vec::new();
-            let mut signed_prekey_fallback = false;
-            let mut last_resort_pq_prekey_id = None;
-            let mut last_resort_pq_prekey_public = None;
-            let mut last_resort_pq_prekey_signature = None;
-            for bundle in &bundles {
-                let pq_prekey_id: u32 = bundle.kyber_pre_key_id()?.into();
-                let pq_prekey_public = bundle.kyber_pre_key_public()?.serialize().to_vec();
-                let pq_prekey_signature = bundle.kyber_pre_key_signature()?.to_vec();
-                match (bundle.pre_key_id()?, bundle.pre_key_public()?) {
-                    (Some(prekey_id), Some(prekey_public)) => {
-                        one_time_prekeys.push(OneTimePrekeyStorable {
-                            prekey_id: prekey_id.into(),
-                            prekey_public: prekey_public.serialize().to_vec(),
-                            pq_prekey_id,
-                            pq_prekey_public,
-                            pq_prekey_signature,
-                        });
-                    }
-                    (None, None) => {
-                        signed_prekey_fallback = true;
-                        last_resort_pq_prekey_id = Some(pq_prekey_id);
-                        last_resort_pq_prekey_public = Some(pq_prekey_public);
-                        last_resort_pq_prekey_signature = Some(pq_prekey_signature);
-                    }
-                    (Some(id), None) => {
-                        return Err(anyhow!("prekey_id {} was present without public key", id));
-                    }
-                    (None, Some(_)) => {
-                        return Err(anyhow!("prekey public key was present without id"));
-                    }
-                }
-            }
-            let batch = PrekeyBundleBatchStorable {
-                registration_id: first.registration_id()?,
-                device_id: first.device_id()?.into(),
-                signed_prekey_id: first.signed_pre_key_id()?.into(),
-                signed_prekey_public: first.signed_pre_key_public()?.serialize().to_vec(),
-                signed_prekey_signature: first.signed_pre_key_signature()?.to_vec(),
-                identity_key_public: first.identity_key()?.public_key().serialize().to_vec(),
-                last_resort_pq_prekey_id: last_resort_pq_prekey_id
-                    .ok_or_else(|| anyhow!("no last-resort PQ prekey bundle generated"))?,
-                last_resort_pq_prekey_public: last_resort_pq_prekey_public
-                    .ok_or_else(|| anyhow!("no last-resort PQ prekey public key generated"))?,
-                last_resort_pq_prekey_signature: last_resort_pq_prekey_signature
-                    .ok_or_else(|| anyhow!("no last-resort PQ prekey signature generated"))?,
-                one_time_prekeys,
-                signed_prekey_fallback,
-            };
+            let batch = prekey_bundle_batch(&bundles)?;
             let artifact_size_bytes = serde_json::to_vec(&batch)?.len();
             let bundle_count =
                 batch.one_time_prekeys.len() + usize::from(batch.signed_prekey_fallback);
+            let one_time_count = batch.one_time_prekeys.len();
+            let stock_before = published_prekey_stock(kr_url, &participant.name).await?;
             let path = format!("/prekey-bundles/{}", participant.name);
             kr_put_json(
                 kr_url,
@@ -1035,6 +1060,7 @@ pub async fn handle_command(
                 &participant.name,
             )
             .await?;
+            let stock_after = published_prekey_stock(kr_url, &participant.name).await?;
             Ok(CommandOutcome::new(
                 format!(
                     "prekey bundle generated and published for {}; bundles={}",
@@ -1043,6 +1069,11 @@ pub async fn handle_command(
                 {
                     profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
                     profile_metrics.prekey_bundle_count = Some(bundle_count);
+                    profile_metrics.prekey_stock_before = Some(stock_before.one_time_available);
+                    profile_metrics.prekey_stock_after = Some(stock_after.one_time_available);
+                    profile_metrics.prekey_refill_count = Some(one_time_count);
+                    profile_metrics.prekey_refill_trigger =
+                        Some("registration_initial_stock".to_string());
                     profile_metrics.participant_count = Some(1);
                     profile_metrics
                 },
@@ -1056,6 +1087,61 @@ pub async fn handle_command(
             profile_metrics.participant_count = Some(1);
             Ok(CommandOutcome::new(
                 format!("prekeys stored locally for {}", participant.name),
+                profile_metrics,
+            ))
+        }
+
+        Command::UpdateOneTimePrekeys => {
+            let stock_before = published_prekey_stock(kr_url, &participant.name).await?;
+            let threshold = participant.one_time_prekey_low_watermark();
+            if stock_before.one_time_available > threshold {
+                return Ok(CommandOutcome::new(
+                    format!(
+                        "one-time prekey stock for {} is above low watermark: available={} threshold={}",
+                        participant.name, stock_before.one_time_available, threshold
+                    ),
+                    CommandMetrics {
+                        participant_count: Some(1),
+                        prekey_stock_before: Some(stock_before.one_time_available),
+                        prekey_stock_after: Some(stock_before.one_time_available),
+                        prekey_refill_count: Some(0),
+                        prekey_refill_trigger: Some("stock_above_low_watermark".to_string()),
+                        ..Default::default()
+                    },
+                ));
+            }
+
+            let (bundles, mut profile_metrics) =
+                measure_profile(|| participant.generate_replenishment_prekey_bundles());
+            let bundles = bundles?;
+            let batch = prekey_bundle_batch(&bundles)?;
+            let artifact_size_bytes = serde_json::to_vec(&batch)?.len();
+            let refill_count = batch.one_time_prekeys.len();
+            let bundle_count = refill_count + usize::from(batch.signed_prekey_fallback);
+            kr_put_json(
+                kr_url,
+                &format!("/prekey-bundles/{}", participant.name),
+                &batch,
+                "update_one_time_prekeys",
+                &participant.name,
+            )
+            .await?;
+            let stock_after = published_prekey_stock(kr_url, &participant.name).await?;
+            profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
+            profile_metrics.prekey_bundle_count = Some(bundle_count);
+            profile_metrics.prekey_stock_before = Some(stock_before.one_time_available);
+            profile_metrics.prekey_stock_after = Some(stock_after.one_time_available);
+            profile_metrics.prekey_refill_count = Some(refill_count);
+            profile_metrics.prekey_refill_trigger = Some("low_watermark".to_string());
+            profile_metrics.participant_count = Some(1);
+            Ok(CommandOutcome::new(
+                format!(
+                    "one-time prekey stock updated for {}; before={} after={} refill={}",
+                    participant.name,
+                    stock_before.one_time_available,
+                    stock_after.one_time_available,
+                    refill_count,
+                ),
                 profile_metrics,
             ))
         }

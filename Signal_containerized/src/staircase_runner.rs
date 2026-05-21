@@ -1,14 +1,16 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     error::Error as StdError,
-    fs::{self, File},
+    fmt,
+    fs::{self, File, OpenOptions},
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -51,11 +53,11 @@ pub struct StaircaseConfig {
     pub workers: Vec<WorkerSpec>,
     pub min_size: usize,
     pub max_size: Option<usize>,
-    pub step_size: usize,
+    pub step_size: StepSize,
     pub roundtrips: usize,
     pub app_rounds: usize,
     pub max_app_samples_per_payload: usize,
-    pub payload_sizes: Vec<usize>,
+    pub payload_sizes: PayloadSizes,
     pub run_id: String,
     pub scenario: String,
     pub output_dir: String,
@@ -70,6 +72,182 @@ pub struct StaircaseConfig {
     pub profile_only_singletons: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StepSize {
+    Fixed(usize),
+    UniformRange { min: usize, max: usize },
+}
+
+impl StepSize {
+    fn sample<R: Rng + ?Sized>(&self, rng: &mut R) -> usize {
+        match self {
+            Self::Fixed(step_size) => *step_size,
+            Self::UniformRange { min, max } => rng.random_range(*min..=*max),
+        }
+    }
+
+    fn is_valid(&self) -> bool {
+        match self {
+            Self::Fixed(step_size) => *step_size > 0,
+            Self::UniformRange { min, .. } => *min > 0,
+        }
+    }
+}
+
+impl FromStr for StepSize {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((min, max)) = parse_uniform_range(value, "--step-size")? {
+            if min == 0 {
+                return Err("--step-size range minimum must be at least 1".to_string());
+            }
+            return Ok(Self::UniformRange { min, max });
+        }
+
+        let step_size = parse_usize(value, "--step-size")?;
+        if step_size == 0 {
+            return Err("--step-size must be at least 1".to_string());
+        }
+        Ok(Self::Fixed(step_size))
+    }
+}
+
+impl fmt::Display for StepSize {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fixed(step_size) => write!(formatter, "{step_size}"),
+            Self::UniformRange { min, max } => write!(formatter, "[{min},{max}]"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PayloadSizes {
+    Fixed(Vec<usize>),
+    UniformRange { min: usize, max: usize },
+}
+
+impl PayloadSizes {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Fixed(sizes) if sizes.is_empty())
+    }
+
+    fn source_count(&self) -> usize {
+        match self {
+            Self::Fixed(sizes) => sizes.len(),
+            Self::UniformRange { .. } => 1,
+        }
+    }
+
+    fn sources(&self) -> Vec<PayloadSizeSource> {
+        match self {
+            Self::Fixed(sizes) => sizes
+                .iter()
+                .copied()
+                .map(PayloadSizeSource::Fixed)
+                .collect(),
+            Self::UniformRange { min, max } => vec![PayloadSizeSource::UniformRange {
+                min: *min,
+                max: *max,
+            }],
+        }
+    }
+}
+
+impl FromStr for PayloadSizes {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        if let Some((min, max)) = parse_uniform_range(value, "--payload-sizes")? {
+            return Ok(Self::UniformRange { min, max });
+        }
+
+        let sizes = value
+            .split(',')
+            .map(|size| parse_usize(size, "--payload-sizes"))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        if sizes.is_empty() {
+            return Err("--payload-sizes requires at least one size".to_string());
+        }
+        Ok(Self::Fixed(sizes))
+    }
+}
+
+impl fmt::Display for PayloadSizes {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fixed(sizes) => {
+                let joined = sizes
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                formatter.write_str(&joined)
+            }
+            Self::UniformRange { min, max } => write!(formatter, "[{min},{max}]"),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PayloadSizeSource {
+    Fixed(usize),
+    UniformRange { min: usize, max: usize },
+}
+
+impl PayloadSizeSource {
+    fn sample<R: Rng + ?Sized>(self, rng: &mut R) -> usize {
+        match self {
+            Self::Fixed(size) => size,
+            Self::UniformRange { min, max } => rng.random_range(min..=max),
+        }
+    }
+
+    fn phase_label(self) -> String {
+        match self {
+            Self::Fixed(size) => format!("payload {size} B"),
+            Self::UniformRange { min, max } => format!("payload range [{min},{max}] B"),
+        }
+    }
+}
+
+fn parse_usize(value: &str, flag: &str) -> std::result::Result<usize, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(format!("{flag} contains an empty integer"));
+    }
+    value
+        .parse::<usize>()
+        .map_err(|_| format!("{flag} expected an integer, got '{value}'"))
+}
+
+fn parse_uniform_range(
+    value: &str,
+    flag: &str,
+) -> std::result::Result<Option<(usize, usize)>, String> {
+    let value = value.trim();
+    if !value.contains('[') && !value.contains(']') {
+        return Ok(None);
+    }
+    if !(value.starts_with('[') && value.ends_with(']')) {
+        return Err(format!("{flag} range must use [min,max], got '{value}'"));
+    }
+
+    let bounds = value[1..value.len() - 1].split(',').collect::<Vec<_>>();
+    if bounds.len() != 2 {
+        return Err(format!(
+            "{flag} range must contain exactly two integers, got '{value}'"
+        ));
+    }
+    let min = parse_usize(bounds[0], flag)?;
+    let max = parse_usize(bounds[1], flag)?;
+    if min > max {
+        return Err(format!("{flag} range minimum {min} exceeds maximum {max}"));
+    }
+    Ok(Some((min, max)))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -190,6 +368,291 @@ impl WorkerSpec {
             profile_enabled: true,
         }
     }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct OomEvidence {
+    #[serde(default)]
+    ts_unix_ns: Option<u128>,
+    #[serde(default)]
+    source: String,
+    #[serde(default)]
+    worker_id: Option<String>,
+    #[serde(default)]
+    physical_worker_id: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
+impl OomEvidence {
+    fn matches(&self, worker: &WorkerSpec) -> bool {
+        self.worker_id.as_deref() == Some(worker.id.as_str())
+            || self.physical_worker_id.as_deref() == Some(worker.physical_worker_id.as_str())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BenchmarkCursor {
+    plateau_index: usize,
+    target_size: usize,
+    active_size: usize,
+    phase: String,
+    operation: String,
+    operation_seq: Option<usize>,
+    payload_size: Option<usize>,
+}
+
+impl BenchmarkCursor {
+    fn new(
+        plateau_index: usize,
+        target_size: usize,
+        active_size: usize,
+        phase: &str,
+        operation: &str,
+    ) -> Self {
+        Self {
+            plateau_index,
+            target_size,
+            active_size,
+            phase: phase.to_string(),
+            operation: operation.to_string(),
+            operation_seq: None,
+            payload_size: None,
+        }
+    }
+
+    fn at_operation(mut self, operation_seq: usize, payload_size: Option<usize>) -> Self {
+        self.operation_seq = Some(operation_seq);
+        self.payload_size = payload_size;
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunnerEvent {
+    profile_schema_version: u32,
+    ts_unix_ns: u128,
+    event_kind: String,
+    failed_worker_id: String,
+    failed_physical_worker_id: String,
+    failure_class: String,
+    failure_detail: String,
+    failure_evidence_source: Option<String>,
+    failure_evidence_detail: Option<String>,
+    failure_action: String,
+    reassigned_to_worker_id: Option<String>,
+    benchmark_plateau_index: usize,
+    benchmark_target_size: usize,
+    benchmark_active_size: usize,
+    benchmark_phase: String,
+    benchmark_operation: String,
+    benchmark_operation_seq: Option<usize>,
+    benchmark_payload_size: Option<usize>,
+}
+
+struct RunnerEventLog {
+    path: PathBuf,
+    oom_evidence_path: PathBuf,
+    run_dir: PathBuf,
+}
+
+impl RunnerEventLog {
+    fn new(run_dir: &Path) -> Self {
+        Self {
+            path: run_dir.join("runner-events.jsonl"),
+            oom_evidence_path: run_dir.join("oom_events.jsonl"),
+            run_dir: run_dir.to_path_buf(),
+        }
+    }
+
+    async fn find_oom_evidence(&self, worker: &WorkerSpec) -> Option<OomEvidence> {
+        // The Python monitors flush cgroup and dmesg evidence asynchronously.
+        for attempt in 0..6 {
+            if let Some(evidence) = latest_oom_evidence_for(&self.oom_evidence_path, worker) {
+                return Some(evidence);
+            }
+            if attempt < 5 {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        None
+    }
+
+    fn record_oom_failure(
+        &self,
+        cursor: &BenchmarkCursor,
+        worker: &WorkerSpec,
+        error: &anyhow::Error,
+        evidence: &OomEvidence,
+        action: &str,
+        reassigned_to: Option<&WorkerSpec>,
+    ) -> Result<()> {
+        let event = RunnerEvent {
+            profile_schema_version: 3,
+            ts_unix_ns: unix_time_ns(),
+            event_kind: "worker_failure".to_string(),
+            failed_worker_id: worker.id.clone(),
+            failed_physical_worker_id: worker.physical_worker_id.clone(),
+            failure_class: "oom_kill".to_string(),
+            failure_detail: format!("{:#}", error),
+            failure_evidence_source: non_empty_string(&evidence.source),
+            failure_evidence_detail: evidence.detail.clone(),
+            failure_action: action.to_string(),
+            reassigned_to_worker_id: reassigned_to.map(|candidate| candidate.id.clone()),
+            benchmark_plateau_index: cursor.plateau_index,
+            benchmark_target_size: cursor.target_size,
+            benchmark_active_size: cursor.active_size,
+            benchmark_phase: cursor.phase.clone(),
+            benchmark_operation: cursor.operation.clone(),
+            benchmark_operation_seq: cursor.operation_seq,
+            benchmark_payload_size: cursor.payload_size,
+        };
+        let mut out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("Failed to open runner event log {}", self.path.display()))?;
+        serde_json::to_writer(&mut out, &event)?;
+        writeln!(out)?;
+        let profile_path = self
+            .run_dir
+            .join(format!("participant-{}.jsonl", worker.id));
+        if let Err(profile_error) =
+            append_signal_profile_event(&profile_path, &event.to_profile_event())
+        {
+            eprintln!(
+                "[oom-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
+                worker.id,
+                profile_error,
+                self.path.display()
+            );
+        }
+        eprintln!(
+            "[oom-attrition] worker={} physical_worker={} phase={} operation={} action={}",
+            worker.id, worker.physical_worker_id, cursor.phase, cursor.operation, action
+        );
+        Ok(())
+    }
+}
+
+impl RunnerEvent {
+    fn to_profile_event(&self) -> SignalProfileEvent {
+        SignalProfileEvent {
+            profile_schema_version: self.profile_schema_version,
+            ts_unix_ns: self.ts_unix_ns,
+            op: "benchmark.worker_failure".to_string(),
+            span_layer: "benchmark_runner".to_string(),
+            protocol_stack: "signal".to_string(),
+            implementation: "benchmark_runner".to_string(),
+            measurement_class: "runner_failure".to_string(),
+            event_family: "worker_lifecycle".to_string(),
+            event_subtype: "oom_kill".to_string(),
+            error_class: Some(self.failure_class.clone()),
+            runner_event_kind: Some(self.event_kind.clone()),
+            failed_worker_id: Some(self.failed_worker_id.clone()),
+            failed_physical_worker_id: Some(self.failed_physical_worker_id.clone()),
+            failure_detail: Some(self.failure_detail.clone()),
+            failure_evidence_source: self.failure_evidence_source.clone(),
+            failure_evidence_detail: self.failure_evidence_detail.clone(),
+            failure_action: Some(self.failure_action.clone()),
+            reassigned_to_worker_id: self.reassigned_to_worker_id.clone(),
+            benchmark_plateau_index: Some(self.benchmark_plateau_index),
+            benchmark_target_size: Some(self.benchmark_target_size),
+            benchmark_active_size: Some(self.benchmark_active_size),
+            benchmark_phase: Some(self.benchmark_phase.clone()),
+            benchmark_operation: Some(self.benchmark_operation.clone()),
+            benchmark_operation_seq: self.benchmark_operation_seq,
+            benchmark_payload_size: self.benchmark_payload_size,
+            participant_id: Some(self.failed_worker_id.clone()),
+            success: false,
+            wall_ns: 0,
+            pid: std::process::id(),
+            thread_id: "benchmark-runner".to_string(),
+            ..SignalProfileEvent::default()
+        }
+    }
+}
+
+fn append_signal_profile_event(path: &Path, event: &SignalProfileEvent) -> Result<()> {
+    let mut out = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("Failed to open {}", path.display()))?;
+    serde_json::to_writer(&mut out, event)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn signal_profile_contains_runner_event(path: &Path, runner_event: &RunnerEvent) -> Result<bool> {
+    if !path.exists() {
+        return Ok(false);
+    }
+
+    let file = File::open(path).with_context(|| format!("Failed to open {}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: SignalProfileEvent = serde_json::from_str(&line)
+            .with_context(|| format!("Invalid json in {}", path.display()))?;
+        if event.op == "benchmark.worker_failure"
+            && event.ts_unix_ns == runner_event.ts_unix_ns
+            && event.failed_worker_id.as_deref() == Some(runner_event.failed_worker_id.as_str())
+        {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+fn materialize_runner_profile_events(run_dir: &Path) -> Result<()> {
+    let path = run_dir.join("runner-events.jsonl");
+    if !path.exists() {
+        return Ok(());
+    }
+
+    let file = File::open(&path).with_context(|| format!("Failed to open {}", path.display()))?;
+    for line in BufReader::new(file).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: RunnerEvent = serde_json::from_str(&line)
+            .with_context(|| format!("Invalid json in {}", path.display()))?;
+        let profile_path = run_dir.join(format!("participant-{}.jsonl", event.failed_worker_id));
+        if !signal_profile_contains_runner_event(&profile_path, &event)? {
+            append_signal_profile_event(&profile_path, &event.to_profile_event())?;
+        }
+    }
+
+    Ok(())
+}
+
+fn unix_time_ns() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
+fn non_empty_string(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+fn latest_oom_evidence_for(path: &Path, worker: &WorkerSpec) -> Option<OomEvidence> {
+    let file = File::open(path).ok()?;
+    let mut latest = None;
+    for line in BufReader::new(file).lines().map_while(Result::ok) {
+        if let Ok(evidence) = serde_json::from_str::<OomEvidence>(&line) {
+            if evidence.matches(worker) {
+                latest = Some(evidence);
+            }
+        }
+    }
+    latest
 }
 
 pub fn parse_worker_layout(path: &Path) -> Result<WorkerLayout> {
@@ -517,6 +980,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
+    let runner_events = RunnerEventLog::new(&run_dir);
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
     let min_fanout_parallelism =
@@ -589,23 +1053,29 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         return Ok(());
     }
 
-    let plateau_sequence = build_plateau_sequence(
+    let mut plateau_rng = rand::rng();
+    let plateau_sequence = build_plateau_sequence_for_step_size(
         config.min_size,
         max_size,
-        config.step_size,
+        &config.step_size,
         config.roundtrips,
+        &mut plateau_rng,
     );
 
     let total_units = estimate_total_units(
         &plateau_sequence,
         config.app_rounds,
         config.max_app_samples_per_payload,
-        config.payload_sizes.len(),
+        config.payload_sizes.source_count(),
     );
 
     eprintln!(
-        "Scenario plan: plateaus={:?}, payload_sizes={:?}, app_cap={}, total_units≈{}",
-        plateau_sequence, config.payload_sizes, config.max_app_samples_per_payload, total_units
+        "Scenario plan: plateaus={:?}, step_size={}, payload_sizes={}, app_cap={}, total_units≈{}",
+        plateau_sequence,
+        config.step_size,
+        config.payload_sizes,
+        config.max_app_samples_per_payload,
+        total_units
     );
 
     let kr_url = config.kr_url.clone();
@@ -634,6 +1104,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size,
             &mut fanout,
             &mut progress,
+            plateau_idx + 1,
+            &runner_events,
         )
         .await?;
 
@@ -652,13 +1124,15 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &http,
             &kr_url,
             &relay_url,
-            &active,
+            &mut active,
             target_size,
             config.app_rounds,
             config.max_app_samples_per_payload,
             &config.payload_sizes,
             &mut fanout,
             &mut progress,
+            plateau_idx + 1,
+            &runner_events,
         )
         .await?;
 
@@ -991,6 +1465,21 @@ impl std::fmt::Display for WorkerCommandError {
 
 impl StdError for WorkerCommandError {}
 
+async fn record_worker_oom_if_evidenced(
+    runner_events: &RunnerEventLog,
+    cursor: &BenchmarkCursor,
+    worker: &WorkerSpec,
+    error: &anyhow::Error,
+    action: &str,
+    reassigned_to: Option<&WorkerSpec>,
+) -> Result<bool> {
+    let Some(evidence) = runner_events.find_oom_evidence(worker).await else {
+        return Ok(false);
+    };
+    runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
+    Ok(true)
+}
+
 fn worker_reqwest_error_diagnostic(err: &reqwest::Error) -> String {
     let mut parts = Vec::new();
     parts.push(format!("top_level={}", err));
@@ -1322,6 +1811,21 @@ async fn establish_sessions(
             &decrypt_context,
         )
         .await?;
+
+        let update_opks_command = Command::UpdateOneTimePrekeys;
+        let update_opks_context = WorkerCommandContext::with_metadata(
+            peer,
+            &update_opks_command,
+            Some("prekey.maintenance_after_handshake"),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            peer,
+            &update_opks_command,
+            "one-time prekey stock",
+            &update_opks_context,
+        )
+        .await?;
     }
 
     Ok(())
@@ -1394,6 +1898,9 @@ async fn enroll_participants(
     batch_size: usize,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    plateau_index: usize,
+    target_size: usize,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     if batch_size == 0 {
         return Err(anyhow!("Cannot enroll zero participants"));
@@ -1414,24 +1921,60 @@ async fn enroll_participants(
         enrollments.push(participant);
     }
 
-    // Register participants
-    for participant in &enrollments {
-        register_participant(http, participant).await?;
+    let mut prepared = Vec::with_capacity(enrollments.len());
+    for participant in enrollments {
+        let cursor = BenchmarkCursor::new(
+            plateau_index,
+            target_size,
+            active.len(),
+            "enrollment",
+            "prepare_participant",
+        );
+        if let Err(error) = register_participant(http, &participant).await {
+            if record_worker_oom_if_evidenced(
+                runner_events,
+                &cursor,
+                &participant,
+                &error,
+                "drop_idle_participant",
+                None,
+            )
+            .await?
+            {
+                continue;
+            }
+            return Err(error);
+        }
+        if let Err(error) = generate_publish_prekey_bundle(http, &participant).await {
+            if record_worker_oom_if_evidenced(
+                runner_events,
+                &cursor,
+                &participant,
+                &error,
+                "drop_idle_participant",
+                None,
+            )
+            .await?
+            {
+                continue;
+            }
+            return Err(error);
+        }
+        prepared.push(participant);
     }
 
-    // Generate and publish prekey bundles
-    for participant in &enrollments {
-        generate_publish_prekey_bundle(http, participant).await?;
+    if prepared.is_empty() {
+        return Ok(());
     }
 
     // Establish pairwise sessions from each new participant to every participant that
     // will be active after this enrollment batch. This includes peers enrolled in the
     // same batch; otherwise the first plateau in a batched ascent lacks new-new sessions.
     let existing_ids: Vec<WorkerSpec> = active.clone();
-    for (idx, participant) in enrollments.iter().enumerate() {
+    for (idx, participant) in prepared.iter().enumerate() {
         let mut peers = existing_ids.clone();
         peers.extend(
-            enrollments
+            prepared
                 .iter()
                 .enumerate()
                 .filter(|(peer_idx, _)| *peer_idx != idx)
@@ -1442,16 +1985,17 @@ async fn enroll_participants(
 
     // Also establish sessions from existing participants to the new ones.
     for existing in &existing_ids {
-        establish_sessions(http, existing, &enrollments, fanout).await?;
+        establish_sessions(http, existing, &prepared, fanout).await?;
     }
 
-    active.extend(enrollments);
+    let enrolled_count = prepared.len();
+    active.extend(prepared);
     let new_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
     progress.tick_units(
-        batch_size,
+        enrolled_count,
         &format!(
             "enrolled {} participants {:?} total={}",
-            batch_size,
+            enrolled_count,
             new_ids,
             active.len()
         ),
@@ -1519,12 +2063,32 @@ async fn transition_to_size(
     target_size: usize,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    plateau_index: usize,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     while active.len() < target_size {
+        if idle.is_empty() {
+            eprintln!(
+                "[oom-attrition] plateau target {} cannot be reached; active={} no idle workers remain",
+                target_size,
+                active.len()
+            );
+            break;
+        }
         let remaining = target_size - active.len();
         let batch_size = remaining.min(idle.len()).min(MAX_RANDOM_BATCH_SIZE).max(1);
         enroll_participants(
-            http, kr_url, relay_url, active, idle, batch_size, fanout, progress,
+            http,
+            kr_url,
+            relay_url,
+            active,
+            idle,
+            batch_size,
+            fanout,
+            progress,
+            plateau_index,
+            target_size,
+            runner_events,
         )
         .await?;
     }
@@ -1547,13 +2111,15 @@ async fn run_application_phase(
     http: &reqwest::Client,
     _kr_url: &str,
     _relay_url: &str,
-    active: &[WorkerSpec],
+    active: &mut Vec<WorkerSpec>,
     plateau_size: usize,
     app_rounds: usize,
     max_app_samples_per_payload: usize,
-    payload_sizes: &[usize],
+    payload_sizes: &PayloadSizes,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    plateau_index: usize,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     if active.len() < 2 {
         eprintln!(
@@ -1569,26 +2135,37 @@ async fn run_application_phase(
         return Ok(());
     }
 
-    for &payload_size in payload_sizes {
+    let mut payload_rng = rand::rng();
+    for payload_source in payload_sizes.sources() {
         eprintln!(
-            "\n[plateau {}] application phase: {} sends at payload {} B",
-            plateau_size, per_payload_count, payload_size
+            "\n[plateau {}] application phase: {} sends at {}",
+            plateau_size,
+            per_payload_count,
+            payload_source.phase_label()
         );
 
-        let mut profiled_indices: Vec<usize> = active
-            .iter()
-            .enumerate()
-            .filter_map(|(idx, worker)| worker.profile_enabled.then_some(idx))
-            .collect();
-        if profiled_indices.is_empty() {
-            profiled_indices = (0..active.len()).collect();
-        }
-
-        for seq_no in 0..per_payload_count {
+        let mut seq_no = 0usize;
+        while seq_no < per_payload_count {
+            if active.len() < 2 {
+                eprintln!(
+                    "\n[plateau {}] application phase stopped after OOM attrition: fewer than 2 active participants",
+                    plateau_size
+                );
+                return Ok(());
+            }
+            let mut profiled_indices: Vec<usize> = active
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, worker)| worker.profile_enabled.then_some(idx))
+                .collect();
+            if profiled_indices.is_empty() {
+                profiled_indices = (0..active.len()).collect();
+            }
             let actor_selection_idx =
                 sampled_participant_index(profiled_indices.len(), per_payload_count, seq_no);
             let actor_idx = profiled_indices[actor_selection_idx];
-            let actor = &active[actor_idx];
+            let actor = active[actor_idx].clone();
+            let payload_size = payload_source.sample(&mut payload_rng);
             let payload =
                 deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
 
@@ -1610,20 +2187,68 @@ async fn run_application_phase(
                     per_payload_count,
                     seq_no,
                 );
-                Some(active[profiled_recipient_indices[sampled_pos]].id.as_str())
+                Some(active[profiled_recipient_indices[sampled_pos]].id.clone())
             } else {
                 None
             };
 
-            broadcast_message(
+            let cursor = BenchmarkCursor::new(
+                plateau_index,
+                plateau_size,
+                active.len(),
+                "application",
+                "broadcast_message",
+            )
+            .at_operation(seq_no + 1, Some(payload_size));
+            let broadcast = broadcast_message(
                 http,
-                actor,
+                &actor,
                 &recipient_workers,
                 &payload,
                 fanout,
-                profiling_recipient_id,
+                profiling_recipient_id.as_deref(),
             )
-            .await?;
+            .await;
+
+            if let Err(error) = broadcast {
+                if record_worker_oom_if_evidenced(
+                    runner_events,
+                    &cursor,
+                    &actor,
+                    &error,
+                    "remove_active_actor_and_retry",
+                    active.iter().find(|worker| worker.id != actor.id),
+                )
+                .await?
+                {
+                    active.retain(|worker| worker.id != actor.id);
+                    continue;
+                }
+
+                if let Some(batch_error) = error.downcast_ref::<BatchFanoutError>() {
+                    let mut oom_ids = HashSet::new();
+                    for failure in &batch_error.failures {
+                        if record_worker_oom_if_evidenced(
+                            runner_events,
+                            &cursor,
+                            &failure.worker,
+                            &failure.error,
+                            "remove_active_recipient_and_retry",
+                            Some(&actor),
+                        )
+                        .await?
+                        {
+                            oom_ids.insert(failure.worker.id.clone());
+                        }
+                    }
+                    if oom_ids.len() == batch_error.failures.len() {
+                        active.retain(|worker| !oom_ids.contains(&worker.id));
+                        continue;
+                    }
+                }
+
+                return Err(error);
+            }
 
             progress.tick(&format!(
                 "plateau {} app payload={} {}/{} actor={} recipients={}",
@@ -1634,6 +2259,7 @@ async fn run_application_phase(
                 actor.id,
                 recipient_workers.len()
             ));
+            seq_no += 1;
         }
     }
 
@@ -1762,11 +2388,45 @@ pub fn build_plateau_sequence(
     sequence
 }
 
+fn build_plateau_sequence_for_step_size<R: Rng + ?Sized>(
+    min_size: usize,
+    max_size: usize,
+    step_size: &StepSize,
+    roundtrips: usize,
+    rng: &mut R,
+) -> Vec<usize> {
+    if let StepSize::Fixed(step_size) = step_size {
+        return build_plateau_sequence(min_size, max_size, *step_size, roundtrips);
+    }
+
+    let mut sequence = Vec::new();
+    let mut current = min_size;
+    for _ in 0..roundtrips {
+        if sequence.last().copied() != Some(current) {
+            sequence.push(current);
+        }
+        while current < max_size {
+            current = current.saturating_add(step_size.sample(rng)).min(max_size);
+            if sequence.last().copied() != Some(current) {
+                sequence.push(current);
+            }
+        }
+        while current > min_size {
+            current = current.saturating_sub(step_size.sample(rng)).max(min_size);
+            if sequence.last().copied() != Some(current) {
+                sequence.push(current);
+            }
+        }
+    }
+
+    sequence
+}
+
 fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usize> {
     if config.min_size == 0 {
         return Err(anyhow!("--min-size must be at least 1"));
     }
-    if config.step_size == 0 {
+    if !config.step_size.is_valid() {
         return Err(anyhow!("--step-size must be at least 1"));
     }
     if config.roundtrips == 0 {
@@ -1795,6 +2455,70 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
         ));
     }
     Ok(max_size)
+}
+
+#[cfg(test)]
+mod random_input_tests {
+    use std::collections::HashSet;
+
+    use rand::{rngs::StdRng, SeedableRng};
+
+    use super::{
+        build_plateau_sequence, build_plateau_sequence_for_step_size, PayloadSizeSource,
+        PayloadSizes, StepSize,
+    };
+
+    #[test]
+    fn fixed_and_range_flag_values_parse() {
+        assert_eq!("8".parse::<StepSize>(), Ok(StepSize::Fixed(8)));
+        assert_eq!(
+            "[2,16]".parse::<StepSize>(),
+            Ok(StepSize::UniformRange { min: 2, max: 16 })
+        );
+        assert_eq!(
+            "32,256".parse::<PayloadSizes>(),
+            Ok(PayloadSizes::Fixed(vec![32, 256]))
+        );
+        assert_eq!(
+            "[32,4096]".parse::<PayloadSizes>(),
+            Ok(PayloadSizes::UniformRange { min: 32, max: 4096 })
+        );
+        assert!("[0,16]".parse::<StepSize>().is_err());
+        assert!("[4096,32]".parse::<PayloadSizes>().is_err());
+    }
+
+    #[test]
+    fn range_steps_and_payloads_sample_independently() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let step_size = StepSize::UniformRange { min: 2, max: 16 };
+        let step_samples = (0..32)
+            .map(|_| step_size.sample(&mut rng))
+            .collect::<Vec<_>>();
+        assert!(step_samples.iter().all(|sample| (2..=16).contains(sample)));
+        assert!(step_samples.iter().collect::<HashSet<_>>().len() > 1);
+
+        let fixed_sequence =
+            build_plateau_sequence_for_step_size(2, 32, &StepSize::Fixed(8), 1, &mut rng);
+        assert_eq!(fixed_sequence, build_plateau_sequence(2, 32, 8, 1));
+
+        let sequence = build_plateau_sequence_for_step_size(2, 32, &step_size, 2, &mut rng);
+        assert_eq!(sequence.first(), Some(&2));
+        assert_eq!(sequence.last(), Some(&2));
+        assert!(sequence.contains(&32));
+        assert!(sequence.windows(2).all(|pair| {
+            let delta = pair[0].abs_diff(pair[1]);
+            delta > 0 && delta <= 16
+        }));
+
+        let payload_source = PayloadSizeSource::UniformRange { min: 32, max: 4096 };
+        let payload_samples = (0..32)
+            .map(|_| payload_source.sample(&mut rng))
+            .collect::<Vec<_>>();
+        assert!(payload_samples
+            .iter()
+            .all(|sample| (32..=4096).contains(sample)));
+        assert!(payload_samples.iter().collect::<HashSet<_>>().len() > 1);
+    }
 }
 
 // ── Fanout infrastructure ─────────────────────────────────────────────────────
@@ -1860,6 +2584,35 @@ struct FanoutFailure {
     worker: WorkerSpec,
     error: anyhow::Error,
 }
+
+#[derive(Debug)]
+struct BatchFanoutError {
+    phase: String,
+    operation: String,
+    failures: Vec<FanoutFailure>,
+}
+
+impl std::fmt::Display for BatchFanoutError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sample_errors = self
+            .failures
+            .iter()
+            .take(5)
+            .map(|failure| format!("{}: {}", failure.worker.id, failure.error))
+            .collect::<Vec<_>>()
+            .join("; ");
+        write!(
+            formatter,
+            "batch_fanout phase={} operation={} failed_workers={} sample_errors=[{}]",
+            self.phase,
+            self.operation,
+            self.failures.len(),
+            sample_errors
+        )
+    }
+}
+
+impl StdError for BatchFanoutError {}
 
 async fn batch_fanout_workers(
     http: &reqwest::Client,
@@ -1971,19 +2724,12 @@ async fn batch_fanout_workers(
     fanout.record(phase, operation, &summary);
 
     if !all_failures.is_empty() {
-        let sample_errors = all_failures
-            .iter()
-            .take(5)
-            .map(|failure| format!("{}: {}", failure.worker.id, failure.error))
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(anyhow!(
-            "batch_fanout phase={} operation={} failed_workers={} sample_errors=[{}]",
-            phase,
-            operation,
-            all_failures.len(),
-            sample_errors
-        ));
+        return Err(BatchFanoutError {
+            phase: phase.to_string(),
+            operation: operation.to_string(),
+            failures: all_failures,
+        }
+        .into());
     }
     Ok(())
 }
@@ -2189,6 +2935,8 @@ pub fn aggregate_csv(
     worker_ids: &[String],
     provided_layout: &Option<WorkerLayout>,
 ) -> Result<()> {
+    materialize_runner_profile_events(run_dir)?;
+
     let csv_path = run_dir.join("events.csv");
     let mut wtr = csv::Writer::from_path(&csv_path)?;
 
@@ -2299,6 +3047,21 @@ pub fn aggregate_csv(
                 event_subtype: String,
                 success: bool,
                 error_class: Option<String>,
+                runner_event_kind: Option<String>,
+                failed_worker_id: Option<String>,
+                failed_physical_worker_id: Option<String>,
+                failure_detail: Option<String>,
+                failure_evidence_source: Option<String>,
+                failure_evidence_detail: Option<String>,
+                failure_action: Option<String>,
+                reassigned_to_worker_id: Option<String>,
+                benchmark_plateau_index: Option<usize>,
+                benchmark_target_size: Option<usize>,
+                benchmark_active_size: Option<usize>,
+                benchmark_phase: Option<String>,
+                benchmark_operation: Option<String>,
+                benchmark_operation_seq: Option<usize>,
+                benchmark_payload_size: Option<usize>,
                 participant_device_id: Option<u32>,
                 role: Option<String>,
                 peer_id: Option<String>,
@@ -2320,6 +3083,10 @@ pub fn aggregate_csv(
                 participant_count: Option<usize>,
                 conversation_size: Option<usize>,
                 prekey_bundle_count: Option<usize>,
+                prekey_stock_before: Option<usize>,
+                prekey_stock_after: Option<usize>,
+                prekey_refill_count: Option<usize>,
+                prekey_refill_trigger: Option<String>,
                 session_count: Option<usize>,
                 ratchet_step_count: Option<usize>,
                 ciphertext_bytes: Option<usize>,
@@ -2402,6 +3169,21 @@ pub fn aggregate_csv(
                 event_subtype: event.event_subtype,
                 success: event.success,
                 error_class: event.error_class,
+                runner_event_kind: event.runner_event_kind,
+                failed_worker_id: event.failed_worker_id,
+                failed_physical_worker_id: event.failed_physical_worker_id,
+                failure_detail: event.failure_detail,
+                failure_evidence_source: event.failure_evidence_source,
+                failure_evidence_detail: event.failure_evidence_detail,
+                failure_action: event.failure_action,
+                reassigned_to_worker_id: event.reassigned_to_worker_id,
+                benchmark_plateau_index: event.benchmark_plateau_index,
+                benchmark_target_size: event.benchmark_target_size,
+                benchmark_active_size: event.benchmark_active_size,
+                benchmark_phase: event.benchmark_phase,
+                benchmark_operation: event.benchmark_operation,
+                benchmark_operation_seq: event.benchmark_operation_seq,
+                benchmark_payload_size: event.benchmark_payload_size,
                 participant_device_id: event.participant_device_id,
                 role: event.role,
                 peer_id: event.peer_id,
@@ -2423,6 +3205,10 @@ pub fn aggregate_csv(
                 participant_count: event.participant_count,
                 conversation_size: event.conversation_size,
                 prekey_bundle_count: event.prekey_bundle_count,
+                prekey_stock_before: event.prekey_stock_before,
+                prekey_stock_after: event.prekey_stock_after,
+                prekey_refill_count: event.prekey_refill_count,
+                prekey_refill_trigger: event.prekey_refill_trigger,
                 session_count: event.session_count,
                 ratchet_step_count: event.ratchet_step_count,
                 ciphertext_bytes: event.ciphertext_bytes,
@@ -2480,6 +3266,76 @@ pub fn aggregate_csv(
 
     wtr.flush()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod aggregate_csv_runner_event_tests {
+    use super::*;
+
+    #[test]
+    fn aggregate_csv_materializes_runner_event_without_profile_append() {
+        let unique = format!(
+            "signal-runner-event-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let runner_event = serde_json::json!({
+            "profile_schema_version": 3,
+            "ts_unix_ns": 7u128,
+            "event_kind": "worker_failure",
+            "failed_worker_id": "00001",
+            "failed_physical_worker_id": "worker-00001",
+            "failure_class": "oom_kill",
+            "failure_detail": "worker OOMed",
+            "failure_evidence_source": "docker_state",
+            "failure_evidence_detail": "State.OOMKilled",
+            "failure_action": "drop_idle_participant",
+            "reassigned_to_worker_id": null,
+            "benchmark_plateau_index": 1,
+            "benchmark_target_size": 2,
+            "benchmark_active_size": 0,
+            "benchmark_phase": "enrollment",
+            "benchmark_operation": "prepare_participant",
+            "benchmark_operation_seq": null,
+            "benchmark_payload_size": null
+        });
+        std::fs::write(
+            run_dir.join("runner-events.jsonl"),
+            serde_json::to_string(&runner_event).expect("runner event json") + "\n",
+        )
+        .expect("write runner event");
+
+        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+
+        let mut reader = csv::Reader::from_path(run_dir.join("events.csv")).expect("open csv");
+        let headers = reader.headers().expect("headers").clone();
+        let record = reader
+            .records()
+            .next()
+            .expect("runner row")
+            .expect("valid row");
+        let value = |name: &str| {
+            let idx = headers
+                .iter()
+                .position(|header| header == name)
+                .expect("header exists");
+            record.get(idx).expect("value").to_string()
+        };
+
+        assert_eq!(value("op"), "benchmark.worker_failure");
+        assert_eq!(value("failed_worker_id"), "00001");
+        assert_eq!(value("failure_evidence_source"), "docker_state");
+        assert_eq!(value("benchmark_operation"), "prepare_participant");
+        assert!(run_dir.join("participant-00001.jsonl").exists());
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
 }
 
 /// Validate a run ID string for safe filesystem usage.

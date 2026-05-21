@@ -26,6 +26,19 @@ pub struct PrekeyBundleStorable {
     pub pq_prekey_signature_present: bool,
 }
 
+impl PrekeyBundleStorable {
+    fn is_one_time(&self) -> bool {
+        self.classical_one_time_prekey_present || self.pq_prekey_type == "one_time"
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct PrekeyStock {
+    pub participant: String,
+    pub one_time_available: usize,
+    pub fallback_available: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OneTimePrekeyStorable {
     pub prekey_id: u32,
@@ -170,7 +183,30 @@ impl KeyRepository {
     pub fn publish_prekey_bundles(&self, participant: &str, bundles: Vec<PrekeyBundleStorable>) {
         let mut guard = self.prekey_bundles.lock().unwrap();
         let queue = guard.entry(participant.to_string()).or_default();
-        queue.extend(bundles);
+        let mut one_time = VecDeque::new();
+        let mut fallback = None;
+
+        while let Some(bundle) = queue.pop_front() {
+            if bundle.is_one_time() {
+                one_time.push_back(bundle);
+            } else {
+                fallback = Some(bundle);
+            }
+        }
+
+        for bundle in bundles {
+            if bundle.is_one_time() {
+                one_time.push_back(bundle);
+            } else {
+                fallback = Some(bundle);
+            }
+        }
+
+        if let Some(bundle) = fallback {
+            one_time.push_back(bundle);
+        }
+
+        *queue = one_time;
     }
 
     pub fn publish_prekey_bundle_batch(&self, participant: &str, batch: PrekeyBundleBatchStorable) {
@@ -220,6 +256,20 @@ impl KeyRepository {
             .unwrap_or(0)
     }
 
+    pub fn prekey_stock(&self, participant: &str) -> PrekeyStock {
+        let bundles = self.prekey_bundles.lock().unwrap();
+        let queue = bundles.get(participant);
+        PrekeyStock {
+            participant: participant.to_string(),
+            one_time_available: queue
+                .map(|queue| queue.iter().filter(|bundle| bundle.is_one_time()).count())
+                .unwrap_or_default(),
+            fallback_available: queue
+                .map(|queue| queue.iter().any(|bundle| !bundle.is_one_time()))
+                .unwrap_or_default(),
+        }
+    }
+
     pub fn remove_participant(&self, participant: &str) {
         self.prekey_bundles.lock().unwrap().remove(participant);
         self.one_time_prekey_consumption
@@ -232,5 +282,53 @@ impl KeyRepository {
 impl Default for KeyRepository {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bundle(prekey_id: Option<u32>, pq_prekey_type: &str) -> PrekeyBundleStorable {
+        PrekeyBundleStorable {
+            registration_id: 1,
+            device_id: 1,
+            bundle_id: format!("bundle-{prekey_id:?}-{pq_prekey_type}"),
+            prekey_id,
+            prekey_public: prekey_id.map(|_| vec![1]),
+            classical_one_time_prekey_present: prekey_id.is_some(),
+            classical_one_time_prekey_id: prekey_id,
+            signed_prekey_id: 1,
+            signed_prekey_public: vec![2],
+            signed_prekey_signature: vec![3],
+            identity_key_public: vec![4],
+            kyber_prekey_id: prekey_id.unwrap_or(99),
+            kyber_prekey_public: vec![5],
+            kyber_prekey_signature: vec![6],
+            pq_prekey_id: prekey_id.unwrap_or(99),
+            pq_prekey_type: pq_prekey_type.to_string(),
+            pq_prekey_signature_present: true,
+        }
+    }
+
+    #[test]
+    fn refill_keeps_one_time_prekeys_ahead_of_fallback() {
+        let repo = KeyRepository::new();
+        repo.publish_prekey_bundles(
+            "bob",
+            vec![bundle(Some(1), "one_time"), bundle(None, "last_resort")],
+        );
+
+        assert!(repo.consume_one_time_prekey("bob"));
+        assert_eq!(repo.prekey_stock("bob").one_time_available, 0);
+        repo.publish_prekey_bundles(
+            "bob",
+            vec![bundle(Some(2), "one_time"), bundle(None, "last_resort")],
+        );
+
+        let stock = repo.prekey_stock("bob");
+        assert_eq!(stock.one_time_available, 1);
+        assert!(stock.fallback_available);
+        assert_eq!(repo.fetch_prekey_bundle("bob").unwrap().prekey_id, Some(2));
     }
 }

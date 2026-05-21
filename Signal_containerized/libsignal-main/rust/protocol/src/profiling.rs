@@ -602,6 +602,15 @@ where
     measure_result_with(op, SpanMetadata::default(), run)
 }
 
+pub fn measure_update_opks_result<T, E>(
+    run: impl FnOnce() -> std::result::Result<T, E>,
+) -> std::result::Result<T, E>
+where
+    E: Display,
+{
+    measure_result("signal_update_opks_generate_protocol", run)
+}
+
 pub(crate) fn measure_result_with<T, E>(
     op: &'static str,
     metadata: SpanMetadata,

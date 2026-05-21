@@ -4,7 +4,9 @@ use anyhow::Result;
 use clap::{ArgAction, Parser};
 
 use signal_benchmark::local_launcher::{launch_local_stack, LocalLaunchConfig};
-use signal_benchmark::staircase_runner::{run_staircase_benchmark, StaircaseConfig};
+use signal_benchmark::staircase_runner::{
+    run_staircase_benchmark, PayloadSizes, StaircaseConfig, StepSize,
+};
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -29,8 +31,8 @@ struct Args {
     #[arg(long)]
     max_size: Option<usize>,
 
-    #[arg(long, default_value_t = 1)]
-    step_size: usize,
+    #[arg(long, default_value = "1")]
+    step_size: StepSize,
 
     #[arg(long, default_value_t = 1)]
     roundtrips: usize,
@@ -43,8 +45,8 @@ struct Args {
     #[arg(long, default_value_t = 16)]
     max_app_samples_per_payload: usize,
 
-    #[arg(long, value_delimiter = ',', default_value = "32,256,1024,4096")]
-    payload_sizes: Vec<usize>,
+    #[arg(long, default_value = "32,256,1024,4096")]
+    payload_sizes: PayloadSizes,
 
     #[arg(long, default_value = "run-001")]
     run_id: String,

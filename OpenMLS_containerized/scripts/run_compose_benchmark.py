@@ -41,7 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--min-size", type=int, default=2)
     p.add_argument("--max-size", type=int, default=None)
-    p.add_argument("--step-size", type=int, default=1)
+    p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
     p.add_argument("--roundtrips", type=int, default=1)
 
     p.add_argument("--update-rounds", type=int, default=2)
@@ -50,7 +50,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--app-rounds", type=int, default=2)
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
 
-    p.add_argument("--payload-sizes", default="32,256,1024", help="Comma-separated payload sizes")
+    p.add_argument(
+        "--payload-sizes",
+        default="32,256,1024",
+        help="Comma-separated payload sizes or uniform per-message [min,max] range",
+    )
 
     p.add_argument("--base-worker-port", type=int, default=8081)
     p.add_argument("--ds-port", type=int, default=3000)
@@ -1619,6 +1623,7 @@ class ResourceMonitor:
         self.thread: threading.Thread | None = None
         self.samples_path = run_dir / "resource_samples.jsonl"
         self.summary_path = run_dir / "resource_summary.csv"
+        self.oom_events_path = run_dir / "oom_events.jsonl"
         self.warning_path = run_dir / "resource_monitor_warnings.txt"
         self.warnings: list[str] = []
         self.targets = [self._build_target(record) for record in targets]
@@ -1796,11 +1801,20 @@ class ResourceMonitor:
                 else max(int(current_max), memory_current)
             )
 
+        previous_oom_kill = int_or_zero(row.get("memory_events_oom_kill"))
         for key in ("low", "high", "max", "oom", "oom_kill"):
             sample_key = f"memory.events.{key}"
             value = sample.get(sample_key)
             if value is not None:
                 row[f"memory_events_{key}"] = value
+
+        current_oom_kill = int_or_zero(sample.get("memory.events.oom_kill"))
+        if current_oom_kill > previous_oom_kill:
+            self._append_oom_event(
+                sample,
+                "docker_cgroup",
+                f"memory.events.oom_kill increased from {previous_oom_kill} to {current_oom_kill}",
+            )
 
         for summary_key, sample_key in (
             ("cpu_usage_usec", "cpu.stat.usage_usec"),
@@ -1827,7 +1841,23 @@ class ResourceMonitor:
 
         row["last_container_status"] = sample.get("container.status") or ""
         row["last_container_exit_code"] = sample.get("container.exit_code")
+        previous_container_oom = bool(row.get("last_container_oom_killed"))
         row["last_container_oom_killed"] = sample.get("container.oom_killed")
+        if sample.get("container.oom_killed") is True and not previous_container_oom:
+            self._append_oom_event(sample, "docker_state", "container State.OOMKilled became true")
+
+    def _append_oom_event(self, sample: dict, source: str, detail: str) -> None:
+        event = {
+            "schema_version": 1,
+            "ts_unix_ns": sample.get("timestamp_unix_ns") or time.time_ns(),
+            "source": source,
+            "worker_id": None,
+            "physical_worker_id": sample.get("physical_worker_id"),
+            "detail": detail,
+            "container_id": sample.get("container_id"),
+        }
+        with self.oom_events_path.open("a", encoding="utf-8") as out:
+            out.write(json.dumps(event, sort_keys=True) + "\n")
 
     def _write_summary(self) -> None:
         fieldnames = [
@@ -1871,6 +1901,108 @@ class ResourceMonitor:
                 writer.writerow({key: row.get(key) for key in fieldnames})
 
 
+def external_worker_oom_dmesg_lines(text: str) -> list[str]:
+    lines: list[str] = []
+    for raw in text.splitlines():
+        lowered = raw.lower()
+        has_oom_signal = (
+            "out of memory" in lowered
+            or "oom-kill" in lowered
+            or "oom_reaper" in lowered
+            or "killed process" in lowered
+        )
+        if has_oom_signal and "worker" in lowered:
+            lines.append(raw.strip())
+    return lines
+
+
+class ExternalOomMonitor:
+    def __init__(self, *, run_dir: Path, targets: list[tuple[object, str, str]], interval_ms: int):
+        self.targets = targets
+        self.interval_seconds = max(interval_ms / 1000.0, 0.25)
+        self.oom_events_path = run_dir / "oom_events.jsonl"
+        self.warning_path = run_dir / "external_oom_monitor_warnings.txt"
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+        self.seen: dict[str, set[str]] = {physical_id: set() for _, physical_id, _ in targets}
+        self.warnings: list[str] = []
+
+    def start(self) -> None:
+        if not self.targets:
+            return
+        for backend, physical_id, _ in self.targets:
+            self.seen[physical_id].update(self._read_lines(backend, physical_id))
+        self.thread = threading.Thread(target=self._run, name="external-oom-monitor", daemon=True)
+        self.thread.start()
+        print(
+            f"[resources] monitoring {len(self.targets)} external device dmesg stream(s) for worker OOM kills",
+            flush=True,
+        )
+
+    def stop(self) -> None:
+        if not self.thread:
+            return
+        self.stop_event.set()
+        self.thread.join(timeout=max(5.0, self.interval_seconds * 4))
+        if self.thread.is_alive():
+            self.warnings.append("external OOM monitor thread did not stop before timeout")
+        if self.warnings:
+            self.warning_path.write_text("\n".join(self.warnings) + "\n", encoding="utf-8")
+
+    def _read_lines(self, backend: object, physical_id: str) -> list[str]:
+        try:
+            result = backend.shell("dmesg", check=False)
+        except Exception as exc:
+            self.warnings.append(
+                f"{dt.datetime.now(dt.timezone.utc).isoformat()} {physical_id}: {type(exc).__name__}: {exc}"
+            )
+            return []
+        if result.returncode != 0:
+            text = (result.stderr or result.stdout or "").strip()
+            if text:
+                self.warnings.append(
+                    f"{dt.datetime.now(dt.timezone.utc).isoformat()} {physical_id}: dmesg failed: {text}"
+                )
+            return []
+        return external_worker_oom_dmesg_lines(result.stdout or "")
+
+    def _run(self) -> None:
+        while not self.stop_event.is_set():
+            for backend, physical_id, worker_id in self.targets:
+                for line in self._read_lines(backend, physical_id):
+                    if line in self.seen[physical_id]:
+                        continue
+                    self.seen[physical_id].add(line)
+                    event = {
+                        "schema_version": 1,
+                        "ts_unix_ns": time.time_ns(),
+                        "source": "external_dmesg",
+                        "worker_id": worker_id,
+                        "physical_worker_id": physical_id,
+                        "detail": line,
+                    }
+                    with self.oom_events_path.open("a", encoding="utf-8") as out:
+                        out.write(json.dumps(event, sort_keys=True) + "\n")
+            self.stop_event.wait(self.interval_seconds)
+
+
+def external_oom_monitor_targets(args: argparse.Namespace, root: Path) -> list[tuple[object, str, str]]:
+    if not args.enable_external_devices or not args.devices_file:
+        return []
+    from external_devices import create_backend, load_devices_config
+
+    devices_file = Path(args.devices_file)
+    if not devices_file.is_absolute():
+        devices_file = root / devices_file
+    configs = [config for config in load_devices_config(devices_file) if config.enabled]
+    if args.external_device_ids:
+        configs = [config for config in configs if config.id in args.external_device_ids]
+    return [
+        (create_backend(config), config.id, config.worker.get("id", config.id))
+        for config in configs
+    ]
+
+
 def delta(first: int | None, last: int | None) -> int | None:
     if first is None or last is None:
         return None
@@ -1880,6 +2012,22 @@ def delta(first: int | None, last: int | None) -> int | None:
 def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
     summary_path = run_dir / "resource_summary.csv"
     evidence: dict = {"resource_summary": str(summary_path) if summary_path.exists() else None}
+    oom_events_path = run_dir / "oom_events.jsonl"
+    if oom_events_path.exists():
+        oom_events = []
+        for line in oom_events_path.read_text(encoding="utf-8").splitlines():
+            try:
+                oom_events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+        if oom_events:
+            evidence["oom_events"] = str(oom_events_path)
+            evidence["oom_workers"] = sorted({
+                str(event.get("worker_id") or event.get("physical_worker_id"))
+                for event in oom_events
+                if event.get("worker_id") or event.get("physical_worker_id")
+            })
+            return "hard_upper_bound_oom_kill", evidence
     if not summary_path.exists():
         return "infrastructure_failure", evidence
 
@@ -1914,7 +2062,6 @@ def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
     ]
     if throttled_rows:
         evidence["cpu_throttled_workers"] = [row.get("physical_worker_id") for row in throttled_rows[:20]]
-        return "resource_pressure_cpu_throttled", evidence
 
     memory_pressure_rows = [
         row for row in rows
@@ -2321,7 +2468,12 @@ def pull_external_device_profiles(
         pulled = False
         for attempt in range(1, 4):
             try:
+                local_runner_profile = local_jsonl.read_bytes() if local_jsonl.exists() else b""
                 backend.pull(remote_jsonl, local_jsonl)
+                if local_runner_profile:
+                    pulled_profile = local_jsonl.read_bytes()
+                    separator = b"" if not pulled_profile or pulled_profile.endswith(b"\n") else b"\n"
+                    local_jsonl.write_bytes(pulled_profile + separator + local_runner_profile)
                 size = local_jsonl.stat().st_size if local_jsonl.exists() else 0
                 print(f"[device] {dev_id}: pulled profile ({size} bytes) to {local_jsonl}", flush=True)
                 pulled = True
@@ -2516,7 +2668,7 @@ def collect_cpu_metadata() -> dict:
 def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
     external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
     metadata = {
-        "profile_schema_version": 2,
+        "profile_schema_version": 3,
         "run_id": run_id,
         "scenario": scenario,
         "scenario_seed": args.scenario_seed,
@@ -2698,6 +2850,8 @@ def main() -> int:
     external_device_stop_required = False
     resource_monitor: ResourceMonitor | None = None
     resource_monitor_stopped = False
+    external_oom_monitor: ExternalOomMonitor | None = None
+    external_oom_monitor_stopped = False
 
     compose_env = build_compose_env(args)
 
@@ -2978,6 +3132,12 @@ def main() -> int:
             external_layout_clients = ext_clients
             external_layout_workers = ext_workers
             external_worker_lines = ext_lines
+            external_oom_monitor = ExternalOomMonitor(
+                run_dir=run_dir,
+                targets=external_oom_monitor_targets(args, root),
+                interval_ms=args.resource_monitor_interval_ms,
+            )
+            external_oom_monitor.start()
 
             # Merge external devices into worker layout
             layout_path = run_dir / "worker_layout.json"
@@ -3171,6 +3331,9 @@ def main() -> int:
         if resource_monitor and not resource_monitor_stopped:
             resource_monitor.stop()
             resource_monitor_stopped = True
+        if external_oom_monitor and not external_oom_monitor_stopped:
+            external_oom_monitor.stop()
+            external_oom_monitor_stopped = True
 
         if exit_code != 0:
             failure_seen = True
@@ -3252,6 +3415,13 @@ def main() -> int:
                 resource_monitor_stopped = True
             except Exception as exc:
                 print(f"[resources] monitor stop failed (non-fatal): {exc}", flush=True)
+
+        if external_oom_monitor and not external_oom_monitor_stopped:
+            try:
+                external_oom_monitor.stop()
+                external_oom_monitor_stopped = True
+            except Exception as exc:
+                print(f"[resources] external OOM monitor stop failed (non-fatal): {exc}", flush=True)
 
         if external_device_stop_required:
             stop_external_device_workers(args, root)

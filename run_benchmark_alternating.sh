@@ -23,6 +23,17 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
+# Ensure cargo is on PATH (it's in ~/.cargo/bin but sudo may not have it)
+export PATH="$HOME/.cargo/bin:$PATH"
+
+if command -v cargo &>/dev/null; then
+  BUILD_EXTERNAL_FLAG="--build-external-binaries"
+else
+  echo "[setup] WARNING: 'cargo' not found on PATH -- --build-external-binaries will be skipped." >&2
+  echo "[setup] Install Rust (rustup) to enable automatic cross-compilation of external worker binaries." >&2
+  BUILD_EXTERNAL_FLAG=""
+fi
+
 python_for() {
   local stack_dir="$1"
   if [ -x "$stack_dir/.venv/bin/python" ]; then
@@ -98,7 +109,7 @@ cleanup_docker() {
 trap cleanup_docker EXIT
 
 # ------------------------------------------------------------------
-# Virtual environment setup
+# Device reachability checks
 # ------------------------------------------------------------------
 ensure_venv() {
   local stack_dir="$1"
@@ -164,8 +175,6 @@ ping_devices() {
 # ------------------------------------------------------------------
 # Pre-flight: venvs and device connectivity
 # ------------------------------------------------------------------
-ensure_venv "$SCRIPT_DIR/OpenMLS_containerized"
-ensure_venv "$SCRIPT_DIR/Signal_containerized"
 ping_devices
 
 echo "============================================================"
@@ -205,7 +214,7 @@ run_openmls() {
 
   OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 256 \
+    --workers 2048 \
     --ds-port 3001 \
     --relay-port 4001 \
     --scenario-seed "$SCENARIO_SEED" \
@@ -215,15 +224,15 @@ run_openmls() {
     --singleton-min-count 12 \
     --singleton-fraction 0.0625 \
     --singleton-selection-strategy evenly-spaced \
-    --singleton-cpus 0.25 \
-    --singleton-memory 256m \
-    --singleton-memory-swap 256m \
+ #   --singleton-cpus 0.25 \
+#    --singleton-memory 256m \
+#    --singleton-memory-swap 256m \
     --resource-monitor-interval-ms 250 \
     --packed-clients-per-container 48 \
     --packed-worker-internal-parallelism 16 \
     --bridge-count 4 \
     --build-images \
-    --build-external-binaries \
+    $BUILD_EXTERNAL_FLAG \
     --force-cleanup-mls-ports \
     --runner-in-docker \
     --ds-delivery-mode group-log \
@@ -252,20 +261,20 @@ run_openmls() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 256 \
-    --step-size 25 \
+    --max-size 2048 \
+    --step-size '[1,32]' \
     --roundtrips 2 \
-    --update-rounds 2 \
-    --app-rounds 2 \
-    --max-update-samples-per-plateau 2 \
-    --max-app-samples-per-payload 2 \
-    --payload-sizes 32,256,1024 \
-    --devices-file devices.yaml \
-    --enable-external-devices \
-    --external-device luckfox-pico-plus-01 \
-    --external-device raspberry-pi-01 \
-    --external-coverage-lane \
-    --wipe-device-run-dirs \
+    --update-rounds 8 \
+    --app-rounds 8 \
+    --max-update-samples-per-plateau 8 \
+    --max-app-samples-per-payload 8 \
+    --payload-sizes '[16,4096]' \
+ #   --devices-file devices.yaml \
+  #  --enable-external-devices \
+   # --external-device luckfox-pico-plus-01 \
+  #  --external-device raspberry-pi-01 \
+ #   --external-coverage-lane \
+ #   --wipe-device-run-dirs \
     --run-id "$RUN_ID"
 
   cd "$SCRIPT_DIR"
@@ -298,7 +307,7 @@ run_signal() {
 
   SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py \
-    --workers 256 \
+    --workers 2048 \
     --kr-port 3001 \
     --relay-port 4001 \
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED" \
@@ -307,16 +316,16 @@ run_signal() {
     --singleton-min-count 16 \
     --singleton-fraction 0.125 \
     --singleton-selection-strategy evenly-spaced \
-    --singleton-cpus 0.5 \
-    --singleton-memory 256m \
-    --singleton-memory-swap 256m \
-    --singleton-pids-limit 256 \
+#    --singleton-cpus 0.5 \
+#    --singleton-memory 256m \
+ #   --singleton-memory-swap 256m \
+ #   --singleton-pids-limit 256 \
     --resource-monitor-interval-ms 250 \
     --packed-clients-per-container 16 \
     --packed-worker-internal-parallelism 16 \
     --bridge-count 4 \
     --build-images \
-    --build-external-binaries \
+    $BUILD_EXTERNAL_FLAG \
     --force-cleanup-signal-ports \
     --runner-in-docker \
     --fanout-adaptive \
@@ -343,17 +352,17 @@ run_signal() {
     --teardown-batch-size 64 \
     --teardown-batch-sleep-seconds 0.1 \
     --min-size 2 \
-    --max-size 256 \
-    --step-size 25 \
+    --max-size 2048 \
+    --step-size '[1,32]' \
     --roundtrips 2 \
-    --app-rounds 2 \
-    --max-app-samples-per-payload 2 \
-    --payload-sizes 32,256,1024 \
-    --devices-file devices.yaml \
-    --enable-external-devices \
-    --external-device luckfox-pico-plus-01 \
-    --external-device raspberry-pi-01 \
-    --wipe-device-run-dirs \
+    --app-rounds 8 \
+    --max-app-samples-per-payload 8 \
+    --payload-sizes '[16,4096]' \
+#    --devices-file devices.yaml \
+#    --enable-external-devices \
+#    --external-device luckfox-pico-plus-01 \
+#    --external-device raspberry-pi-01 \
+#    --wipe-device-run-dirs \
     --run-id "$RUN_ID"
 
   cd "$SCRIPT_DIR"

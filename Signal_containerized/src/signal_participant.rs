@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use libsignal_core::DeviceId;
 use libsignal_core::ProtocolAddress;
 use libsignal_protocol::kem;
-use libsignal_protocol::profiling::{with_profile_context, ProfileContext};
+use libsignal_protocol::profiling::{self, with_profile_context, ProfileContext};
 use libsignal_protocol::GenericSignedPreKey;
 use libsignal_protocol::Timestamp;
 use libsignal_protocol::{
@@ -20,7 +20,10 @@ use rand::{Rng, SeedableRng};
 
 use crate::debug::print_bytes;
 
-const DEFAULT_ONE_TIME_PREKEY_COUNT: u32 = 1024;
+const DEFAULT_INITIAL_ONE_TIME_PREKEY_COUNT: u32 = 16;
+const DEFAULT_ONE_TIME_PREKEY_REFILL_COUNT: u32 = 16;
+const DEFAULT_ONE_TIME_PREKEY_LOW_WATERMARK: usize = 4;
+const LAST_RESORT_PQ_PREKEY_ID: u32 = u32::MAX;
 const DEVICE_ID: u8 = 1;
 
 pub struct SignalParticipant {
@@ -33,10 +36,10 @@ pub struct SignalParticipant {
     signed_prekey_record: SignedPreKeyRecord,
     last_resort_pq_prekey_id: KyberPreKeyId,
     last_resort_pq_prekey_record: KyberPreKeyRecord,
-    one_time_prekey_ids: Vec<PreKeyId>,
-    one_time_prekey_records: Vec<PreKeyRecord>,
-    one_time_pq_prekey_ids: Vec<KyberPreKeyId>,
-    one_time_pq_prekey_records: Vec<KyberPreKeyRecord>,
+    next_one_time_prekey_id: u32,
+    initial_one_time_prekey_count: u32,
+    one_time_prekey_refill_count: u32,
+    one_time_prekey_low_watermark: usize,
     csprng: StdRng,
 }
 
@@ -97,6 +100,21 @@ fn generate_kyber_prekey_record(
     ))
 }
 
+fn env_positive_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 impl SignalParticipant {
     fn profile_context(
         &self,
@@ -149,30 +167,20 @@ impl SignalParticipant {
 
         let store = InMemSignalProtocolStore::new(identity_key_pair, registration_id)?;
 
-        let one_time_prekey_count = std::env::var("SIGNAL_ONE_TIME_PREKEY_COUNT")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|count| *count > 0)
-            .unwrap_or(DEFAULT_ONE_TIME_PREKEY_COUNT);
+        let initial_one_time_prekey_count = env_positive_u32(
+            "SIGNAL_INITIAL_ONE_TIME_PREKEY_COUNT",
+            DEFAULT_INITIAL_ONE_TIME_PREKEY_COUNT,
+        );
+        let one_time_prekey_refill_count = env_positive_u32(
+            "SIGNAL_ONE_TIME_PREKEY_REFILL_COUNT",
+            DEFAULT_ONE_TIME_PREKEY_REFILL_COUNT,
+        );
+        let one_time_prekey_low_watermark = env_usize(
+            "SIGNAL_ONE_TIME_PREKEY_LOW_WATERMARK",
+            DEFAULT_ONE_TIME_PREKEY_LOW_WATERMARK,
+        );
 
-        let mut one_time_prekey_ids = Vec::new();
-        let mut one_time_prekey_records = Vec::new();
-        let mut one_time_pq_prekey_ids = Vec::new();
-        let mut one_time_pq_prekey_records = Vec::new();
-        for i in 1..=one_time_prekey_count {
-            let prekey_id = PreKeyId::from(i);
-            let key_pair = libsignal_core::curve::KeyPair::generate(&mut csprng);
-            let record = PreKeyRecord::new(prekey_id, &key_pair);
-            one_time_prekey_ids.push(prekey_id);
-            one_time_prekey_records.push(record);
-
-            let pq_prekey_id = KyberPreKeyId::from(i);
-            let pq_record =
-                generate_kyber_prekey_record(pq_prekey_id, &identity_key_pair, &mut csprng)?;
-            one_time_pq_prekey_ids.push(pq_prekey_id);
-            one_time_pq_prekey_records.push(pq_record);
-        }
-        let last_resort_pq_prekey_id = KyberPreKeyId::from(one_time_prekey_count + 1);
+        let last_resort_pq_prekey_id = KyberPreKeyId::from(LAST_RESORT_PQ_PREKEY_ID);
         let last_resort_pq_prekey_record = generate_kyber_prekey_record(
             last_resort_pq_prekey_id,
             &identity_key_pair,
@@ -189,29 +197,105 @@ impl SignalParticipant {
             signed_prekey_record,
             last_resort_pq_prekey_id,
             last_resort_pq_prekey_record,
-            one_time_prekey_ids,
-            one_time_prekey_records,
-            one_time_pq_prekey_ids,
-            one_time_pq_prekey_records,
+            next_one_time_prekey_id: 1,
+            initial_one_time_prekey_count,
+            one_time_prekey_refill_count,
+            one_time_prekey_low_watermark,
             csprng,
         })
     }
 
     pub fn generate_prekey_bundles(&mut self) -> Result<Vec<PreKeyBundle>> {
-        let mut bundles = Vec::with_capacity(self.one_time_prekey_records.len() + 1);
+        self.generate_publishable_prekey_bundles(
+            self.initial_one_time_prekey_count,
+            true,
+            "prekey.initial_upload",
+        )
+    }
+
+    pub fn generate_replenishment_prekey_bundles(&mut self) -> Result<Vec<PreKeyBundle>> {
+        self.generate_publishable_prekey_bundles(
+            self.one_time_prekey_refill_count,
+            true,
+            "prekey.update_opks",
+        )
+    }
+
+    pub fn one_time_prekey_low_watermark(&self) -> usize {
+        self.one_time_prekey_low_watermark
+    }
+
+    fn local_prekey_profile_context(&self, phase: &str) -> ProfileContext {
+        ProfileContext {
+            participant_id: Some(self.address.name().to_string()),
+            participant_device_id: Some(self.address.device_id().into()),
+            role: Some("prekey_publisher".to_string()),
+            direction: Some("outbound".to_string()),
+            phase: Some(phase.to_string()),
+            ..ProfileContext::default()
+        }
+    }
+
+    fn generate_publishable_prekey_bundles(
+        &mut self,
+        one_time_prekey_count: u32,
+        include_last_resort: bool,
+        phase: &str,
+    ) -> Result<Vec<PreKeyBundle>> {
+        let context = self.local_prekey_profile_context(phase);
+
+        with_profile_context(context, || {
+            profiling::measure_update_opks_result(|| {
+                self.generate_publishable_prekey_bundles_inner(
+                    one_time_prekey_count,
+                    include_last_resort,
+                )
+            })
+        })
+    }
+
+    fn generate_publishable_prekey_bundles_inner(
+        &mut self,
+        one_time_prekey_count: u32,
+        include_last_resort: bool,
+    ) -> Result<Vec<PreKeyBundle>> {
+        let mut bundles =
+            Vec::with_capacity(one_time_prekey_count as usize + usize::from(include_last_resort));
 
         let identity_public = *self.identity_key_pair.identity_key().public_key();
         let signed_prekey = self.signed_prekey_record.public_key()?;
         let signed_prekey_signature = self.signed_prekey_record.signature()?.to_vec();
         let registration_id = self.registration_id;
-        for (((prekey_id, prekey_record), pq_prekey_id), pq_record) in self
-            .one_time_prekey_ids
-            .iter()
-            .copied()
-            .zip(self.one_time_prekey_records.iter())
-            .zip(self.one_time_pq_prekey_ids.iter().copied())
-            .zip(self.one_time_pq_prekey_records.iter())
-        {
+        for _ in 0..one_time_prekey_count {
+            let raw_prekey_id = self.next_one_time_prekey_id;
+            self.next_one_time_prekey_id = self
+                .next_one_time_prekey_id
+                .checked_add(1)
+                .context("one-time prekey id space exhausted")?;
+
+            let prekey_id = PreKeyId::from(raw_prekey_id);
+            let prekey_key_pair = libsignal_core::curve::KeyPair::generate(&mut self.csprng);
+            let prekey_record = PreKeyRecord::new(prekey_id, &prekey_key_pair);
+
+            let pq_prekey_id = KyberPreKeyId::from(raw_prekey_id);
+            let pq_record = generate_kyber_prekey_record(
+                pq_prekey_id,
+                &self.identity_key_pair,
+                &mut self.csprng,
+            )?;
+
+            block_on_protocol(async {
+                self.store
+                    .pre_key_store
+                    .save_pre_key(prekey_id, &prekey_record)
+                    .await?;
+                self.store
+                    .kyber_pre_key_store
+                    .save_kyber_pre_key(pq_prekey_id, &pq_record)
+                    .await?;
+                Ok::<(), anyhow::Error>(())
+            })?;
+
             bundles.push(PreKeyBundle::new(
                 registration_id,
                 DeviceId::new(DEVICE_ID).expect("DEVICE_ID is valid"),
@@ -226,18 +310,20 @@ impl SignalParticipant {
             )?);
         }
 
-        bundles.push(PreKeyBundle::new(
-            registration_id,
-            DeviceId::new(DEVICE_ID).expect("DEVICE_ID is valid"),
-            None,
-            self.signed_prekey_id,
-            signed_prekey,
-            signed_prekey_signature,
-            self.last_resort_pq_prekey_id,
-            self.last_resort_pq_prekey_record.public_key()?,
-            self.last_resort_pq_prekey_record.signature()?.to_vec(),
-            IdentityKey::new(identity_public),
-        )?);
+        if include_last_resort {
+            bundles.push(PreKeyBundle::new(
+                registration_id,
+                DeviceId::new(DEVICE_ID).expect("DEVICE_ID is valid"),
+                None,
+                self.signed_prekey_id,
+                signed_prekey,
+                signed_prekey_signature,
+                self.last_resort_pq_prekey_id,
+                self.last_resort_pq_prekey_record.public_key()?,
+                self.last_resort_pq_prekey_record.signature()?.to_vec(),
+                IdentityKey::new(identity_public),
+            )?);
+        }
 
         print_bytes(
             &format!("{} PreKeyBundle identity", self.name),
@@ -254,45 +340,12 @@ impl SignalParticipant {
             .context("no prekey bundles generated")
     }
 
-    pub fn consume_one_time_prekey(&mut self) {
-        if !self.one_time_prekey_ids.is_empty() {
-            self.one_time_prekey_ids.remove(0);
-            self.one_time_prekey_records.remove(0);
-        }
-        if !self.one_time_pq_prekey_ids.is_empty() {
-            self.one_time_pq_prekey_ids.remove(0);
-            self.one_time_pq_prekey_records.remove(0);
-        }
-    }
-
     pub fn store_own_prekeys(&mut self) -> Result<()> {
         block_on_protocol(async {
-            for (prekey_id, record) in self
-                .one_time_prekey_ids
-                .iter()
-                .copied()
-                .zip(self.one_time_prekey_records.iter())
-            {
-                self.store
-                    .pre_key_store
-                    .save_pre_key(prekey_id, record)
-                    .await?;
-            }
             self.store
                 .signed_pre_key_store
                 .save_signed_pre_key(self.signed_prekey_id, &self.signed_prekey_record)
                 .await?;
-            for (pq_prekey_id, record) in self
-                .one_time_pq_prekey_ids
-                .iter()
-                .copied()
-                .zip(self.one_time_pq_prekey_records.iter())
-            {
-                self.store
-                    .kyber_pre_key_store
-                    .save_kyber_pre_key(pq_prekey_id, record)
-                    .await?;
-            }
             self.store
                 .kyber_pre_key_store
                 .save_kyber_pre_key(
@@ -412,9 +465,9 @@ impl SignalParticipant {
     }
 
     pub fn remaining_prekeys(&self) -> usize {
-        self.one_time_prekey_ids
-            .len()
-            .min(self.one_time_pq_prekey_ids.len())
+        let one_time_ec_count = self.store.all_pre_key_ids().count();
+        let one_time_pq_count = self.store.all_kyber_pre_key_ids().count().saturating_sub(1);
+        one_time_ec_count.min(one_time_pq_count)
     }
 
     pub fn private_key(&self) -> &libsignal_core::curve::PrivateKey {
