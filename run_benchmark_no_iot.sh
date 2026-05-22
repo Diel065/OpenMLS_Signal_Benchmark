@@ -130,7 +130,7 @@ run_openmls() {
   cd "$SCRIPT_DIR/OpenMLS_containerized"
 
   local -a _args=(
-    --workers 2048
+    --workers 4096
     --ds-port 3001
     --relay-port 4001
     --scenario-seed "$SCENARIO_SEED"
@@ -144,8 +144,8 @@ run_openmls() {
 #    --singleton-memory 256m
 #    --singleton-memory-swap 256m
     --resource-monitor-interval-ms 250
-    --packed-clients-per-container 48
-    --packed-worker-internal-parallelism 16
+    --packed-clients-per-container 192
+    --packed-worker-internal-parallelism 32
     --bridge-count 4
     --build-images
 #    $BUILD_EXTERNAL_FLAG
@@ -226,7 +226,7 @@ run_signal() {
   cd "$SCRIPT_DIR/Signal_containerized"
 
   local -a _args=(
-    --workers 2048
+    --workers 4096
     --kr-port 3001
     --relay-port 4001
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED"
@@ -240,8 +240,8 @@ run_signal() {
 #    --singleton-memory-swap 256m
 #    --singleton-pids-limit 256
     --resource-monitor-interval-ms 250
-    --packed-clients-per-container 96
-    --packed-worker-internal-parallelism 16
+    --packed-clients-per-container 256
+    --packed-worker-internal-parallelism 32
     --bridge-count 4
     --build-images
 #    $BUILD_EXTERNAL_FLAG
@@ -271,7 +271,7 @@ run_signal() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 2048
+    --max-size 4096
     --step-size '[1,32]'
     --roundtrips 2
     --app-rounds 8
