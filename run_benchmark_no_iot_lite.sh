@@ -11,7 +11,7 @@
 #   bash run_benchmark_no_iot.sh
 #
 # Run from the repository root (parent of *_containerized/).
-# Requires Docker and the project Python environments with pyyaml and pexpect.
+# Requires Docker and Python 3.
 
 set -euo pipefail
 
@@ -71,38 +71,11 @@ cleanup_docker() {
 
 trap cleanup_docker EXIT
 
-# ------------------------------------------------------------------
-# Virtual environment setup
-# ------------------------------------------------------------------
-ensure_venv() {
-  local stack_dir="$1"
-  local req="$stack_dir/requirements.txt"
-
-  if [ ! -f "$req" ]; then
-    echo "[setup] WARNING: no requirements.txt at $req, skipping"
-    return
-  fi
-
-  if [ ! -d "$stack_dir/.venv" ]; then
-    echo "[setup] Creating .venv in $stack_dir ..."
-    python3 -m venv "$stack_dir/.venv"
-  fi
-
-  echo "[setup] Updating .venv in $stack_dir ..."
-  "$stack_dir/.venv/bin/pip" install -q -r "$req" 2>/dev/null || \
-    "$stack_dir/.venv/bin/pip" install --break-system-packages -q -r "$req"
-}
-
-# ------------------------------------------------------------------
-# Pre-flight: venvs
-# ------------------------------------------------------------------
-ensure_venv "$SCRIPT_DIR/OpenMLS_containerized"
-ensure_venv "$SCRIPT_DIR/Signal_containerized"
 
 echo "============================================================"
 echo " Alternating benchmark suite (no IoT devices) - $DATE_TAG"
-echo " OpenMLS: 16 x 2048 workers, no resource constraints, no external devices"
-echo " Signal : 16 x 2048 workers, no resource constraints, no external devices"
+echo " OpenMLS: 16 x 768 workers, no resource constraints, no external devices"
+echo " Signal : 16 x 768 workers, no resource constraints, no external devices"
 echo "============================================================"
 echo ""
 
@@ -130,7 +103,7 @@ run_openmls() {
   cd "$SCRIPT_DIR/OpenMLS_containerized"
 
   local -a _args=(
-    --workers 2048
+    --workers 768
     --ds-port 3001
     --relay-port 4001
     --scenario-seed "$SCENARIO_SEED"
@@ -177,7 +150,7 @@ run_openmls() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 2048
+    --max-size 768
     --step-size '[1,32]'
     --roundtrips 2
     --update-rounds 8
@@ -226,21 +199,21 @@ run_signal() {
   cd "$SCRIPT_DIR/Signal_containerized"
 
   local -a _args=(
-    --workers 2048
+    --workers 768
     --kr-port 3001
     --relay-port 4001
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED"
     --output-dir benchmark_output
     --worker-layout-mode hybrid
     --singleton-min-count 12
-    --singleton-fraction 0.0625
+    --singleton-fraction 0.06125
     --singleton-selection-strategy evenly-spaced
 #    --singleton-cpus 0.5
 #    --singleton-memory 256m
 #    --singleton-memory-swap 256m
 #    --singleton-pids-limit 256
     --resource-monitor-interval-ms 250
-    --packed-clients-per-container 96
+    --packed-clients-per-container 64
     --packed-worker-internal-parallelism 16
     --bridge-count 4
     --build-images
@@ -271,7 +244,7 @@ run_signal() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 2048
+    --max-size 768
     --step-size '[1,32]'
     --roundtrips 2
     --app-rounds 8
