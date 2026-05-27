@@ -103,7 +103,7 @@ run_openmls() {
   cd "$SCRIPT_DIR/OpenMLS_containerized"
 
   local -a _args=(
-    --workers 768
+    --workers 512
     --ds-port 3001
     --relay-port 4001
     --scenario-seed "$SCENARIO_SEED"
@@ -150,7 +150,7 @@ run_openmls() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 768
+    --max-size 512
     --step-size '[1,32]'
     --roundtrips 2
     --update-rounds 8
@@ -199,7 +199,7 @@ run_signal() {
   cd "$SCRIPT_DIR/Signal_containerized"
 
   local -a _args=(
-    --workers 768
+    --workers 512
     --kr-port 3001
     --relay-port 4001
     --singleton-selection-seed "$SINGLETON_SELECTION_SEED"
@@ -244,7 +244,7 @@ run_signal() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 768
+    --max-size 512
     --step-size '[1,32]'
     --roundtrips 2
     --app-rounds 8
