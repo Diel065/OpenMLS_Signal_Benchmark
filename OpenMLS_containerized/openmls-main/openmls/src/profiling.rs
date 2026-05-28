@@ -8,6 +8,7 @@ use std::{
 };
 
 use cpu_time::{ProcessTime, ThreadTime};
+use l1d_cache_counter::L1DCacheCounterScope;
 use serde::Serialize;
 
 static PROFILE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
@@ -321,6 +322,8 @@ pub(crate) struct ProfileEvent {
 
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
+    pub l1d_cache_accesses: Option<u64>,
+    pub l1d_cache_misses: Option<u64>,
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
 
@@ -374,6 +377,7 @@ pub(crate) struct ProfileScope {
     wall_start: Instant,
     cpu_start: Option<ThreadTime>,
     resource_start: ResourceSnapshot,
+    l1d_cache_start: Option<L1DCacheCounterScope>,
 }
 
 impl ProfileScope {
@@ -384,6 +388,7 @@ impl ProfileScope {
         if !profiling_enabled() {
             return None;
         }
+        let _ = L1DCacheCounterScope::counters_available();
 
         Some(Self {
             op: op.into(),
@@ -391,10 +396,15 @@ impl ProfileScope {
             wall_start: Instant::now(),
             cpu_start: Some(ThreadTime::now()),
             resource_start: ResourceSnapshot::capture_start(),
+            l1d_cache_start: L1DCacheCounterScope::start(),
         })
     }
 
     pub(crate) fn finish(self) -> ProfileEvent {
+        let l1d_cache_counts = self
+            .l1d_cache_start
+            .map(L1DCacheCounterScope::finish)
+            .unwrap_or_default();
         let wall_ns = self.wall_start.elapsed().as_nanos();
         let cpu_thread_ns = self.cpu_start.map(|start| start.elapsed().as_nanos());
         let resource_end = ResourceSnapshot::capture_end();
@@ -446,6 +456,8 @@ impl ProfileScope {
 
             alloc_bytes: None,
             alloc_count: None,
+            l1d_cache_accesses: l1d_cache_counts.accesses,
+            l1d_cache_misses: l1d_cache_counts.misses,
             ram_rss_delta_bytes,
             ram_rss_utilization,
 

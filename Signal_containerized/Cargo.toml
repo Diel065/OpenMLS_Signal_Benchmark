@@ -21,6 +21,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 once_cell = "1"
 cpu-time = "1.0"
 allocation-counter = "0.8.1"
+l1d-cache-counter = { path = "l1d_cache_counter" }
 
 [profile.release]
 opt-level = 3

@@ -856,6 +856,10 @@ struct ProfileEvent {
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     #[serde(default)]
+    l1d_cache_accesses: Option<u64>,
+    #[serde(default)]
+    l1d_cache_misses: Option<u64>,
+    #[serde(default)]
     ram_rss_delta_bytes: Option<i64>,
     #[serde(default)]
     ram_rss_utilization: Option<f64>,
@@ -4927,6 +4931,8 @@ pub fn aggregate_csv(
         cpu_throttled_time_ratio: Option<f64>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
+        l1d_cache_accesses: Option<u64>,
+        l1d_cache_misses: Option<u64>,
         ram_rss_delta_bytes: Option<i64>,
         ram_rss_utilization: Option<f64>,
         artifact_size_bytes: Option<usize>,
@@ -5060,6 +5066,8 @@ pub fn aggregate_csv(
                 cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
+                l1d_cache_accesses: event.l1d_cache_accesses,
+                l1d_cache_misses: event.l1d_cache_misses,
                 ram_rss_delta_bytes: event.ram_rss_delta_bytes,
                 ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
@@ -5268,6 +5276,8 @@ mod aggregate_csv_resource_tests {
             "cpu_throttled_time_ratio": 0.1,
             "alloc_bytes": 42u64,
             "alloc_count": 3u64,
+            "l1d_cache_accesses": 1000u64,
+            "l1d_cache_misses": 25u64,
             "ram_rss_delta_bytes": 4096i64,
             "ram_rss_utilization": 0.25,
             "pid": 123,
@@ -5311,6 +5321,8 @@ mod aggregate_csv_resource_tests {
         );
         assert_eq!(value("cpu_envelope_utilization"), "0.9");
         assert_eq!(value("cpu_throttled_time_ratio"), "0.1");
+        assert_eq!(value("l1d_cache_accesses"), "1000");
+        assert_eq!(value("l1d_cache_misses"), "25");
         assert_eq!(value("ram_rss_delta_bytes"), "4096");
         assert_eq!(value("ram_rss_utilization"), "0.25");
 

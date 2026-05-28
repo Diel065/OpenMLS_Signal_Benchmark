@@ -80,6 +80,10 @@ pub struct SignalProfileEvent {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     #[serde(default)]
+    pub l1d_cache_accesses: Option<u64>,
+    #[serde(default)]
+    pub l1d_cache_misses: Option<u64>,
+    #[serde(default)]
     pub ram_rss_delta_bytes: Option<i64>,
     #[serde(default)]
     pub ram_rss_utilization: Option<f64>,
@@ -211,6 +215,8 @@ pub struct SignalCsvRow<'a> {
     pub cpu_throttled_time_ratio: Option<f64>,
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
+    pub l1d_cache_accesses: Option<u64>,
+    pub l1d_cache_misses: Option<u64>,
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
     pub artifact_size_bytes: Option<usize>,

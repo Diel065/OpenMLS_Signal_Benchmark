@@ -988,6 +988,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "l1d-cache-counter"
+version = "0.1.0"
+
+[[package]]
 name = "leb128fmt"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1151,6 +1155,7 @@ dependencies = [
  "hmac",
  "indexmap",
  "itertools",
+ "l1d-cache-counter",
  "libcrux-ml-kem",
  "libsignal-core",
  "libsignal-debug",
@@ -1772,6 +1777,7 @@ dependencies = [
  "csv",
  "futures-util",
  "hex",
+ "l1d-cache-counter",
  "libsignal-core",
  "libsignal-protocol",
  "once_cell",

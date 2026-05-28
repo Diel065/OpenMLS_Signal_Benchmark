@@ -59,6 +59,8 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "cpu_throttled_time_ratio",
         "alloc_bytes",
         "alloc_count",
+        "l1d_cache_accesses",
+        "l1d_cache_misses",
         "ram_rss_delta_bytes",
         "ram_rss_utilization",
         "artifact_size_bytes",

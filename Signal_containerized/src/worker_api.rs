@@ -21,6 +21,7 @@ use crate::http_retry::{
 use crate::key_repository::{
     OneTimePrekeyStorable, PrekeyBundleBatchStorable, PrekeyBundleStorable, PrekeyStock,
 };
+use crate::l1d_cache::{L1DCacheCounterScope, L1DCacheCounts};
 use crate::signal_participant::SignalParticipant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -139,6 +140,8 @@ pub struct CommandMetrics {
     pub cpu_thread_ns: Option<u128>,
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
+    pub l1d_cache_accesses: Option<u64>,
+    pub l1d_cache_misses: Option<u64>,
     pub artifact_size_bytes: Option<usize>,
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
@@ -171,6 +174,9 @@ impl CommandMetrics {
         self.cpu_thread_ns = add_u128_options(self.cpu_thread_ns, other.cpu_thread_ns);
         self.alloc_bytes = add_u64_options(self.alloc_bytes, other.alloc_bytes);
         self.alloc_count = add_u64_options(self.alloc_count, other.alloc_count);
+        self.l1d_cache_accesses =
+            add_u64_options(self.l1d_cache_accesses, other.l1d_cache_accesses);
+        self.l1d_cache_misses = add_u64_options(self.l1d_cache_misses, other.l1d_cache_misses);
     }
 }
 
@@ -221,10 +227,16 @@ fn add_usize_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 }
 
 fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
+    let _ = L1DCacheCounterScope::counters_available();
     let cpu_start = ThreadTime::now();
     let mut result = None;
+    let mut l1d_cache_counts = L1DCacheCounts::default();
     let allocation_info = allocation_counter::measure(|| {
+        let l1d_cache_scope = L1DCacheCounterScope::start();
         result = Some(run());
+        l1d_cache_counts = l1d_cache_scope
+            .map(L1DCacheCounterScope::finish)
+            .unwrap_or_default();
     });
 
     let cpu_thread_ns = cpu_start.elapsed().as_nanos();
@@ -236,6 +248,8 @@ fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
             cpu_thread_ns: Some(cpu_thread_ns),
             alloc_bytes: Some(allocation_info.bytes_total),
             alloc_count: Some(allocation_info.count_total),
+            l1d_cache_accesses: l1d_cache_counts.accesses,
+            l1d_cache_misses: l1d_cache_counts.misses,
             ..Default::default()
         },
     )

@@ -617,6 +617,8 @@ async fn participant_command_actor(
                     cpu_throttled_time_ratio: None,
                     alloc_bytes: metrics.alloc_bytes,
                     alloc_count: metrics.alloc_count,
+                    l1d_cache_accesses: metrics.l1d_cache_accesses,
+                    l1d_cache_misses: metrics.l1d_cache_misses,
                     ram_rss_delta_bytes: None,
                     ram_rss_utilization: None,
                     artifact_size_bytes: metrics.artifact_size_bytes,

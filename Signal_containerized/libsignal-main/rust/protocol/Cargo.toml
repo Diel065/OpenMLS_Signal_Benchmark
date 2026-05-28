@@ -50,6 +50,7 @@ uuid = { workspace = true }
 zerocopy = { workspace = true, features = ["derive"] }
 cpu-time = "1.0"
 allocation-counter = "0.8.1"
+l1d-cache-counter = { path = "../../../l1d_cache_counter" }
 
 [features]
 kyber768 = ["libcrux-ml-kem/kyber", "libcrux-ml-kem/mlkem768"]
