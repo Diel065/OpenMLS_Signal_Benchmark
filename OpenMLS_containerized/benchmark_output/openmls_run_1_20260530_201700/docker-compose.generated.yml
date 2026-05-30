@@ -1,0 +1,1620 @@
+name: mls-openmls_run_1_20260530_201700
+
+x-worker-common: &worker-common
+  image: mls-worker
+  cap_add:
+    - PERFMON
+  security_opt:
+    - seccomp=unconfined
+  environment:
+    OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+    OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+    OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+    MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+    OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+    OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+    OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+    OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+    OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+    OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+    OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+    OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+  depends_on:
+    - ds
+    - relay
+  volumes:
+    - ./benchmark_output:/results
+  logging:
+    driver: "local"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  ds:
+    image: mls-ds
+    command: ["--listen-addr", "0.0.0.0:3001"]
+    environment:
+      OPENMLS_DS_DELIVERY_MODE: ${OPENMLS_DS_DELIVERY_MODE:-group-log}
+      OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT: ${OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT:-128}
+    ports:
+      - "3001:3001"
+    networks:
+      - bench-net-000
+      - bench-net-001
+      - bench-net-002
+      - bench-net-003
+    logging:
+      driver: "local"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  relay:
+    image: mls-relay
+    command: ["--listen-addr", "0.0.0.0:4001"]
+    environment:
+      OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT: ${OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT:-128}
+    ports:
+      - "4001:4001"
+    networks:
+      - bench-net-000
+      - bench-net-001
+      - bench-net-002
+      - bench-net-003
+    logging:
+      driver: "local"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  worker-00001:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00001"
+      - "--clients"
+      - "00001"
+      - "--profile-enabled-client-ids"
+      - "00001"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00001"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00001.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00010:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00010"
+      - "--clients"
+      - "00010"
+      - "--profile-enabled-client-ids"
+      - "00010"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00010"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00010.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00026:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00026"
+      - "--clients"
+      - "00026"
+      - "--profile-enabled-client-ids"
+      - "00026"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00026"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00026.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00043:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00043"
+      - "--clients"
+      - "00043"
+      - "--profile-enabled-client-ids"
+      - "00043"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00043"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00043.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00059:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00059"
+      - "--clients"
+      - "00059"
+      - "--profile-enabled-client-ids"
+      - "00059"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00059"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00059.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00076:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00076"
+      - "--clients"
+      - "00076"
+      - "--profile-enabled-client-ids"
+      - "00076"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00076"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00076.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00092:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00092"
+      - "--clients"
+      - "00092"
+      - "--profile-enabled-client-ids"
+      - "00092"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00092"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00092.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00109:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00109"
+      - "--clients"
+      - "00109"
+      - "--profile-enabled-client-ids"
+      - "00109"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00109"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00109.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00125:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00125"
+      - "--clients"
+      - "00125"
+      - "--profile-enabled-client-ids"
+      - "00125"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00125"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00125.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00142:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00142"
+      - "--clients"
+      - "00142"
+      - "--profile-enabled-client-ids"
+      - "00142"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00142"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00142.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00158:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00158"
+      - "--clients"
+      - "00158"
+      - "--profile-enabled-client-ids"
+      - "00158"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00158"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00158.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-000
+
+  worker-00175:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00175"
+      - "--clients"
+      - "00175"
+      - "--profile-enabled-client-ids"
+      - "00175"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00175"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00175.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00191:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00191"
+      - "--clients"
+      - "00191"
+      - "--profile-enabled-client-ids"
+      - "00191"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00191"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00191.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00208:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00208"
+      - "--clients"
+      - "00208"
+      - "--profile-enabled-client-ids"
+      - "00208"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00208"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00208.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00224:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00224"
+      - "--clients"
+      - "00224"
+      - "--profile-enabled-client-ids"
+      - "00224"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00224"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00224.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00241:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00241"
+      - "--clients"
+      - "00241"
+      - "--profile-enabled-client-ids"
+      - "00241"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00241"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00241.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00257:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00257"
+      - "--clients"
+      - "00257"
+      - "--profile-enabled-client-ids"
+      - "00257"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00257"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00257.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00273:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00273"
+      - "--clients"
+      - "00273"
+      - "--profile-enabled-client-ids"
+      - "00273"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00273"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00273.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00290:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00290"
+      - "--clients"
+      - "00290"
+      - "--profile-enabled-client-ids"
+      - "00290"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00290"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00290.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00306:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00306"
+      - "--clients"
+      - "00306"
+      - "--profile-enabled-client-ids"
+      - "00306"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00306"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00306.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00323:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00323"
+      - "--clients"
+      - "00323"
+      - "--profile-enabled-client-ids"
+      - "00323"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00323"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00323.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-001
+
+  worker-00339:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00339"
+      - "--clients"
+      - "00339"
+      - "--profile-enabled-client-ids"
+      - "00339"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00339"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00339.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00356:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00356"
+      - "--clients"
+      - "00356"
+      - "--profile-enabled-client-ids"
+      - "00356"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00356"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00356.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00372:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00372"
+      - "--clients"
+      - "00372"
+      - "--profile-enabled-client-ids"
+      - "00372"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00372"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00372.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00389:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00389"
+      - "--clients"
+      - "00389"
+      - "--profile-enabled-client-ids"
+      - "00389"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00389"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00389.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00405:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00405"
+      - "--clients"
+      - "00405"
+      - "--profile-enabled-client-ids"
+      - "00405"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00405"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00405.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00422:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00422"
+      - "--clients"
+      - "00422"
+      - "--profile-enabled-client-ids"
+      - "00422"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00422"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00422.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00438:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00438"
+      - "--clients"
+      - "00438"
+      - "--profile-enabled-client-ids"
+      - "00438"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00438"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00438.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00455:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00455"
+      - "--clients"
+      - "00455"
+      - "--profile-enabled-client-ids"
+      - "00455"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00455"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00455.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00471:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00471"
+      - "--clients"
+      - "00471"
+      - "--profile-enabled-client-ids"
+      - "00471"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00471"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00471.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00488:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00488"
+      - "--clients"
+      - "00488"
+      - "--profile-enabled-client-ids"
+      - "00488"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00488"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00488.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-00504:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-00504"
+      - "--clients"
+      - "00504"
+      - "--profile-enabled-client-ids"
+      - "00504"
+      - "--profile-path-template"
+      - "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "true"
+      OPENMLS_PROFILE_CLIENT_IDS: "00504"
+      OPENMLS_PROFILE_PATH_TEMPLATE: "/results/openmls_run_1_20260530_201700/client-{client_id}.jsonl"
+      OPENMLS_PROFILE_PATH: "/results/openmls_run_1_20260530_201700/client-00504.jsonl"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-002
+
+  worker-pack-000:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-000"
+      - "--clients"
+      - "00002,00003,00004,00005,00006,00007,00008,00009,00011,00012,00013,00014,00015,00016,00017,00018,00019,00020,00021,00022,00023,00024,00025,00027,00028,00029,00030,00031,00032,00033,00034,00035,00036,00037,00038,00039,00040,00041,00042,00044,00045,00046,00047,00048,00049,00050,00051,00052"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-001:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-001"
+      - "--clients"
+      - "00053,00054,00055,00056,00057,00058,00060,00061,00062,00063,00064,00065,00066,00067,00068,00069,00070,00071,00072,00073,00074,00075,00077,00078,00079,00080,00081,00082,00083,00084,00085,00086,00087,00088,00089,00090,00091,00093,00094,00095,00096,00097,00098,00099,00100,00101,00102,00103"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-002:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-002"
+      - "--clients"
+      - "00104,00105,00106,00107,00108,00110,00111,00112,00113,00114,00115,00116,00117,00118,00119,00120,00121,00122,00123,00124,00126,00127,00128,00129,00130,00131,00132,00133,00134,00135,00136,00137,00138,00139,00140,00141,00143,00144,00145,00146,00147,00148,00149,00150,00151,00152,00153,00154"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-003:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-003"
+      - "--clients"
+      - "00155,00156,00157,00159,00160,00161,00162,00163,00164,00165,00166,00167,00168,00169,00170,00171,00172,00173,00174,00176,00177,00178,00179,00180,00181,00182,00183,00184,00185,00186,00187,00188,00189,00190,00192,00193,00194,00195,00196,00197,00198,00199,00200,00201,00202,00203,00204,00205"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-004:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-004"
+      - "--clients"
+      - "00206,00207,00209,00210,00211,00212,00213,00214,00215,00216,00217,00218,00219,00220,00221,00222,00223,00225,00226,00227,00228,00229,00230,00231,00232,00233,00234,00235,00236,00237,00238,00239,00240,00242,00243,00244,00245,00246,00247,00248,00249,00250,00251,00252,00253,00254,00255,00256"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-005:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-005"
+      - "--clients"
+      - "00258,00259,00260,00261,00262,00263,00264,00265,00266,00267,00268,00269,00270,00271,00272,00274,00275,00276,00277,00278,00279,00280,00281,00282,00283,00284,00285,00286,00287,00288,00289,00291,00292,00293,00294,00295,00296,00297,00298,00299,00300,00301,00302,00303,00304,00305,00307,00308"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-006:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-006"
+      - "--clients"
+      - "00309,00310,00311,00312,00313,00314,00315,00316,00317,00318,00319,00320,00321,00322,00324,00325,00326,00327,00328,00329,00330,00331,00332,00333,00334,00335,00336,00337,00338,00340,00341,00342,00343,00344,00345,00346,00347,00348,00349,00350,00351,00352,00353,00354,00355,00357,00358,00359"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-007:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-007"
+      - "--clients"
+      - "00360,00361,00362,00363,00364,00365,00366,00367,00368,00369,00370,00371,00373,00374,00375,00376,00377,00378,00379,00380,00381,00382,00383,00384,00385,00386,00387,00388,00390,00391,00392,00393,00394,00395,00396,00397,00398,00399,00400,00401,00402,00403,00404,00406,00407,00408,00409,00410"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-008:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-008"
+      - "--clients"
+      - "00411,00412,00413,00414,00415,00416,00417,00418,00419,00420,00421,00423,00424,00425,00426,00427,00428,00429,00430,00431,00432,00433,00434,00435,00436,00437,00439,00440,00441,00442,00443,00444,00445,00446,00447,00448,00449,00450,00451,00452,00453,00454,00456,00457,00458,00459,00460,00461"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  worker-pack-009:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "worker-pack-009"
+      - "--clients"
+      - "00462,00463,00464,00465,00466,00467,00468,00469,00470,00472,00473,00474,00475,00476,00477,00478,00479,00480,00481,00482,00483,00484,00485,00486,00487,00489,00490,00491,00492,00493,00494,00495,00496,00497,00498,00499,00500,00501,00502,00503,00505,00506,00507,00508,00509,00510,00511,00512"
+      - "--ds-url"
+      - "http://ds:3001"
+      - "--relay-url"
+      - "http://relay:4001"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: openmls_run_1_20260530_201700
+      OPENMLS_PROFILE_SCENARIO: http-staircase-compose
+      OPENMLS_PROFILE_SCENARIO_SEED: 235709651
+      OPENMLS_PROFILE_ENABLED: "false"
+      OPENMLS_PROFILE_CLIENT_IDS: ""
+      OPENMLS_PROFILE_PATH_TEMPLATE: ""
+      OPENMLS_PACKED_WORKER_INTERNAL_PARALLELISM: "16"
+      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}
+      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}
+      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}
+      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}
+      OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST: ${OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST:-32}
+      OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS:-5000}
+      OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS:-30000}
+      OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS: ${OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS:-32}
+    networks:
+      - bench-net-003
+
+  runner:
+    image: mls-runner
+    profiles:
+      - runner
+    depends_on:
+      - ds
+      - relay
+    environment:
+      OPENMLS_RUNNER_HTTP_CONNECT_TIMEOUT_MS: ${OPENMLS_RUNNER_HTTP_CONNECT_TIMEOUT_MS:-2000}
+      OPENMLS_RUNNER_HTTP_REQUEST_TIMEOUT_MS: ${OPENMLS_RUNNER_HTTP_REQUEST_TIMEOUT_MS:-60000}
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - ./benchmark_output:/results
+    networks:
+      - bench-net-000
+      - bench-net-001
+      - bench-net-002
+      - bench-net-003
+    logging:
+      driver: "local"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  bench-net-000:
+    driver: bridge
+  bench-net-001:
+    driver: bridge
+  bench-net-002:
+    driver: bridge
+  bench-net-003:
+    driver: bridge

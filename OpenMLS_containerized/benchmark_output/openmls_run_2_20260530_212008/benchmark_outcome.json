@@ -1,0 +1,7 @@
+{
+  "evidence": {
+    "error": "Command '['docker', 'build', '--target', 'ds-runtime', '-t', 'mls-ds', '.']' returned non-zero exit status 1."
+  },
+  "outcome_class": "infrastructure_failure",
+  "written_utc": "2026-05-30T19:51:02.348673+00:00"
+}

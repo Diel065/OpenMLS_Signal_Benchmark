@@ -1,0 +1,5 @@
+op,rows,nodes_equal_filtered_pct,deriv_equal_filtered_pct,hpke_equal_eps_pct,eps_equal_resolution_pct,filtered_direct_path_median,encrypted_path_secret_median,update_path_bytes_median
+update_path_compute_protocol_core,5316,1,1,1,1,8,21,2196
+commit_create_protocol_update,5088,1,1,1,1,8,21,2196
+commit_create_protocol_add,121,1,1,0,1,8,13,1575
+commit_create_protocol_remove,107,1,1,1,1,8,55,4984

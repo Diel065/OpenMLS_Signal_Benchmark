@@ -1,0 +1,15 @@
+op,measurement_plane,span_kind,rows,runs,member_min,member_max,tree_height_min,tree_height_max,payload_min,payload_max,wall_ms_median,alloc_bytes_median,finite_l1d_hit_ratio
+update_path_compute_protocol_core,protocol_scaling,tree_structure,5316,5,NA,NA,1,9,NA,NA,5.6657095,NA,5316
+commit_create_protocol_update,openmls_implementation,openmls_api,5088,5,2,512,1,9,NA,NA,14.813401,640474,5088
+commit_create_protocol_add,openmls_implementation,openmls_api,121,5,1,507,1,9,NA,NA,12.983255,588774,121
+commit_create_protocol_remove,openmls_implementation,openmls_api,107,5,3,512,8,9,NA,NA,17.204013,702371,107
+welcome_create_protocol,openmls_implementation,openmls_api,121,5,2,509,NA,NA,NA,NA,0.61831,12932,121
+welcome_create_serialize,serialization,serialization,121,5,2,509,NA,NA,NA,NA,0.059111,538,121
+join_from_welcome_protocol,openmls_implementation,openmls_api,314,5,12,510,NA,NA,NA,NA,30.625894000000002,3088623.5,314
+join_from_welcome_deserialize_ratchet_tree,serialization,serialization,314,5,12,510,NA,NA,NA,NA,0.408634,174117.5,314
+join_from_welcome_deserialize_welcome,serialization,serialization,314,5,12,510,NA,NA,NA,NA,0.20982050000000002,1820,314
+application_message_create_protocol,openmls_implementation,openmls_api,5088,5,2,512,NA,NA,17,4096,0.619128,76896,5088
+application_message_create_serialize,serialization,serialization,5088,5,2,512,NA,NA,17,4096,0.0974975,2178.5,5088
+application_message_receive_protocol,openmls_implementation,openmls_api,4896,5,14,512,NA,NA,17,4096,0.669547,71162.5,4896
+application_message_receive_deserialize,serialization,serialization,4896,5,14,512,NA,NA,NA,NA,0.2205185,2153.5,4896
+commit_create_serialize,serialization,serialization,5316,5,1,512,NA,NA,NA,NA,0.1104665,2392,5316

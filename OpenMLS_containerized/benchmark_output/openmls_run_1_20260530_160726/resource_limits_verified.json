@@ -1,0 +1,18 @@
+{
+  "aggregate_status": "disabled",
+  "enabled": false,
+  "singleton_resource_envelope": {
+    "applies_to": "all_containerized_singletons",
+    "cpus": null,
+    "enabled": false,
+    "memory": null,
+    "memory_bytes": null,
+    "memory_swap": null,
+    "memory_swap_bytes": null,
+    "memory_swap_defaulted_to_memory": false,
+    "pids_limit": null,
+    "resource_profile": "",
+    "scientific_interpretation": "host-specific reproducible resource envelope; not exact hardware emulation"
+  },
+  "targets": []
+}
