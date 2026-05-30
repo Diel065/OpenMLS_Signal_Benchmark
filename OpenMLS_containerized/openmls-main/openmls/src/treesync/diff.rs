@@ -39,6 +39,12 @@ use super::{
 };
 use crate::binary_tree::array_representation::tree::ABinaryTree;
 use crate::group::diff::compute_path::CommitType;
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
+#[cfg(feature = "profiling-json")]
+use crate::group::diff::compute_path::parent_operation_for_span_prefix;
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{finish_and_emit, ProfileScope};
 use crate::group::GroupId;
 use crate::{
     binary_tree::{
@@ -293,14 +299,50 @@ impl TreeSyncDiff<'_> {
         crypto: &impl OpenMlsCrypto,
         ciphersuite: Ciphersuite,
         leaf_index: LeafNodeIndex,
+        profile_span_prefix: &'static str,
     ) -> Result<PathDerivationResult, LibraryError> {
         let path_secret = PathSecret::from(
             Secret::random(ciphersuite, rand).map_err(LibraryError::unexpected_crypto_error)?,
         );
 
         let path_indices = self.filtered_direct_path(leaf_index);
+        #[cfg(feature = "profiling-json")]
+        let path_len = path_indices.len();
 
-        ParentNode::derive_path(crypto, ciphersuite, path_secret, path_indices)
+        #[cfg(feature = "profiling-json")]
+        let path_secret_scope = ProfileScope::start(
+            format!("{profile_span_prefix}.path_secret_derive"),
+            "openmls",
+        );
+        #[cfg(feature = "profiling-json")]
+        let mut measured_result = None;
+        #[cfg(feature = "profiling-json")]
+        let allocation_info = measure(|| {
+            measured_result = Some(ParentNode::derive_path(
+                crypto,
+                ciphersuite,
+                path_secret,
+                path_indices,
+            ));
+        });
+        #[cfg(feature = "profiling-json")]
+        let result = measured_result.expect("allocation_counter measure closure did not run");
+        #[cfg(not(feature = "profiling-json"))]
+        let result = ParentNode::derive_path(crypto, ciphersuite, path_secret, path_indices);
+        #[cfg(feature = "profiling-json")]
+        finish_and_emit(path_secret_scope, |event| {
+            event.parent_operation =
+                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+            event.tree_size = Some(self.diff.size().u32());
+            event.filtered_direct_path_len = Some(path_len);
+            event.update_path_nodes_count = Some(path_len);
+            event.path_secret_derivation_count = Some(path_len as u64);
+            event.node_secret_derivation_count = Some(path_len as u64);
+            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+            event.alloc_count = Some(allocation_info.count_total as u64);
+        });
+
+        result
     }
 
     /// Given a new [`LeafNode`], use it to create a new path starting from
@@ -322,6 +364,7 @@ impl TreeSyncDiff<'_> {
         group_id: GroupId,
         leaf_index: LeafNodeIndex,
         leaf_node_params: UpdateLeafNodeParams,
+        profile_span_prefix: &'static str,
     ) -> Result<UpdatePathResult, TreeSyncAddLeaf> {
         // For External Commits, we temporarily add a placeholder leaf node to the tree, because it
         // might be required to make the tree grow to the right size. If we
@@ -335,9 +378,9 @@ impl TreeSyncDiff<'_> {
 
         // We calculate the parent hash so that we can use it for a fresh leaf
         let (path, update_path_nodes, parent_keypairs, commit_secret) =
-            self.derive_path(rand, crypto, ciphersuite, leaf_index)?;
+            self.derive_path(rand, crypto, ciphersuite, leaf_index, profile_span_prefix)?;
         let parent_hash = self
-            .process_update_path(crypto, ciphersuite, leaf_index, path)
+            .process_update_path(crypto, ciphersuite, leaf_index, path, profile_span_prefix)
             .map_err(|e| match e {
                 ApplyUpdatePathError::LibraryError(e) => TreeSyncAddLeaf::LibraryError(e),
                 _ => TreeSyncAddLeaf::LibraryError(LibraryError::custom(
@@ -415,7 +458,8 @@ impl TreeSyncDiff<'_> {
             .collect();
 
         // Verify the parent hash.
-        let parent_hash = self.process_update_path(crypto, ciphersuite, sender_leaf_index, path)?;
+        let parent_hash =
+            self.process_update_path(crypto, ciphersuite, sender_leaf_index, path, "commit_recv")?;
         let leaf_node_parent_hash = update_path
             .leaf_node()
             .parent_hash()
@@ -442,9 +486,39 @@ impl TreeSyncDiff<'_> {
         ciphersuite: Ciphersuite,
         leaf_index: LeafNodeIndex,
         mut path: Vec<(ParentNodeIndex, ParentNode)>,
+        profile_span_prefix: &'static str,
     ) -> Result<Vec<u8>, ApplyUpdatePathError> {
         // Compute the parent hash.
-        let parent_hash = self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index)?;
+        #[cfg(feature = "profiling-json")]
+        let path_len = path.len();
+        #[cfg(feature = "profiling-json")]
+        let parent_hash_scope = ProfileScope::start(
+            format!("{profile_span_prefix}.parent_hash_recompute"),
+            "openmls",
+        );
+        #[cfg(feature = "profiling-json")]
+        let mut measured_parent_hash = None;
+        #[cfg(feature = "profiling-json")]
+        let allocation_info = measure(|| {
+            measured_parent_hash =
+                Some(self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index));
+        });
+        #[cfg(feature = "profiling-json")]
+        let parent_hash =
+            measured_parent_hash.expect("allocation_counter measure closure did not run");
+        #[cfg(not(feature = "profiling-json"))]
+        let parent_hash = self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index);
+        #[cfg(feature = "profiling-json")]
+        finish_and_emit(parent_hash_scope, |event| {
+            event.parent_operation =
+                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+            event.tree_size = Some(self.diff.size().u32());
+            event.filtered_direct_path_len = Some(path_len);
+            event.update_path_nodes_count = Some(path_len);
+            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+            event.alloc_count = Some(allocation_info.count_total as u64);
+        });
+        let parent_hash = parent_hash?;
 
         // While probably not necessary, the spec mandates we blank the direct path nodes
         let direct_path_nodes = self.diff.direct_path(leaf_index);
@@ -597,7 +671,7 @@ impl TreeSyncDiff<'_> {
 
     /// Compute the copath resolutions, but leave out empty resolutions.
     /// Additionally, resolutions are filtered by the given exclusion list.
-    pub(super) fn filtered_copath_resolutions(
+    pub(crate) fn filtered_copath_resolutions(
         &self,
         leaf_index: LeafNodeIndex,
         exclusion_list: &HashSet<&LeafNodeIndex>,
@@ -629,6 +703,29 @@ impl TreeSyncDiff<'_> {
             }
         }
         copath_resolutions
+    }
+
+    pub(crate) fn direct_path_len(&self, leaf_index: LeafNodeIndex) -> usize {
+        self.diff.direct_path(leaf_index).len()
+    }
+
+    pub(crate) fn copath_len(&self, leaf_index: LeafNodeIndex) -> usize {
+        if self.diff.leaf_count() == MIN_TREE_SIZE {
+            0
+        } else {
+            self.diff.copath(leaf_index).len()
+        }
+    }
+
+    pub(crate) fn filtered_copath_resolution_sizes(
+        &self,
+        leaf_index: LeafNodeIndex,
+        exclusion_list: &HashSet<&LeafNodeIndex>,
+    ) -> Vec<usize> {
+        self.filtered_copath_resolutions(leaf_index, exclusion_list)
+            .into_iter()
+            .map(|resolution| resolution.len())
+            .collect()
     }
 
     /// Verify the parent hashes of all parent nodes in the tree.
@@ -744,6 +841,9 @@ impl TreeSyncDiff<'_> {
         node_index: TreeNodeIndex,
         exclusion_list: &HashSet<&LeafNodeIndex>,
     ) -> Result<Vec<u8>, LibraryError> {
+        #[cfg(feature = "profiling-json")]
+        crate::profiling::count_tree_hash_node_touch(1);
+
         match node_index {
             TreeNodeIndex::Leaf(leaf_index) => {
                 let leaf = self.diff.leaf(leaf_index);

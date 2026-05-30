@@ -431,7 +431,7 @@ impl Client {
                 .try_into_protocol_message()
                 .map_err(|_| anyhow!("Expected a protocol message"))?;
 
-            let processed_message = group.process_message(&self.crypto, protocol_message, false)?;
+            let processed_message = group.process_message(&self.crypto, protocol_message)?;
 
             match processed_message.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => {

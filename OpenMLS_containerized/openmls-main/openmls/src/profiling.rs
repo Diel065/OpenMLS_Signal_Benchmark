@@ -1,9 +1,13 @@
 //ADDED THIS ENTIRE FILE FOR THE MASTERS THESIS PROJECT!!!
 use std::{
+    cell::RefCell,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex, OnceLock,
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -16,6 +20,17 @@ static CPU_STAT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static CPU_LIMIT_CORES: OnceLock<Option<f64>> = OnceLock::new();
 static MEMORY_LIMIT_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 static PAGE_SIZE_BYTES: OnceLock<u64> = OnceLock::new();
+static TREE_HASH_NODES_TOUCHED: AtomicU64 = AtomicU64::new(0);
+static PARENT_HASH_NODES_TOUCHED: AtomicU64 = AtomicU64::new(0);
+static PATH_SECRET_DERIVATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static NODE_SECRET_DERIVATION_COUNT: AtomicU64 = AtomicU64::new(0);
+static HPKE_ENCRYPT_COUNT: AtomicU64 = AtomicU64::new(0);
+static HPKE_DECRYPT_COUNT: AtomicU64 = AtomicU64::new(0);
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+
+thread_local! {
+    static SPAN_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+}
 
 fn profile_path() -> Option<PathBuf> {
     std::env::var_os("OPENMLS_PROFILE_PATH").map(PathBuf::from)
@@ -83,6 +98,85 @@ fn measurement_class_for_op(op: &str) -> &'static str {
     } else {
         "other"
     }
+}
+
+fn measurement_plane_for_op(op: &str) -> &'static str {
+    if op.contains("serialize") || op.contains("deserialize") {
+        "serialization"
+    } else if op.starts_with("self_update.")
+        || op.starts_with("commit_add.")
+        || op.starts_with("commit_remove.")
+    {
+        "protocol_scaling"
+    } else if op.starts_with("update_path_") {
+        "protocol_scaling"
+    } else if op.ends_with("_protocol") || op.contains("_protocol_") {
+        "openmls_implementation"
+    } else {
+        "openmls_implementation"
+    }
+}
+
+fn span_kind_for_op(op: &str) -> &'static str {
+    if op.contains("serialize") || op.contains("deserialize") {
+        "serialization"
+    } else if op.ends_with(".path_secret_derive")
+        || op.ends_with(".path_hpke_encrypt")
+        || op.ends_with(".welcome_group_secrets_encrypt")
+        || op.ends_with(".group_secrets_hpke_decrypt")
+        || op.ends_with(".aead_encrypt")
+        || op.ends_with(".aead_decrypt")
+    {
+        "crypto_primitive"
+    } else if op.ends_with(".tree_hash_recompute")
+        || op.ends_with(".parent_hash_recompute")
+        || op.ends_with(".path_structure_build")
+        || op.ends_with(".tree_restructure")
+    {
+        "tree_structure"
+    } else if op.ends_with(".key_schedule_step") {
+        "key_schedule"
+    } else if op.starts_with("self_update.")
+        || op.starts_with("commit_add.")
+        || op.starts_with("commit_remove.")
+    {
+        "protocol_core"
+    } else if op.starts_with("update_path_") {
+        "tree_structure"
+    } else if op.contains("welcome") {
+        "openmls_api"
+    } else if op.contains("join_from_welcome") {
+        "openmls_api"
+    } else if op.contains("application_message") {
+        "openmls_api"
+    } else if op.contains("commit_create") {
+        "openmls_api"
+    } else {
+        "openmls_api"
+    }
+}
+
+fn next_span_id() -> u64 {
+    NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn current_parent_span_id() -> Option<u64> {
+    SPAN_STACK.with(|stack| stack.borrow().last().copied())
+}
+
+fn push_span_id(span_id: u64) {
+    SPAN_STACK.with(|stack| stack.borrow_mut().push(span_id));
+}
+
+fn pop_span_id(span_id: u64) {
+    SPAN_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.last().copied() == Some(span_id) {
+            stack.pop();
+        } else if let Some(position) = stack.iter().rposition(|id| *id == span_id) {
+            stack.remove(position);
+        }
+    });
 }
 
 fn cgroup_file_candidates(controller: &str, file_name: &str) -> Vec<PathBuf> {
@@ -307,12 +401,85 @@ pub(crate) fn profiling_enabled() -> bool {
     writer().is_some()
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct StructuralCounterSnapshot {
+    tree_hash_nodes_touched: u64,
+    parent_hash_nodes_touched: u64,
+    path_secret_derivation_count: u64,
+    node_secret_derivation_count: u64,
+    hpke_encrypt_count: u64,
+    hpke_decrypt_count: u64,
+}
+
+impl StructuralCounterSnapshot {
+    fn capture() -> Self {
+        Self {
+            tree_hash_nodes_touched: TREE_HASH_NODES_TOUCHED.load(Ordering::Relaxed),
+            parent_hash_nodes_touched: PARENT_HASH_NODES_TOUCHED.load(Ordering::Relaxed),
+            path_secret_derivation_count: PATH_SECRET_DERIVATION_COUNT.load(Ordering::Relaxed),
+            node_secret_derivation_count: NODE_SECRET_DERIVATION_COUNT.load(Ordering::Relaxed),
+            hpke_encrypt_count: HPKE_ENCRYPT_COUNT.load(Ordering::Relaxed),
+            hpke_decrypt_count: HPKE_DECRYPT_COUNT.load(Ordering::Relaxed),
+        }
+    }
+
+    fn delta_since(self, start: Self) -> Self {
+        Self {
+            tree_hash_nodes_touched: self
+                .tree_hash_nodes_touched
+                .saturating_sub(start.tree_hash_nodes_touched),
+            parent_hash_nodes_touched: self
+                .parent_hash_nodes_touched
+                .saturating_sub(start.parent_hash_nodes_touched),
+            path_secret_derivation_count: self
+                .path_secret_derivation_count
+                .saturating_sub(start.path_secret_derivation_count),
+            node_secret_derivation_count: self
+                .node_secret_derivation_count
+                .saturating_sub(start.node_secret_derivation_count),
+            hpke_encrypt_count: self.hpke_encrypt_count.saturating_sub(start.hpke_encrypt_count),
+            hpke_decrypt_count: self.hpke_decrypt_count.saturating_sub(start.hpke_decrypt_count),
+        }
+    }
+}
+
+pub(crate) fn count_tree_hash_node_touch(count: u64) {
+    TREE_HASH_NODES_TOUCHED.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn count_parent_hash_node_touch(count: u64) {
+    PARENT_HASH_NODES_TOUCHED.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn count_path_secret_derivation(count: u64) {
+    PATH_SECRET_DERIVATION_COUNT.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn count_node_secret_derivation(count: u64) {
+    NODE_SECRET_DERIVATION_COUNT.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn count_hpke_encrypt(count: u64) {
+    HPKE_ENCRYPT_COUNT.fetch_add(count, Ordering::Relaxed);
+}
+
+pub(crate) fn count_hpke_decrypt(count: u64) {
+    HPKE_DECRYPT_COUNT.fetch_add(count, Ordering::Relaxed);
+}
+
 #[derive(Serialize, Debug)]
 pub(crate) struct ProfileEvent {
     pub profile_schema_version: u32,
     pub ts_unix_ns: u128,
     pub op: String,
     pub measurement_class: String,
+    pub measurement_plane: String,
+    pub span_kind: String,
+    pub span_name: String,
+    pub span_id: u64,
+    pub parent_span_id: Option<u64>,
+    pub parent_operation: Option<String>,
+    pub span_inclusive: bool,
     pub implementation: String,
 
     pub wall_ns: u128,
@@ -336,9 +503,34 @@ pub(crate) struct ProfileEvent {
 
     pub group_epoch: Option<u64>,
     pub tree_size: Option<u32>,
+    pub tree_height: Option<u32>,
+    pub tree_leaf_count: Option<u32>,
+    pub tree_node_count: Option<u32>,
     pub member_count: Option<usize>,
     pub invitee_count: Option<isize>,
+    pub added_members_count: Option<usize>,
+    pub removed_members_count: Option<usize>,
     pub ciphersuite: Option<String>,
+
+    pub committer_leaf_index: Option<u32>,
+    pub direct_path_len: Option<usize>,
+    pub filtered_direct_path_len: Option<usize>,
+    pub copath_len: Option<usize>,
+    pub update_path_nodes_count: Option<usize>,
+    pub encrypted_path_secret_count: Option<usize>,
+    pub sum_copath_resolution_sizes: Option<usize>,
+    pub max_copath_resolution_size: Option<usize>,
+    pub path_secret_derivation_count: Option<u64>,
+    pub node_secret_derivation_count: Option<u64>,
+    pub hpke_encrypt_count: Option<u64>,
+    pub hpke_decrypt_count: Option<u64>,
+    pub tree_hash_nodes_touched: Option<u64>,
+    pub parent_hash_nodes_touched: Option<u64>,
+    pub commit_size_bytes: Option<usize>,
+    pub update_path_size_bytes: Option<usize>,
+    pub welcome_recipient_count: Option<usize>,
+    pub ratchet_tree_included: Option<bool>,
+    pub ratchet_tree_delivery_mode: Option<String>,
 
     pub app_msg_plaintext_bytes: Option<usize>,
     pub app_msg_padding_bytes: Option<usize>,
@@ -377,7 +569,11 @@ pub(crate) struct ProfileScope {
     wall_start: Instant,
     cpu_start: Option<ThreadTime>,
     resource_start: ResourceSnapshot,
+    structural_start: StructuralCounterSnapshot,
     l1d_cache_start: Option<L1DCacheCounterScope>,
+    span_id: u64,
+    parent_span_id: Option<u64>,
+    finished: bool,
 }
 
 impl ProfileScope {
@@ -389,6 +585,9 @@ impl ProfileScope {
             return None;
         }
         let _ = L1DCacheCounterScope::counters_available();
+        let span_id = next_span_id();
+        let parent_span_id = current_parent_span_id();
+        push_span_id(span_id);
 
         Some(Self {
             op: op.into(),
@@ -396,21 +595,31 @@ impl ProfileScope {
             wall_start: Instant::now(),
             cpu_start: Some(ThreadTime::now()),
             resource_start: ResourceSnapshot::capture_start(),
+            structural_start: StructuralCounterSnapshot::capture(),
             l1d_cache_start: L1DCacheCounterScope::start(),
+            span_id,
+            parent_span_id,
+            finished: false,
         })
     }
 
-    pub(crate) fn finish(self) -> ProfileEvent {
+    pub(crate) fn finish(mut self) -> ProfileEvent {
+        let op = self.op.clone();
+        let implementation = self.implementation.clone();
+        let structural_counters =
+            StructuralCounterSnapshot::capture().delta_since(self.structural_start);
         let l1d_cache_counts = self
             .l1d_cache_start
+            .take()
             .map(L1DCacheCounterScope::finish)
             .unwrap_or_default();
         let wall_ns = self.wall_start.elapsed().as_nanos();
-        let cpu_thread_ns = self.cpu_start.map(|start| start.elapsed().as_nanos());
+        let cpu_thread_ns = self.cpu_start.as_ref().map(|start| start.elapsed().as_nanos());
         let resource_end = ResourceSnapshot::capture_end();
         let process_cpu_ns = self
             .resource_start
             .process_cpu_start
+            .as_ref()
             .map(|start| start.elapsed().as_nanos());
         let effective_cpu_limit = effective_cpu_limit_cores().unwrap_or(1.0);
         let cpu_envelope_utilization = process_cpu_ns.and_then(|cpu_ns| {
@@ -442,12 +651,22 @@ impl ProfileScope {
             _ => None,
         };
 
+        self.finished = true;
+        pop_span_id(self.span_id);
+
         ProfileEvent {
-            profile_schema_version: 3,
+            profile_schema_version: 5,
             ts_unix_ns: unix_timestamp_ns(),
-            measurement_class: measurement_class_for_op(&self.op).to_string(),
-            op: self.op,
-            implementation: self.implementation,
+            measurement_class: measurement_class_for_op(&op).to_string(),
+            measurement_plane: measurement_plane_for_op(&op).to_string(),
+            span_kind: span_kind_for_op(&op).to_string(),
+            span_name: op.clone(),
+            span_id: self.span_id,
+            parent_span_id: self.parent_span_id,
+            parent_operation: None,
+            span_inclusive: true,
+            op,
+            implementation,
 
             wall_ns,
             cpu_thread_ns,
@@ -470,9 +689,34 @@ impl ProfileScope {
 
             group_epoch: None,
             tree_size: None,
+            tree_height: None,
+            tree_leaf_count: None,
+            tree_node_count: None,
             member_count: None,
             invitee_count: None,
+            added_members_count: None,
+            removed_members_count: None,
             ciphersuite: None,
+
+            committer_leaf_index: None,
+            direct_path_len: None,
+            filtered_direct_path_len: None,
+            copath_len: None,
+            update_path_nodes_count: None,
+            encrypted_path_secret_count: None,
+            sum_copath_resolution_sizes: None,
+            max_copath_resolution_size: None,
+            path_secret_derivation_count: Some(structural_counters.path_secret_derivation_count),
+            node_secret_derivation_count: Some(structural_counters.node_secret_derivation_count),
+            hpke_encrypt_count: Some(structural_counters.hpke_encrypt_count),
+            hpke_decrypt_count: Some(structural_counters.hpke_decrypt_count),
+            tree_hash_nodes_touched: Some(structural_counters.tree_hash_nodes_touched),
+            parent_hash_nodes_touched: Some(structural_counters.parent_hash_nodes_touched),
+            commit_size_bytes: None,
+            update_path_size_bytes: None,
+            welcome_recipient_count: None,
+            ratchet_tree_included: None,
+            ratchet_tree_delivery_mode: None,
 
             app_msg_plaintext_bytes: None,
             app_msg_padding_bytes: None,
@@ -490,7 +734,15 @@ impl ProfileScope {
         }
     }
 }
-/*
+
+impl Drop for ProfileScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            pop_span_id(self.span_id);
+        }
+    }
+}
+
 pub(crate) fn finish_and_emit(
     scope: Option<ProfileScope>,
     fill: impl FnOnce(&mut ProfileEvent),
@@ -503,4 +755,3 @@ pub(crate) fn finish_and_emit(
     fill(&mut event);
     emit_event(&event);
 }
-*/

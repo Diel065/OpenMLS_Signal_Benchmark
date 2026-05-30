@@ -133,7 +133,7 @@ impl MlsGroup {
         > = None;
 
         let allocation_info = measure(|| {
-            measured_result = Some(self.process_message(provider, message, false));
+            measured_result = Some(self.process_message_internal(provider, message, false));
         });
 
         let processed_message =
@@ -174,6 +174,14 @@ impl MlsGroup {
     /// Returns an [`ProcessMessageError`] when the validation checks fail
     /// with the exact reason of the failure.
     pub fn process_message<Provider: OpenMlsProvider>(
+        &mut self,
+        provider: &Provider,
+        message: impl Into<ProtocolMessage>,
+    ) -> Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>> {
+        self.process_message_internal(provider, message, false)
+    }
+
+    fn process_message_internal<Provider: OpenMlsProvider>(
         &mut self,
         provider: &Provider,
         message: impl Into<ProtocolMessage>,
@@ -257,7 +265,7 @@ impl MlsGroup {
             );
         }
 
-        self.process_message(provider, protocol_message, profile_application_receive)
+        self.process_message_internal(provider, protocol_message, profile_application_receive)
     }
 
     #[cfg(feature = "extensions-draft-08")]

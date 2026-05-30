@@ -15,6 +15,9 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tls_codec::{TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
 
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
+
 use super::{
     diff::TreeSyncDiff,
     errors::UpdatePathError,
@@ -33,6 +36,10 @@ use crate::{
     schedule::{psk::PreSharedKeyId, CommitSecret, JoinerSecret},
     treesync::node::NodeReference,
 };
+#[cfg(feature = "profiling-json")]
+use crate::group::diff::compute_path::parent_operation_for_span_prefix;
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{finish_and_emit, ProfileScope};
 
 impl TreeSyncDiff<'_> {
     /// Encrypt the given `path` to the nodes in the copath resolution of the
@@ -50,6 +57,7 @@ impl TreeSyncDiff<'_> {
         group_context: &[u8],
         exclusion_list: &HashSet<&LeafNodeIndex>,
         own_leaf_index: LeafNodeIndex,
+        profile_span_prefix: &'static str,
     ) -> Result<Vec<UpdatePathNode>, LibraryError> {
         // Copath resolutions with the corresponding public keys.
         let copath_resolutions = self
@@ -76,9 +84,57 @@ impl TreeSyncDiff<'_> {
         #[cfg(target_arch = "wasm32")]
         let resolved_path = path.iter().zip(copath_resolutions.iter());
 
-        resolved_path
+        #[cfg(feature = "profiling-json")]
+        let hpke_scope = ProfileScope::start(
+            format!("{profile_span_prefix}.path_hpke_encrypt"),
+            "openmls",
+        );
+        #[cfg(feature = "profiling-json")]
+        let encrypted_path_secret_count: usize = copath_resolutions
+            .iter()
+            .map(Vec::len)
+            .sum();
+        #[cfg(feature = "profiling-json")]
+        let max_copath_resolution_size = copath_resolutions
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(0);
+
+        #[cfg(feature = "profiling-json")]
+        let mut measured_result = None;
+        #[cfg(feature = "profiling-json")]
+        let allocation_info = measure(|| {
+            measured_result = Some(
+                resolved_path
+                    .map(|(node, resolution)| {
+                        node.encrypt(crypto, ciphersuite, resolution, group_context)
+                    })
+                    .collect::<Result<Vec<UpdatePathNode>, LibraryError>>(),
+            );
+        });
+        #[cfg(feature = "profiling-json")]
+        let result = measured_result.expect("allocation_counter measure closure did not run");
+        #[cfg(not(feature = "profiling-json"))]
+        let result = resolved_path
             .map(|(node, resolution)| node.encrypt(crypto, ciphersuite, resolution, group_context))
-            .collect::<Result<Vec<UpdatePathNode>, LibraryError>>()
+            .collect::<Result<Vec<UpdatePathNode>, LibraryError>>();
+
+        #[cfg(feature = "profiling-json")]
+        finish_and_emit(hpke_scope, |event| {
+            event.parent_operation =
+                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+            event.update_path_nodes_count = Some(path.len());
+            event.filtered_direct_path_len = Some(path.len());
+            event.encrypted_path_secret_count = Some(encrypted_path_secret_count);
+            event.sum_copath_resolution_sizes = Some(encrypted_path_secret_count);
+            event.max_copath_resolution_size = Some(max_copath_resolution_size);
+            event.hpke_encrypt_count = Some(encrypted_path_secret_count as u64);
+            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+            event.alloc_count = Some(allocation_info.count_total as u64);
+        });
+
+        result
     }
 
     /// Decrypt an [`UpdatePath`] originating from the given
@@ -257,6 +313,10 @@ pub struct UpdatePathNode {
 }
 
 impl UpdatePathNode {
+    pub(crate) fn encrypted_path_secret_count(&self) -> usize {
+        self.encrypted_path_secrets.len()
+    }
+
     /// Return the `encrypted_path_secrets`.
     fn encrypted_path_secrets(&self, ciphertext_index: usize) -> Option<&HpkeCiphertext> {
         self.encrypted_path_secrets.get(ciphertext_index)

@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 #
-# Alternating benchmark runner — NO external devices / NO resource constraints
+# OpenMLS benchmark runner — NO external devices / NO resource constraints
 # -----------------------------------------
-# Runs 16 iterations, alternating OpenMLS and Signal.
-# Each benchmark waits for the previous one to finish and then tears down
-# containers before starting the next benchmark.
+# Runs 16 OpenMLS iterations. Signal is intentionally disabled in the main loop
+# for the current OpenMLS-only profiling/statistics refactor.
 #
 # Usage:
-#   chmod +x run_benchmark_no_iot.sh
-#   bash run_benchmark_no_iot.sh
+#   chmod +x run_benchmark_no_iot_lite.sh
+#   bash run_benchmark_no_iot_lite.sh
 #
 # Run from the repository root (parent of *_containerized/).
 # Requires Docker and Python 3.
@@ -73,9 +72,9 @@ trap cleanup_docker EXIT
 
 
 echo "============================================================"
-echo " Alternating benchmark suite (no IoT devices) - $DATE_TAG"
-echo " OpenMLS: 16 x 768 workers, no resource constraints, no external devices"
-echo " Signal : 16 x 768 workers, no resource constraints, no external devices"
+echo " OpenMLS benchmark suite (no IoT devices) - $DATE_TAG"
+echo " OpenMLS: 16 x 512 workers, no resource constraints, no external devices"
+echo " Signal : disabled for this OpenMLS-only refactor run"
 echo "============================================================"
 echo ""
 
@@ -269,17 +268,18 @@ run_signal() {
 }
 
 # ==================================================================
-# Main loop: 16 iterations alternating OpenMLS / Signal
+# Main loop: 16 OpenMLS iterations.
+# Signal is left defined above but intentionally not run here.
 # ==================================================================
 
 cleanup_docker
 
 for I in $(seq 1 16); do
   run_openmls "$I"
-  run_signal "$I"
+  # run_signal "$I"
 done
 
 echo ""
 echo "============================================================"
-echo " All 32 runs complete ($DATE_TAG)"
+echo " All 16 OpenMLS runs complete ($DATE_TAG)"
 echo "============================================================"

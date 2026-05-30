@@ -365,6 +365,9 @@ impl PathSecret {
         crypto: &impl OpenMlsCrypto,
         ciphersuite: Ciphersuite,
     ) -> Result<EncryptionKeyPair, LibraryError> {
+        #[cfg(feature = "profiling-json")]
+        crate::profiling::count_node_secret_derivation(1);
+
         let node_secret = self
             .path_secret
             .kdf_expand_label(crypto, ciphersuite, "node", &[], ciphersuite.hash_length())

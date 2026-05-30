@@ -141,6 +141,9 @@ fn encrypt_with_label_internal(
     ciphersuite: Ciphersuite,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<HpkeCiphertext, Error> {
+    #[cfg(feature = "profiling-json")]
+    crate::profiling::count_hpke_encrypt(1);
+
     let context = context.tls_serialize_detached()?;
 
     log_crypto!(debug, "* context:     {context:x?}");
@@ -223,6 +226,9 @@ fn decrypt_with_label_internal(
     ciphersuite: Ciphersuite,
     crypto: &impl OpenMlsCrypto,
 ) -> Result<Vec<u8>, Error> {
+    #[cfg(feature = "profiling-json")]
+    crate::profiling::count_hpke_decrypt(1);
+
     let context = context.tls_serialize_detached()?;
 
     log_crypto!(debug, "* context:     {context:x?}");

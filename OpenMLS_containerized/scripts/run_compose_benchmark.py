@@ -2668,7 +2668,7 @@ def collect_cpu_metadata() -> dict:
 def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
     external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
     metadata = {
-        "profile_schema_version": 3,
+        "profile_schema_version": 5,
         "run_id": run_id,
         "scenario": scenario,
         "scenario_seed": args.scenario_seed,

@@ -495,7 +495,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 3,
+            profile_schema_version: 5,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -815,6 +815,20 @@ struct ProfileEvent {
     #[serde(default)]
     measurement_class: Option<String>,
     #[serde(default)]
+    measurement_plane: Option<String>,
+    #[serde(default)]
+    span_kind: Option<String>,
+    #[serde(default)]
+    span_name: Option<String>,
+    #[serde(default)]
+    span_id: Option<u64>,
+    #[serde(default)]
+    parent_span_id: Option<u64>,
+    #[serde(default)]
+    parent_operation: Option<String>,
+    #[serde(default)]
+    span_inclusive: Option<bool>,
+    #[serde(default)]
     runner_event_kind: Option<String>,
     #[serde(default)]
     failed_worker_id: Option<String>,
@@ -874,9 +888,57 @@ struct ProfileEvent {
     encrypted_secrets_count: Option<usize>,
     group_epoch: Option<u64>,
     tree_size: Option<u32>,
+    #[serde(default)]
+    tree_height: Option<u32>,
+    #[serde(default)]
+    tree_leaf_count: Option<u32>,
+    #[serde(default)]
+    tree_node_count: Option<u32>,
     member_count: Option<usize>,
     invitee_count: Option<isize>,
+    #[serde(default)]
+    added_members_count: Option<usize>,
+    #[serde(default)]
+    removed_members_count: Option<usize>,
     ciphersuite: Option<String>,
+    #[serde(default)]
+    committer_leaf_index: Option<u32>,
+    #[serde(default)]
+    direct_path_len: Option<usize>,
+    #[serde(default)]
+    filtered_direct_path_len: Option<usize>,
+    #[serde(default)]
+    copath_len: Option<usize>,
+    #[serde(default)]
+    update_path_nodes_count: Option<usize>,
+    #[serde(default)]
+    encrypted_path_secret_count: Option<usize>,
+    #[serde(default)]
+    sum_copath_resolution_sizes: Option<usize>,
+    #[serde(default)]
+    max_copath_resolution_size: Option<usize>,
+    #[serde(default)]
+    path_secret_derivation_count: Option<u64>,
+    #[serde(default)]
+    node_secret_derivation_count: Option<u64>,
+    #[serde(default)]
+    hpke_encrypt_count: Option<u64>,
+    #[serde(default)]
+    hpke_decrypt_count: Option<u64>,
+    #[serde(default)]
+    tree_hash_nodes_touched: Option<u64>,
+    #[serde(default)]
+    parent_hash_nodes_touched: Option<u64>,
+    #[serde(default)]
+    commit_size_bytes: Option<usize>,
+    #[serde(default)]
+    update_path_size_bytes: Option<usize>,
+    #[serde(default)]
+    welcome_recipient_count: Option<usize>,
+    #[serde(default)]
+    ratchet_tree_included: Option<bool>,
+    #[serde(default)]
+    ratchet_tree_delivery_mode: Option<String>,
     app_msg_plaintext_bytes: Option<usize>,
     app_msg_padding_bytes: Option<usize>,
     app_msg_ciphertext_bytes: Option<usize>,
@@ -4908,6 +4970,13 @@ pub fn aggregate_csv(
         ts_unix_ns: u128,
         op: String,
         measurement_class: Option<String>,
+        measurement_plane: Option<String>,
+        span_kind: Option<String>,
+        span_name: Option<String>,
+        span_id: Option<u64>,
+        parent_span_id: Option<u64>,
+        parent_operation: Option<String>,
+        span_inclusive: Option<bool>,
         runner_event_kind: Option<String>,
         failed_worker_id: Option<String>,
         failed_physical_worker_id: Option<String>,
@@ -4943,9 +5012,33 @@ pub fn aggregate_csv(
         encrypted_secrets_count: Option<usize>,
         group_epoch: Option<u64>,
         tree_size: Option<u32>,
+        tree_height: Option<u32>,
+        tree_leaf_count: Option<u32>,
+        tree_node_count: Option<u32>,
         member_count: Option<usize>,
         invitee_count: Option<isize>,
+        added_members_count: Option<usize>,
+        removed_members_count: Option<usize>,
         ciphersuite: Option<String>,
+        committer_leaf_index: Option<u32>,
+        direct_path_len: Option<usize>,
+        filtered_direct_path_len: Option<usize>,
+        copath_len: Option<usize>,
+        update_path_nodes_count: Option<usize>,
+        encrypted_path_secret_count: Option<usize>,
+        sum_copath_resolution_sizes: Option<usize>,
+        max_copath_resolution_size: Option<usize>,
+        path_secret_derivation_count: Option<u64>,
+        node_secret_derivation_count: Option<u64>,
+        hpke_encrypt_count: Option<u64>,
+        hpke_decrypt_count: Option<u64>,
+        tree_hash_nodes_touched: Option<u64>,
+        parent_hash_nodes_touched: Option<u64>,
+        commit_size_bytes: Option<usize>,
+        update_path_size_bytes: Option<usize>,
+        welcome_recipient_count: Option<usize>,
+        ratchet_tree_included: Option<bool>,
+        ratchet_tree_delivery_mode: Option<String>,
         app_msg_plaintext_bytes: Option<usize>,
         app_msg_padding_bytes: Option<usize>,
         app_msg_ciphertext_bytes: Option<usize>,
@@ -5043,6 +5136,13 @@ pub fn aggregate_csv(
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
                 measurement_class: event.measurement_class,
+                measurement_plane: event.measurement_plane,
+                span_kind: event.span_kind,
+                span_name: event.span_name,
+                span_id: event.span_id,
+                parent_span_id: event.parent_span_id,
+                parent_operation: event.parent_operation,
+                span_inclusive: event.span_inclusive,
                 runner_event_kind: event.runner_event_kind,
                 failed_worker_id: event.failed_worker_id,
                 failed_physical_worker_id: event.failed_physical_worker_id,
@@ -5078,9 +5178,33 @@ pub fn aggregate_csv(
                 encrypted_secrets_count: event.encrypted_secrets_count,
                 group_epoch: event.group_epoch,
                 tree_size: event.tree_size,
+                tree_height: event.tree_height,
+                tree_leaf_count: event.tree_leaf_count,
+                tree_node_count: event.tree_node_count,
                 member_count: event.member_count,
                 invitee_count: event.invitee_count,
+                added_members_count: event.added_members_count,
+                removed_members_count: event.removed_members_count,
                 ciphersuite: event.ciphersuite,
+                committer_leaf_index: event.committer_leaf_index,
+                direct_path_len: event.direct_path_len,
+                filtered_direct_path_len: event.filtered_direct_path_len,
+                copath_len: event.copath_len,
+                update_path_nodes_count: event.update_path_nodes_count,
+                encrypted_path_secret_count: event.encrypted_path_secret_count,
+                sum_copath_resolution_sizes: event.sum_copath_resolution_sizes,
+                max_copath_resolution_size: event.max_copath_resolution_size,
+                path_secret_derivation_count: event.path_secret_derivation_count,
+                node_secret_derivation_count: event.node_secret_derivation_count,
+                hpke_encrypt_count: event.hpke_encrypt_count,
+                hpke_decrypt_count: event.hpke_decrypt_count,
+                tree_hash_nodes_touched: event.tree_hash_nodes_touched,
+                parent_hash_nodes_touched: event.parent_hash_nodes_touched,
+                commit_size_bytes: event.commit_size_bytes,
+                update_path_size_bytes: event.update_path_size_bytes,
+                welcome_recipient_count: event.welcome_recipient_count,
+                ratchet_tree_included: event.ratchet_tree_included,
+                ratchet_tree_delivery_mode: event.ratchet_tree_delivery_mode,
                 app_msg_plaintext_bytes: event.app_msg_plaintext_bytes,
                 app_msg_padding_bytes: event.app_msg_padding_bytes,
                 app_msg_ciphertext_bytes: event.app_msg_ciphertext_bytes,
@@ -5270,6 +5394,12 @@ mod aggregate_csv_resource_tests {
             "ts_unix_ns": 1u128,
             "op": "create_group",
             "implementation": "openmls",
+            "measurement_plane": "openmls_implementation",
+            "span_kind": "openmls_api",
+            "span_name": "create_group",
+            "span_id": 44u64,
+            "parent_span_id": 43u64,
+            "span_inclusive": true,
             "wall_ns": 10u128,
             "cpu_thread_ns": 9u128,
             "cpu_envelope_utilization": 0.9,
@@ -5280,6 +5410,16 @@ mod aggregate_csv_resource_tests {
             "l1d_cache_misses": 25u64,
             "ram_rss_delta_bytes": 4096i64,
             "ram_rss_utilization": 0.25,
+            "tree_height": 3u32,
+            "tree_leaf_count": 8u32,
+            "tree_node_count": 15u32,
+            "direct_path_len": 3usize,
+            "filtered_direct_path_len": 3usize,
+            "encrypted_path_secret_count": 7usize,
+            "node_secret_derivation_count": 3u64,
+            "hpke_encrypt_count": 7u64,
+            "tree_hash_nodes_touched": 15u64,
+            "commit_size_bytes": 1234usize,
             "pid": 123,
             "thread_id": "test-thread",
             "run_id": "test-run",
@@ -5325,6 +5465,22 @@ mod aggregate_csv_resource_tests {
         assert_eq!(value("l1d_cache_misses"), "25");
         assert_eq!(value("ram_rss_delta_bytes"), "4096");
         assert_eq!(value("ram_rss_utilization"), "0.25");
+        assert_eq!(value("measurement_plane"), "openmls_implementation");
+        assert_eq!(value("span_kind"), "openmls_api");
+        assert_eq!(value("span_name"), "create_group");
+        assert_eq!(value("span_id"), "44");
+        assert_eq!(value("parent_span_id"), "43");
+        assert_eq!(value("span_inclusive"), "true");
+        assert_eq!(value("tree_height"), "3");
+        assert_eq!(value("tree_leaf_count"), "8");
+        assert_eq!(value("tree_node_count"), "15");
+        assert_eq!(value("direct_path_len"), "3");
+        assert_eq!(value("filtered_direct_path_len"), "3");
+        assert_eq!(value("encrypted_path_secret_count"), "7");
+        assert_eq!(value("node_secret_derivation_count"), "3");
+        assert_eq!(value("hpke_encrypt_count"), "7");
+        assert_eq!(value("tree_hash_nodes_touched"), "15");
+        assert_eq!(value("commit_size_bytes"), "1234");
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

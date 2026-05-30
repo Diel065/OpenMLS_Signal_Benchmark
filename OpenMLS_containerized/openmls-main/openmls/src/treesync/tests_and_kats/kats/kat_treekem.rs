@@ -258,6 +258,7 @@ pub fn run_test_vector(test: TreeKemTest, provider: &impl OpenMlsProvider) {
                     group_context.group_id().clone(),
                     LeafNodeIndex::new(path_test.sender),
                     leaf_node_params,
+                    "test",
                 )
                 .unwrap();
 
@@ -273,6 +274,7 @@ pub fn run_test_vector(test: TreeKemTest, provider: &impl OpenMlsProvider) {
                     &serialized_group_context,
                     &HashSet::new(),
                     LeafNodeIndex::new(path_test.sender),
+                    "test",
                 )
                 .unwrap();
 

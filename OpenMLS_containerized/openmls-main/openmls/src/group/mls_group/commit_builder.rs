@@ -41,6 +41,9 @@ use crate::{
     prelude::processing::{AppDataDictionaryUpdater, AppDataUpdates},
     schedule::application_export_tree::ApplicationExportTree,
 };
+use crate::group::diff::compute_path::UpdatePathProfilingData;
+#[cfg(feature = "profiling-json")]
+use crate::group::diff::compute_path::parent_operation_for_span_prefix;
 
 pub(crate) mod external_commits;
 
@@ -59,7 +62,7 @@ use super::{
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileEvent, ProfileScope};
+use crate::profiling::{emit_event, finish_and_emit, ProfileEvent, ProfileScope};
 
 #[derive(Debug)]
 struct ExternalCommitInfo {
@@ -83,6 +86,7 @@ struct CommitProfilingData {
     invitee_count: isize,
     member_count: usize,
     ciphersuite: String,
+    profile_span_prefix: &'static str,
     protocol_event: Option<ProfileEvent>,
 }
 
@@ -91,7 +95,10 @@ fn emit_commit_serialize_event(
     message: &MlsMessageOut,
     profiling: &CommitProfilingData,
 ) -> Option<usize> {
-    let scope = ProfileScope::start("commit_create_serialize", "openmls");
+    let scope = ProfileScope::start(
+        format!("{}.commit_serialize", profiling.profile_span_prefix),
+        "openmls",
+    );
     let mut serialized_len: Option<Option<usize>> = None;
     let allocation_info = measure(|| {
         serialized_len = Some(
@@ -105,6 +112,9 @@ fn emit_commit_serialize_event(
     if let Some(scope) = scope {
         let mut event = scope.finish();
         event.group_epoch = Some(profiling.group_epoch);
+        event.parent_operation =
+            Some(parent_operation_for_span_prefix(profiling.profile_span_prefix).to_string());
+        event.parent_span_id = profiling.protocol_event.as_ref().map(|event| event.span_id);
         event.tree_size = Some(profiling.tree_size);
         event.member_count = Some(profiling.member_count);
         event.invitee_count = Some(profiling.invitee_count);
@@ -112,10 +122,30 @@ fn emit_commit_serialize_event(
         event.alloc_bytes = Some(allocation_info.bytes_total as u64);
         event.alloc_count = Some(allocation_info.count_total as u64);
         event.artifact_size_bytes = serialized_len.flatten();
+        event.commit_size_bytes = serialized_len.flatten();
         emit_event(&event);
     }
 
     serialized_len.flatten()
+}
+
+#[cfg(feature = "profiling-json")]
+fn fill_update_path_profile(event: &mut ProfileEvent, profiling: &UpdatePathProfilingData) {
+    event.tree_height = Some(profiling.tree_height);
+    event.tree_leaf_count = Some(profiling.tree_leaf_count);
+    event.tree_node_count = Some(profiling.tree_node_count);
+    event.committer_leaf_index = Some(profiling.committer_leaf_index);
+    event.direct_path_len = Some(profiling.direct_path_len);
+    event.filtered_direct_path_len = Some(profiling.filtered_direct_path_len);
+    event.copath_len = Some(profiling.copath_len);
+    event.update_path_nodes_count = Some(profiling.update_path_nodes_count);
+    event.encrypted_path_secret_count = Some(profiling.encrypted_path_secret_count);
+    event.sum_copath_resolution_sizes = Some(profiling.sum_copath_resolution_sizes);
+    event.max_copath_resolution_size = Some(profiling.max_copath_resolution_size);
+    event.path_secret_derivation_count = Some(profiling.path_secret_derivation_count);
+    event.node_secret_derivation_count = Some(profiling.node_secret_derivation_count);
+    event.hpke_encrypt_count = Some(profiling.hpke_encrypt_count);
+    event.update_path_size_bytes = Some(profiling.update_path_size_bytes);
 }
 
 /// This stage is for populating the builder.
@@ -518,6 +548,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 isize,
                 usize,
                 Option<usize>,
+                Option<UpdatePathProfilingData>,
             ),
             CreateCommitError,
         > {
@@ -592,6 +623,12 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             } else {
                 "commit_create_protocol_update"
             };
+            let profile_span_prefix = match final_commit_op {
+                "commit_create_protocol_add" => "commit_add",
+                "commit_create_protocol_remove" => "commit_remove",
+                "commit_create_protocol_update" => "self_update",
+                _ => "commit",
+            };
 
             let invitee_count = add_count as isize - remove_count as isize;
 
@@ -658,14 +695,61 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             let mut diff = group.public_group.empty_diff();
 
             // Apply proposals to tree
-            #[cfg(feature = "extensions-draft-08")]
+            #[cfg(feature = "profiling-json")]
+            let proposal_apply_scope = ProfileScope::start(
+                format!("{profile_span_prefix}.proposal_apply"),
+                "openmls",
+            );
+            #[cfg(feature = "profiling-json")]
+            let proposal_apply_tree_size_before = diff.tree_size().u32();
+            #[cfg(all(feature = "profiling-json", feature = "extensions-draft-08"))]
+            let (apply_proposals_values, proposal_apply_allocation_info) = {
+                let mut measured_result = None;
+                let allocation_info = measure(|| {
+                    measured_result = Some(diff.apply_proposals_with_app_data_updates(
+                        &proposal_queue,
+                        own_leaf_index,
+                        cur_stage.app_data_dictionary_updates,
+                    ));
+                });
+                (
+                    measured_result.expect("allocation_counter measure closure did not run")?,
+                    allocation_info,
+                )
+            };
+            #[cfg(all(feature = "profiling-json", not(feature = "extensions-draft-08")))]
+            let (apply_proposals_values, proposal_apply_allocation_info) = {
+                let mut measured_result = None;
+                let allocation_info = measure(|| {
+                    measured_result =
+                        Some(diff.apply_proposals(&proposal_queue, own_leaf_index));
+                });
+                (
+                    measured_result.expect("allocation_counter measure closure did not run")?,
+                    allocation_info,
+                )
+            };
+            #[cfg(all(not(feature = "profiling-json"), feature = "extensions-draft-08"))]
             let apply_proposals_values = diff.apply_proposals_with_app_data_updates(
                 &proposal_queue,
                 own_leaf_index,
                 cur_stage.app_data_dictionary_updates,
             )?;
-            #[cfg(not(feature = "extensions-draft-08"))]
+            #[cfg(all(not(feature = "profiling-json"), not(feature = "extensions-draft-08")))]
             let apply_proposals_values = diff.apply_proposals(&proposal_queue, own_leaf_index)?;
+            #[cfg(feature = "profiling-json")]
+            finish_and_emit(proposal_apply_scope, |event| {
+                event.parent_operation =
+                    Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+                event.group_epoch = Some(group.context().epoch().as_u64());
+                event.tree_size = Some(proposal_apply_tree_size_before);
+                event.member_count = Some(member_count_before);
+                event.added_members_count = Some(add_count);
+                event.removed_members_count = Some(remove_count);
+                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                event.alloc_bytes = Some(proposal_apply_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(proposal_apply_allocation_info.count_total as u64);
+            });
             if apply_proposals_values.self_removed && !is_external_commit {
                 return Err(CreateCommitError::CannotRemoveSelf);
             }
@@ -707,6 +791,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             &cur_stage.leaf_node_parameters,
                             new_signer.signer,
                             apply_proposals_values.extensions.clone(),
+                            profile_span_prefix,
                         )?
                     } else {
                         diff.compute_path(
@@ -718,6 +803,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             &cur_stage.leaf_node_parameters,
                             old_signer,
                             apply_proposals_values.extensions.clone(),
+                            profile_span_prefix,
                         )?
                     }
                 } else {
@@ -731,6 +817,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 .encrypted_path
                 .as_ref()
                 .map(|path| path.leaf_node().clone());
+            let update_path_profile = path_computation_result.profiling.clone();
 
             // Validate that the update path leaf node's capabilities
             if let Some(ref leaf_node) = update_path_leaf_node {
@@ -787,11 +874,130 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             // Update the confirmed transcript hash using the commit we just created.
             diff.update_confirmed_transcript_hash(crypto, &authenticated_content)?;
 
+            #[cfg(feature = "profiling-json")]
+            let key_schedule_scope = ProfileScope::start(
+                format!("{profile_span_prefix}.key_schedule_step"),
+                "openmls",
+            );
+
+            #[cfg(feature = "profiling-json")]
+            let mut joiner_secret_result = None;
+            #[cfg(feature = "profiling-json")]
+            let mut welcome_secret_result = None;
+            #[cfg(feature = "profiling-json")]
+            let mut provisional_epoch_secrets_result = None;
+            #[cfg(feature = "profiling-json")]
+            let mut serialized_provisional_group_context_result = None;
+            #[cfg(feature = "profiling-json")]
+            let mut confirmation_tag_result = None;
+            #[cfg(all(feature = "profiling-json", feature = "extensions-draft-08"))]
+            let mut application_exporter_result = None;
+            #[cfg(feature = "profiling-json")]
+            let mut key_schedule_result = None;
+
+            #[cfg(feature = "profiling-json")]
+            let key_schedule_allocation_info = measure(|| {
+                key_schedule_result = Some((|| -> Result<(), CreateCommitError> {
+                    let serialized_provisional_group_context = diff
+                        .group_context()
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?;
+
+                    let joiner_secret = JoinerSecret::new(
+                        crypto,
+                        ciphersuite,
+                        path_computation_result.commit_secret,
+                        group.group_epoch_secrets().init_secret(),
+                        &serialized_provisional_group_context,
+                    )
+                    .map_err(LibraryError::unexpected_crypto_error)?;
+
+                    // Prepare the PskSecret
+                    let psk_secret = PskSecret::new(crypto, ciphersuite, psks)?;
+
+                    // Create key schedule
+                    let mut key_schedule =
+                        KeySchedule::init(ciphersuite, crypto, &joiner_secret, psk_secret)?;
+
+                    let serialized_provisional_group_context = diff
+                        .group_context()
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?;
+
+                    let welcome_secret = key_schedule.welcome(crypto, ciphersuite).map_err(|_| {
+                        LibraryError::custom("Using the key schedule in the wrong state")
+                    })?;
+                    key_schedule
+                        .add_context(crypto, &serialized_provisional_group_context)
+                        .map_err(|_| {
+                            LibraryError::custom("Using the key schedule in the wrong state")
+                        })?;
+                    let EpochSecretsResult {
+                        epoch_secrets: provisional_epoch_secrets,
+                        #[cfg(feature = "extensions-draft-08")]
+                        application_exporter,
+                    } = key_schedule.epoch_secrets(crypto, ciphersuite).map_err(|_| {
+                        LibraryError::custom("Using the key schedule in the wrong state")
+                    })?;
+
+                    // Calculate the confirmation tag
+                    let confirmation_tag = provisional_epoch_secrets
+                        .confirmation_key()
+                        .tag(
+                            crypto,
+                            ciphersuite,
+                            diff.group_context().confirmed_transcript_hash(),
+                        )
+                        .map_err(LibraryError::unexpected_crypto_error)?;
+
+                    // Set the confirmation tag
+                    authenticated_content.set_confirmation_tag(confirmation_tag.clone());
+
+                    diff.update_interim_transcript_hash(
+                        ciphersuite,
+                        crypto,
+                        confirmation_tag.clone(),
+                    )?;
+
+                    joiner_secret_result = Some(joiner_secret);
+                    welcome_secret_result = Some(welcome_secret);
+                    provisional_epoch_secrets_result = Some(provisional_epoch_secrets);
+                    serialized_provisional_group_context_result =
+                        Some(serialized_provisional_group_context);
+                    confirmation_tag_result = Some(confirmation_tag);
+                    #[cfg(feature = "extensions-draft-08")]
+                    {
+                        application_exporter_result = Some(application_exporter);
+                    }
+                    Ok(())
+                })());
+            });
+            #[cfg(feature = "profiling-json")]
+            key_schedule_result.expect("allocation_counter measure closure did not run")?;
+
+            #[cfg(feature = "profiling-json")]
+            let joiner_secret = joiner_secret_result.expect("key schedule span did not run");
+            #[cfg(feature = "profiling-json")]
+            let welcome_secret = welcome_secret_result.expect("key schedule span did not run");
+            #[cfg(feature = "profiling-json")]
+            let provisional_epoch_secrets =
+                provisional_epoch_secrets_result.expect("key schedule span did not run");
+            #[cfg(feature = "profiling-json")]
+            let serialized_provisional_group_context = serialized_provisional_group_context_result
+                .expect("key schedule span did not run");
+            #[cfg(feature = "profiling-json")]
+            let confirmation_tag = confirmation_tag_result.expect("key schedule span did not run");
+            #[cfg(all(feature = "profiling-json", feature = "extensions-draft-08"))]
+            let application_exporter =
+                application_exporter_result.expect("key schedule span did not run");
+
+            #[cfg(not(feature = "profiling-json"))]
             let serialized_provisional_group_context = diff
                 .group_context()
                 .tls_serialize_detached()
                 .map_err(LibraryError::missing_bound_check)?;
 
+            #[cfg(not(feature = "profiling-json"))]
             let joiner_secret = JoinerSecret::new(
                 crypto,
                 ciphersuite,
@@ -799,25 +1005,32 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 group.group_epoch_secrets().init_secret(),
                 &serialized_provisional_group_context,
             )
-                .map_err(LibraryError::unexpected_crypto_error)?;
+            .map_err(LibraryError::unexpected_crypto_error)?;
 
             // Prepare the PskSecret
-            let psk_secret = { PskSecret::new(crypto, ciphersuite, psks)? };
+            #[cfg(not(feature = "profiling-json"))]
+            let psk_secret = PskSecret::new(crypto, ciphersuite, psks)?;
 
             // Create key schedule
-            let mut key_schedule = KeySchedule::init(ciphersuite, crypto, &joiner_secret, psk_secret)?;
+            #[cfg(not(feature = "profiling-json"))]
+            let mut key_schedule =
+                KeySchedule::init(ciphersuite, crypto, &joiner_secret, psk_secret)?;
 
+            #[cfg(not(feature = "profiling-json"))]
             let serialized_provisional_group_context = diff
                 .group_context()
                 .tls_serialize_detached()
                 .map_err(LibraryError::missing_bound_check)?;
 
+            #[cfg(not(feature = "profiling-json"))]
             let welcome_secret = key_schedule
                 .welcome(crypto, ciphersuite)
                 .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+            #[cfg(not(feature = "profiling-json"))]
             key_schedule
                 .add_context(crypto, &serialized_provisional_group_context)
                 .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
+            #[cfg(not(feature = "profiling-json"))]
             let EpochSecretsResult {
                 epoch_secrets: provisional_epoch_secrets,
                 #[cfg(feature = "extensions-draft-08")]
@@ -827,6 +1040,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 .map_err(|_| LibraryError::custom("Using the key schedule in the wrong state"))?;
 
             // Calculate the confirmation tag
+            #[cfg(not(feature = "profiling-json"))]
             let confirmation_tag = provisional_epoch_secrets
                 .confirmation_key()
                 .tag(
@@ -837,9 +1051,24 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 .map_err(LibraryError::unexpected_crypto_error)?;
 
             // Set the confirmation tag
+            #[cfg(not(feature = "profiling-json"))]
             authenticated_content.set_confirmation_tag(confirmation_tag.clone());
 
+            #[cfg(not(feature = "profiling-json"))]
             diff.update_interim_transcript_hash(ciphersuite, crypto, confirmation_tag.clone())?;
+            #[cfg(feature = "profiling-json")]
+            finish_and_emit(key_schedule_scope, |event| {
+                event.parent_operation =
+                    Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+                event.group_epoch = Some(diff.group_context().epoch().as_u64());
+                event.tree_size = Some(diff.tree_size().u32());
+                event.member_count = Some(member_count_after);
+                event.added_members_count = Some(add_count);
+                event.removed_members_count = Some(remove_count);
+                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                event.alloc_bytes = Some(key_schedule_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(key_schedule_allocation_info.count_total as u64);
+            });
 
             // If there are invitations, we need to build a welcome
             let needs_welcome = !apply_proposals_values.invitation_list.is_empty();
@@ -950,8 +1179,21 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
                             event.encrypted_group_info_bytes = Some(encrypted_group_info_bytes);
                             event.encrypted_secrets_count = Some(encrypted_secrets_count);
+                            event.welcome_recipient_count = Some(encrypted_secrets_count);
+                            event.ratchet_tree_included = Some(use_ratchet_tree_extension);
+                            event.ratchet_tree_delivery_mode = Some(
+                                if use_ratchet_tree_extension {
+                                    "welcome_extension"
+                                } else {
+                                    "not_in_welcome"
+                                }
+                                .to_string(),
+                            );
 
                             event.invitee_count = Some(invitee_count);
+                            if invitee_count > 0 {
+                                event.added_members_count = Some(invitee_count as usize);
+                            }
                             event.group_epoch = Some(group_epoch);
                             event.tree_size = Some(tree_size);
                             event.member_count = Some(member_count_after);
@@ -983,7 +1225,20 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                 event.encrypted_group_info_bytes =
                                     Some(encrypted_group_info_bytes);
                                 event.encrypted_secrets_count = Some(encrypted_secrets_count);
+                                event.welcome_recipient_count = Some(encrypted_secrets_count);
+                                event.ratchet_tree_included = Some(use_ratchet_tree_extension);
+                                event.ratchet_tree_delivery_mode = Some(
+                                    if use_ratchet_tree_extension {
+                                        "welcome_extension"
+                                    } else {
+                                        "not_in_welcome"
+                                    }
+                                    .to_string(),
+                                );
                                 event.invitee_count = Some(invitee_count);
+                                if invitee_count > 0 {
+                                    event.added_members_count = Some(invitee_count as usize);
+                                }
                                 event.group_epoch = Some(group_epoch);
                                 event.tree_size = Some(tree_size);
                                 event.member_count = Some(member_count_after);
@@ -1132,6 +1387,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         invitee_count,
                         member_count: member_count_before,
                         ciphersuite: final_ciphersuite.clone(),
+                        profile_span_prefix,
                         protocol_event: None,
                     }),
                 }),
@@ -1142,6 +1398,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 invitee_count,
                 member_count_before,
                 None,
+                update_path_profile,
             ))
         };
 
@@ -1158,6 +1415,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         isize,
                         usize,
                         Option<usize>,
+                        Option<UpdatePathProfilingData>,
                     ),
                     CreateCommitError,
                 >,
@@ -1176,6 +1434,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 invitee_count,
                 member_count_before,
                 commit_artifact_size_bytes,
+                update_path_profile,
             ) = measured_result.expect("allocation_counter measure closure did not run")?;
 
             if let Some(scope) = commit_scope {
@@ -1186,9 +1445,18 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 event.member_count = Some(member_count_before);
                 event.ciphersuite = Some(final_ciphersuite);
                 event.invitee_count = Some(invitee_count);
+                if invitee_count > 0 {
+                    event.added_members_count = Some(invitee_count as usize);
+                } else if invitee_count < 0 {
+                    event.removed_members_count = Some(invitee_count.unsigned_abs());
+                }
                 event.artifact_size_bytes = commit_artifact_size_bytes;
+                event.commit_size_bytes = commit_artifact_size_bytes;
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
+                if let Some(update_path_profile) = update_path_profile.as_ref() {
+                    fill_update_path_profile(&mut event, update_path_profile);
+                }
                 if let Some(profiling) = result_builder.stage.profiling.as_mut() {
                     profiling.protocol_event = Some(event);
                 } else {
@@ -1201,7 +1469,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
         #[cfg(not(feature = "profiling-json"))]
         {
-            let (result_builder, _, _, _, _, _, _, _) = build_commit()?;
+            let (result_builder, _, _, _, _, _, _, _, _) = build_commit()?;
             Ok(result_builder)
         }
     }
@@ -1301,6 +1569,7 @@ impl CommitBuilder<'_, Complete, &mut MlsGroup> {
 
             if let Some(mut event) = profiling.protocol_event.take() {
                 event.artifact_size_bytes = commit_artifact_size_bytes;
+                event.commit_size_bytes = commit_artifact_size_bytes;
                 emit_event(&event);
             }
         }

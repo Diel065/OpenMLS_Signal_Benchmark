@@ -120,6 +120,9 @@ impl ParentNode {
         path_secret: PathSecret,
         path_indices: Vec<ParentNodeIndex>,
     ) -> Result<PathDerivationResult, LibraryError> {
+        #[cfg(feature = "profiling-json")]
+        crate::profiling::count_path_secret_derivation(path_indices.len() as u64);
+
         let mut next_path_secret = path_secret;
         let mut path_secrets = Vec::with_capacity(path_indices.len());
 
@@ -205,6 +208,9 @@ impl ParentNode {
         ciphersuite: Ciphersuite,
         original_child_resolution: &[u8],
     ) -> Result<Vec<u8>, LibraryError> {
+        #[cfg(feature = "profiling-json")]
+        crate::profiling::count_parent_hash_node_touch(1);
+
         let parent_hash_input = ParentHashInput::new(
             self.encryption_key.key(),
             self.parent_hash(),

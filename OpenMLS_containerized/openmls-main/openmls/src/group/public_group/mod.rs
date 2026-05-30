@@ -579,6 +579,7 @@ impl PublicGroup {
             group_context,
             exclusion_list,
             own_leaf_index,
+            "test",
         )
     }
 }
