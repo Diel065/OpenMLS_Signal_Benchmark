@@ -1,6 +1,7 @@
 //ADDED THIS ENTIRE FILE FOR THE MASTERS THESIS PROJECT!!!
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
+    collections::HashMap,
     fs::{self, File, OpenOptions},
     io::{BufWriter, Write},
     path::{Path, PathBuf},
@@ -29,7 +30,81 @@ static HPKE_DECRYPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
-    static SPAN_STACK: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+    static SPAN_STACK: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
+    /// Propagated sender_generation from the most recent sender_data decryption,
+    /// consumed by the parent receive protocol span.
+    pub(crate) static LAST_SENDER_GENERATION: Cell<Option<u64>> = const { Cell::new(None) };
+    /// Propagated app_msg_ciphertext_bytes from the most recent content decrypt,
+    /// consumed by the parent receive protocol span.
+    pub(crate) static LAST_CIPHERTEXT_BYTES: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Propagated receive-sequence metadata from the most recent receive,
+    /// consumed by the parent receive protocol span.
+    pub(crate) static LAST_FIRST_RECEIVE: Cell<Option<bool>> = const { Cell::new(None) };
+    pub(crate) static LAST_GENERATION_GAP: Cell<Option<u64>> = const { Cell::new(None) };
+    pub(crate) static LAST_OUT_OF_ORDER: Cell<Option<bool>> = const { Cell::new(None) };
+    static COMMIT_RECEIVE_CONTEXT: RefCell<Option<CommitReceiveContext>> = const { RefCell::new(None) };
+}
+
+#[derive(Clone, Debug, Default)]
+#[allow(dead_code)]
+pub struct CommitReceiveContext {
+    pub commit_create_op: Option<String>,
+    pub commit_receive_sampling_policy: Option<String>,
+    pub commit_receive_sampling_seed: Option<u64>,
+    pub commit_receive_sample_index: Option<usize>,
+    pub commit_receive_sample_count: Option<usize>,
+    pub commit_receive_population_size: Option<usize>,
+    pub commit_id: Option<String>,
+}
+
+pub fn set_commit_receive_context(ctx: CommitReceiveContext) {
+    COMMIT_RECEIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+pub fn clear_commit_receive_context() {
+    COMMIT_RECEIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+#[allow(dead_code)]
+pub fn with_commit_receive_context(fill: impl FnOnce(&CommitReceiveContext)) {
+    COMMIT_RECEIVE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            fill(ctx);
+        }
+    });
+}
+
+/// Per-(epoch, sender) receive-sequence tracker.
+/// Updated after every successful application message receive.
+/// Uses a Mutex to allow interior mutability from &self methods.
+static RECEIVE_TRACKER: OnceLock<Mutex<HashMap<(Vec<u8>, u64, u32), u64>>> = OnceLock::new();
+
+fn receive_tracker() -> &'static Mutex<HashMap<(Vec<u8>, u64, u32), u64>> {
+    RECEIVE_TRACKER.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn compute_receive_sequence(
+    group_id: &[u8],
+    epoch: u64,
+    sender_leaf: u32,
+    generation: u64,
+) -> (bool, u64, bool) {
+    let mut map = receive_tracker().lock().unwrap();
+    let key = (group_id.to_vec(), epoch, sender_leaf);
+    let first = !map.contains_key(&key);
+    let last = map.get(&key).copied().unwrap_or(0);
+    let gap = if generation >= last + 1 {
+        generation - (last + 1)
+    } else {
+        0
+    };
+    let ooo = !first && generation != last + 1;
+    map.insert(key, generation.max(last));
+    (first, gap, ooo)
 }
 
 fn profile_path() -> Option<PathBuf> {
@@ -89,7 +164,18 @@ fn env_positive_f64_or_none(key: &str) -> Option<f64> {
 }
 
 fn measurement_class_for_op(op: &str) -> &'static str {
-    if op.ends_with("_protocol") || op.contains("_protocol_") {
+    if op.ends_with("_protocol")
+        || op.contains("_protocol_")
+        || op.ends_with(".welcome_build")
+        || op.ends_with(".welcome_group_secrets_encrypt")
+        || op.ends_with(".proposal_apply")
+        || op.ends_with(".key_schedule_step")
+        || op.starts_with("join_from_welcome.")
+        || op.starts_with("application_message_create.")
+        || op.starts_with("application_message_receive.")
+        || op.starts_with("commit_receive.")
+        || op == "commit_receive_protocol"
+    {
         "protocol"
     } else if op.ends_with("_serialize") {
         "serialize"
@@ -106,6 +192,10 @@ fn measurement_plane_for_op(op: &str) -> &'static str {
     } else if op.starts_with("self_update.")
         || op.starts_with("commit_add.")
         || op.starts_with("commit_remove.")
+        || op.starts_with("commit_receive.")
+        || op.starts_with("join_from_welcome.")
+        || op.starts_with("application_message_create.")
+        || op.starts_with("application_message_receive.")
     {
         "protocol_scaling"
     } else if op.starts_with("update_path_") {
@@ -122,7 +212,6 @@ fn span_kind_for_op(op: &str) -> &'static str {
         "serialization"
     } else if op.ends_with(".path_secret_derive")
         || op.ends_with(".path_hpke_encrypt")
-        || op.ends_with(".welcome_group_secrets_encrypt")
         || op.ends_with(".group_secrets_hpke_decrypt")
         || op.ends_with(".aead_encrypt")
         || op.ends_with(".aead_decrypt")
@@ -136,10 +225,51 @@ fn span_kind_for_op(op: &str) -> &'static str {
         "tree_structure"
     } else if op.ends_with(".key_schedule_step") {
         "key_schedule"
+    } else if op.starts_with("join_from_welcome.") {
+        "protocol_core"
     } else if op.starts_with("self_update.")
         || op.starts_with("commit_add.")
         || op.starts_with("commit_remove.")
     {
+        "protocol_core"
+    } else if op == "application_message_create.secret_tree_derive" {
+        "key_schedule"
+    } else if op == "application_message_create.sender_data_encrypt"
+        || op == "application_message_create.content_encrypt"
+    {
+        "crypto_primitive"
+    } else if op.starts_with("application_message_create.") {
+        "protocol_core"
+    } else if op == "application_message_receive.secret_tree_lookup_or_derive" {
+        "key_schedule"
+    } else if op == "application_message_receive.sender_data_decrypt"
+        || op == "application_message_receive.content_decrypt"
+    {
+        "crypto_primitive"
+    } else if op == "application_message_receive.auth_verify" {
+        "authentication"
+    } else if op == "commit_receive.message_auth_verify"
+        || op == "commit_receive.confirmation_tag_verify"
+    {
+        "authentication"
+    } else if op == "commit_receive.proposal_apply" || op == "commit_receive.proposal_resolve" {
+        "protocol_core"
+    } else if op == "commit_receive.update_path_validate"
+        || op == "commit_receive.tree_hash_recompute"
+        || op == "commit_receive.parent_hash_verify"
+    {
+        "tree_structure"
+    } else if op == "commit_receive.path_secret_decrypt" {
+        "crypto_primitive"
+    } else if op == "commit_receive.key_schedule_step" {
+        "key_schedule"
+    } else if op == "commit_receive.group_state_install" {
+        "state_construction"
+    } else if op.starts_with("commit_receive.") {
+        "protocol_core"
+    } else if op == "application_message_receive.payload_extract" {
+        "payload_handling"
+    } else if op.starts_with("application_message_receive.") {
         "protocol_core"
     } else if op.starts_with("update_path_") {
         "tree_structure"
@@ -161,19 +291,23 @@ fn next_span_id() -> u64 {
 }
 
 fn current_parent_span_id() -> Option<u64> {
-    SPAN_STACK.with(|stack| stack.borrow().last().copied())
+    SPAN_STACK.with(|stack| stack.borrow().last().map(|&(id, _)| id))
 }
 
-fn push_span_id(span_id: u64) {
-    SPAN_STACK.with(|stack| stack.borrow_mut().push(span_id));
+fn current_parent_operation() -> Option<String> {
+    SPAN_STACK.with(|stack| stack.borrow().last().map(|(_, op)| op.clone()))
+}
+
+fn push_span_id(span_id: u64, op_name: String) {
+    SPAN_STACK.with(|stack| stack.borrow_mut().push((span_id, op_name)));
 }
 
 fn pop_span_id(span_id: u64) {
     SPAN_STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
-        if stack.last().copied() == Some(span_id) {
+        if stack.last().map(|&(id, _)| id) == Some(span_id) {
             stack.pop();
-        } else if let Some(position) = stack.iter().rposition(|id| *id == span_id) {
+        } else if let Some(position) = stack.iter().rposition(|&(id, _)| id == span_id) {
             stack.remove(position);
         }
     });
@@ -191,7 +325,11 @@ fn cgroup_file_candidates(controller: &str, file_name: &str) -> Vec<PathBuf> {
             let rel_path = raw_path.trim_start_matches('/');
 
             if controllers.is_empty() {
-                candidates.push(PathBuf::from("/sys/fs/cgroup").join(rel_path).join(file_name));
+                candidates.push(
+                    PathBuf::from("/sys/fs/cgroup")
+                        .join(rel_path)
+                        .join(file_name),
+                );
             } else if controllers
                 .split(',')
                 .any(|c| c == controller || (controller == "cpu" && c == "cpuacct"))
@@ -208,7 +346,11 @@ fn cgroup_file_candidates(controller: &str, file_name: &str) -> Vec<PathBuf> {
                         .join(rel_path)
                         .join(file_name),
                 );
-                candidates.push(PathBuf::from("/sys/fs/cgroup").join(rel_path).join(file_name));
+                candidates.push(
+                    PathBuf::from("/sys/fs/cgroup")
+                        .join(rel_path)
+                        .join(file_name),
+                );
             }
         }
     }
@@ -320,7 +462,8 @@ fn mem_total_bytes() -> Option<u64> {
 }
 
 fn page_size_bytes() -> u64 {
-    *PAGE_SIZE_BYTES.get_or_init(|| env_positive_u64_or_none("OPENMLS_PAGE_SIZE_BYTES").unwrap_or(4096))
+    *PAGE_SIZE_BYTES
+        .get_or_init(|| env_positive_u64_or_none("OPENMLS_PAGE_SIZE_BYTES").unwrap_or(4096))
 }
 
 fn effective_memory_limit_bytes() -> Option<u64> {
@@ -437,8 +580,12 @@ impl StructuralCounterSnapshot {
             node_secret_derivation_count: self
                 .node_secret_derivation_count
                 .saturating_sub(start.node_secret_derivation_count),
-            hpke_encrypt_count: self.hpke_encrypt_count.saturating_sub(start.hpke_encrypt_count),
-            hpke_decrypt_count: self.hpke_decrypt_count.saturating_sub(start.hpke_decrypt_count),
+            hpke_encrypt_count: self
+                .hpke_encrypt_count
+                .saturating_sub(start.hpke_encrypt_count),
+            hpke_decrypt_count: self
+                .hpke_decrypt_count
+                .saturating_sub(start.hpke_decrypt_count),
         }
     }
 }
@@ -510,9 +657,29 @@ pub(crate) struct ProfileEvent {
     pub invitee_count: Option<isize>,
     pub added_members_count: Option<usize>,
     pub removed_members_count: Option<usize>,
+    pub removed_leaf_indices: Option<Vec<u32>>,
+    pub removed_right_edge_count: Option<usize>,
+    pub rightmost_removed_leaf: Option<u32>,
+    pub removed_right_edge_suffix_count: Option<usize>,
+    pub right_edge_suffix_fully_removed: Option<bool>,
+    pub tree_truncated: Option<bool>,
+    pub truncated_levels_count: Option<usize>,
+    pub tree_size_before: Option<u32>,
+    pub tree_size_after: Option<u32>,
+    pub tree_leaf_count_before: Option<u32>,
+    pub tree_leaf_count_after: Option<u32>,
+    pub tree_node_count_before: Option<u32>,
+    pub tree_node_count_after: Option<u32>,
     pub ciphersuite: Option<String>,
 
+    pub add_commit_mode: Option<String>,
+    pub remove_commit_mode: Option<String>,
+    pub commit_path_policy: Option<String>,
+    pub force_self_update: Option<bool>,
+    pub update_path_present: Option<bool>,
+
     pub committer_leaf_index: Option<u32>,
+    pub joiner_leaf_index: Option<u32>,
     pub direct_path_len: Option<usize>,
     pub filtered_direct_path_len: Option<usize>,
     pub copath_len: Option<usize>,
@@ -527,6 +694,12 @@ pub(crate) struct ProfileEvent {
     pub tree_hash_nodes_touched: Option<u64>,
     pub parent_hash_nodes_touched: Option<u64>,
     pub commit_size_bytes: Option<usize>,
+    pub commit_message_size_bytes: Option<usize>,
+    pub commit_kind: Option<String>,
+    pub commit_create_op: Option<String>,
+    pub commit_id: Option<String>,
+    pub commit_has_path: Option<bool>,
+    pub commit_is_external: Option<bool>,
     pub update_path_size_bytes: Option<usize>,
     pub welcome_recipient_count: Option<usize>,
     pub ratchet_tree_included: Option<bool>,
@@ -536,6 +709,36 @@ pub(crate) struct ProfileEvent {
     pub app_msg_padding_bytes: Option<usize>,
     pub app_msg_ciphertext_bytes: Option<usize>,
     pub aad_bytes: Option<usize>,
+
+    pub sender_leaf_index: Option<u32>,
+    pub sender_generation: Option<u64>,
+    pub first_message_in_epoch: Option<bool>,
+
+    pub receiver_leaf_index: Option<u32>,
+    pub receiver_member_index: Option<u32>,
+    pub receiver_is_committer: Option<bool>,
+    pub commit_receive_sampled: Option<bool>,
+    pub commit_receive_sampling_policy: Option<String>,
+    pub commit_receive_sampling_seed: Option<u64>,
+    pub commit_receive_sample_index: Option<usize>,
+    pub commit_receive_sample_count: Option<usize>,
+    pub commit_receive_population_size: Option<usize>,
+    pub selected_encrypted_path_secret_index: Option<usize>,
+    pub path_secret_decryption_count: Option<u64>,
+    pub confirmation_tag_verified: Option<bool>,
+    pub proposal_count: Option<usize>,
+    pub inline_proposal_count: Option<usize>,
+    pub proposal_ref_count: Option<usize>,
+    pub add_proposal_count: Option<usize>,
+    pub update_proposal_count: Option<usize>,
+    pub remove_proposal_count: Option<usize>,
+    pub first_receive_from_sender: Option<bool>,
+    pub generation_gap: Option<u64>,
+    pub out_of_order_message: Option<bool>,
+
+    pub aead_decrypt_count: Option<u64>,
+    pub sender_data_decrypt_count: Option<u64>,
+    pub signature_verify_count: Option<u64>,
 
     pub pid: u32,
     pub thread_id: String,
@@ -573,24 +776,24 @@ pub(crate) struct ProfileScope {
     l1d_cache_start: Option<L1DCacheCounterScope>,
     span_id: u64,
     parent_span_id: Option<u64>,
+    parent_operation: Option<String>,
     finished: bool,
 }
 
 impl ProfileScope {
-    pub(crate) fn start(
-        op: impl Into<String>,
-        implementation: impl Into<String>,
-    ) -> Option<Self> {
+    pub(crate) fn start(op: impl Into<String>, implementation: impl Into<String>) -> Option<Self> {
         if !profiling_enabled() {
             return None;
         }
         let _ = L1DCacheCounterScope::counters_available();
         let span_id = next_span_id();
+        let op_name: String = op.into();
         let parent_span_id = current_parent_span_id();
-        push_span_id(span_id);
+        let parent_operation = current_parent_operation();
+        push_span_id(span_id, op_name.clone());
 
         Some(Self {
-            op: op.into(),
+            op: op_name,
             implementation: implementation.into(),
             wall_start: Instant::now(),
             cpu_start: Some(ThreadTime::now()),
@@ -599,6 +802,7 @@ impl ProfileScope {
             l1d_cache_start: L1DCacheCounterScope::start(),
             span_id,
             parent_span_id,
+            parent_operation,
             finished: false,
         })
     }
@@ -614,7 +818,10 @@ impl ProfileScope {
             .map(L1DCacheCounterScope::finish)
             .unwrap_or_default();
         let wall_ns = self.wall_start.elapsed().as_nanos();
-        let cpu_thread_ns = self.cpu_start.as_ref().map(|start| start.elapsed().as_nanos());
+        let cpu_thread_ns = self
+            .cpu_start
+            .as_ref()
+            .map(|start| start.elapsed().as_nanos());
         let resource_end = ResourceSnapshot::capture_end();
         let process_cpu_ns = self
             .resource_start
@@ -663,7 +870,7 @@ impl ProfileScope {
             span_name: op.clone(),
             span_id: self.span_id,
             parent_span_id: self.parent_span_id,
-            parent_operation: None,
+            parent_operation: self.parent_operation.clone(),
             span_inclusive: true,
             op,
             implementation,
@@ -696,9 +903,29 @@ impl ProfileScope {
             invitee_count: None,
             added_members_count: None,
             removed_members_count: None,
+            removed_leaf_indices: None,
+            removed_right_edge_count: None,
+            rightmost_removed_leaf: None,
+            removed_right_edge_suffix_count: None,
+            right_edge_suffix_fully_removed: None,
+            tree_truncated: None,
+            truncated_levels_count: None,
+            tree_size_before: None,
+            tree_size_after: None,
+            tree_leaf_count_before: None,
+            tree_leaf_count_after: None,
+            tree_node_count_before: None,
+            tree_node_count_after: None,
             ciphersuite: None,
 
+            add_commit_mode: None,
+            remove_commit_mode: None,
+            commit_path_policy: None,
+            force_self_update: None,
+            update_path_present: None,
+
             committer_leaf_index: None,
+            joiner_leaf_index: None,
             direct_path_len: None,
             filtered_direct_path_len: None,
             copath_len: None,
@@ -713,6 +940,12 @@ impl ProfileScope {
             tree_hash_nodes_touched: Some(structural_counters.tree_hash_nodes_touched),
             parent_hash_nodes_touched: Some(structural_counters.parent_hash_nodes_touched),
             commit_size_bytes: None,
+            commit_message_size_bytes: None,
+            commit_kind: None,
+            commit_create_op: None,
+            commit_id: None,
+            commit_has_path: None,
+            commit_is_external: None,
             update_path_size_bytes: None,
             welcome_recipient_count: None,
             ratchet_tree_included: None,
@@ -722,6 +955,36 @@ impl ProfileScope {
             app_msg_padding_bytes: None,
             app_msg_ciphertext_bytes: None,
             aad_bytes: None,
+
+            sender_leaf_index: None,
+            sender_generation: None,
+            first_message_in_epoch: None,
+
+            receiver_leaf_index: None,
+            receiver_member_index: None,
+            receiver_is_committer: None,
+            commit_receive_sampled: None,
+            commit_receive_sampling_policy: None,
+            commit_receive_sampling_seed: None,
+            commit_receive_sample_index: None,
+            commit_receive_sample_count: None,
+            commit_receive_population_size: None,
+            selected_encrypted_path_secret_index: None,
+            path_secret_decryption_count: None,
+            confirmation_tag_verified: None,
+            proposal_count: None,
+            inline_proposal_count: None,
+            proposal_ref_count: None,
+            add_proposal_count: None,
+            update_proposal_count: None,
+            remove_proposal_count: None,
+            first_receive_from_sender: None,
+            generation_gap: None,
+            out_of_order_message: None,
+
+            aead_decrypt_count: None,
+            sender_data_decrypt_count: None,
+            signature_verify_count: None,
 
             pid: current_pid(),
             thread_id: current_thread_id(),
@@ -743,10 +1006,7 @@ impl Drop for ProfileScope {
     }
 }
 
-pub(crate) fn finish_and_emit(
-    scope: Option<ProfileScope>,
-    fill: impl FnOnce(&mut ProfileEvent),
-) {
+pub(crate) fn finish_and_emit(scope: Option<ProfileScope>, fill: impl FnOnce(&mut ProfileEvent)) {
     let Some(scope) = scope else {
         return;
     };

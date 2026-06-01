@@ -39,13 +39,9 @@ use super::{
 };
 use crate::binary_tree::array_representation::tree::ABinaryTree;
 use crate::group::diff::compute_path::CommitType;
-#[cfg(feature = "profiling-json")]
-use allocation_counter::measure;
-#[cfg(feature = "profiling-json")]
-use crate::group::diff::compute_path::parent_operation_for_span_prefix;
+use crate::group::GroupId;
 #[cfg(feature = "profiling-json")]
 use crate::profiling::{finish_and_emit, ProfileScope};
-use crate::group::GroupId;
 use crate::{
     binary_tree::{
         array_representation::{
@@ -59,6 +55,8 @@ use crate::{
     schedule::CommitSecret,
     treesync::RatchetTree,
 };
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 
 pub(crate) type UpdatePathResult = (
     Vec<PlainUpdatePathNode>,
@@ -308,6 +306,14 @@ impl TreeSyncDiff<'_> {
         let path_indices = self.filtered_direct_path(leaf_index);
         #[cfg(feature = "profiling-json")]
         let path_len = path_indices.len();
+        #[cfg(feature = "profiling-json")]
+        let leaf_count = self.leaf_count();
+        #[cfg(feature = "profiling-json")]
+        let tree_height = if leaf_count <= 1 {
+            0
+        } else {
+            u32::BITS - (leaf_count - 1).leading_zeros()
+        };
 
         #[cfg(feature = "profiling-json")]
         let path_secret_scope = ProfileScope::start(
@@ -331,15 +337,16 @@ impl TreeSyncDiff<'_> {
         let result = ParentNode::derive_path(crypto, ciphersuite, path_secret, path_indices);
         #[cfg(feature = "profiling-json")]
         finish_and_emit(path_secret_scope, |event| {
-            event.parent_operation =
-                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
             event.tree_size = Some(self.diff.size().u32());
+            event.tree_height = Some(tree_height);
+            event.committer_leaf_index = Some(leaf_index.u32());
             event.filtered_direct_path_len = Some(path_len);
             event.update_path_nodes_count = Some(path_len);
             event.path_secret_derivation_count = Some(path_len as u64);
             event.node_secret_derivation_count = Some(path_len as u64);
             event.alloc_bytes = Some(allocation_info.bytes_total as u64);
             event.alloc_count = Some(allocation_info.count_total as u64);
+            event.ciphersuite = Some(format!("{:?}", ciphersuite));
         });
 
         result
@@ -459,7 +466,7 @@ impl TreeSyncDiff<'_> {
 
         // Verify the parent hash.
         let parent_hash =
-            self.process_update_path(crypto, ciphersuite, sender_leaf_index, path, "commit_recv")?;
+            self.process_update_path(crypto, ciphersuite, sender_leaf_index, path, "commit_receive")?;
         let leaf_node_parent_hash = update_path
             .leaf_node()
             .parent_hash()
@@ -509,15 +516,24 @@ impl TreeSyncDiff<'_> {
         #[cfg(not(feature = "profiling-json"))]
         let parent_hash = self.set_parent_hashes(crypto, ciphersuite, &mut path, leaf_index);
         #[cfg(feature = "profiling-json")]
-        finish_and_emit(parent_hash_scope, |event| {
-            event.parent_operation =
-                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
-            event.tree_size = Some(self.diff.size().u32());
-            event.filtered_direct_path_len = Some(path_len);
-            event.update_path_nodes_count = Some(path_len);
-            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-            event.alloc_count = Some(allocation_info.count_total as u64);
-        });
+        {
+            let leaf_count = self.leaf_count();
+            let tree_height = if leaf_count <= 1 {
+                0
+            } else {
+                u32::BITS - (leaf_count - 1).leading_zeros()
+            };
+            finish_and_emit(parent_hash_scope, |event| {
+                event.tree_height = Some(tree_height);
+                event.committer_leaf_index = Some(leaf_index.u32());
+                event.tree_size = Some(self.diff.size().u32());
+                event.filtered_direct_path_len = Some(path_len);
+                event.update_path_nodes_count = Some(path_len);
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+            });
+        }
         let parent_hash = parent_hash?;
 
         // While probably not necessary, the spec mandates we blank the direct path nodes

@@ -59,36 +59,84 @@ impl MlsGroup {
         let ciphersuite = format!("{:?}", self.ciphersuite());
 
         #[cfg(feature = "profiling-json")]
-        let mut measured_result: Option<Result<MlsMessageOut, CreateMessageError>> = None;
+        let sender_leaf = self.own_leaf_index();
+
+        #[cfg(feature = "profiling-json")]
+        let mut measured_result: Option<Result<(MlsMessageOut, u32), CreateMessageError>> = None;
 
         #[cfg(feature = "profiling-json")]
         let allocation_info = measure(|| {
-            measured_result = Some((|| -> Result<MlsMessageOut, CreateMessageError> {
-                let authenticated_content = AuthenticatedContent::new_application(
-                    self.own_leaf_index(),
-                    &self.aad,
-                    message,
-                    self.context(),
-                    signer,
-                )?;
-                let ciphertext = self
-                    .encrypt(authenticated_content, provider)
-                    // We know the application message is wellformed and we have the key material of the current epoch
-                    .map_err(|_| LibraryError::custom("Malformed plaintext"))?;
+            measured_result = Some((|| -> Result<(MlsMessageOut, u32), CreateMessageError> {
+                // ---- sign_content ----
+                let sign_scope =
+                    ProfileScope::start("application_message_create.sign_content", "openmls");
+                let mut sign_result: Option<Result<AuthenticatedContent, CreateMessageError>> =
+                    None;
+                let sign_ai = measure(|| {
+                    sign_result = Some(AuthenticatedContent::new_application(
+                        sender_leaf,
+                        &self.aad,
+                        message,
+                        self.context(),
+                        signer,
+                    ).map_err(Into::into));
+                });
+                let authenticated_content = sign_result
+                    .expect("measure closure did not run")?;
+                if let Some(s) = sign_scope {
+                    let mut event = s.finish();
+                    event.sender_leaf_index = Some(sender_leaf.u32());
+                    event.app_msg_plaintext_bytes = Some(plaintext_len);
+                    event.group_epoch = Some(group_epoch);
+                    event.ciphersuite = Some(ciphersuite.clone());
+                    event.aad_bytes = Some(aad_len);
+                    event.alloc_bytes = Some(sign_ai.bytes_total as u64);
+                    event.alloc_count = Some(sign_ai.count_total as u64);
+                    emit_event(&event);
+                }
+
+                // ---- encrypt_content ----
+                let encrypt_scope =
+                    ProfileScope::start("application_message_create.encrypt_content", "openmls");
+                let mut encrypt_result: Option<
+                    Result<(PrivateMessage, u32), CreateMessageError>,
+                > = None;
+                let encrypt_ai = measure(|| {
+                    encrypt_result = Some(
+                        self.encrypt(authenticated_content, provider)
+                            .map_err(|_| LibraryError::custom("Malformed plaintext").into()),
+                    );
+                });
+                let (ciphertext, generation) = encrypt_result
+                    .expect("measure closure did not run")?;
+                if let Some(s) = encrypt_scope {
+                    let mut event = s.finish();
+                    event.group_epoch = Some(group_epoch);
+                    event.tree_size = Some(tree_size);
+                    event.member_count = Some(member_count);
+                    event.ciphersuite = Some(ciphersuite.clone());
+                    event.sender_leaf_index = Some(sender_leaf.u32());
+                    event.sender_generation = Some(generation as u64);
+                    event.app_msg_plaintext_bytes = Some(plaintext_len);
+                    event.alloc_bytes = Some(encrypt_ai.bytes_total as u64);
+                    event.alloc_count = Some(encrypt_ai.count_total as u64);
+                    emit_event(&event);
+                }
 
                 self.reset_aad();
-                Ok(MlsMessageOut::from_private_message(
-                    ciphertext,
-                    self.version(),
+                Ok((
+                    MlsMessageOut::from_private_message(ciphertext, self.version()),
+                    generation,
                 ))
             })());
         });
 
         #[cfg(feature = "profiling-json")]
         {
-            let message_out =
+            let (message_out, generation) =
                 measured_result.expect("allocation_counter measure closure did not run")?;
 
+            // Parent event
             let mut protocol_event = scope.map(|scope| {
                 let mut event = scope.finish();
                 event.group_epoch = Some(group_epoch);
@@ -99,9 +147,13 @@ impl MlsGroup {
                 event.alloc_count = Some(allocation_info.count_total as u64);
                 event.app_msg_plaintext_bytes = Some(plaintext_len);
                 event.aad_bytes = Some(aad_len);
+                event.sender_leaf_index = Some(sender_leaf.u32());
+                event.sender_generation = Some(generation as u64);
+                event.first_message_in_epoch = Some(generation == 0);
                 event
             });
 
+            // ---- serialize ----
             let serialize_scope =
                 ProfileScope::start("application_message_create_serialize", "openmls");
             let mut serialized_len: Option<Option<usize>> = None;
@@ -110,7 +162,7 @@ impl MlsGroup {
                     message_out
                         .tls_serialize_detached()
                         .ok()
-                    .map(|bytes| bytes.len()),
+                        .map(|bytes| bytes.len()),
                 );
             });
 
@@ -147,7 +199,7 @@ impl MlsGroup {
                 self.context(),
                 signer,
             )?;
-            let ciphertext = self
+            let (ciphertext, _generation) = self
                 .encrypt(authenticated_content, provider)
                 // We know the application message is wellformed and we have the key material of the current epoch
                 .map_err(|_| LibraryError::custom("Malformed plaintext"))?;

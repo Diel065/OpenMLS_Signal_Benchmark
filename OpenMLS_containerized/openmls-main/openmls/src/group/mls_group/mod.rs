@@ -617,9 +617,9 @@ impl MlsGroup {
         &mut self,
         public_message: AuthenticatedContent,
         provider: &Provider,
-    ) -> Result<PrivateMessage, MessageEncryptionError<Provider::StorageError>> {
+    ) -> Result<(PrivateMessage, u32), MessageEncryptionError<Provider::StorageError>> {
         let padding_size = self.configuration().padding_size();
-        let msg = PrivateMessage::try_from_authenticated_content(
+        let (msg, generation) = PrivateMessage::try_from_authenticated_content(
             provider.crypto(),
             provider.rand(),
             &public_message,
@@ -633,7 +633,7 @@ impl MlsGroup {
             .write_message_secrets(self.group_id(), &self.message_secrets_store)
             .map_err(MessageEncryptionError::StorageError)?;
 
-        Ok(msg)
+        Ok((msg, generation))
     }
 
     /// Group framing parameters
@@ -769,7 +769,7 @@ impl MlsGroup {
                 plaintext.into()
             }
             OutgoingWireFormatPolicy::AlwaysCiphertext => {
-                let ciphertext = self
+                let (ciphertext, _generation) = self
                     .encrypt(mls_auth_content, provider)
                     // We can be sure the encryption will work because the plaintext was created by us
                     .map_err(|_| LibraryError::custom("Malformed plaintext"))?;

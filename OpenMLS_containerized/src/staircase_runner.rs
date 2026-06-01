@@ -60,6 +60,8 @@ pub struct StaircaseConfig {
     pub app_rounds: usize,
     pub max_update_samples_per_plateau: usize,
     pub max_app_samples_per_payload: usize,
+    pub max_commit_receive_samples_per_plateau: usize,
+    pub commit_receive_sampling_seed: u64,
     pub payload_sizes: PayloadSizes,
     pub scenario_seed: u64,
     pub run_id: String,
@@ -900,9 +902,47 @@ struct ProfileEvent {
     added_members_count: Option<usize>,
     #[serde(default)]
     removed_members_count: Option<usize>,
+    #[serde(default)]
+    removed_leaf_indices: Option<Vec<u32>>,
+    #[serde(default)]
+    removed_right_edge_count: Option<usize>,
+    #[serde(default)]
+    rightmost_removed_leaf: Option<u32>,
+    #[serde(default)]
+    removed_right_edge_suffix_count: Option<usize>,
+    #[serde(default)]
+    right_edge_suffix_fully_removed: Option<bool>,
+    #[serde(default)]
+    tree_truncated: Option<bool>,
+    #[serde(default)]
+    truncated_levels_count: Option<usize>,
+    #[serde(default)]
+    tree_size_before: Option<u32>,
+    #[serde(default)]
+    tree_size_after: Option<u32>,
+    #[serde(default)]
+    tree_leaf_count_before: Option<u32>,
+    #[serde(default)]
+    tree_leaf_count_after: Option<u32>,
+    #[serde(default)]
+    tree_node_count_before: Option<u32>,
+    #[serde(default)]
+    tree_node_count_after: Option<u32>,
+    #[serde(default)]
+    add_commit_mode: Option<String>,
+    #[serde(default)]
+    remove_commit_mode: Option<String>,
+    #[serde(default)]
+    commit_path_policy: Option<String>,
+    #[serde(default)]
+    force_self_update: Option<bool>,
+    #[serde(default)]
+    update_path_present: Option<bool>,
     ciphersuite: Option<String>,
     #[serde(default)]
     committer_leaf_index: Option<u32>,
+    #[serde(default)]
+    joiner_leaf_index: Option<u32>,
     #[serde(default)]
     direct_path_len: Option<usize>,
     #[serde(default)]
@@ -932,6 +972,18 @@ struct ProfileEvent {
     #[serde(default)]
     commit_size_bytes: Option<usize>,
     #[serde(default)]
+    commit_message_size_bytes: Option<usize>,
+    #[serde(default)]
+    commit_kind: Option<String>,
+    #[serde(default)]
+    commit_create_op: Option<String>,
+    #[serde(default)]
+    commit_id: Option<String>,
+    #[serde(default)]
+    commit_has_path: Option<bool>,
+    #[serde(default)]
+    commit_is_external: Option<bool>,
+    #[serde(default)]
     update_path_size_bytes: Option<usize>,
     #[serde(default)]
     welcome_recipient_count: Option<usize>,
@@ -943,6 +995,50 @@ struct ProfileEvent {
     app_msg_padding_bytes: Option<usize>,
     app_msg_ciphertext_bytes: Option<usize>,
     aad_bytes: Option<usize>,
+    sender_leaf_index: Option<u32>,
+    sender_generation: Option<u64>,
+    first_message_in_epoch: Option<bool>,
+    receiver_leaf_index: Option<u32>,
+    #[serde(default)]
+    receiver_member_index: Option<u32>,
+    #[serde(default)]
+    receiver_is_committer: Option<bool>,
+    #[serde(default)]
+    commit_receive_sampled: Option<bool>,
+    #[serde(default)]
+    commit_receive_sampling_policy: Option<String>,
+    #[serde(default)]
+    commit_receive_sampling_seed: Option<u64>,
+    #[serde(default)]
+    commit_receive_sample_index: Option<usize>,
+    #[serde(default)]
+    commit_receive_sample_count: Option<usize>,
+    #[serde(default)]
+    commit_receive_population_size: Option<usize>,
+    #[serde(default)]
+    selected_encrypted_path_secret_index: Option<usize>,
+    #[serde(default)]
+    path_secret_decryption_count: Option<u64>,
+    #[serde(default)]
+    confirmation_tag_verified: Option<bool>,
+    #[serde(default)]
+    proposal_count: Option<usize>,
+    #[serde(default)]
+    inline_proposal_count: Option<usize>,
+    #[serde(default)]
+    proposal_ref_count: Option<usize>,
+    #[serde(default)]
+    add_proposal_count: Option<usize>,
+    #[serde(default)]
+    update_proposal_count: Option<usize>,
+    #[serde(default)]
+    remove_proposal_count: Option<usize>,
+    first_receive_from_sender: Option<bool>,
+    generation_gap: Option<u64>,
+    out_of_order_message: Option<bool>,
+    aead_decrypt_count: Option<u64>,
+    sender_data_decrypt_count: Option<u64>,
+    signature_verify_count: Option<u64>,
     pid: u32,
     thread_id: String,
     run_id: Option<String>,
@@ -1407,6 +1503,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &mut progress,
             config.process_pending_fanout,
             config.external_coverage_lane,
+            config.max_commit_receive_samples_per_plateau,
+            config.commit_receive_sampling_seed,
             &mut scenario_rng,
             plateau_idx + 1,
             &runner_events,
@@ -1426,6 +1524,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size,
             config.update_rounds,
             config.max_update_samples_per_plateau,
+            config.max_commit_receive_samples_per_plateau,
+            config.commit_receive_sampling_seed,
             &mut fanout,
             &mut progress,
             config.process_pending_fanout,
@@ -1455,6 +1555,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size,
             config.app_rounds,
             config.max_app_samples_per_payload,
+            config.max_commit_receive_samples_per_plateau,
+            config.commit_receive_sampling_seed,
             &config.payload_sizes,
             &mut fanout,
             &mut progress,
@@ -2318,7 +2420,15 @@ async fn receive_commit_expect(
     expected: ExpectedReceiveCommitState,
     phase: &str,
 ) -> Result<()> {
-    let command = Command::ReceiveCommit;
+    let command = Command::ReceiveCommit {
+        profile: false,
+        commit_create_op: None,
+        commit_receive_sampling_policy: None,
+        commit_receive_sampling_seed: None,
+        commit_receive_sample_index: None,
+        commit_receive_sample_count: None,
+        commit_receive_population_size: None,
+    };
     let context = WorkerCommandContext::with_metadata(
         worker,
         &command,
@@ -3656,6 +3766,81 @@ fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize)
     one_based_index.saturating_sub(1)
 }
 
+fn deterministic_commit_receive_sample_indices(
+    recipient_count: usize,
+    max_samples: usize,
+    seed: u64,
+    plateau_size: usize,
+    epoch: u64,
+    seq_no: usize,
+) -> Vec<usize> {
+    if recipient_count == 0 || max_samples == 0 {
+        return Vec::new();
+    }
+    if recipient_count <= max_samples {
+        return (0..recipient_count).collect();
+    }
+
+    let mut chosen = Vec::new();
+    chosen.push(0);
+    if recipient_count > 1 {
+        chosen.push(recipient_count - 1);
+    }
+    if recipient_count > 2 {
+        chosen.push(recipient_count / 2);
+    }
+
+    let mut state = seed
+        ^ ((plateau_size as u64) << 32)
+        ^ epoch
+        ^ ((seq_no as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15));
+    while chosen.len() < max_samples {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let idx = (state as usize) % recipient_count;
+        if !chosen.contains(&idx) {
+            chosen.push(idx);
+        }
+    }
+    chosen.sort_unstable();
+    chosen
+}
+
+fn build_commit_receive_sampling_map(
+    recipients: &[WorkerSpec],
+    max_samples: usize,
+    seed: u64,
+    plateau_size: usize,
+    epoch: u64,
+    seq_no: usize,
+) -> (HashSet<String>, HashMap<String, usize>, usize) {
+    let sample_indices = deterministic_commit_receive_sample_indices(
+        recipients.len(),
+        max_samples,
+        seed,
+        plateau_size,
+        epoch,
+        seq_no,
+    );
+    let sampled_ids: HashSet<String> = sample_indices
+        .iter()
+        .filter_map(|idx| recipients.get(*idx))
+        .map(|w| w.id.clone())
+        .collect();
+    let index_map = sample_indices
+        .iter()
+        .enumerate()
+        .filter_map(|(sample_index, recipient_index)| {
+            recipients
+                .get(*recipient_index)
+                .map(|w| (w.id.clone(), sample_index))
+        })
+        .collect::<HashMap<_, _>>();
+    let sample_count = sampled_ids.len();
+    (sampled_ids, index_map, sample_count)
+}
+
 fn estimate_total_units(
     plateau_sequence: &[usize],
     update_rounds: usize,
@@ -3767,6 +3952,8 @@ async fn add_n_members(
     rng: &mut StdRng,
     plateau_index: usize,
     target_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
     runner_events: &RunnerEventLog,
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
@@ -3922,6 +4109,14 @@ async fn add_n_members(
     } else {
         "add_member.fanout_receive_commit"
     };
+    let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+        &recipients,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
+        target_size,
+        expected_after_commit.epoch,
+        0,
+    );
     let commands_by_physical = build_batch_commands(&recipients, |worker| BatchFanoutCommand {
         client_id: worker.id.clone(),
         request_id: None,
@@ -3932,11 +4127,20 @@ async fn add_n_members(
                 expected_epoch: expected_ep,
             }
         } else {
-            Command::ReceiveCommit
+            let sampled = sampled_ids.contains(&worker.id);
+            Command::ReceiveCommit {
+                profile: sampled,
+                commit_create_op: Some("add".to_string()),
+                commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                commit_receive_sample_count: Some(sample_count),
+                commit_receive_population_size: Some(recipients.len()),
+            }
         },
         expected_epoch: expected_ep,
         phase: Some(fanout_phase.to_string()),
-        profile: is_external_device(worker).then_some(true),
+        profile: sampled_ids.contains(&worker.id).then_some(true),
     });
     let expected_by_client = recipients
         .iter()
@@ -3962,6 +4166,9 @@ async fn add_n_members(
         &failed_joiners,
         fanout,
         process_pending_fanout,
+        target_size,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
     )
     .await?;
     progress.tick_units(
@@ -3984,6 +4191,9 @@ async fn remove_n_members(
     process_pending_fanout: bool,
     forced_actor_id: Option<&str>,
     protect_external_members: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
 ) -> Result<()> {
     if active.len() <= 1 {
@@ -4073,6 +4283,14 @@ async fn remove_n_members(
     } else {
         "remove_member.fanout_receive_commit"
     };
+    let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+        &recipients,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
+        plateau_size,
+        expected_after_commit.epoch,
+        0,
+    );
     let commands_by_physical = build_batch_commands(&recipients, |worker| {
         let is_removed = removed_id_set.contains(&worker.id);
         let expected_ep = if is_removed {
@@ -4082,6 +4300,7 @@ async fn remove_n_members(
                 expected_after_commit.clone(),
             ))
         };
+        let sampled = sampled_ids.contains(&worker.id);
         BatchFanoutCommand {
             client_id: worker.id.clone(),
             request_id: None,
@@ -4092,11 +4311,19 @@ async fn remove_n_members(
                     expected_epoch: expected_ep,
                 }
             } else {
-                Command::ReceiveCommit
+                Command::ReceiveCommit {
+                    profile: sampled,
+                    commit_create_op: Some("remove".to_string()),
+                    commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                    commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                    commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                    commit_receive_sample_count: Some(sample_count),
+                    commit_receive_population_size: Some(recipients.len()),
+                }
             },
             expected_epoch: expected_ep,
             phase: Some(fanout_phase.to_string()),
-            profile: is_external_device(worker).then_some(true),
+            profile: sampled.then_some(true),
         }
     });
     let expected_by_client = recipients
@@ -4145,6 +4372,9 @@ async fn evict_oom_group_members(
     dead_workers: &[WorkerSpec],
     fanout: &mut FanoutController,
     process_pending_fanout: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
 ) -> Result<()> {
     if dead_workers.is_empty() {
         return Ok(());
@@ -4220,6 +4450,14 @@ async fn evict_oom_group_members(
     } else {
         "oom_eviction.fanout_receive_commit"
     };
+    let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+        &recipients,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
+        plateau_size,
+        expected_after_commit.epoch,
+        0,
+    );
     let commands_by_physical = build_batch_commands(&recipients, |worker| BatchFanoutCommand {
         client_id: worker.id.clone(),
         request_id: None,
@@ -4230,11 +4468,20 @@ async fn evict_oom_group_members(
                 expected_epoch: expected_ep,
             }
         } else {
-            Command::ReceiveCommit
+            let sampled = sampled_ids.contains(&worker.id);
+            Command::ReceiveCommit {
+                profile: sampled,
+                commit_create_op: Some("remove".to_string()),
+                commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                commit_receive_sample_count: Some(sample_count),
+                commit_receive_population_size: Some(recipients.len()),
+            }
         },
         expected_epoch: expected_ep,
         phase: Some(fanout_phase.to_string()),
-        profile: is_external_device(worker).then_some(true),
+        profile: sampled_ids.contains(&worker.id).then_some(true),
     });
     let expected_by_client = recipients
         .iter()
@@ -4265,6 +4512,8 @@ async fn transition_to_size(
     progress: &mut Progress,
     process_pending_fanout: bool,
     external_coverage_lane: bool,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
     plateau_index: usize,
     runner_events: &RunnerEventLog,
@@ -4311,6 +4560,8 @@ async fn transition_to_size(
             rng,
             plateau_index,
             target_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
             runner_events,
         )
         .await?;
@@ -4351,6 +4602,9 @@ async fn transition_to_size(
             process_pending_fanout,
             forced_actor_id.as_deref(),
             external_coverage_lane,
+            target_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
             rng,
         )
         .await?;
@@ -4365,6 +4619,8 @@ async fn run_update_phase(
     plateau_size: usize,
     update_rounds: usize,
     max_update_samples_per_plateau: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
@@ -4470,8 +4726,17 @@ async fn run_update_phase(
                 )
                 .await?
                 {
-                    evict_oom_group_members(http, active, &[actor], fanout, process_pending_fanout)
-                        .await?;
+                    evict_oom_group_members(
+                        http,
+                        active,
+                        &[actor],
+                        fanout,
+                        process_pending_fanout,
+                        plateau_size,
+                        max_commit_receive_samples_per_plateau,
+                        commit_receive_sampling_seed,
+                    )
+                    .await?;
                     continue;
                 }
                 return Err(error);
@@ -4502,8 +4767,17 @@ async fn run_update_phase(
             )
             .await?
             {
-                evict_oom_group_members(http, active, &[actor], fanout, process_pending_fanout)
-                    .await?;
+                evict_oom_group_members(
+                    http,
+                    active,
+                    &[actor],
+                    fanout,
+                    process_pending_fanout,
+                    plateau_size,
+                    max_commit_receive_samples_per_plateau,
+                    commit_receive_sampling_seed,
+                )
+                .await?;
                 continue;
             }
             return Err(error);
@@ -4539,8 +4813,17 @@ async fn run_update_phase(
             )
             .await?
             {
-                evict_oom_group_members(http, active, &[actor], fanout, process_pending_fanout)
-                    .await?;
+                evict_oom_group_members(
+                    http,
+                    active,
+                    &[actor],
+                    fanout,
+                    process_pending_fanout,
+                    plateau_size,
+                    max_commit_receive_samples_per_plateau,
+                    commit_receive_sampling_seed,
+                )
+                .await?;
                 continue;
             }
             return Err(error);
@@ -4559,21 +4842,49 @@ async fn run_update_phase(
         } else {
             "update.fanout_receive_commit"
         };
-        let commands_by_physical = build_batch_commands(&recipients, |worker| BatchFanoutCommand {
-            client_id: worker.id.clone(),
-            request_id: None,
-            command: if process_pending_fanout {
-                Command::ProcessPending {
-                    kinds: Some(vec![PendingKind::Commits]),
-                    max_messages: None,
-                    expected_epoch: expected_ep,
-                }
-            } else {
-                Command::ReceiveCommit
-            },
-            expected_epoch: expected_ep,
-            phase: Some(fanout_phase.to_string()),
-            profile: is_external_device(worker).then_some(true),
+        let sample_indices = deterministic_commit_receive_sample_indices(
+            recipients.len(),
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            plateau_size,
+            expected_after_commit.epoch,
+            seq_no,
+        );
+        let sampled_ids: HashSet<String> = sample_indices
+            .iter()
+            .filter_map(|idx| recipients.get(*idx))
+            .map(|w| w.id.clone())
+            .collect();
+        let sample_count = sampled_ids.len();
+        let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            let sampled = sampled_ids.contains(&worker.id);
+            let sample_index = sample_indices
+                .iter()
+                .position(|idx| recipients.get(*idx).map(|w| &w.id) == Some(&worker.id));
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                    }
+                } else {
+                    Command::ReceiveCommit {
+                        profile: sampled,
+                        commit_create_op: Some("self_update".to_string()),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index,
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: sampled.then_some(true),
+            }
         });
         let expected_by_client = recipients
             .iter()
@@ -4606,6 +4917,9 @@ async fn run_update_phase(
                     &dead_workers,
                     fanout,
                     process_pending_fanout,
+                    plateau_size,
+                    max_commit_receive_samples_per_plateau,
+                    commit_receive_sampling_seed,
                 )
                 .await?;
                 continue;
@@ -4632,6 +4946,8 @@ async fn run_application_phase(
     plateau_size: usize,
     app_rounds: usize,
     max_app_samples_per_payload: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
     payload_sizes: &PayloadSizes,
     fanout: &mut FanoutController,
     progress: &mut Progress,
@@ -4787,7 +5103,17 @@ async fn run_application_phase(
                 )
                 .await?
                 {
-                    evict_oom_group_members(http, active, &[actor], fanout, false).await?;
+                    evict_oom_group_members(
+                        http,
+                        active,
+                        &[actor],
+                        fanout,
+                        false,
+                        plateau_size,
+                        max_commit_receive_samples_per_plateau,
+                        commit_receive_sampling_seed,
+                    )
+                    .await?;
                     continue;
                 }
                 return Err(error);
@@ -4852,7 +5178,17 @@ async fn run_application_phase(
                 )
                 .await?
                 {
-                    evict_oom_group_members(http, active, &dead_workers, fanout, false).await?;
+                    evict_oom_group_members(
+                        http,
+                        active,
+                        &dead_workers,
+                        fanout,
+                        false,
+                        plateau_size,
+                        max_commit_receive_samples_per_plateau,
+                        commit_receive_sampling_seed,
+                    )
+                    .await?;
                     continue;
                 }
                 return Err(error);
@@ -5019,8 +5355,27 @@ pub fn aggregate_csv(
         invitee_count: Option<isize>,
         added_members_count: Option<usize>,
         removed_members_count: Option<usize>,
+        removed_leaf_indices: Option<String>,
+        removed_right_edge_count: Option<usize>,
+        rightmost_removed_leaf: Option<u32>,
+        removed_right_edge_suffix_count: Option<usize>,
+        right_edge_suffix_fully_removed: Option<bool>,
+        tree_truncated: Option<bool>,
+        truncated_levels_count: Option<usize>,
+        tree_size_before: Option<u32>,
+        tree_size_after: Option<u32>,
+        tree_leaf_count_before: Option<u32>,
+        tree_leaf_count_after: Option<u32>,
+        tree_node_count_before: Option<u32>,
+        tree_node_count_after: Option<u32>,
+        add_commit_mode: Option<String>,
+        remove_commit_mode: Option<String>,
+        commit_path_policy: Option<String>,
+        force_self_update: Option<bool>,
+        update_path_present: Option<bool>,
         ciphersuite: Option<String>,
         committer_leaf_index: Option<u32>,
+        joiner_leaf_index: Option<u32>,
         direct_path_len: Option<usize>,
         filtered_direct_path_len: Option<usize>,
         copath_len: Option<usize>,
@@ -5035,6 +5390,12 @@ pub fn aggregate_csv(
         tree_hash_nodes_touched: Option<u64>,
         parent_hash_nodes_touched: Option<u64>,
         commit_size_bytes: Option<usize>,
+        commit_message_size_bytes: Option<usize>,
+        commit_kind: Option<String>,
+        commit_create_op: Option<String>,
+        commit_id: Option<String>,
+        commit_has_path: Option<bool>,
+        commit_is_external: Option<bool>,
         update_path_size_bytes: Option<usize>,
         welcome_recipient_count: Option<usize>,
         ratchet_tree_included: Option<bool>,
@@ -5043,6 +5404,33 @@ pub fn aggregate_csv(
         app_msg_padding_bytes: Option<usize>,
         app_msg_ciphertext_bytes: Option<usize>,
         aad_bytes: Option<usize>,
+        sender_leaf_index: Option<u32>,
+        sender_generation: Option<u64>,
+        first_message_in_epoch: Option<bool>,
+        receiver_leaf_index: Option<u32>,
+        receiver_member_index: Option<u32>,
+        receiver_is_committer: Option<bool>,
+        commit_receive_sampled: Option<bool>,
+        commit_receive_sampling_policy: Option<String>,
+        commit_receive_sampling_seed: Option<u64>,
+        commit_receive_sample_index: Option<usize>,
+        commit_receive_sample_count: Option<usize>,
+        commit_receive_population_size: Option<usize>,
+        selected_encrypted_path_secret_index: Option<usize>,
+        path_secret_decryption_count: Option<u64>,
+        confirmation_tag_verified: Option<bool>,
+        proposal_count: Option<usize>,
+        inline_proposal_count: Option<usize>,
+        proposal_ref_count: Option<usize>,
+        add_proposal_count: Option<usize>,
+        update_proposal_count: Option<usize>,
+        remove_proposal_count: Option<usize>,
+        first_receive_from_sender: Option<bool>,
+        generation_gap: Option<u64>,
+        out_of_order_message: Option<bool>,
+        aead_decrypt_count: Option<u64>,
+        sender_data_decrypt_count: Option<u64>,
+        signature_verify_count: Option<u64>,
         pid: u32,
         thread_id: String,
         run_id: Option<String>,
@@ -5185,8 +5573,29 @@ pub fn aggregate_csv(
                 invitee_count: event.invitee_count,
                 added_members_count: event.added_members_count,
                 removed_members_count: event.removed_members_count,
+                removed_leaf_indices: event
+                    .removed_leaf_indices
+                    .map(|v| serde_json::to_string(&v).unwrap_or_default()),
+                removed_right_edge_count: event.removed_right_edge_count,
+                rightmost_removed_leaf: event.rightmost_removed_leaf,
+                removed_right_edge_suffix_count: event.removed_right_edge_suffix_count,
+                right_edge_suffix_fully_removed: event.right_edge_suffix_fully_removed,
+                tree_truncated: event.tree_truncated,
+                truncated_levels_count: event.truncated_levels_count,
+                tree_size_before: event.tree_size_before,
+                tree_size_after: event.tree_size_after,
+                tree_leaf_count_before: event.tree_leaf_count_before,
+                tree_leaf_count_after: event.tree_leaf_count_after,
+                tree_node_count_before: event.tree_node_count_before,
+                tree_node_count_after: event.tree_node_count_after,
+                add_commit_mode: event.add_commit_mode,
+                remove_commit_mode: event.remove_commit_mode,
+                commit_path_policy: event.commit_path_policy,
+                force_self_update: event.force_self_update,
+                update_path_present: event.update_path_present,
                 ciphersuite: event.ciphersuite,
                 committer_leaf_index: event.committer_leaf_index,
+                joiner_leaf_index: event.joiner_leaf_index,
                 direct_path_len: event.direct_path_len,
                 filtered_direct_path_len: event.filtered_direct_path_len,
                 copath_len: event.copath_len,
@@ -5201,6 +5610,12 @@ pub fn aggregate_csv(
                 tree_hash_nodes_touched: event.tree_hash_nodes_touched,
                 parent_hash_nodes_touched: event.parent_hash_nodes_touched,
                 commit_size_bytes: event.commit_size_bytes,
+                commit_message_size_bytes: event.commit_message_size_bytes,
+                commit_kind: event.commit_kind,
+                commit_create_op: event.commit_create_op,
+                commit_id: event.commit_id,
+                commit_has_path: event.commit_has_path,
+                commit_is_external: event.commit_is_external,
                 update_path_size_bytes: event.update_path_size_bytes,
                 welcome_recipient_count: event.welcome_recipient_count,
                 ratchet_tree_included: event.ratchet_tree_included,
@@ -5209,6 +5624,33 @@ pub fn aggregate_csv(
                 app_msg_padding_bytes: event.app_msg_padding_bytes,
                 app_msg_ciphertext_bytes: event.app_msg_ciphertext_bytes,
                 aad_bytes: event.aad_bytes,
+                sender_leaf_index: event.sender_leaf_index,
+                sender_generation: event.sender_generation,
+                first_message_in_epoch: event.first_message_in_epoch,
+                receiver_leaf_index: event.receiver_leaf_index,
+                receiver_member_index: event.receiver_member_index,
+                receiver_is_committer: event.receiver_is_committer,
+                commit_receive_sampled: event.commit_receive_sampled,
+                commit_receive_sampling_policy: event.commit_receive_sampling_policy,
+                commit_receive_sampling_seed: event.commit_receive_sampling_seed,
+                commit_receive_sample_index: event.commit_receive_sample_index,
+                commit_receive_sample_count: event.commit_receive_sample_count,
+                commit_receive_population_size: event.commit_receive_population_size,
+                selected_encrypted_path_secret_index: event.selected_encrypted_path_secret_index,
+                path_secret_decryption_count: event.path_secret_decryption_count,
+                confirmation_tag_verified: event.confirmation_tag_verified,
+                proposal_count: event.proposal_count,
+                inline_proposal_count: event.inline_proposal_count,
+                proposal_ref_count: event.proposal_ref_count,
+                add_proposal_count: event.add_proposal_count,
+                update_proposal_count: event.update_proposal_count,
+                remove_proposal_count: event.remove_proposal_count,
+                first_receive_from_sender: event.first_receive_from_sender,
+                generation_gap: event.generation_gap,
+                out_of_order_message: event.out_of_order_message,
+                aead_decrypt_count: event.aead_decrypt_count,
+                sender_data_decrypt_count: event.sender_data_decrypt_count,
+                signature_verify_count: event.signature_verify_count,
                 pid: event.pid,
                 thread_id: event.thread_id,
                 run_id: event.run_id,
@@ -5737,7 +6179,15 @@ mod tests {
         let commands_by_physical = build_batch_commands(&workers, |worker| BatchFanoutCommand {
             client_id: worker.id.clone(),
             request_id: None,
-            command: Command::ReceiveCommit,
+            command: Command::ReceiveCommit {
+                profile: false,
+                commit_create_op: None,
+                commit_receive_sampling_policy: None,
+                commit_receive_sampling_seed: None,
+                commit_receive_sample_index: None,
+                commit_receive_sample_count: None,
+                commit_receive_population_size: None,
+            },
             expected_epoch: Some(3),
             phase: Some("test.phase".to_string()),
             profile: None,
@@ -5763,7 +6213,15 @@ mod tests {
                 BatchFanoutCommand {
                     client_id: "00001".to_string(),
                     request_id: Some("rid-1".to_string()),
-                    command: Command::ReceiveCommit,
+                    command: Command::ReceiveCommit {
+                        profile: false,
+                        commit_create_op: None,
+                        commit_receive_sampling_policy: None,
+                        commit_receive_sampling_seed: None,
+                        commit_receive_sample_index: None,
+                        commit_receive_sample_count: None,
+                        commit_receive_population_size: None,
+                    },
                     expected_epoch: Some(7),
                     phase: Some("test.phase".to_string()),
                     profile: None,
@@ -5771,7 +6229,15 @@ mod tests {
                 BatchFanoutCommand {
                     client_id: "00002".to_string(),
                     request_id: Some("rid-2".to_string()),
-                    command: Command::ReceiveCommit,
+                    command: Command::ReceiveCommit {
+                        profile: false,
+                        commit_create_op: None,
+                        commit_receive_sampling_policy: None,
+                        commit_receive_sampling_seed: None,
+                        commit_receive_sample_index: None,
+                        commit_receive_sample_count: None,
+                        commit_receive_population_size: None,
+                    },
                     expected_epoch: Some(7),
                     phase: Some("test.phase".to_string()),
                     profile: None,
@@ -5829,7 +6295,15 @@ mod tests {
         let local_cmd = BatchFanoutCommand {
             client_id: "00001".to_string(),
             request_id: Some("rid-1".to_string()),
-            command: Command::ReceiveCommit,
+            command: Command::ReceiveCommit {
+                profile: false,
+                commit_create_op: None,
+                commit_receive_sampling_policy: None,
+                commit_receive_sampling_seed: None,
+                commit_receive_sample_index: None,
+                commit_receive_sample_count: None,
+                commit_receive_population_size: None,
+            },
             expected_epoch: None,
             phase: None,
             profile: None,
@@ -5837,7 +6311,15 @@ mod tests {
         let layout_cmd = BatchFanoutCommand {
             client_id: "00002".to_string(),
             request_id: Some("rid-2".to_string()),
-            command: Command::ReceiveCommit,
+            command: Command::ReceiveCommit {
+                profile: false,
+                commit_create_op: None,
+                commit_receive_sampling_policy: None,
+                commit_receive_sampling_seed: None,
+                commit_receive_sample_index: None,
+                commit_receive_sample_count: None,
+                commit_receive_population_size: None,
+            },
             expected_epoch: None,
             phase: None,
             profile: None,

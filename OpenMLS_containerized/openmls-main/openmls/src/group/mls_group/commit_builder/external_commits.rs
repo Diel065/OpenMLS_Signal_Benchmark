@@ -359,7 +359,7 @@ impl CommitBuilder<'_, super::Complete, MlsGroup> {
                     result: create_commit_result,
                     original_wire_format_policy,
                     #[cfg(feature = "profiling-json")]
-                    profiling: _,
+                        profiling: _,
                 },
             ..
         } = self;

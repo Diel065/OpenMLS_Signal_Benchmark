@@ -30,9 +30,9 @@ use crate::{
 #[cfg(doc)]
 use crate::key_packages::KeyPackage;
 #[cfg(feature = "profiling-json")]
-use allocation_counter::measure;
-#[cfg(feature = "profiling-json")]
 use crate::profiling::{emit_event, ProfileScope};
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 use tls_codec::Deserialize as _;
 
 impl MlsGroup {
@@ -159,29 +159,120 @@ impl MlsGroup {
 
         #[cfg(feature = "profiling-json")]
         {
-            let scope = ProfileScope::start("join_from_welcome_protocol", "openmls");
-            let mut measured_result: Option<Result<Self, WelcomeError<Provider::StorageError>>> =
-                None;
-            let allocation_info = measure(|| {
-                measured_result = Some((|| {
-                    StagedWelcome::new_from_welcome(
+            let parent_scope = ProfileScope::start("join_from_welcome_protocol", "openmls");
+            let mut allocation_info = allocation_counter::AllocationInfo::default();
+
+            // Step 1: Decrypt and parse Welcome (HPKE, GroupSecrets, GroupInfo)
+            let processed_welcome = {
+                let child_scope =
+                    ProfileScope::start("join_from_welcome.welcome_decrypt_and_parse", "openmls");
+                let mut measured: Option<Result<_, WelcomeError<Provider::StorageError>>> = None;
+                let ai = measure(|| {
+                    measured = Some(ProcessedWelcome::new_from_welcome(
                         provider,
                         mls_group_config,
                         welcome,
-                        Some(ratchet_tree),
-                    )?
-                    .into_group(provider)
-                })());
-            });
+                    ));
+                });
+                allocation_info = ai;
+                let processed =
+                    measured.expect("allocation_counter measure closure did not run")?;
 
-            let group = measured_result
-                .expect("allocation_counter measure closure did not run")?;
+                if let Some(s) = child_scope {
+                    let mut event = s.finish();
+                    event.ciphersuite = Some(format!("{:?}", processed.ciphersuite));
+                    event.alloc_bytes = Some(ai.bytes_total as u64);
+                    event.alloc_count = Some(ai.count_total as u64);
+                    emit_event(&event);
+                }
+                processed
+            };
 
-            if let Some(scope) = scope {
-                let mut event = scope.finish();
+            // Step 2: Ratchet tree parsing and validation, key schedule
+            // PublicGroup metadata is unavailable until after into_staged_welcome,
+            // and StagedWelcome's internals are crate-private. Tree metadata
+            // is populated on the group_state_build span instead.
+            let staged_welcome = {
+                let child_scope = ProfileScope::start(
+                    "join_from_welcome.ratchet_tree_parse_and_validate",
+                    "openmls",
+                );
+                let mut measured: Option<Result<_, WelcomeError<Provider::StorageError>>> = None;
+                let ai = measure(|| {
+                    measured =
+                        Some(processed_welcome.into_staged_welcome(provider, Some(ratchet_tree)));
+                });
+                allocation_info.bytes_total += ai.bytes_total;
+                allocation_info.count_total += ai.count_total;
+                let staged = measured.expect("allocation_counter measure closure did not run")?;
+
+                if let Some(s) = child_scope {
+                    let mut event = s.finish();
+                    event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
+                    event.alloc_bytes = Some(ai.bytes_total as u64);
+                    event.alloc_count = Some(ai.count_total as u64);
+                    emit_event(&event);
+                }
+                staged
+            };
+
+            // Step 3: Build the MlsGroup (store keypairs, persist)
+            let group = {
+                let child_scope =
+                    ProfileScope::start("join_from_welcome.group_state_build", "openmls");
+                let mut measured: Option<Result<_, WelcomeError<Provider::StorageError>>> = None;
+                let ai = measure(|| {
+                    measured = Some(staged_welcome.into_group(provider));
+                });
+                allocation_info.bytes_total += ai.bytes_total;
+                allocation_info.count_total += ai.count_total;
+                let group = measured.expect("allocation_counter measure closure did not run")?;
+
+                if let Some(s) = child_scope {
+                    let mut event = s.finish();
+                    let ts = group.treesync().tree_size();
+                    let leaf_count = ts.leaf_count();
+                    let tree_size_u32 = ts.u32();
+                    let tree_height = if leaf_count <= 1 {
+                        0
+                    } else {
+                        leaf_count.next_power_of_two().ilog2()
+                    };
+                    let joiner_leaf = group.own_leaf_index();
+                    event.group_epoch = Some(group.context().epoch().as_u64());
+                    event.tree_size = Some(tree_size_u32);
+                    event.tree_leaf_count = Some(leaf_count);
+                    event.tree_node_count = Some(tree_size_u32);
+                    event.tree_height = Some(tree_height);
+                    event.member_count = Some(group.members().count());
+                    event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
+                    event.joiner_leaf_index = Some(joiner_leaf.u32());
+                    event.alloc_bytes = Some(ai.bytes_total as u64);
+                    event.alloc_count = Some(ai.count_total as u64);
+                    emit_event(&event);
+                }
+                group
+            };
+
+            // Parent event: total join_from_welcome_protocol
+            if let Some(s) = parent_scope {
+                let mut event = s.finish();
+                let ts = group.treesync().tree_size();
+                let leaf_count = ts.leaf_count();
+                let tree_size_u32 = ts.u32();
+                let tree_height = if leaf_count <= 1 {
+                    0
+                } else {
+                    leaf_count.next_power_of_two().ilog2()
+                };
+                let joiner_leaf = group.own_leaf_index();
                 event.group_epoch = Some(group.context().epoch().as_u64());
-                event.tree_size = Some(group.treesync().tree_size().u32());
+                event.tree_size = Some(tree_size_u32);
+                event.tree_leaf_count = Some(leaf_count);
+                event.tree_node_count = Some(tree_size_u32);
+                event.tree_height = Some(tree_height);
                 event.member_count = Some(group.members().count());
+                event.joiner_leaf_index = Some(joiner_leaf.u32());
                 event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
                 event.artifact_size_bytes = Some(welcome_bytes.len() + ratchet_tree_bytes.len());
                 event.welcome_bytes = Some(welcome_bytes.len());
@@ -193,6 +284,7 @@ impl MlsGroup {
                 emit_event(&event);
             }
 
+            // Backfill deserialize events with group metadata
             if let Some(event) = welcome_deserialize_event.as_mut() {
                 event.group_epoch = Some(group.context().epoch().as_u64());
                 event.tree_size = Some(group.treesync().tree_size().u32());

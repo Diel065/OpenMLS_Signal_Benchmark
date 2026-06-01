@@ -101,6 +101,7 @@ impl DecryptedMessage {
     ) -> Result<Self, ValidationError> {
         // This will be refactored with #265.
         let ciphersuite = group.ciphersuite();
+        let receiver_leaf = group.own_leaf_index();
         // TODO: #819 The old leaves should not be needed any more.
         //       Revisit when the transition is further along.
         let (message_secrets, _old_leaves) = group
@@ -108,7 +109,7 @@ impl DecryptedMessage {
             .map_err(MessageDecryptionError::SecretTreeError)?;
         let sender_data = ciphertext.sender_data(message_secrets, crypto, ciphersuite)?;
         // Check if we are the sender
-        if sender_data.leaf_index == group.own_leaf_index() {
+        if sender_data.leaf_index == receiver_leaf {
             return Err(ValidationError::CannotDecryptOwnMessage);
         }
         let message_secrets = group

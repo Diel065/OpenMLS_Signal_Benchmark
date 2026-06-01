@@ -34,6 +34,17 @@ pub enum CommitReceiveOutcome {
     },
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct CommitReceiveProfileOptions {
+    pub enabled: bool,
+    pub commit_create_op: Option<String>,
+    pub commit_receive_sampling_policy: Option<String>,
+    pub commit_receive_sampling_seed: Option<u64>,
+    pub commit_receive_sample_index: Option<usize>,
+    pub commit_receive_sample_count: Option<usize>,
+    pub commit_receive_population_size: Option<usize>,
+}
+
 impl Client {
     fn fresh(name: &str) -> Result<Self> {
         let crypto = OpenMlsRustCrypto::default();
@@ -372,7 +383,11 @@ impl Client {
         }
     }
 
-    pub fn receive_commit(&mut self, commit_bytes: &[u8]) -> Result<CommitReceiveOutcome> {
+    pub fn receive_commit(
+        &mut self,
+        commit_bytes: &[u8],
+        profile: CommitReceiveProfileOptions,
+    ) -> Result<CommitReceiveOutcome> {
         let is_own_pending_commit = self
             .pending_commit_bytes
             .as_ref()
@@ -424,14 +439,25 @@ impl Client {
                 .as_mut()
                 .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-            let mls_message_in = MlsMessageIn::tls_deserialize_exact(commit_bytes)
-                .map_err(|_| anyhow!("Could not deserialize incoming commit"))?;
-
-            let protocol_message = mls_message_in
-                .try_into_protocol_message()
-                .map_err(|_| anyhow!("Expected a protocol message"))?;
-
-            let processed_message = group.process_message(&self.crypto, protocol_message)?;
+            let processed_message = if profile.enabled {
+                group.process_commit_message_from_bytes_profiled(
+                    &self.crypto,
+                    commit_bytes,
+                    profile.commit_create_op.as_deref(),
+                    profile.commit_receive_sampling_policy.as_deref(),
+                    profile.commit_receive_sampling_seed,
+                    profile.commit_receive_sample_index,
+                    profile.commit_receive_sample_count,
+                    profile.commit_receive_population_size,
+                )?
+            } else {
+                let mls_message_in = MlsMessageIn::tls_deserialize_exact(commit_bytes)
+                    .map_err(|_| anyhow!("Could not deserialize incoming commit"))?;
+                let protocol_message = mls_message_in
+                    .try_into_protocol_message()
+                    .map_err(|_| anyhow!("Expected a protocol message"))?;
+                group.process_message(&self.crypto, protocol_message)?
+            };
 
             match processed_message.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => {

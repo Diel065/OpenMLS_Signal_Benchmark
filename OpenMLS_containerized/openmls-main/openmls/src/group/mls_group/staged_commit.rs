@@ -5,6 +5,8 @@ use openmls_traits::crypto::OpenMlsCrypto;
 use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as _;
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{emit_event, ProfileScope};
 
 use super::proposal_store::{
     QueuedAddProposal, QueuedPskProposal, QueuedRemoveProposal, QueuedUpdateProposal,
@@ -177,8 +179,16 @@ impl MlsGroup {
         let mut diff = self.public_group.empty_diff();
 
         #[cfg(not(feature = "extensions-draft-08"))]
+        #[cfg(feature = "profiling-json")]
+        let proposal_scope = ProfileScope::start("commit_receive.proposal_apply", "openmls");
         let apply_proposals_values =
             diff.apply_proposals(&proposal_queue, self.own_leaf_index())?;
+        #[cfg(feature = "profiling-json")]
+        if let Some(scope) = proposal_scope {
+            let mut event = scope.finish();
+            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            emit_event(&event);
+        }
 
         #[cfg(feature = "extensions-draft-08")]
         let apply_proposals_values = diff.apply_proposals_with_app_data_updates(
@@ -261,12 +271,22 @@ impl MlsGroup {
             if let Some(path) = commit.path.clone() {
                 // Update the public group
                 // ValSem202: Path must be the right length
+                #[cfg(feature = "profiling-json")]
+                let up_scope = ProfileScope::start("commit_receive.update_path_validate", "openmls");
                 diff.apply_received_update_path(
                     provider.crypto(),
                     ciphersuite,
                     sender_index,
                     &path,
                 )?;
+                #[cfg(feature = "profiling-json")]
+                if let Some(scope) = up_scope {
+                    let mut event = scope.finish();
+                    event.committer_leaf_index = Some(sender_index.u32());
+                    event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+                    event.update_path_present = Some(true);
+                    emit_event(&event);
+                }
 
                 // Update group context
                 diff.update_group_context(
@@ -296,6 +316,9 @@ impl MlsGroup {
 
                 // ValSem203: Path secrets must decrypt correctly
                 // ValSem204: Public keys from Path must be verified and match the private keys from the direct path
+                #[cfg(feature = "profiling-json")]
+                let decrypt_scope =
+                    ProfileScope::start("commit_receive.path_secret_decrypt", "openmls");
                 let (new_keypairs, commit_secret) = diff.decrypt_path(
                     provider.crypto(),
                     &decryption_keypairs,
@@ -304,6 +327,15 @@ impl MlsGroup {
                     path.nodes(),
                     &apply_proposals_values.exclusion_list(),
                 )?;
+                #[cfg(feature = "profiling-json")]
+                if let Some(scope) = decrypt_scope {
+                    let mut event = scope.finish();
+                    event.committer_leaf_index = Some(sender_index.u32());
+                    event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+                    event.path_secret_decryption_count = Some(1);
+                    event.hpke_decrypt_count = Some(1);
+                    emit_event(&event);
+                }
 
                 // Check if one of our update proposals was applied. If so, we
                 // need to store that keypair separately, because after merging
@@ -363,6 +395,8 @@ impl MlsGroup {
             .tls_serialize_detached()
             .map_err(LibraryError::missing_bound_check)?;
 
+        #[cfg(feature = "profiling-json")]
+        let ks_scope = ProfileScope::start("commit_receive.key_schedule_step", "openmls");
         let EpochSecretsResult {
             epoch_secrets,
             #[cfg(feature = "extensions-draft-08")]
@@ -374,6 +408,12 @@ impl MlsGroup {
             commit_secret,
             &serialized_provisional_group_context,
         )?;
+        #[cfg(feature = "profiling-json")]
+        if let Some(scope) = ks_scope {
+            let mut event = scope.finish();
+            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            emit_event(&event);
+        }
         let (provisional_group_secrets, provisional_message_secrets) = epoch_secrets.split_secrets(
             serialized_provisional_group_context,
             diff.tree_size(),
@@ -382,6 +422,9 @@ impl MlsGroup {
 
         // Verify confirmation tag
         // ValSem205
+        #[cfg(feature = "profiling-json")]
+        let confirm_scope =
+            ProfileScope::start("commit_receive.confirmation_tag_verify", "openmls");
         let own_confirmation_tag = provisional_message_secrets
             .confirmation_key()
             .tag(
@@ -403,6 +446,13 @@ impl MlsGroup {
             if !crate::skip_validation::is_disabled::confirmation_tag() {
                 return Err(StageCommitError::ConfirmationTagMismatch);
             }
+        }
+        #[cfg(feature = "profiling-json")]
+        if let Some(scope) = confirm_scope {
+            let mut event = scope.finish();
+            event.confirmation_tag_verified = Some(true);
+            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            emit_event(&event);
         }
 
         diff.update_interim_transcript_hash(ciphersuite, provider.crypto(), own_confirmation_tag)?;

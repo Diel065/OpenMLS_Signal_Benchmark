@@ -290,11 +290,37 @@ async fn run_batch_command(
                 }
             };
 
+            let command = match item.command {
+                Command::ReceiveCommit {
+                    profile: _,
+                    commit_create_op,
+                    commit_receive_sampling_policy,
+                    commit_receive_sampling_seed,
+                    commit_receive_sample_index,
+                    commit_receive_sample_count,
+                    commit_receive_population_size,
+                } => Command::ReceiveCommit {
+                    profile: item.profile.unwrap_or(false),
+                    commit_create_op,
+                    commit_receive_sampling_policy,
+                    commit_receive_sampling_seed,
+                    commit_receive_sample_index,
+                    commit_receive_sample_count,
+                    commit_receive_population_size,
+                },
+                Command::ReceiveApplicationMessage { profile: _ } => {
+                    Command::ReceiveApplicationMessage {
+                        profile: item.profile.unwrap_or(false),
+                    }
+                }
+                other => other,
+            };
+
             let (_, response) = send_to_client_actor(
                 &handle,
                 &item.client_id,
                 item.request_id.clone(),
-                item.command,
+                command,
                 item.expected_epoch,
                 item.phase.as_deref(),
             )

@@ -10,7 +10,7 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::client::{Client, CommitReceiveOutcome, EpochChangeOutput};
+use crate::client::{Client, CommitReceiveOutcome, CommitReceiveProfileOptions, EpochChangeOutput};
 use crate::http_retry::{
     is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
     retry_transient_http_async, RetryDecision,
@@ -35,7 +35,22 @@ pub enum Command {
     RemoveMembers {
         members: Vec<String>,
     },
-    ReceiveCommit,
+    ReceiveCommit {
+        #[serde(default)]
+        profile: bool,
+        #[serde(default)]
+        commit_create_op: Option<String>,
+        #[serde(default)]
+        commit_receive_sampling_policy: Option<String>,
+        #[serde(default)]
+        commit_receive_sampling_seed: Option<u64>,
+        #[serde(default)]
+        commit_receive_sample_index: Option<usize>,
+        #[serde(default)]
+        commit_receive_sample_count: Option<usize>,
+        #[serde(default)]
+        commit_receive_population_size: Option<usize>,
+    },
     ProcessPending {
         kinds: Option<Vec<PendingKind>>,
         max_messages: Option<usize>,
@@ -63,7 +78,7 @@ impl Command {
             Command::ReceiveApplicationMessage { .. } => "ReceiveApplicationMessage",
             Command::SelfUpdate => "SelfUpdate",
             Command::RemoveMembers { .. } => "RemoveMembers",
-            Command::ReceiveCommit => "ReceiveCommit",
+            Command::ReceiveCommit { .. } => "ReceiveCommit",
             Command::ProcessPending { .. } => "ProcessPending",
             Command::ShowGroupState => "ShowGroupState",
         }
@@ -77,7 +92,7 @@ impl Command {
                 | Command::JoinFromWelcome
                 | Command::SelfUpdate
                 | Command::RemoveMembers { .. }
-                | Command::ReceiveCommit
+                | Command::ReceiveCommit { .. }
                 | Command::ProcessPending { .. }
         )
     }
@@ -953,8 +968,9 @@ async fn apply_commit_bytes(
     ds_url: &str,
     queued_intent: &mut Option<PendingIntent>,
     commit_bytes: &[u8],
+    profile: CommitReceiveProfileOptions,
 ) -> Result<String> {
-    match client.receive_commit(commit_bytes)? {
+    match client.receive_commit(commit_bytes, profile)? {
         CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
             if self_removed {
                 *queued_intent = None;
@@ -1060,6 +1076,7 @@ async fn receive_commit_delivery(
     ds_url: &str,
     queued_intent: &mut Option<PendingIntent>,
     expected_epoch: Option<u64>,
+    profile: CommitReceiveProfileOptions,
 ) -> Result<String> {
     let mut stale_acked = 0usize;
 
@@ -1122,7 +1139,14 @@ async fn receive_commit_delivery(
             )
         })?;
 
-        let result = apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await?;
+        let result = apply_commit_bytes(
+            client,
+            ds_url,
+            queued_intent,
+            &commit_bytes,
+            profile.clone(),
+        )
+        .await?;
         ack_commit_delivery_best_effort(ds_url, &client.name, &delivery.id, delivery.epoch).await;
 
         return Ok(format!(
@@ -1243,7 +1267,15 @@ async fn process_pending(
                 )
             })?;
 
-            match apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await {
+            match apply_commit_bytes(
+                client,
+                ds_url,
+                queued_intent,
+                &commit_bytes,
+                CommitReceiveProfileOptions::default(),
+            )
+            .await
+            {
                 Ok(_) => {
                     commits_processed += 1;
                     remaining = remaining.saturating_sub(1);
@@ -1463,8 +1495,26 @@ pub async fn handle_command(
             }
         }
 
-        Command::ReceiveCommit => {
-            receive_commit_delivery(client, ds_url, queued_intent, expected_epoch).await
+        Command::ReceiveCommit {
+            profile,
+            commit_create_op,
+            commit_receive_sampling_policy,
+            commit_receive_sampling_seed,
+            commit_receive_sample_index,
+            commit_receive_sample_count,
+            commit_receive_population_size,
+        } => {
+            let profile_opts = CommitReceiveProfileOptions {
+                enabled: profile,
+                commit_create_op,
+                commit_receive_sampling_policy,
+                commit_receive_sampling_seed,
+                commit_receive_sample_index,
+                commit_receive_sample_count,
+                commit_receive_population_size,
+            };
+            receive_commit_delivery(client, ds_url, queued_intent, expected_epoch, profile_opts)
+                .await
         }
 
         Command::ProcessPending {

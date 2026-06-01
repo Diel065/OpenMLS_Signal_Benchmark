@@ -107,6 +107,11 @@ impl<'a> PublicGroupDiff<'a> {
         self.diff.tree_size()
     }
 
+    /// Returns the number of leaves in the tree
+    pub(crate) fn leaf_count(&self) -> u32 {
+        self.diff.leaf_count()
+    }
+
     /// Returns a vector of all nodes in the tree resulting from merging this
     /// diff.
     pub(crate) fn export_ratchet_tree(&self) -> RatchetTree {

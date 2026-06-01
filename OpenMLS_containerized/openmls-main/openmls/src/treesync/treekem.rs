@@ -28,6 +28,8 @@ use super::{
     },
     ApplyUpdatePathError, LeafNode,
 };
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{finish_and_emit, ProfileScope};
 use crate::{
     binary_tree::array_representation::LeafNodeIndex,
     ciphersuite::{hpke, signable::Verifiable, HpkePublicKey},
@@ -36,10 +38,6 @@ use crate::{
     schedule::{psk::PreSharedKeyId, CommitSecret, JoinerSecret},
     treesync::node::NodeReference,
 };
-#[cfg(feature = "profiling-json")]
-use crate::group::diff::compute_path::parent_operation_for_span_prefix;
-#[cfg(feature = "profiling-json")]
-use crate::profiling::{finish_and_emit, ProfileScope};
 
 impl TreeSyncDiff<'_> {
     /// Encrypt the given `path` to the nodes in the copath resolution of the
@@ -90,16 +88,17 @@ impl TreeSyncDiff<'_> {
             "openmls",
         );
         #[cfg(feature = "profiling-json")]
-        let encrypted_path_secret_count: usize = copath_resolutions
-            .iter()
-            .map(Vec::len)
-            .sum();
+        let encrypted_path_secret_count: usize = copath_resolutions.iter().map(Vec::len).sum();
         #[cfg(feature = "profiling-json")]
-        let max_copath_resolution_size = copath_resolutions
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(0);
+        let max_copath_resolution_size = copath_resolutions.iter().map(Vec::len).max().unwrap_or(0);
+        #[cfg(feature = "profiling-json")]
+        let leaf_count = self.leaf_count();
+        #[cfg(feature = "profiling-json")]
+        let tree_height = if leaf_count <= 1 {
+            0
+        } else {
+            u32::BITS - (leaf_count - 1).leading_zeros()
+        };
 
         #[cfg(feature = "profiling-json")]
         let mut measured_result = None;
@@ -122,8 +121,8 @@ impl TreeSyncDiff<'_> {
 
         #[cfg(feature = "profiling-json")]
         finish_and_emit(hpke_scope, |event| {
-            event.parent_operation =
-                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
+            event.tree_height = Some(tree_height);
+            event.committer_leaf_index = Some(own_leaf_index.u32());
             event.update_path_nodes_count = Some(path.len());
             event.filtered_direct_path_len = Some(path.len());
             event.encrypted_path_secret_count = Some(encrypted_path_secret_count);
@@ -132,6 +131,7 @@ impl TreeSyncDiff<'_> {
             event.hpke_encrypt_count = Some(encrypted_path_secret_count as u64);
             event.alloc_bytes = Some(allocation_info.bytes_total as u64);
             event.alloc_count = Some(allocation_info.count_total as u64);
+            event.ciphersuite = Some(format!("{:?}", ciphersuite));
         });
 
         result

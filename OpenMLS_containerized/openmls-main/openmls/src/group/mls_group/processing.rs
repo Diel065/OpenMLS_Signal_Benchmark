@@ -28,9 +28,12 @@ use std::collections::BTreeMap;
 use super::{errors::ProcessMessageError, *};
 
 #[cfg(feature = "profiling-json")]
-use allocation_counter::measure;
+use crate::profiling::{
+    clear_commit_receive_context, emit_event, set_commit_receive_context, CommitReceiveContext,
+    ProfileScope,
+};
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use allocation_counter::measure;
 use tls_codec::Deserialize as _;
 
 #[cfg(feature = "extensions-draft-08")]
@@ -115,6 +118,114 @@ impl<'a> AppDataDictionaryUpdater<'a> {
 }
 
 impl MlsGroup {
+    /// Deserialize and process an incoming commit while emitting first-class
+    /// commit-receive profiling spans.
+    #[cfg(feature = "profiling-json")]
+    pub fn process_commit_message_from_bytes_profiled<Provider: OpenMlsProvider>(
+        &mut self,
+        provider: &Provider,
+        message_bytes: &[u8],
+        commit_create_op: Option<&str>,
+        commit_receive_sampling_policy: Option<&str>,
+        commit_receive_sampling_seed: Option<u64>,
+        commit_receive_sample_index: Option<usize>,
+        commit_receive_sample_count: Option<usize>,
+        commit_receive_population_size: Option<usize>,
+    ) -> Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>> {
+        let deserialize_scope = ProfileScope::start("commit_receive.deserialize", "openmls");
+        let mut measured_deser: Option<Result<MlsMessageIn, tls_codec::Error>> = None;
+        let deser_alloc = measure(|| {
+            measured_deser = Some(MlsMessageIn::tls_deserialize_exact(message_bytes));
+        });
+        let mls_message_in = measured_deser
+            .expect("allocation_counter measure closure did not run")
+            .map_err(LibraryError::missing_bound_check)?;
+        if let Some(scope) = deserialize_scope {
+            let mut event = scope.finish();
+            event.alloc_bytes = Some(deser_alloc.bytes_total as u64);
+            event.alloc_count = Some(deser_alloc.count_total as u64);
+            event.artifact_size_bytes = Some(message_bytes.len());
+            event.commit_size_bytes = Some(message_bytes.len());
+            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            emit_event(&event);
+        }
+
+        let protocol_message = mls_message_in
+            .try_into_protocol_message()
+            .map_err(|_| LibraryError::custom("Expected a protocol message"))?;
+        let protocol_scope = ProfileScope::start("commit_receive_protocol", "openmls");
+        set_commit_receive_context(CommitReceiveContext {
+            commit_create_op: commit_create_op.map(ToOwned::to_owned),
+            commit_receive_sampling_policy: commit_receive_sampling_policy.map(ToOwned::to_owned),
+            commit_receive_sampling_seed,
+            commit_receive_sample_index,
+            commit_receive_sample_count,
+            commit_receive_population_size,
+            commit_id: None,
+        });
+        let mut measured_result: Option<
+            Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>>,
+        > = None;
+        let alloc = measure(|| {
+            measured_result = Some(self.process_message_internal(provider, protocol_message, false));
+        });
+        let processed = measured_result.expect("allocation_counter measure closure did not run")?;
+        if let Some(scope) = protocol_scope {
+            let mut event = scope.finish();
+            let receiver_leaf = self.own_leaf_index().u32();
+            let sender_leaf = processed
+                .sender()
+                .as_member()
+                .map(|leaf| leaf.u32());
+            let commit_kind = match commit_create_op {
+                Some("add") | Some("commit_add") => Some("add".to_string()),
+                Some("remove") | Some("commit_remove") => Some("remove".to_string()),
+                Some("self_update") | Some("update") => Some("update".to_string()),
+                _ => None,
+            };
+            event.alloc_bytes = Some(alloc.bytes_total as u64);
+            event.alloc_count = Some(alloc.count_total as u64);
+            event.commit_size_bytes = Some(message_bytes.len());
+            event.commit_message_size_bytes = Some(message_bytes.len());
+            event.artifact_size_bytes = Some(message_bytes.len());
+            event.receiver_leaf_index = Some(receiver_leaf);
+            event.receiver_member_index = Some(receiver_leaf);
+            event.committer_leaf_index = sender_leaf;
+            event.receiver_is_committer = sender_leaf.map(|leaf| leaf == receiver_leaf);
+            event.commit_create_op = commit_create_op.map(ToOwned::to_owned);
+            event.commit_kind = commit_kind;
+            let prefix_hex = message_bytes[..message_bytes.len().min(16)]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>();
+            event.commit_id = Some(format!("len{}_{}", message_bytes.len(), prefix_hex));
+            event.commit_receive_sampled = Some(true);
+            event.commit_receive_sampling_policy =
+                commit_receive_sampling_policy.map(ToOwned::to_owned);
+            event.commit_receive_sampling_seed = commit_receive_sampling_seed;
+            event.commit_receive_sample_index = commit_receive_sample_index;
+            event.commit_receive_sample_count = commit_receive_sample_count;
+            event.commit_receive_population_size = commit_receive_population_size;
+            event.confirmation_tag_verified = Some(true);
+            if let ProcessedMessageContent::StagedCommitMessage(staged_commit) = processed.content() {
+                let proposal_count = staged_commit.queued_proposals().count();
+                let add_count = staged_commit.add_proposals().count();
+                let update_count = staged_commit.update_proposals().count();
+                let remove_count = staged_commit.remove_proposals().count();
+                let has_path = staged_commit.update_path_leaf_node().is_some();
+                event.proposal_count = Some(proposal_count);
+                event.add_proposal_count = Some(add_count);
+                event.update_proposal_count = Some(update_count);
+                event.remove_proposal_count = Some(remove_count);
+                event.update_path_present = Some(has_path);
+                event.commit_has_path = Some(has_path);
+            }
+            emit_event(&event);
+        }
+        clear_commit_receive_context();
+        Ok(processed)
+    }
+
     #[cfg(feature = "profiling-json")]
     fn profile_application_message_receive_protocol<Provider: OpenMlsProvider>(
         &mut self,
@@ -151,8 +262,29 @@ impl MlsGroup {
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
                 event.artifact_size_bytes = artifact_size_bytes;
+                event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+                let sender_leaf =
+                    processed_message.sender().as_member().map(|l| l.u32());
+                event.sender_leaf_index = sender_leaf;
+                let sender_gen = crate::profiling::LAST_SENDER_GENERATION.get();
+                event.sender_generation = sender_gen;
                 event.app_msg_plaintext_bytes = Some(application_message.as_slice().len());
+                event.app_msg_ciphertext_bytes =
+                    crate::profiling::LAST_CIPHERTEXT_BYTES.get();
                 event.aad_bytes = Some(processed_message.aad().len());
+                event.aead_decrypt_count = Some(1);
+                event.sender_data_decrypt_count = Some(1);
+                event.signature_verify_count = Some(1);
+
+                let group_id = self.group_id();
+                if let (Some(ep), Some(sx), Some(sg)) = (Some(group_epoch), sender_leaf, sender_gen) {
+                    let (first, gap, ooo) =
+                        crate::profiling::compute_receive_sequence(group_id.as_slice(), ep, sx, sg);
+                    event.first_receive_from_sender = Some(first);
+                    event.generation_gap = Some(gap);
+                    event.out_of_order_message = Some(ooo);
+                }
+
                 emit_event(&event);
             }
         }
@@ -239,6 +371,7 @@ impl MlsGroup {
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
                 event.artifact_size_bytes = Some(message_bytes.len());
+                event.receiver_leaf_index = Some(self.own_leaf_index().u32());
                 emit_event(&event);
             }
 
@@ -293,10 +426,10 @@ impl MlsGroup {
         if !message.is_external()
             && message.is_handshake_message()
             && !self
-            .configuration()
-            .wire_format_policy()
-            .incoming()
-            .is_compatible_with(message.wire_format())
+                .configuration()
+                .wire_format_policy()
+                .incoming()
+                .is_compatible_with(message.wire_format())
         {
             return Err(ProcessMessageError::IncompatibleWireFormat);
         }
@@ -397,6 +530,8 @@ impl MlsGroup {
         provider: &Provider,
         staged_commit: StagedCommit,
     ) -> Result<(), MergeCommitError<Provider::StorageError>> {
+        #[cfg(feature = "profiling-json")]
+        let install_scope = ProfileScope::start("commit_receive.group_state_install", "openmls");
         // Check if we were removed from the group
         if staged_commit.self_removed() {
             self.group_state = MlsGroupState::Inactive;
@@ -408,6 +543,12 @@ impl MlsGroup {
 
         // Merge staged commit
         self.merge_commit(provider, staged_commit)?;
+        #[cfg(feature = "profiling-json")]
+        if let Some(scope) = install_scope {
+            let mut event = scope.finish();
+            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            emit_event(&event);
+        }
 
         // Extract and store the resumption psk for the current epoch
         let resumption_psk = self.group_epoch_secrets().resumption_psk();
@@ -546,18 +687,26 @@ impl MlsGroup {
         //  - ValSem246 (as part of ValSem010)
         //  - https://validation.openmls.tech/#valn1302
         //  - https://validation.openmls.tech/#valn1304
+        #[cfg(feature = "profiling-json")]
+        let auth_scope =
+            ProfileScope::start("application_message_receive.auth_verify", "openmls");
         let (content, credential) =
             unverified_message.verify(self.ciphersuite(), provider.crypto(), self.version())?;
+        #[cfg(feature = "profiling-json")]
+        if let Some(s) = auth_scope {
+            let mut event = s.finish();
+            event.signature_verify_count = Some(1);
+            emit_event(&event);
+        }
 
         match content.sender() {
-            Sender::Member(_) | Sender::NewMemberProposal | Sender::NewMemberCommit => {
-                self.process_internal_authenticated_content(
+            Sender::Member(_) | Sender::NewMemberProposal | Sender::NewMemberCommit => self
+                .process_internal_authenticated_content(
                     provider,
                     content,
                     credential,
                     profile_application_receive,
-                )
-            }
+                ),
             Sender::External(_) => {
                 self.process_external_authenticated_content(provider, content, credential)
             }
@@ -602,9 +751,8 @@ impl MlsGroup {
 
         let content = match content.content() {
             FramedContentBody::Application(application_message) => {
-                let processed = self.application_message_receive_no_profile(
-                    application_message.as_slice(),
-                );
+                let processed =
+                    self.application_message_receive_no_profile(application_message.as_slice());
                 ProcessedMessageContent::ApplicationMessage(processed)
             }
             FramedContentBody::Proposal(_) => {
@@ -661,13 +809,9 @@ impl MlsGroup {
         let content = match content.content() {
             FramedContentBody::Application(application_message) => {
                 let processed = if profile_application_receive {
-                    self.application_message_receive_no_profile(
-                        application_message.as_slice(),
-                    )
+                    self.application_message_receive_no_profile(application_message.as_slice())
                 } else {
-                    self.application_message_receive_no_profile(
-                        application_message.as_slice(),
-                    )
+                    self.application_message_receive_no_profile(application_message.as_slice())
                 };
 
                 ProcessedMessageContent::ApplicationMessage(processed)
@@ -825,7 +969,7 @@ impl MlsGroup {
                         _ => LibraryError::custom(
                             "Unexpected error while retrieving message secrets for epoch.",
                         )
-                            .into(),
+                        .into(),
                     })?;
                 DecryptedMessage::from_inbound_public_message(
                     *public_message,

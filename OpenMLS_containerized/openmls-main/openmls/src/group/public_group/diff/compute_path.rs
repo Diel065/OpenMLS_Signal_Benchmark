@@ -24,9 +24,9 @@ use crate::{
 use super::PublicGroupDiff;
 
 #[cfg(feature = "profiling-json")]
-use allocation_counter::measure;
-#[cfg(feature = "profiling-json")]
 use crate::profiling::{emit_event, finish_and_emit, ProfileEvent, ProfileScope};
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 
 /// Can be used to denote the type of a commit.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -155,8 +155,6 @@ impl PublicGroupDiff<'_> {
                 };
             });
             finish_and_emit(path_structure_scope, |event| {
-                event.parent_operation =
-                    Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
                 event.group_epoch = Some(self.group_context().epoch().as_u64());
                 event.tree_size = Some(self.diff.tree_size().u32());
                 event.ciphersuite = Some(format!("{:?}", ciphersuite));
@@ -249,16 +247,25 @@ impl PublicGroupDiff<'_> {
         #[cfg(not(feature = "profiling-json"))]
         let update_group_context_result = self.update_group_context(crypto, gc_extensions);
         #[cfg(feature = "profiling-json")]
-        finish_and_emit(tree_hash_scope, |event| {
-            event.parent_operation =
-                Some(parent_operation_for_span_prefix(profile_span_prefix).to_string());
-            event.group_epoch = Some(self.group_context().epoch().as_u64());
-            event.tree_size = Some(self.diff.tree_size().u32());
-            event.ciphersuite = Some(format!("{:?}", ciphersuite));
-            event.alloc_bytes = Some(tree_hash_allocation_info.bytes_total as u64);
-            event.alloc_count = Some(tree_hash_allocation_info.count_total as u64);
-            fill_update_path_event(event, &update_path_profiling);
-        });
+        {
+            let tree_leaf_count = self.diff.leaf_count();
+            let tree_height = if tree_leaf_count <= 1 {
+                0
+            } else {
+                u32::BITS - (tree_leaf_count - 1).leading_zeros()
+            };
+            finish_and_emit(tree_hash_scope, |event| {
+                event.group_epoch = Some(self.group_context().epoch().as_u64());
+                event.tree_size = Some(self.diff.tree_size().u32());
+                event.tree_height = Some(tree_height);
+                event.tree_leaf_count = Some(tree_leaf_count);
+                event.tree_node_count = Some(self.diff.tree_size().u32());
+                event.committer_leaf_index = Some(leaf_index.u32());
+                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                event.alloc_bytes = Some(tree_hash_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(tree_hash_allocation_info.count_total as u64);
+            });
+        }
         update_group_context_result?;
 
         let serialized_group_context = self

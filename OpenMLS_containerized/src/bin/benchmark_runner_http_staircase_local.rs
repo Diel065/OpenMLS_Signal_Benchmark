@@ -91,6 +91,12 @@ struct Args {
 
     #[arg(long, action = ArgAction::SetTrue)]
     process_pending_fanout: bool,
+
+    #[arg(long, default_value_t = 8)]
+    max_commit_receive_samples_per_plateau: usize,
+
+    #[arg(long, default_value_t = 1)]
+    commit_receive_sampling_seed: u64,
 }
 
 fn main() -> Result<()> {
@@ -129,6 +135,8 @@ fn main() -> Result<()> {
         update_rounds: args.update_rounds,
         app_rounds: args.app_rounds,
         max_update_samples_per_plateau: args.max_update_samples_per_plateau,
+        max_commit_receive_samples_per_plateau: args.max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed: args.commit_receive_sampling_seed,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
         payload_sizes: args.payload_sizes,
         scenario_seed: args.scenario_seed,

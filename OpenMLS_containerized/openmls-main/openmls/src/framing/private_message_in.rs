@@ -16,6 +16,9 @@ use crate::{
     tree::{secret_tree::SecretType, sender_ratchet::SenderRatchetConfiguration},
 };
 
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{emit_event, ProfileScope};
+
 use super::*;
 
 /// `PrivateMessage` is the framing struct for an encrypted `PublicMessage`.
@@ -61,6 +64,10 @@ impl PrivateMessageIn {
         ciphersuite: Ciphersuite,
     ) -> Result<MlsSenderData, MessageDecryptionError> {
         log::debug!("Decrypting PrivateMessage");
+
+        #[cfg(feature = "profiling-json")]
+        let scope = ProfileScope::start("application_message_receive.sender_data_decrypt", "openmls");
+
         // Derive key from the key schedule using the ciphertext.
         let sender_data_key = message_secrets
             .sender_data_secret()
@@ -95,8 +102,22 @@ impl PrivateMessageIn {
                 MessageDecryptionError::AeadError
             })?;
         log::trace!("  Successfully decrypted sender data.");
-        MlsSenderData::tls_deserialize(&mut sender_data_bytes.as_slice())
-            .map_err(|_| MessageDecryptionError::MalformedContent)
+        let sender_data = MlsSenderData::tls_deserialize(&mut sender_data_bytes.as_slice())
+            .map_err(|_| MessageDecryptionError::MalformedContent)?;
+
+        #[cfg(feature = "profiling-json")]
+        {
+            crate::profiling::LAST_SENDER_GENERATION.set(Some(sender_data.generation as u64));
+            if let Some(s) = scope {
+                let mut event = s.finish();
+                event.sender_leaf_index = Some(sender_data.leaf_index.u32());
+                event.sender_generation = Some(sender_data.generation as u64);
+                event.sender_data_decrypt_count = Some(1);
+                emit_event(&event);
+            }
+        }
+
+        Ok(sender_data)
     }
 
     /// Decrypt this [`PrivateMessage`] and return the
@@ -162,6 +183,9 @@ impl PrivateMessageIn {
     ) -> Result<VerifiableAuthenticatedContentIn, MessageDecryptionError> {
         let secret_type = SecretType::from(&self.content_type);
         // Extract generation and key material for encryption
+        #[cfg(feature = "profiling-json")]
+        let secret_tree_scope =
+            ProfileScope::start("application_message_receive.secret_tree_lookup_or_derive", "openmls");
         let (ratchet_key, ratchet_nonce) = message_secrets
             .secret_tree_mut()
             .secret_for_decryption(
@@ -179,9 +203,34 @@ impl PrivateMessageIn {
                 );
                 MessageDecryptionError::SecretTreeError(e)
             })?;
+
+        #[cfg(feature = "profiling-json")]
+        if let Some(s) = secret_tree_scope {
+            let mut event = s.finish();
+            event.sender_leaf_index = Some(sender_index.u32());
+            event.sender_generation = Some(sender_data.generation as u64);
+            emit_event(&event);
+        }
+
         // Prepare the nonce by xoring with the reuse guard.
         let prepared_nonce = ratchet_nonce.xor_with_reuse_guard(&sender_data.reuse_guard);
+
+        #[cfg(feature = "profiling-json")]
+        let content_decrypt_scope =
+            ProfileScope::start("application_message_receive.content_decrypt", "openmls");
         let private_message_content = self.decrypt(crypto, ratchet_key, &prepared_nonce)?;
+
+        #[cfg(feature = "profiling-json")]
+        {
+            let ct_len = self.ciphertext.as_slice().len();
+            crate::profiling::LAST_CIPHERTEXT_BYTES.set(Some(ct_len));
+            if let Some(s) = content_decrypt_scope {
+                let mut event = s.finish();
+                event.app_msg_ciphertext_bytes = Some(ct_len);
+                event.aead_decrypt_count = Some(1);
+                emit_event(&event);
+            }
+        }
 
         // Extract sender. The sender type is always of type Member for PrivateMessage.
         let sender = Sender::from_sender_data(sender_data);
