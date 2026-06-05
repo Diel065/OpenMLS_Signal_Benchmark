@@ -1,10 +1,20 @@
-use std::{fs, path::Path};
+use std::{fs, path::Path, sync::Once};
 
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::{types::SignatureScheme, OpenMlsProvider};
 use tls_codec::Serialize as _;
+
+static PROFILE_INIT: Once = Once::new();
+const JSONL_PATH: &str = "/tmp/openmls_commit_receive_smoke.jsonl";
+
+fn init_profile_path() {
+    PROFILE_INIT.call_once(|| {
+        let _ = fs::remove_file(JSONL_PATH);
+    });
+    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+}
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -23,11 +33,18 @@ fn generate_credential(
     )
 }
 
+fn assert_span_with_alloc(jsonl_path: &str, op: &str) {
+    let text = fs::read_to_string(Path::new(jsonl_path)).expect("read profiling jsonl");
+    let found = text.lines().any(|line| {
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("valid jsonl line");
+        parsed["op"].as_str() == Some(op) && parsed["alloc_bytes"].is_number()
+    });
+    assert!(found, "missing span with allocation data: {op}");
+}
+
 #[openmls_test]
 fn commit_receive_profiling_smoke() {
-    let out = "/tmp/openmls_commit_receive_smoke.jsonl";
-    let _ = fs::remove_file(out);
-    std::env::set_var("OPENMLS_PROFILE_PATH", out);
+    init_profile_path();
 
     let alice_provider = &Provider::default();
     let bob_provider = &Provider::default();
@@ -115,9 +132,16 @@ fn commit_receive_profiling_smoke() {
         panic!("expected staged commit");
     }
 
-    let text = fs::read_to_string(Path::new(out)).unwrap();
+    let text = fs::read_to_string(Path::new(JSONL_PATH)).unwrap();
     assert!(text.contains("\"op\":\"commit_receive_protocol\""));
     assert!(text.contains("\"op\":\"commit_receive.deserialize\""));
+    assert!(text.contains("\"op\":\"commit_receive.message_auth_verify\""));
     assert!(text.contains("\"commit_receive_sampled\":true"));
     assert!(text.contains("\"commit_create_op\":\"self_update\""));
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.message_auth_verify");
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.update_path_validate");
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.path_secret_decrypt");
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.key_schedule_step");
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.confirmation_tag_verify");
+    assert_span_with_alloc(JSONL_PATH, "commit_receive.group_state_install");
 }

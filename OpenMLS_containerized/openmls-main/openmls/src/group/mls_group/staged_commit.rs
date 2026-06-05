@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as _;
 #[cfg(feature = "profiling-json")]
 use crate::profiling::{emit_event, ProfileScope};
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 
 use super::proposal_store::{
     QueuedAddProposal, QueuedPskProposal, QueuedRemoveProposal, QueuedUpdateProposal,
@@ -181,12 +183,26 @@ impl MlsGroup {
         #[cfg(not(feature = "extensions-draft-08"))]
         #[cfg(feature = "profiling-json")]
         let proposal_scope = ProfileScope::start("commit_receive.proposal_apply", "openmls");
+        #[cfg(all(not(feature = "extensions-draft-08"), feature = "profiling-json"))]
+        let (apply_proposals_values, proposal_allocation_info) = {
+            let mut measured_result = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(diff.apply_proposals(&proposal_queue, self.own_leaf_index()));
+            });
+            (
+                measured_result.expect("allocation_counter measure closure did not run")?,
+                allocation_info,
+            )
+        };
+        #[cfg(all(not(feature = "extensions-draft-08"), not(feature = "profiling-json")))]
         let apply_proposals_values =
             diff.apply_proposals(&proposal_queue, self.own_leaf_index())?;
-        #[cfg(feature = "profiling-json")]
+        #[cfg(all(not(feature = "extensions-draft-08"), feature = "profiling-json"))]
         if let Some(scope) = proposal_scope {
             let mut event = scope.finish();
             event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            event.alloc_bytes = Some(proposal_allocation_info.bytes_total as u64);
+            event.alloc_count = Some(proposal_allocation_info.count_total as u64);
             emit_event(&event);
         }
 
@@ -273,6 +289,22 @@ impl MlsGroup {
                 // ValSem202: Path must be the right length
                 #[cfg(feature = "profiling-json")]
                 let up_scope = ProfileScope::start("commit_receive.update_path_validate", "openmls");
+                #[cfg(feature = "profiling-json")]
+                let update_path_allocation_info = {
+                    let mut measured_result = None;
+                    let allocation_info = measure(|| {
+                        measured_result = Some(diff.apply_received_update_path(
+                            provider.crypto(),
+                            ciphersuite,
+                            sender_index,
+                            &path,
+                        ));
+                    });
+                    measured_result
+                        .expect("allocation_counter measure closure did not run")?;
+                    allocation_info
+                };
+                #[cfg(not(feature = "profiling-json"))]
                 diff.apply_received_update_path(
                     provider.crypto(),
                     ciphersuite,
@@ -285,6 +317,8 @@ impl MlsGroup {
                     event.committer_leaf_index = Some(sender_index.u32());
                     event.receiver_leaf_index = Some(self.own_leaf_index().u32());
                     event.update_path_present = Some(true);
+                    event.alloc_bytes = Some(update_path_allocation_info.bytes_total as u64);
+                    event.alloc_count = Some(update_path_allocation_info.count_total as u64);
                     emit_event(&event);
                 }
 
@@ -319,6 +353,25 @@ impl MlsGroup {
                 #[cfg(feature = "profiling-json")]
                 let decrypt_scope =
                     ProfileScope::start("commit_receive.path_secret_decrypt", "openmls");
+                #[cfg(feature = "profiling-json")]
+                let ((new_keypairs, commit_secret), decrypt_allocation_info) = {
+                    let mut measured_result = None;
+                    let allocation_info = measure(|| {
+                        measured_result = Some(diff.decrypt_path(
+                            provider.crypto(),
+                            &decryption_keypairs,
+                            self.own_leaf_index(),
+                            sender_index,
+                            path.nodes(),
+                            &apply_proposals_values.exclusion_list(),
+                        ));
+                    });
+                    (
+                        measured_result.expect("allocation_counter measure closure did not run")?,
+                        allocation_info,
+                    )
+                };
+                #[cfg(not(feature = "profiling-json"))]
                 let (new_keypairs, commit_secret) = diff.decrypt_path(
                     provider.crypto(),
                     &decryption_keypairs,
@@ -334,6 +387,8 @@ impl MlsGroup {
                     event.receiver_leaf_index = Some(self.own_leaf_index().u32());
                     event.path_secret_decryption_count = Some(1);
                     event.hpke_decrypt_count = Some(1);
+                    event.alloc_bytes = Some(decrypt_allocation_info.bytes_total as u64);
+                    event.alloc_count = Some(decrypt_allocation_info.count_total as u64);
                     emit_event(&event);
                 }
 
@@ -397,6 +452,30 @@ impl MlsGroup {
 
         #[cfg(feature = "profiling-json")]
         let ks_scope = ProfileScope::start("commit_receive.key_schedule_step", "openmls");
+        #[cfg(feature = "profiling-json")]
+        let (epoch_secrets_result, key_schedule_allocation_info) = {
+            let mut measured_result = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(self.derive_epoch_secrets(
+                    provider,
+                    apply_proposals_values,
+                    self.group_epoch_secrets(),
+                    commit_secret,
+                    &serialized_provisional_group_context,
+                ));
+            });
+            (
+                measured_result.expect("allocation_counter measure closure did not run")?,
+                allocation_info,
+            )
+        };
+        #[cfg(feature = "profiling-json")]
+        let EpochSecretsResult {
+            epoch_secrets,
+            #[cfg(feature = "extensions-draft-08")]
+            application_exporter,
+        } = epoch_secrets_result;
+        #[cfg(not(feature = "profiling-json"))]
         let EpochSecretsResult {
             epoch_secrets,
             #[cfg(feature = "extensions-draft-08")]
@@ -412,6 +491,8 @@ impl MlsGroup {
         if let Some(scope) = ks_scope {
             let mut event = scope.finish();
             event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            event.alloc_bytes = Some(key_schedule_allocation_info.bytes_total as u64);
+            event.alloc_count = Some(key_schedule_allocation_info.count_total as u64);
             emit_event(&event);
         }
         let (provisional_group_secrets, provisional_message_secrets) = epoch_secrets.split_secrets(
@@ -425,6 +506,27 @@ impl MlsGroup {
         #[cfg(feature = "profiling-json")]
         let confirm_scope =
             ProfileScope::start("commit_receive.confirmation_tag_verify", "openmls");
+        #[cfg(feature = "profiling-json")]
+        let (own_confirmation_tag, confirmation_allocation_info) = {
+            let mut measured_result = None;
+            let allocation_info = measure(|| {
+                measured_result = Some(
+                    provisional_message_secrets
+                        .confirmation_key()
+                        .tag(
+                            provider.crypto(),
+                            self.ciphersuite(),
+                            diff.group_context().confirmed_transcript_hash(),
+                        )
+                        .map_err(LibraryError::unexpected_crypto_error),
+                );
+            });
+            (
+                measured_result.expect("allocation_counter measure closure did not run")?,
+                allocation_info,
+            )
+        };
+        #[cfg(not(feature = "profiling-json"))]
         let own_confirmation_tag = provisional_message_secrets
             .confirmation_key()
             .tag(
@@ -452,6 +554,8 @@ impl MlsGroup {
             let mut event = scope.finish();
             event.confirmation_tag_verified = Some(true);
             event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+            event.alloc_bytes = Some(confirmation_allocation_info.bytes_total as u64);
+            event.alloc_count = Some(confirmation_allocation_info.count_total as u64);
             emit_event(&event);
         }
 

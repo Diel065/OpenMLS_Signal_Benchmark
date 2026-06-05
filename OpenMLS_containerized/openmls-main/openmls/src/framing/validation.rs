@@ -265,6 +265,11 @@ impl UnverifiedMessage {
         Ok((content, self.credential))
     }
 
+    /// Get the unverified content type before authentication.
+    pub(crate) fn content_type(&self) -> ContentType {
+        self.verifiable_content.content_type()
+    }
+
     /// Get the proposals of the commit, if it is one. If not, return `None`.
     #[cfg(feature = "extensions-draft-08")]
     pub fn committed_proposals(&self) -> Option<&[ProposalOrRefIn]> {

@@ -122,6 +122,8 @@ fn main() -> Result<()> {
         scenario: args.scenario.clone(),
         scenario_seed: args.scenario_seed,
         output_dir: args.output_dir.clone(),
+        device_kind: None,
+        execution_backend: None,
     })?;
 
     run_staircase_benchmark(StaircaseConfig {

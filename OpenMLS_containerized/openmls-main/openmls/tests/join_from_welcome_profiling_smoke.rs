@@ -1,8 +1,20 @@
+use std::{fs, path::Path, sync::Once};
+
 use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::types::SignatureScheme;
 use tls_codec::Serialize;
+
+static PROFILE_INIT: Once = Once::new();
+const JSONL_PATH: &str = "/tmp/openmls_join_from_welcome_smoke.jsonl";
+
+fn init_profile_path(path: &str) {
+    PROFILE_INIT.call_once(|| {
+        let _ = fs::remove_file(path);
+    });
+    std::env::set_var("OPENMLS_PROFILE_PATH", path);
+}
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -68,12 +80,18 @@ fn create_group_with_n_members(
     alice_group
 }
 
+fn assert_span_with_alloc(jsonl_path: &str, op: &str) {
+    let text = fs::read_to_string(Path::new(jsonl_path)).expect("read profiling jsonl");
+    let found = text.lines().any(|line| {
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("valid jsonl line");
+        parsed["op"].as_str() == Some(op) && parsed["alloc_bytes"].is_number()
+    });
+    assert!(found, "missing span with allocation data: {op}");
+}
+
 #[openmls_test]
 fn join_from_welcome_profiling_smoke() {
-    std::env::set_var(
-        "OPENMLS_PROFILE_PATH",
-        "/tmp/openmls_join_from_welcome_smoke.jsonl",
-    );
+    init_profile_path(JSONL_PATH);
 
     let provider = &Provider::default();
 
@@ -149,14 +167,19 @@ fn join_from_welcome_profiling_smoke() {
         alice_group.export_ratchet_tree(),
         bob_group.export_ratchet_tree()
     );
+
+    assert_span_with_alloc(JSONL_PATH, "join_from_welcome.group_secrets_hpke_decrypt");
+    assert_span_with_alloc(JSONL_PATH, "join_from_welcome.group_info_signature_verify");
+    assert_span_with_alloc(
+        JSONL_PATH,
+        "join_from_welcome.ratchet_tree_parse_and_validate",
+    );
+    assert_span_with_alloc(JSONL_PATH, "join_from_welcome.group_state_build");
 }
 
 #[openmls_test]
 fn join_from_welcome_n_sweep() {
-    std::env::set_var(
-        "OPENMLS_PROFILE_PATH",
-        "/tmp/openmls_join_from_welcome_sweep.jsonl",
-    );
+    init_profile_path(JSONL_PATH);
 
     let provider = &Provider::default();
 

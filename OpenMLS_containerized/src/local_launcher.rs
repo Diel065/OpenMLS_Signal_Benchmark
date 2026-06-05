@@ -19,6 +19,8 @@ pub struct LocalLaunchConfig {
     pub scenario: String,
     pub scenario_seed: u64,
     pub output_dir: String,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
 }
 
 pub struct LocalDeployment {
@@ -130,11 +132,20 @@ pub fn launch_local_stack(config: &LocalLaunchConfig) -> Result<LocalDeployment>
             .arg("--listen-addr")
             .arg(listen_addr.to_string())
             .env("OPENMLS_PROFILE_PATH", profile_path.as_os_str())
+            .env("OPENMLS_PROFILE_WORKER_ID", &id)
             .env("OPENMLS_PROFILE_RUN_ID", &config.run_id)
             .env("OPENMLS_PROFILE_SCENARIO", &config.scenario)
             .env(
                 "OPENMLS_PROFILE_SCENARIO_SEED",
                 config.scenario_seed.to_string(),
+            )
+            .env(
+                "OPENMLS_PROFILE_DEVICE_KIND",
+                config.device_kind.clone().unwrap_or_default(),
+            )
+            .env(
+                "OPENMLS_PROFILE_EXECUTION_BACKEND",
+                config.execution_backend.clone().unwrap_or_default(),
             )
             .stdout(Stdio::from(worker_log))
             .stderr(Stdio::from(worker_log_err))

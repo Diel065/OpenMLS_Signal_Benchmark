@@ -2,6 +2,9 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::types::SignatureScheme;
+use std::fs;
+
+const JSONL_PATH: &str = "/tmp/openmls_commit_add_smoke.jsonl";
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -22,10 +25,8 @@ fn generate_credential(
 
 #[openmls_test]
 fn commit_add_profiling_smoke() {
-    std::env::set_var(
-        "OPENMLS_PROFILE_PATH",
-        "/tmp/openmls_commit_add_smoke.jsonl",
-    );
+    let _ = fs::remove_file(JSONL_PATH);
+    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
 
     let alice_provider = &Provider::default();
 
@@ -116,4 +117,67 @@ fn commit_add_profiling_smoke() {
     }
 
     assert_eq!(alice_group.members().count(), 32);
+
+    let text = fs::read_to_string(JSONL_PATH).expect("read profiling jsonl");
+    let mut saw_group_info_aead = false;
+    let mut saw_welcome_with_tree_metadata = false;
+
+    for line in text.lines() {
+        let event: serde_json::Value = serde_json::from_str(line).expect("valid jsonl line");
+        match event["op"].as_str() {
+            Some("commit_add.group_info.aead_encrypt") => {
+                saw_group_info_aead = true;
+                assert_eq!(event["span_kind"].as_str(), Some("crypto_primitive"));
+                assert!(
+                    event["group_info_bytes"].as_u64().unwrap_or_default() > 0,
+                    "GroupInfo AEAD span must record plaintext GroupInfo bytes"
+                );
+                assert!(
+                    event["encrypted_group_info_bytes"]
+                        .as_u64()
+                        .unwrap_or_default()
+                        > 0,
+                    "GroupInfo AEAD span must record encrypted GroupInfo bytes"
+                );
+                assert!(
+                    event["ratchet_tree_bytes"].as_u64().unwrap_or_default() > 0,
+                    "GroupInfo AEAD span must carry ratchet-tree artifact bytes"
+                );
+                assert_eq!(event["ratchet_tree_included"].as_bool(), Some(false));
+                assert_eq!(event["ratchet_tree_delivery_mode"].as_str(), Some("out_of_band"));
+                assert!(
+                    event["alloc_bytes"].as_u64().is_some(),
+                    "GroupInfo AEAD span must record allocation bytes"
+                );
+                assert!(
+                    event["alloc_count"].as_u64().is_some(),
+                    "GroupInfo AEAD span must record allocation count"
+                );
+            }
+            Some("welcome_create_protocol") => {
+                if event["ratchet_tree_bytes"].as_u64().unwrap_or_default() > 0 {
+                    saw_welcome_with_tree_metadata = true;
+                    assert_eq!(event["ratchet_tree_included"].as_bool(), Some(false));
+                    assert_eq!(event["ratchet_tree_delivery_mode"].as_str(), Some("out_of_band"));
+                    assert!(
+                        event["welcome_plus_ratchet_tree_bytes"]
+                            .as_u64()
+                            .unwrap_or_default()
+                            > event["welcome_bytes"].as_u64().unwrap_or_default(),
+                        "Welcome plus ratchet tree bytes must include both artifacts"
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    assert!(
+        saw_group_info_aead,
+        "missing commit_add.group_info.aead_encrypt profiling span"
+    );
+    assert!(
+        saw_welcome_with_tree_metadata,
+        "missing AddCommit Welcome event with ratchet-tree artifact metadata"
+    );
 }

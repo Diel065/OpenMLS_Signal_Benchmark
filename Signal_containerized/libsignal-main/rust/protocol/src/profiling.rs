@@ -443,6 +443,8 @@ pub(crate) struct ProfileEvent {
     pub scenario_seed: Option<u64>,
     pub node_name: Option<String>,
     pub pod_name: Option<String>,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
 }
 
 pub(crate) fn emit_event(event: &ProfileEvent) {
@@ -536,7 +538,7 @@ impl ProfileScope {
         let context = self.context;
 
         ProfileEvent {
-            profile_schema_version: 3,
+            profile_schema_version: 4,
             ts_unix_ns: unix_timestamp_ns(),
             span_layer: "libsignal_main".to_string(),
             protocol_stack: "signal".to_string(),
@@ -600,6 +602,8 @@ impl ProfileScope {
             scenario_seed: env_u64_or_none("SIGNAL_PROFILE_SCENARIO_SEED"),
             node_name: env_or_none("SIGNAL_PROFILE_NODE"),
             pod_name: env_or_none("HOSTNAME"),
+            device_kind: env_or_none("SIGNAL_PROFILE_DEVICE_KIND"),
+            execution_backend: env_or_none("SIGNAL_PROFILE_EXECUTION_BACKEND"),
         }
     }
 }

@@ -202,4 +202,5 @@ pub mod wasm {
 }
 
 #[cfg(feature = "profiling-json")]
-pub(crate) mod profiling;
+#[allow(missing_docs)]
+pub mod profiling;

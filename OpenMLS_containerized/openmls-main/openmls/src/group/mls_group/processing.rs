@@ -150,9 +150,21 @@ impl MlsGroup {
             emit_event(&event);
         }
 
+        let group_epoch = self.context().epoch().as_u64();
+        let tree_size = self.treesync().tree_size().u32();
+        let member_count = self.members().count();
+        let ciphersuite = format!("{:?}", self.ciphersuite());
+
         let protocol_message = mls_message_in
             .try_into_protocol_message()
             .map_err(|_| LibraryError::custom("Expected a protocol message"))?;
+
+        let prefix_hex = message_bytes[..message_bytes.len().min(16)]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let commit_id = format!("len{}_{}", message_bytes.len(), prefix_hex);
+
         let protocol_scope = ProfileScope::start("commit_receive_protocol", "openmls");
         set_commit_receive_context(CommitReceiveContext {
             commit_create_op: commit_create_op.map(ToOwned::to_owned),
@@ -161,7 +173,11 @@ impl MlsGroup {
             commit_receive_sample_index,
             commit_receive_sample_count,
             commit_receive_population_size,
-            commit_id: None,
+            commit_id: Some(commit_id.clone()),
+            group_epoch: Some(group_epoch),
+            tree_size: Some(tree_size),
+            member_count: Some(member_count),
+            ciphersuite: Some(ciphersuite.clone()),
         });
         let mut measured_result: Option<
             Result<ProcessedMessage, ProcessMessageError<Provider::StorageError>>,
@@ -194,11 +210,13 @@ impl MlsGroup {
             event.receiver_is_committer = sender_leaf.map(|leaf| leaf == receiver_leaf);
             event.commit_create_op = commit_create_op.map(ToOwned::to_owned);
             event.commit_kind = commit_kind;
-            let prefix_hex = message_bytes[..message_bytes.len().min(16)]
-                .iter()
-                .map(|b| format!("{b:02x}"))
-                .collect::<String>();
-            event.commit_id = Some(format!("len{}_{}", message_bytes.len(), prefix_hex));
+            event.commit_id = Some(commit_id);
+
+            event.group_epoch = Some(group_epoch);
+            event.tree_size = Some(tree_size);
+            event.member_count = Some(member_count);
+            event.ciphersuite = Some(ciphersuite);
+
             event.commit_receive_sampled = Some(true);
             event.commit_receive_sampling_policy =
                 commit_receive_sampling_policy.map(ToOwned::to_owned);
@@ -217,8 +235,38 @@ impl MlsGroup {
                 event.add_proposal_count = Some(add_count);
                 event.update_proposal_count = Some(update_count);
                 event.remove_proposal_count = Some(remove_count);
+                event.removed_leaf_indices = Some(
+                    staged_commit
+                        .remove_proposals()
+                        .map(|rp| rp.remove_proposal().removed().u32())
+                        .collect(),
+                );
                 event.update_path_present = Some(has_path);
                 event.commit_has_path = Some(has_path);
+                event.commit_semantics = commit_create_op.map(|op| match op {
+                    "add" | "commit_add" => "add_with_update_path_and_welcome".to_string(),
+                    "remove" | "commit_remove" => {
+                        if has_path {
+                            "remove_with_update_path".to_string()
+                        } else {
+                            "remove_commit".to_string()
+                        }
+                    }
+                    _ => {
+                        if has_path {
+                            "self_update_with_path".to_string()
+                        } else {
+                            "self_update".to_string()
+                        }
+                    }
+                });
+                event.add_semantics = commit_create_op.and_then(|op| {
+                    if matches!(op, "add" | "commit_add") {
+                        Some("add_with_forced_update_path_and_welcome".to_string())
+                    } else {
+                        None
+                    }
+                });
             }
             emit_event(&event);
         }
@@ -531,23 +579,52 @@ impl MlsGroup {
         staged_commit: StagedCommit,
     ) -> Result<(), MergeCommitError<Provider::StorageError>> {
         #[cfg(feature = "profiling-json")]
-        let install_scope = ProfileScope::start("commit_receive.group_state_install", "openmls");
-        // Check if we were removed from the group
-        if staged_commit.self_removed() {
-            self.group_state = MlsGroupState::Inactive;
-        }
-        provider
-            .storage()
-            .write_group_state(self.group_id(), &self.group_state)
-            .map_err(MergeCommitError::StorageError)?;
+        {
+            let install_scope =
+                ProfileScope::start("commit_receive.group_state_install", "openmls");
+            let mut measured_result: Option<Result<(), MergeCommitError<Provider::StorageError>>> =
+                None;
 
-        // Merge staged commit
-        self.merge_commit(provider, staged_commit)?;
-        #[cfg(feature = "profiling-json")]
-        if let Some(scope) = install_scope {
-            let mut event = scope.finish();
-            event.receiver_leaf_index = Some(self.own_leaf_index().u32());
-            emit_event(&event);
+            let allocation_info = measure(|| {
+                measured_result = Some((|| {
+                    // Check if we were removed from the group
+                    if staged_commit.self_removed() {
+                        self.group_state = MlsGroupState::Inactive;
+                    }
+                    provider
+                        .storage()
+                        .write_group_state(self.group_id(), &self.group_state)
+                        .map_err(MergeCommitError::StorageError)?;
+
+                    // Merge staged commit
+                    self.merge_commit(provider, staged_commit)?;
+                    Ok(())
+                })());
+            });
+
+            measured_result.expect("allocation_counter measure closure did not run")?;
+            if let Some(scope) = install_scope {
+                let mut event = scope.finish();
+                event.receiver_leaf_index = Some(self.own_leaf_index().u32());
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                emit_event(&event);
+            }
+        }
+
+        #[cfg(not(feature = "profiling-json"))]
+        {
+            // Check if we were removed from the group
+            if staged_commit.self_removed() {
+                self.group_state = MlsGroupState::Inactive;
+            }
+            provider
+                .storage()
+                .write_group_state(self.group_id(), &self.group_state)
+                .map_err(MergeCommitError::StorageError)?;
+
+            // Merge staged commit
+            self.merge_commit(provider, staged_commit)?;
         }
 
         // Extract and store the resumption psk for the current epoch
@@ -688,16 +765,44 @@ impl MlsGroup {
         //  - https://validation.openmls.tech/#valn1302
         //  - https://validation.openmls.tech/#valn1304
         #[cfg(feature = "profiling-json")]
-        let auth_scope =
-            ProfileScope::start("application_message_receive.auth_verify", "openmls");
+        let auth_scope_name = if matches!(
+            unverified_message.content_type(),
+            crate::framing::ContentType::Commit
+        ) {
+            "commit_receive.message_auth_verify"
+        } else {
+            "application_message_receive.auth_verify"
+        };
         let (content, credential) =
-            unverified_message.verify(self.ciphersuite(), provider.crypto(), self.version())?;
-        #[cfg(feature = "profiling-json")]
-        if let Some(s) = auth_scope {
-            let mut event = s.finish();
-            event.signature_verify_count = Some(1);
-            emit_event(&event);
-        }
+            {
+                #[cfg(feature = "profiling-json")]
+                {
+                    let auth_scope = ProfileScope::start(auth_scope_name, "openmls");
+                    let mut measured_result = None;
+                    let allocation_info = measure(|| {
+                        measured_result = Some(unverified_message.verify(
+                            self.ciphersuite(),
+                            provider.crypto(),
+                            self.version(),
+                        ));
+                    });
+                    let verified =
+                        measured_result.expect("allocation_counter measure closure did not run")?;
+                    if let Some(s) = auth_scope {
+                        let mut event = s.finish();
+                        event.signature_verify_count = Some(1);
+                        event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                        event.alloc_count = Some(allocation_info.count_total as u64);
+                        emit_event(&event);
+                    }
+                    verified
+                }
+
+                #[cfg(not(feature = "profiling-json"))]
+                {
+                    unverified_message.verify(self.ciphersuite(), provider.crypto(), self.version())?
+                }
+            };
 
         match content.sender() {
             Sender::Member(_) | Sender::NewMemberProposal | Sender::NewMemberCommit => self

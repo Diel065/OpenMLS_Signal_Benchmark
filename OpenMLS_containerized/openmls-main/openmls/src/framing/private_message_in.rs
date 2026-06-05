@@ -18,6 +18,8 @@ use crate::{
 
 #[cfg(feature = "profiling-json")]
 use crate::profiling::{emit_event, ProfileScope};
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 
 use super::*;
 
@@ -69,41 +71,88 @@ impl PrivateMessageIn {
         let scope = ProfileScope::start("application_message_receive.sender_data_decrypt", "openmls");
 
         // Derive key from the key schedule using the ciphertext.
-        let sender_data_key = message_secrets
-            .sender_data_secret()
-            .derive_aead_key(crypto, ciphersuite, self.ciphertext.as_slice())
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        // Derive initial nonce from the key schedule using the ciphertext.
-        let sender_data_nonce = message_secrets
-            .sender_data_secret()
-            .derive_aead_nonce(ciphersuite, crypto, self.ciphertext.as_slice())
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        // Serialize sender data AAD
-        let mls_sender_data_aad =
-            MlsSenderDataAad::new(self.group_id.clone(), self.epoch, self.content_type);
-        let mls_sender_data_aad_bytes = mls_sender_data_aad
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
-        // Decrypt sender data
-        log_crypto!(
-            trace,
-            "Decryption key for sender data: {sender_data_key:x?}"
-        );
-        log_crypto!(trace, "Decryption of sender data mls_sender_data_aad_bytes: {mls_sender_data_aad_bytes:x?} - sender_data_nonce: {sender_data_nonce:x?}");
-        let sender_data_bytes = sender_data_key
-            .aead_open(
-                crypto,
-                self.encrypted_sender_data.as_slice(),
-                &mls_sender_data_aad_bytes,
-                &sender_data_nonce,
+        #[cfg(feature = "profiling-json")]
+        let (sender_data, sender_data_allocation_info) = {
+            let mut measured: Option<Result<_, MessageDecryptionError>> = None;
+            let allocation_info = measure(|| {
+                measured = Some((|| {
+                    let sender_data_key = message_secrets
+                        .sender_data_secret()
+                        .derive_aead_key(crypto, ciphersuite, self.ciphertext.as_slice())
+                        .map_err(LibraryError::unexpected_crypto_error)?;
+                    // Derive initial nonce from the key schedule using the ciphertext.
+                    let sender_data_nonce = message_secrets
+                        .sender_data_secret()
+                        .derive_aead_nonce(ciphersuite, crypto, self.ciphertext.as_slice())
+                        .map_err(LibraryError::unexpected_crypto_error)?;
+                    // Serialize sender data AAD
+                    let mls_sender_data_aad =
+                        MlsSenderDataAad::new(self.group_id.clone(), self.epoch, self.content_type);
+                    let mls_sender_data_aad_bytes = mls_sender_data_aad
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?;
+                    // Decrypt sender data
+                    log_crypto!(
+                        trace,
+                        "Decryption key for sender data: {sender_data_key:x?}"
+                    );
+                    log_crypto!(trace, "Decryption of sender data mls_sender_data_aad_bytes: {mls_sender_data_aad_bytes:x?} - sender_data_nonce: {sender_data_nonce:x?}");
+                    let sender_data_bytes = sender_data_key
+                        .aead_open(
+                            crypto,
+                            self.encrypted_sender_data.as_slice(),
+                            &mls_sender_data_aad_bytes,
+                            &sender_data_nonce,
+                        )
+                        .map_err(|_| {
+                            log::error!("Sender data decryption error");
+                            MessageDecryptionError::AeadError
+                        })?;
+                    log::trace!("  Successfully decrypted sender data.");
+                    MlsSenderData::tls_deserialize(&mut sender_data_bytes.as_slice())
+                        .map_err(|_| MessageDecryptionError::MalformedContent)
+                })());
+            });
+            (
+                measured.expect("allocation_counter measure closure did not run")?,
+                allocation_info,
             )
-            .map_err(|_| {
-                log::error!("Sender data decryption error");
-                MessageDecryptionError::AeadError
-            })?;
-        log::trace!("  Successfully decrypted sender data.");
-        let sender_data = MlsSenderData::tls_deserialize(&mut sender_data_bytes.as_slice())
-            .map_err(|_| MessageDecryptionError::MalformedContent)?;
+        };
+        #[cfg(not(feature = "profiling-json"))]
+        let sender_data = {
+            let sender_data_key = message_secrets
+                .sender_data_secret()
+                .derive_aead_key(crypto, ciphersuite, self.ciphertext.as_slice())
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            let sender_data_nonce = message_secrets
+                .sender_data_secret()
+                .derive_aead_nonce(ciphersuite, crypto, self.ciphertext.as_slice())
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            let mls_sender_data_aad =
+                MlsSenderDataAad::new(self.group_id.clone(), self.epoch, self.content_type);
+            let mls_sender_data_aad_bytes = mls_sender_data_aad
+                .tls_serialize_detached()
+                .map_err(LibraryError::missing_bound_check)?;
+            log_crypto!(
+                trace,
+                "Decryption key for sender data: {sender_data_key:x?}"
+            );
+            log_crypto!(trace, "Decryption of sender data mls_sender_data_aad_bytes: {mls_sender_data_aad_bytes:x?} - sender_data_nonce: {sender_data_nonce:x?}");
+            let sender_data_bytes = sender_data_key
+                .aead_open(
+                    crypto,
+                    self.encrypted_sender_data.as_slice(),
+                    &mls_sender_data_aad_bytes,
+                    &sender_data_nonce,
+                )
+                .map_err(|_| {
+                    log::error!("Sender data decryption error");
+                    MessageDecryptionError::AeadError
+                })?;
+            log::trace!("  Successfully decrypted sender data.");
+            MlsSenderData::tls_deserialize(&mut sender_data_bytes.as_slice())
+                .map_err(|_| MessageDecryptionError::MalformedContent)?
+        };
 
         #[cfg(feature = "profiling-json")]
         {
@@ -113,6 +162,8 @@ impl PrivateMessageIn {
                 event.sender_leaf_index = Some(sender_data.leaf_index.u32());
                 event.sender_generation = Some(sender_data.generation as u64);
                 event.sender_data_decrypt_count = Some(1);
+                event.alloc_bytes = Some(sender_data_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(sender_data_allocation_info.count_total as u64);
                 emit_event(&event);
             }
         }
@@ -186,6 +237,35 @@ impl PrivateMessageIn {
         #[cfg(feature = "profiling-json")]
         let secret_tree_scope =
             ProfileScope::start("application_message_receive.secret_tree_lookup_or_derive", "openmls");
+        #[cfg(feature = "profiling-json")]
+        let (ratchet_key, ratchet_nonce, secret_tree_allocation_info) = {
+            let mut measured: Option<Result<_, MessageDecryptionError>> = None;
+            let allocation_info = measure(|| {
+                measured = Some(
+                    message_secrets
+                        .secret_tree_mut()
+                        .secret_for_decryption(
+                            ciphersuite,
+                            crypto,
+                            sender_index,
+                            secret_type,
+                            sender_data.generation,
+                            sender_ratchet_configuration,
+                        )
+                        .map_err(|e| {
+                            log::error!(
+                                "  Ciphertext generation out of bounds {}\n\t{e:?}",
+                                sender_data.generation
+                            );
+                            MessageDecryptionError::SecretTreeError(e)
+                        }),
+                );
+            });
+            let (ratchet_key, ratchet_nonce) =
+                measured.expect("allocation_counter measure closure did not run")?;
+            (ratchet_key, ratchet_nonce, allocation_info)
+        };
+        #[cfg(not(feature = "profiling-json"))]
         let (ratchet_key, ratchet_nonce) = message_secrets
             .secret_tree_mut()
             .secret_for_decryption(
@@ -209,6 +289,8 @@ impl PrivateMessageIn {
             let mut event = s.finish();
             event.sender_leaf_index = Some(sender_index.u32());
             event.sender_generation = Some(sender_data.generation as u64);
+            event.alloc_bytes = Some(secret_tree_allocation_info.bytes_total as u64);
+            event.alloc_count = Some(secret_tree_allocation_info.count_total as u64);
             emit_event(&event);
         }
 
@@ -218,6 +300,18 @@ impl PrivateMessageIn {
         #[cfg(feature = "profiling-json")]
         let content_decrypt_scope =
             ProfileScope::start("application_message_receive.content_decrypt", "openmls");
+        #[cfg(feature = "profiling-json")]
+        let (private_message_content, content_decrypt_allocation_info) = {
+            let mut measured: Option<Result<_, MessageDecryptionError>> = None;
+            let allocation_info = measure(|| {
+                measured = Some(self.decrypt(crypto, ratchet_key, &prepared_nonce));
+            });
+            (
+                measured.expect("allocation_counter measure closure did not run")?,
+                allocation_info,
+            )
+        };
+        #[cfg(not(feature = "profiling-json"))]
         let private_message_content = self.decrypt(crypto, ratchet_key, &prepared_nonce)?;
 
         #[cfg(feature = "profiling-json")]
@@ -228,6 +322,8 @@ impl PrivateMessageIn {
                 let mut event = s.finish();
                 event.app_msg_ciphertext_bytes = Some(ct_len);
                 event.aead_decrypt_count = Some(1);
+                event.alloc_bytes = Some(content_decrypt_allocation_info.bytes_total as u64);
+                event.alloc_count = Some(content_decrypt_allocation_info.count_total as u64);
                 emit_event(&event);
             }
         }

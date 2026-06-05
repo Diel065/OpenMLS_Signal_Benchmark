@@ -3,6 +3,7 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::types::SignatureScheme;
+use std::io::BufRead;
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -298,7 +299,47 @@ fn commit_remove_profiling_smoke() {
     let trunc_count = trunc_group.members().count();
     assert!(
         trunc_count <= 4,
-        "Expected truncation to reduce group to ≤4 members, got {}",
+        "Expected truncation to reduce group to <=4 members, got {}",
         trunc_count
+    );
+
+    // Verify tree_truncated=true appears in JSONL output
+    let jsonl_path = std::env::var("OPENMLS_PROFILE_PATH")
+        .unwrap_or_else(|_| "/tmp/openmls_commit_remove_smoke.jsonl".to_string());
+    let file = std::fs::File::open(&jsonl_path)
+        .expect("Failed to open JSONL output for truncation check");
+    let reader = std::io::BufReader::new(file);
+
+    let mut found_truncated = false;
+    let mut total_events = 0usize;
+    let mut found_parent_removed_leaf_indices = false;
+    for line in reader.lines() {
+        let line = line.expect("Failed to read line from JSONL");
+        if line.trim().is_empty() {
+            continue;
+        }
+        total_events += 1;
+        if line.contains("\"tree_truncated\":true") {
+            found_truncated = true;
+        }
+        // Verify that parent commit_create_protocol_remove events carry restructuring fields
+        if line.contains("\"op\":\"commit_create_protocol_remove\"")
+            && line.contains("\"removed_leaf_indices\"")
+        {
+            found_parent_removed_leaf_indices = true;
+        }
+    }
+
+    assert!(
+        found_truncated,
+        "Expected at least one profile event with tree_truncated=true in {} (checked {} events)",
+        jsonl_path,
+        total_events
+    );
+    assert!(
+        found_parent_removed_leaf_indices,
+        "Expected parent commit_create_protocol_remove event to have removed_leaf_indices in {} (checked {} events)",
+        jsonl_path,
+        total_events
     );
 }

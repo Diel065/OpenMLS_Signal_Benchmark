@@ -101,6 +101,8 @@ fn main() -> Result<()> {
         run_id: args.run_id.clone(),
         scenario: args.scenario.clone(),
         output_dir: args.output_dir.clone(),
+        device_kind: None,
+        execution_backend: None,
     })?;
 
     run_staircase_benchmark(StaircaseConfig {

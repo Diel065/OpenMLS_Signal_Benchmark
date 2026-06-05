@@ -55,6 +55,20 @@ pub enum Command {
         kinds: Option<Vec<PendingKind>>,
         max_messages: Option<usize>,
         expected_epoch: Option<u64>,
+        #[serde(default)]
+        profile: bool,
+        #[serde(default)]
+        commit_create_op: Option<String>,
+        #[serde(default)]
+        commit_receive_sampling_policy: Option<String>,
+        #[serde(default)]
+        commit_receive_sampling_seed: Option<u64>,
+        #[serde(default)]
+        commit_receive_sample_index: Option<usize>,
+        #[serde(default)]
+        commit_receive_sample_count: Option<usize>,
+        #[serde(default)]
+        commit_receive_population_size: Option<usize>,
     },
     ShowGroupState,
 }
@@ -106,6 +120,26 @@ pub struct CommandRequestEnvelope {
     pub expected_epoch: Option<u64>,
     #[serde(default)]
     pub phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub execution_backend: Option<String>,
+    #[serde(default)]
+    pub ciphersuite: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -115,16 +149,52 @@ pub enum IncomingCommandRequest {
     Raw(Command),
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct BenchmarkContextFields {
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
+    pub ciphersuite: Option<String>,
+}
+
 impl IncomingCommandRequest {
-    pub fn into_parts(self) -> (Option<String>, Command, Option<u64>, Option<String>) {
+    pub fn into_parts(
+        self,
+    ) -> (
+        Option<String>,
+        Command,
+        Option<u64>,
+        Option<String>,
+        BenchmarkContextFields,
+    ) {
         match self {
             IncomingCommandRequest::Envelope(envelope) => (
                 Some(envelope.request_id),
                 envelope.command,
                 envelope.expected_epoch,
                 envelope.phase,
+                BenchmarkContextFields {
+                    benchmark_plateau_index: envelope.benchmark_plateau_index,
+                    benchmark_target_size: envelope.benchmark_target_size,
+                    benchmark_active_size: envelope.benchmark_active_size,
+                    benchmark_phase: envelope.benchmark_phase,
+                    benchmark_operation: envelope.benchmark_operation,
+                    benchmark_operation_seq: envelope.benchmark_operation_seq,
+                    benchmark_payload_size: envelope.benchmark_payload_size,
+                    device_kind: envelope.device_kind,
+                    execution_backend: envelope.execution_backend,
+                    ciphersuite: envelope.ciphersuite,
+                },
             ),
-            IncomingCommandRequest::Raw(command) => (None, command, None, None),
+            IncomingCommandRequest::Raw(command) => {
+                (None, command, None, None, BenchmarkContextFields::default())
+            }
         }
     }
 }
@@ -168,6 +238,26 @@ pub struct BatchCommandItem {
     pub phase: Option<String>,
     #[serde(default)]
     pub profile: Option<bool>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub execution_backend: Option<String>,
+    #[serde(default)]
+    pub ciphersuite: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1240,6 +1330,7 @@ async fn process_pending(
     kinds: Option<Vec<PendingKind>>,
     max_messages: Option<usize>,
     expected_epoch: Option<u64>,
+    profile_opts: CommitReceiveProfileOptions,
 ) -> Result<String> {
     let kinds = kinds.unwrap_or_else(|| {
         vec![
@@ -1272,7 +1363,7 @@ async fn process_pending(
                 ds_url,
                 queued_intent,
                 &commit_bytes,
-                CommitReceiveProfileOptions::default(),
+                profile_opts.clone(),
             )
             .await
             {
@@ -1521,7 +1612,23 @@ pub async fn handle_command(
             kinds,
             max_messages,
             expected_epoch,
+            profile,
+            commit_create_op,
+            commit_receive_sampling_policy,
+            commit_receive_sampling_seed,
+            commit_receive_sample_index,
+            commit_receive_sample_count,
+            commit_receive_population_size,
         } => {
+            let profile_opts = CommitReceiveProfileOptions {
+                enabled: profile,
+                commit_create_op,
+                commit_receive_sampling_policy,
+                commit_receive_sampling_seed,
+                commit_receive_sample_index,
+                commit_receive_sample_count,
+                commit_receive_population_size,
+            };
             process_pending(
                 client,
                 ds_url,
@@ -1530,6 +1637,7 @@ pub async fn handle_command(
                 kinds,
                 max_messages,
                 expected_epoch,
+                profile_opts,
             )
             .await
         }

@@ -2,9 +2,18 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::types::SignatureScheme;
+use std::sync::Once;
 use tls_codec::Serialize;
 
 const JSONL_PATH: &str = "/tmp/openmls_application_message_create_smoke.jsonl";
+static PROFILE_INIT: Once = Once::new();
+
+fn init_profile_path() {
+    PROFILE_INIT.call_once(|| {
+        let _ = std::fs::remove_file(JSONL_PATH);
+    });
+    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+}
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -93,6 +102,7 @@ fn verify_jsonl_basics(expected_test: &str) {
     let mut has_secret_tree = false;
     let mut has_content_encrypt = false;
     let mut has_sender_data = false;
+    let mut has_sender_data_alloc = false;
     let mut has_serialize = false;
     let mut has_sender_leaf = false;
     let mut has_sender_generation = false;
@@ -110,7 +120,10 @@ fn verify_jsonl_basics(expected_test: &str) {
             "application_message_create.encrypt_content" => has_encrypt_wrapper = true,
             "application_message_create.secret_tree_derive" => has_secret_tree = true,
             "application_message_create.content_encrypt" => has_content_encrypt = true,
-            "application_message_create.sender_data_encrypt" => has_sender_data = true,
+            "application_message_create.sender_data_encrypt" => {
+                has_sender_data = true;
+                has_sender_data_alloc |= parsed["alloc_bytes"].is_number();
+            }
             "application_message_create_serialize" => has_serialize = true,
             _ => {}
         }
@@ -135,6 +148,7 @@ fn verify_jsonl_basics(expected_test: &str) {
     assert!(has_secret_tree, "Missing secret_tree_derive span (test: {expected_test})");
     assert!(has_content_encrypt, "Missing content_encrypt span (test: {expected_test})");
     assert!(has_sender_data, "Missing sender_data_encrypt span (test: {expected_test})");
+    assert!(has_sender_data_alloc, "Missing sender_data_encrypt alloc_bytes (test: {expected_test})");
     assert!(has_serialize, "Missing serialize span (test: {expected_test})");
     assert!(has_sender_leaf, "No event has sender_leaf_index (test: {expected_test})");
     assert!(has_sender_generation, "No event has sender_generation (test: {expected_test})");
@@ -144,7 +158,7 @@ fn verify_jsonl_basics(expected_test: &str) {
 
 #[openmls_test]
 fn application_message_create_profiling_smoke() {
-    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+    init_profile_path();
 
     let provider = &Provider::default();
     let (alice_credential, alice_signer) = generate_credential(
@@ -195,11 +209,13 @@ fn application_message_create_profiling_smoke() {
     // After commit, Alice has a new epoch. First message in new epoch -> generation=0 again
     let _msg_after_commit =
         send_message_and_check(&mut alice_group, provider, &alice_signer, b"After commit");
+
+    verify_jsonl_basics("application_message_create_profiling_smoke");
 }
 
 #[openmls_test]
 fn application_message_create_n_sweep() {
-    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+    init_profile_path();
 
     let provider = &Provider::default();
     let (alice_credential, alice_signer) = generate_credential(
@@ -236,4 +252,6 @@ fn application_message_create_n_sweep() {
             let _msg_alt = send_message_and_check(&mut alice_group, provider, &alice_signer, &alt_payload);
         }
     }
+
+    verify_jsonl_basics("application_message_create_n_sweep");
 }

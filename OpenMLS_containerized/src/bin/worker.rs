@@ -18,9 +18,10 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use mls_playground::client::Client;
 use mls_playground::debug::{debug_logs_enabled, worker_debug_logs_enabled};
 use mls_playground::worker_api::{
-    handle_command, Command, CommandResponse, CompletedCommandCache, IncomingCommandRequest,
-    PendingIntent,
+    handle_command, BenchmarkContextFields, Command, CommandResponse, CompletedCommandCache,
+    IncomingCommandRequest, PendingIntent,
 };
+use openmls::profiling::{set_benchmark_context, set_worker_id, BenchmarkContext};
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_PACKED_INTERNAL_PARALLELISM: usize = 4;
@@ -51,6 +52,16 @@ struct WorkerCommandEnvelope {
     command: Command,
     expected_epoch: Option<u64>,
     phase: Option<String>,
+    benchmark_plateau_index: Option<usize>,
+    benchmark_target_size: Option<usize>,
+    benchmark_active_size: Option<usize>,
+    benchmark_phase: Option<String>,
+    benchmark_operation: Option<String>,
+    benchmark_operation_seq: Option<usize>,
+    benchmark_payload_size: Option<usize>,
+    device_kind: Option<String>,
+    execution_backend: Option<String>,
+    ciphersuite: Option<String>,
     enqueued_at: Instant,
     enqueued_unix_ms: u128,
     queue_depth_estimate: usize,
@@ -75,6 +86,26 @@ struct BatchCommandItem {
     pub phase: Option<String>,
     #[serde(default)]
     pub profile: Option<bool>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub device_kind: Option<String>,
+    #[serde(default)]
+    pub execution_backend: Option<String>,
+    #[serde(default)]
+    pub ciphersuite: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -214,7 +245,7 @@ async fn run_command(
     State(state): State<Arc<WorkerProcessState>>,
     Json(request): Json<IncomingCommandRequest>,
 ) -> Json<CommandResponse> {
-    let (request_id, command, expected_epoch, phase) = request.into_parts();
+    let (request_id, command, expected_epoch, phase, benchmark_ctx) = request.into_parts();
 
     if state.client_handles.len() == 1 {
         let (client_id, handle) = state.client_handles.iter().next().unwrap();
@@ -225,6 +256,7 @@ async fn run_command(
             command,
             expected_epoch,
             phase.as_deref(),
+            benchmark_ctx,
         )
         .await;
         return Json(response);
@@ -240,7 +272,7 @@ async fn run_command_for_client(
     State(state): State<Arc<WorkerProcessState>>,
     Json(request): Json<IncomingCommandRequest>,
 ) -> Json<CommandResponse> {
-    let (request_id, command, expected_epoch, phase) = request.into_parts();
+    let (request_id, command, expected_epoch, phase, benchmark_ctx) = request.into_parts();
 
     let handle = match state.client_handles.get(&client_id) {
         Some(h) => h,
@@ -259,6 +291,7 @@ async fn run_command_for_client(
         command,
         expected_epoch,
         phase.as_deref(),
+        benchmark_ctx,
     )
     .await;
     Json(response)
@@ -308,12 +341,48 @@ async fn run_batch_command(
                     commit_receive_sample_count,
                     commit_receive_population_size,
                 },
+                Command::ProcessPending {
+                    kinds,
+                    max_messages,
+                    expected_epoch,
+                    profile: _,
+                    commit_create_op,
+                    commit_receive_sampling_policy,
+                    commit_receive_sampling_seed,
+                    commit_receive_sample_index,
+                    commit_receive_sample_count,
+                    commit_receive_population_size,
+                } => Command::ProcessPending {
+                    kinds,
+                    max_messages,
+                    expected_epoch,
+                    profile: item.profile.unwrap_or(false),
+                    commit_create_op,
+                    commit_receive_sampling_policy,
+                    commit_receive_sampling_seed,
+                    commit_receive_sample_index,
+                    commit_receive_sample_count,
+                    commit_receive_population_size,
+                },
                 Command::ReceiveApplicationMessage { profile: _ } => {
                     Command::ReceiveApplicationMessage {
                         profile: item.profile.unwrap_or(false),
                     }
                 }
                 other => other,
+            };
+
+            let benchmark_ctx = BenchmarkContextFields {
+                benchmark_plateau_index: item.benchmark_plateau_index,
+                benchmark_target_size: item.benchmark_target_size,
+                benchmark_active_size: item.benchmark_active_size,
+                benchmark_phase: item.benchmark_phase,
+                benchmark_operation: item.benchmark_operation,
+                benchmark_operation_seq: item.benchmark_operation_seq,
+                benchmark_payload_size: item.benchmark_payload_size,
+                device_kind: item.device_kind,
+                execution_backend: item.execution_backend,
+                ciphersuite: item.ciphersuite,
             };
 
             let (_, response) = send_to_client_actor(
@@ -323,6 +392,7 @@ async fn run_batch_command(
                 command,
                 item.expected_epoch,
                 item.phase.as_deref(),
+                benchmark_ctx,
             )
             .await;
 
@@ -351,6 +421,7 @@ async fn send_to_client_actor(
     command: Command,
     expected_epoch: Option<u64>,
     phase: Option<&str>,
+    benchmark_ctx: BenchmarkContextFields,
 ) -> (String, CommandResponse) {
     let (response_tx, response_rx) = oneshot::channel();
     let queue_depth_estimate = handle
@@ -363,6 +434,16 @@ async fn send_to_client_actor(
         command,
         expected_epoch,
         phase: phase.map(ToOwned::to_owned),
+        benchmark_plateau_index: benchmark_ctx.benchmark_plateau_index,
+        benchmark_target_size: benchmark_ctx.benchmark_target_size,
+        benchmark_active_size: benchmark_ctx.benchmark_active_size,
+        benchmark_phase: benchmark_ctx.benchmark_phase,
+        benchmark_operation: benchmark_ctx.benchmark_operation,
+        benchmark_operation_seq: benchmark_ctx.benchmark_operation_seq,
+        benchmark_payload_size: benchmark_ctx.benchmark_payload_size,
+        device_kind: benchmark_ctx.device_kind,
+        execution_backend: benchmark_ctx.execution_backend,
+        ciphersuite: benchmark_ctx.ciphersuite,
         enqueued_at: Instant::now(),
         enqueued_unix_ms: unix_ms_now(),
         queue_depth_estimate,
@@ -443,6 +524,28 @@ async fn client_command_actor(
                 envelope.enqueued_at.elapsed().as_millis(),
                 before_epoch
             );
+        }
+
+        // Clear stale benchmark context and worker ID, then set current command's context.
+        set_benchmark_context(BenchmarkContext::default());
+        set_worker_id(client_id.clone());
+        if envelope.benchmark_phase.is_some()
+            || envelope.benchmark_operation.is_some()
+            || envelope.benchmark_plateau_index.is_some()
+        {
+            set_benchmark_context(BenchmarkContext {
+                benchmark_plateau_index: envelope.benchmark_plateau_index,
+                benchmark_target_size: envelope.benchmark_target_size,
+                benchmark_active_size: envelope.benchmark_active_size,
+                benchmark_phase: envelope.benchmark_phase,
+                benchmark_operation: envelope.benchmark_operation,
+                benchmark_operation_seq: envelope.benchmark_operation_seq,
+                benchmark_payload_size: envelope.benchmark_payload_size,
+                configured_payload_label: envelope.benchmark_payload_size.map(|s| s.to_string()),
+                device_kind: envelope.device_kind,
+                execution_backend: envelope.execution_backend,
+                ciphersuite: envelope.ciphersuite,
+            });
         }
 
         let result = handle_command(

@@ -590,7 +590,7 @@ async fn participant_command_actor(
             {
                 let metrics = metrics.unwrap_or_default();
                 let event = SignalProfileEvent {
-                    profile_schema_version: 3,
+                    profile_schema_version: 4,
                     ts_unix_ns: start_unix_ms * 1_000_000,
                     op: event_context.event_subtype.to_string(),
                     span_layer: "benchmark_wrapper".to_string(),
@@ -666,6 +666,8 @@ async fn participant_command_actor(
                     node_name: env_nonempty("SIGNAL_PROFILE_NODE")
                         .or_else(|| Some(physical_worker_id.clone())),
                     pod_name: env_nonempty("HOSTNAME").or_else(|| Some(physical_worker_id.clone())),
+                    device_kind: env_nonempty("SIGNAL_PROFILE_DEVICE_KIND"),
+                    execution_backend: env_nonempty("SIGNAL_PROFILE_EXECUTION_BACKEND"),
                     ..SignalProfileEvent::default()
                 };
                 if let Ok(json_line) = serde_json::to_string(&event) {

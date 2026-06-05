@@ -2,9 +2,18 @@ use openmls::prelude::*;
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_test::openmls_test;
 use openmls_traits::types::SignatureScheme;
+use std::sync::Once;
 use tls_codec::Serialize;
 
 const JSONL_PATH: &str = "/tmp/openmls_application_message_receive_smoke.jsonl";
+static PROFILE_INIT: Once = Once::new();
+
+fn init_profile_path() {
+    PROFILE_INIT.call_once(|| {
+        let _ = std::fs::remove_file(JSONL_PATH);
+    });
+    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+}
 
 fn generate_credential(
     identity: Vec<u8>,
@@ -21,6 +30,15 @@ fn generate_credential(
         },
         signature_keys,
     )
+}
+
+fn assert_span_with_alloc(op: &str) {
+    let text = std::fs::read_to_string(JSONL_PATH).expect("read profiling jsonl");
+    let found = text.lines().any(|line| {
+        let parsed: serde_json::Value = serde_json::from_str(line).expect("valid jsonl line");
+        parsed["op"].as_str() == Some(op) && parsed["alloc_bytes"].is_number()
+    });
+    assert!(found, "missing span with allocation data: {op}");
 }
 
 fn create_group_then_add_and_join(
@@ -74,9 +92,7 @@ fn create_group_then_add_and_join(
 
 #[openmls_test]
 fn application_message_receive_profiling_comprehensive() {
-    // Delete stale JSONL — fresh path per run
-    let _ = std::fs::remove_file(JSONL_PATH);
-    std::env::set_var("OPENMLS_PROFILE_PATH", JSONL_PATH);
+    init_profile_path();
 
     // =========================================================
     // PART A: Basic Alice→Bob, 2 messages, first+later receive
@@ -273,4 +289,8 @@ fn application_message_receive_profiling_comprehensive() {
         }
     }
 
+    assert_span_with_alloc("application_message_receive.sender_data_decrypt");
+    assert_span_with_alloc("application_message_receive.secret_tree_lookup_or_derive");
+    assert_span_with_alloc("application_message_receive.content_decrypt");
+    assert_span_with_alloc("application_message_receive.auth_verify");
 }

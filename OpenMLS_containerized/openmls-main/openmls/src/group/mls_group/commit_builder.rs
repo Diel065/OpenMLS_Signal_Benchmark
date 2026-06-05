@@ -6,7 +6,7 @@ use std::{borrow::BorrowMut, marker::PhantomData};
 use openmls_traits::{
     crypto::OpenMlsCrypto, random::OpenMlsRand, signatures::Signer, storage::StorageProvider as _,
 };
-use tls_codec::Serialize as _;
+use tls_codec::{Serialize as _, Size as _};
 
 #[cfg(feature = "profiling-json")]
 use crate::group::diff::compute_path::parent_operation_for_span_prefix;
@@ -94,6 +94,17 @@ struct CommitProfilingData {
     commit_path_policy: String,
     force_self_update: bool,
     update_path_present: bool,
+    removed_leaf_indices: Option<Vec<u32>>,
+    removed_right_edge_count: Option<usize>,
+    rightmost_removed_leaf: Option<u32>,
+    removed_right_edge_suffix_count: Option<usize>,
+    right_edge_suffix_fully_removed: Option<bool>,
+    tree_truncated: Option<bool>,
+    truncated_levels_count: Option<usize>,
+    tree_size_before: Option<u32>,
+    tree_size_after: Option<u32>,
+    tree_leaf_count_before: Option<u32>,
+    tree_leaf_count_after: Option<u32>,
 }
 
 #[cfg(feature = "profiling-json")]
@@ -761,27 +772,34 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             #[cfg(feature = "profiling-json")]
             let proposal_apply_leaf_count_after = diff.leaf_count();
             #[cfg(feature = "profiling-json")]
-            {
-                let tree_truncated = proposal_apply_tree_size_after < proposal_apply_tree_size_before;
-                let truncated_levels_count = if tree_truncated {
-                    let lb = (proposal_apply_leaf_count_before as f64).log2().ceil() as u32;
-                    let la = (proposal_apply_leaf_count_after as f64).log2().ceil() as u32;
-                    (lb - la) as usize
-                } else {
-                    0
-                };
-                let rightmost_leaf = proposal_apply_leaf_count_before - 1;
-                let removed_right_edge_count = proposal_apply_removed_indices
-                    .iter()
-                    .filter(|&&idx| idx == rightmost_leaf)
-                    .count();
-                let rightmost_removed_leaf = proposal_apply_removed_indices
-                    .iter()
-                    .max()
-                    .copied();
-                let removed_right_edge_suffix_count = rightmost_removed_leaf
+            let _proposal_apply_tree_truncated =
+                proposal_apply_tree_size_after < proposal_apply_tree_size_before;
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_truncated_levels_count: usize = if _proposal_apply_tree_truncated {
+                let lb = (proposal_apply_leaf_count_before as f64).log2().ceil() as u32;
+                let la = (proposal_apply_leaf_count_after as f64).log2().ceil() as u32;
+                (lb - la) as usize
+            } else {
+                0
+            };
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_rightmost_leaf = proposal_apply_leaf_count_before - 1;
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_removed_right_edge_count = proposal_apply_removed_indices
+                .iter()
+                .filter(|&&idx| idx == _proposal_apply_rightmost_leaf)
+                .count();
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_rightmost_removed_leaf = proposal_apply_removed_indices
+                .iter()
+                .max()
+                .copied();
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_removed_right_edge_suffix_count =
+                _proposal_apply_rightmost_removed_leaf
                     .map(|max_idx| {
-                        let mut sorted: Vec<u32> = proposal_apply_removed_indices.iter().copied().collect();
+                        let mut sorted: Vec<u32> =
+                            proposal_apply_removed_indices.iter().copied().collect();
                         sorted.sort_unstable();
                         sorted.reverse();
                         let mut count = 0usize;
@@ -800,22 +818,33 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         count
                     })
                     .unwrap_or(0);
-                let right_edge_suffix_fully_removed = rightmost_removed_leaf
-                    .map(|max_idx| removed_right_edge_suffix_count > 0 && max_idx == rightmost_leaf)
+            #[cfg(feature = "profiling-json")]
+            let _proposal_apply_right_edge_suffix_fully_removed =
+                _proposal_apply_rightmost_removed_leaf
+                    .map(|max_idx| {
+                        _proposal_apply_removed_right_edge_suffix_count > 0
+                            && max_idx == _proposal_apply_rightmost_leaf
+                    })
                     .unwrap_or(false);
+            #[cfg(feature = "profiling-json")]
+            {
                 finish_and_emit(proposal_apply_scope, |event| {
                     event.group_epoch = Some(group.context().epoch().as_u64());
                     event.tree_size = Some(proposal_apply_tree_size_before);
                     event.member_count = Some(member_count_before);
                     event.added_members_count = Some(add_count);
                     event.removed_members_count = Some(remove_count);
-                    event.removed_leaf_indices = Some(proposal_apply_removed_indices);
-                    event.removed_right_edge_count = Some(removed_right_edge_count);
-                    event.rightmost_removed_leaf = rightmost_removed_leaf;
-                    event.removed_right_edge_suffix_count = Some(removed_right_edge_suffix_count);
-                    event.right_edge_suffix_fully_removed = Some(right_edge_suffix_fully_removed);
-                    event.tree_truncated = Some(tree_truncated);
-                    event.truncated_levels_count = Some(truncated_levels_count);
+                    event.removed_leaf_indices = Some(proposal_apply_removed_indices.clone());
+                    event.removed_right_edge_count =
+                        Some(_proposal_apply_removed_right_edge_count);
+                    event.rightmost_removed_leaf = _proposal_apply_rightmost_removed_leaf;
+                    event.removed_right_edge_suffix_count =
+                        Some(_proposal_apply_removed_right_edge_suffix_count);
+                    event.right_edge_suffix_fully_removed =
+                        Some(_proposal_apply_right_edge_suffix_fully_removed);
+                    event.tree_truncated = Some(_proposal_apply_tree_truncated);
+                    event.truncated_levels_count =
+                        Some(_proposal_apply_truncated_levels_count);
                     event.tree_size_before = Some(proposal_apply_tree_size_before);
                     event.tree_size_after = Some(proposal_apply_tree_size_after);
                     event.tree_leaf_count_before = Some(proposal_apply_leaf_count_before);
@@ -1176,6 +1205,12 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             let (welcome_option, group_info) = if !needs_group_info {
                 (None, None)
             } else {
+                #[cfg(feature = "profiling-json")]
+                let ratchet_tree_artifact_bytes = {
+                    let ratchet_tree = diff.export_ratchet_tree();
+                    Some(ratchet_tree.tls_serialized_len())
+                };
+
                 // Create the ratchet tree extension if necessary
                 let mut extensions_list = vec![];
                 if use_ratchet_tree_extension {
@@ -1197,6 +1232,9 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         let invitee_count = apply_proposals_values.invitation_list.len() as isize;
 
                         #[cfg(feature = "profiling-json")]
+                        let invitation_count = apply_proposals_values.invitation_list.len();
+
+                        #[cfg(feature = "profiling-json")]
                         let group_epoch = diff.group_context().epoch().as_u64();
 
                         #[cfg(feature = "profiling-json")]
@@ -1214,13 +1252,13 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
                         #[cfg(feature = "profiling-json")]
                         let mut measured_result: Option<
-                            Result<(Welcome, usize, usize), CreateCommitError>,
+                            Result<(Welcome, usize, usize, usize), CreateCommitError>,
                         > = None;
 
                         #[cfg(feature = "profiling-json")]
                         let allocation_info = measure(|| {
                             measured_result =
-                                Some((|| -> Result<(Welcome, usize, usize), CreateCommitError> {
+                                Some((|| -> Result<(Welcome, usize, usize, usize), CreateCommitError> {
                                     let group_info_tbs = {
                                         GroupInfoTBS::new(
                                             diff.group_context().clone(),
@@ -1236,6 +1274,73 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                     let (welcome_key, welcome_nonce) = welcome_secret
                                         .derive_welcome_key_nonce(crypto, ciphersuite)
                                         .map_err(LibraryError::unexpected_crypto_error)?;
+
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_aead_scope = ProfileScope::start(
+                                        format!("{profile_span_prefix}.group_info.aead_encrypt"),
+                                        "openmls",
+                                    );
+                                    #[cfg(feature = "profiling-json")]
+                                    let mut group_info_aead_result: Option<
+                                        Result<(Vec<u8>, usize), CreateCommitError>,
+                                    > = None;
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_aead_allocation_info = measure(|| {
+                                        group_info_aead_result = Some((|| {
+                                            let group_info_plaintext = group_info
+                                                .tls_serialize_detached()
+                                                .map_err(LibraryError::missing_bound_check)?;
+                                            let group_info_bytes = group_info_plaintext.len();
+                                            let encrypted_group_info = welcome_key
+                                                .aead_seal(
+                                                    crypto,
+                                                    group_info_plaintext.as_slice(),
+                                                    &[],
+                                                    &welcome_nonce,
+                                                )
+                                                .map_err(LibraryError::unexpected_crypto_error)?;
+                                            Ok((encrypted_group_info, group_info_bytes))
+                                        })());
+                                    });
+                                    #[cfg(feature = "profiling-json")]
+                                    let (encrypted_group_info, group_info_bytes) =
+                                        group_info_aead_result
+                                            .expect("allocation_counter measure closure did not run")?;
+                                    #[cfg(feature = "profiling-json")]
+                                    let encrypted_group_info_bytes = encrypted_group_info.len();
+                                    #[cfg(feature = "profiling-json")]
+                                    finish_and_emit(group_info_aead_scope, |event| {
+                                        event.artifact_size_bytes = Some(group_info_bytes);
+                                        event.group_info_bytes = Some(group_info_bytes);
+                                        event.encrypted_group_info_bytes =
+                                            Some(encrypted_group_info_bytes);
+                                        event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                                        event.ratchet_tree_included =
+                                            Some(use_ratchet_tree_extension);
+                                        event.ratchet_tree_delivery_mode = Some(
+                                            if use_ratchet_tree_extension {
+                                                "welcome_extension"
+                                            } else {
+                                                "out_of_band"
+                                            }
+                                            .to_string(),
+                                        );
+                                        event.added_members_count = Some(invitation_count);
+                                        event.welcome_recipient_count = Some(invitation_count);
+                                        event.group_epoch = Some(group_epoch);
+                                        event.tree_size = Some(tree_size);
+                                        event.member_count = Some(member_count_after);
+                                        event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                                        event.tree_height = Some(tree_height);
+                                        event.tree_leaf_count = Some(tree_leaf_count);
+                                        event.tree_node_count = Some(tree_node_count);
+                                        event.alloc_bytes =
+                                            Some(group_info_aead_allocation_info.bytes_total as u64);
+                                        event.alloc_count =
+                                            Some(group_info_aead_allocation_info.count_total as u64);
+                                    });
+
+                                    #[cfg(not(feature = "profiling-json"))]
                                     let encrypted_group_info = welcome_key
                                         .aead_seal(
                                             crypto,
@@ -1251,12 +1356,28 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                     // Create group secrets for later use, so we can afterwards consume the
                                     // `joiner_secret`.
                                     #[cfg(feature = "profiling-json")]
-                                    let invitation_count = apply_proposals_values.invitation_list.len();
-                                    #[cfg(feature = "profiling-json")]
                                     let welcome_encrypt_scope = ProfileScope::start(
                                         format!("{profile_span_prefix}.welcome_group_secrets_encrypt"),
                                         "openmls",
                                     );
+                                    #[cfg(feature = "profiling-json")]
+                                    let mut encrypted_secrets_result = None;
+                                    #[cfg(feature = "profiling-json")]
+                                    let welcome_encrypt_allocation_info = measure(|| {
+                                        encrypted_secrets_result = Some(diff.encrypt_group_secrets(
+                                            &joiner_secret,
+                                            apply_proposals_values.invitation_list,
+                                            path_computation_result.plain_path.as_deref(),
+                                            &apply_proposals_values.presharedkeys,
+                                            &encrypted_group_info,
+                                            crypto,
+                                            own_leaf_index,
+                                        ));
+                                    });
+                                    #[cfg(feature = "profiling-json")]
+                                    let encrypted_secrets = encrypted_secrets_result
+                                        .expect("allocation_counter measure closure did not run")?;
+                                    #[cfg(not(feature = "profiling-json"))]
                                     let encrypted_secrets = diff.encrypt_group_secrets(
                                         &joiner_secret,
                                         apply_proposals_values.invitation_list,
@@ -1273,8 +1394,13 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                         event.encrypted_secrets_count = Some(encrypted_secrets.len());
                                         event.hpke_encrypt_count = Some(invitation_count as u64);
                                         event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                                        event.alloc_bytes =
+                                            Some(welcome_encrypt_allocation_info.bytes_total as u64);
+                                        event.alloc_count =
+                                            Some(welcome_encrypt_allocation_info.count_total as u64);
                                     });
 
+                                    #[cfg(not(feature = "profiling-json"))]
                                     let encrypted_group_info_bytes = encrypted_group_info.len();
                                     let encrypted_secrets_count = encrypted_secrets.len();
 
@@ -1297,12 +1423,26 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                         event.ciphersuite = Some(format!("{:?}", ciphersuite));
                                     });
 
-                                    Ok((welcome, encrypted_group_info_bytes, encrypted_secrets_count))
+                                    #[cfg(feature = "profiling-json")]
+                                    return Ok((
+                                        welcome,
+                                        group_info_bytes,
+                                        encrypted_group_info_bytes,
+                                        encrypted_secrets_count,
+                                    ));
+
+                                    #[cfg(not(feature = "profiling-json"))]
+                                    Ok((welcome, 0, encrypted_group_info_bytes, encrypted_secrets_count))
                                 })());
                         });
 
                         #[cfg(feature = "profiling-json")]
-                        let (welcome, encrypted_group_info_bytes, encrypted_secrets_count) =
+                        let (
+                            welcome,
+                            group_info_bytes,
+                            encrypted_group_info_bytes,
+                            encrypted_secrets_count,
+                        ) =
                             measured_result.expect("allocation_counter measure closure did not run")?;
 
                         #[cfg(feature = "profiling-json")]
@@ -1310,14 +1450,20 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             let mut event = scope.finish();
 
                             event.encrypted_group_info_bytes = Some(encrypted_group_info_bytes);
+                            event.group_info_bytes = Some(group_info_bytes);
                             event.encrypted_secrets_count = Some(encrypted_secrets_count);
                             event.welcome_recipient_count = Some(encrypted_secrets_count);
+                            event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                            event.welcome_plus_ratchet_tree_bytes = event
+                                .welcome_bytes
+                                .zip(event.ratchet_tree_bytes)
+                                .map(|(welcome, tree)| welcome + tree);
                             event.ratchet_tree_included = Some(use_ratchet_tree_extension);
                             event.ratchet_tree_delivery_mode = Some(
                                 if use_ratchet_tree_extension {
                                     "welcome_extension"
                                 } else {
-                                    "not_in_welcome"
+                                    "out_of_band"
                                 }
                                 .to_string(),
                             );
@@ -1359,14 +1505,20 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                 event.welcome_bytes = serialized_len.flatten();
                                 event.encrypted_group_info_bytes =
                                     Some(encrypted_group_info_bytes);
+                                event.group_info_bytes = Some(group_info_bytes);
                                 event.encrypted_secrets_count = Some(encrypted_secrets_count);
                                 event.welcome_recipient_count = Some(encrypted_secrets_count);
+                                event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                                event.welcome_plus_ratchet_tree_bytes = event
+                                    .welcome_bytes
+                                    .zip(event.ratchet_tree_bytes)
+                                    .map(|(welcome, tree)| welcome + tree);
                                 event.ratchet_tree_included = Some(use_ratchet_tree_extension);
                                 event.ratchet_tree_delivery_mode = Some(
                                     if use_ratchet_tree_extension {
                                         "welcome_extension"
                                     } else {
-                                        "not_in_welcome"
+                                        "out_of_band"
                                     }
                                     .to_string(),
                                 );
@@ -1398,6 +1550,10 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                             if let Some(event) = welcome_protocol_event.as_mut() {
                                 event.artifact_size_bytes = serialized_len.flatten();
                                 event.welcome_bytes = serialized_len.flatten();
+                                event.welcome_plus_ratchet_tree_bytes = event
+                                    .welcome_bytes
+                                    .zip(event.ratchet_tree_bytes)
+                                    .map(|(welcome, tree)| welcome + tree);
                                 emit_event(event);
                             }
                         }
@@ -1560,6 +1716,17 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         },
                         force_self_update: cur_stage.force_self_update,
                         update_path_present: update_path_profile.is_some(),
+                        removed_leaf_indices: Some(proposal_apply_removed_indices.clone()),
+                        removed_right_edge_count: Some(_proposal_apply_removed_right_edge_count),
+                        rightmost_removed_leaf: _proposal_apply_rightmost_removed_leaf,
+                        removed_right_edge_suffix_count: Some(_proposal_apply_removed_right_edge_suffix_count),
+                        right_edge_suffix_fully_removed: Some(_proposal_apply_right_edge_suffix_fully_removed),
+                        tree_truncated: Some(_proposal_apply_tree_truncated),
+                        truncated_levels_count: Some(_proposal_apply_truncated_levels_count),
+                        tree_size_before: Some(proposal_apply_tree_size_before),
+                        tree_size_after: Some(proposal_apply_tree_size_after),
+                        tree_leaf_count_before: Some(proposal_apply_leaf_count_before),
+                        tree_leaf_count_after: Some(proposal_apply_leaf_count_after),
                     }),
                 }),
                 final_commit_op,
@@ -1631,6 +1798,38 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                     event.commit_path_policy = Some(profiling.commit_path_policy.clone());
                     event.force_self_update = Some(profiling.force_self_update);
                     event.update_path_present = Some(profiling.update_path_present);
+                    event.removed_leaf_indices = profiling.removed_leaf_indices.clone();
+                    event.removed_right_edge_count = profiling.removed_right_edge_count;
+                    event.rightmost_removed_leaf = profiling.rightmost_removed_leaf;
+                    event.removed_right_edge_suffix_count = profiling.removed_right_edge_suffix_count;
+                    event.right_edge_suffix_fully_removed = profiling.right_edge_suffix_fully_removed;
+                    event.tree_truncated = profiling.tree_truncated;
+                    event.truncated_levels_count = profiling.truncated_levels_count;
+                    event.tree_size_before = profiling.tree_size_before;
+                    event.tree_size_after = profiling.tree_size_after;
+                    event.tree_leaf_count_before = profiling.tree_leaf_count_before;
+                    event.tree_leaf_count_after = profiling.tree_leaf_count_after;
+                    event.commit_semantics = match final_commit_op {
+                        "commit_create_protocol_add" =>
+                            Some("add_with_update_path_and_welcome".to_string()),
+                        "commit_create_protocol_remove" =>
+                            if profiling.force_self_update {
+                                Some("remove_with_forced_update_path".to_string())
+                            } else {
+                                Some("remove_with_required_update_path".to_string())
+                            },
+                        _ =>
+                            if profiling.force_self_update {
+                                Some("forced_self_update".to_string())
+                            } else {
+                                Some("required_self_update".to_string())
+                            },
+                    };
+                    event.add_semantics = match final_commit_op {
+                        "commit_create_protocol_add" =>
+                            Some("add_with_forced_update_path_and_welcome".to_string()),
+                        _ => None,
+                    };
                 }
                 if let Some(update_path_profile) = update_path_profile.as_ref() {
                     fill_update_path_profile(&mut event, update_path_profile);

@@ -55,6 +55,10 @@ use crate::{
 };
 #[cfg(doc)]
 use crate::{framing::PublicMessage, group::MlsGroup};
+#[cfg(feature = "profiling-json")]
+use crate::profiling::{emit_event, ProfileScope};
+#[cfg(feature = "profiling-json")]
+use allocation_counter::measure;
 
 pub(crate) mod builder;
 pub(crate) mod diff;
@@ -247,9 +251,36 @@ impl PublicGroup {
                 .clone()
                 .into_signature_public_key_enriched(ciphersuite.signature_algorithm());
 
-            verifiable_group_info
-                .verify(crypto, &signer_signature_key)
-                .map_err(|_| CreationFromExternalError::InvalidGroupInfoSignature)?
+            #[cfg(feature = "profiling-json")]
+            {
+                let scope = ProfileScope::start(
+                    "join_from_welcome.group_info_signature_verify",
+                    "openmls",
+                );
+                let mut measured: Option<Result<GroupInfo, _>> = None;
+                let allocation_info = measure(|| {
+                    measured = Some(verifiable_group_info.verify(crypto, &signer_signature_key));
+                });
+                let group_info = measured
+                    .expect("allocation_counter measure closure did not run")
+                    .map_err(|_| CreationFromExternalError::InvalidGroupInfoSignature)?;
+                if let Some(scope) = scope {
+                    let mut event = scope.finish();
+                    event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                    event.signature_verify_count = Some(1);
+                    event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                    event.alloc_count = Some(allocation_info.count_total as u64);
+                    emit_event(&event);
+                }
+                group_info
+            }
+
+            #[cfg(not(feature = "profiling-json"))]
+            {
+                verifiable_group_info
+                    .verify(crypto, &signer_signature_key)
+                    .map_err(|_| CreationFromExternalError::InvalidGroupInfoSignature)?
+            }
         };
 
         // https://validation.openmls.tech/#valn1405

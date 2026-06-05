@@ -43,10 +43,14 @@ thread_local! {
     pub(crate) static LAST_GENERATION_GAP: Cell<Option<u64>> = const { Cell::new(None) };
     pub(crate) static LAST_OUT_OF_ORDER: Cell<Option<bool>> = const { Cell::new(None) };
     static COMMIT_RECEIVE_CONTEXT: RefCell<Option<CommitReceiveContext>> = const { RefCell::new(None) };
+    static BENCHMARK_CONTEXT: RefCell<Option<BenchmarkContext>> = const { RefCell::new(None) };
+    /// Worker/client ID for span identity.
+    /// Set before each command by the benchmark runner.
+    pub(crate) static WORKER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Debug, Default)]
-#[allow(dead_code)]
+#[allow(dead_code, missing_docs)]
 pub struct CommitReceiveContext {
     pub commit_create_op: Option<String>,
     pub commit_receive_sampling_policy: Option<String>,
@@ -55,6 +59,40 @@ pub struct CommitReceiveContext {
     pub commit_receive_sample_count: Option<usize>,
     pub commit_receive_population_size: Option<usize>,
     pub commit_id: Option<String>,
+    pub group_epoch: Option<u64>,
+    pub tree_size: Option<u32>,
+    pub member_count: Option<usize>,
+    pub ciphersuite: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+#[allow(missing_docs)]
+pub struct BenchmarkContext {
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    /// Human-readable label for the configured payload size (e.g. "32", "256").
+    /// Distinct from actual measured sizes like app_msg_plaintext_bytes.
+    pub configured_payload_label: Option<String>,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
+    pub ciphersuite: Option<String>,
+}
+
+pub fn set_benchmark_context(ctx: BenchmarkContext) {
+    BENCHMARK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+pub fn clear_benchmark_context() {
+    BENCHMARK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
 }
 
 pub fn set_commit_receive_context(ctx: CommitReceiveContext) {
@@ -65,6 +103,18 @@ pub fn set_commit_receive_context(ctx: CommitReceiveContext) {
 
 pub fn clear_commit_receive_context() {
     COMMIT_RECEIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+pub fn set_worker_id(id: String) {
+    WORKER_ID.with(|slot| {
+        *slot.borrow_mut() = Some(id);
+    });
+}
+
+pub fn clear_worker_id() {
+    WORKER_ID.with(|slot| {
         *slot.borrow_mut() = None;
     });
 }
@@ -225,6 +275,8 @@ fn span_kind_for_op(op: &str) -> &'static str {
         "tree_structure"
     } else if op.ends_with(".key_schedule_step") {
         "key_schedule"
+    } else if op == "join_from_welcome.group_info_signature_verify" {
+        "authentication"
     } else if op.starts_with("join_from_welcome.") {
         "protocol_core"
     } else if op.starts_with("self_update.")
@@ -645,6 +697,7 @@ pub(crate) struct ProfileEvent {
     pub welcome_bytes: Option<usize>,
     pub ratchet_tree_bytes: Option<usize>,
     pub welcome_plus_ratchet_tree_bytes: Option<usize>,
+    pub group_info_bytes: Option<usize>,
     pub encrypted_group_info_bytes: Option<usize>,
     pub encrypted_secrets_count: Option<usize>,
 
@@ -697,6 +750,10 @@ pub(crate) struct ProfileEvent {
     pub commit_message_size_bytes: Option<usize>,
     pub commit_kind: Option<String>,
     pub commit_create_op: Option<String>,
+    pub commit_semantics: Option<String>,
+    /// Explicit add semantics: always "add_with_forced_update_path_and_welcome"
+    /// for Add operations, because measured Add includes forced UpdatePath and Welcome work.
+    pub add_semantics: Option<String>,
     pub commit_id: Option<String>,
     pub commit_has_path: Option<bool>,
     pub commit_is_external: Option<bool>,
@@ -742,12 +799,26 @@ pub(crate) struct ProfileEvent {
 
     pub pid: u32,
     pub thread_id: String,
+    pub worker_id: Option<String>,
+    pub global_span_id: Option<String>,
+    pub parent_global_span_id: Option<String>,
 
     pub run_id: Option<String>,
     pub scenario: Option<String>,
     pub scenario_seed: Option<u64>,
     pub node_name: Option<String>,
     pub pod_name: Option<String>,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
+
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    pub configured_payload_label: Option<String>,
 }
 
 pub(crate) fn emit_event(event: &ProfileEvent) {
@@ -861,8 +932,8 @@ impl ProfileScope {
         self.finished = true;
         pop_span_id(self.span_id);
 
-        ProfileEvent {
-            profile_schema_version: 5,
+        let mut event = ProfileEvent {
+            profile_schema_version: 6,
             ts_unix_ns: unix_timestamp_ns(),
             measurement_class: measurement_class_for_op(&op).to_string(),
             measurement_plane: measurement_plane_for_op(&op).to_string(),
@@ -891,6 +962,7 @@ impl ProfileScope {
             welcome_bytes: None,
             ratchet_tree_bytes: None,
             welcome_plus_ratchet_tree_bytes: None,
+            group_info_bytes: None,
             encrypted_group_info_bytes: None,
             encrypted_secrets_count: None,
 
@@ -943,6 +1015,8 @@ impl ProfileScope {
             commit_message_size_bytes: None,
             commit_kind: None,
             commit_create_op: None,
+            commit_semantics: None,
+            add_semantics: None,
             commit_id: None,
             commit_has_path: None,
             commit_is_external: None,
@@ -988,13 +1062,87 @@ impl ProfileScope {
 
             pid: current_pid(),
             thread_id: current_thread_id(),
+            worker_id: None,
+            global_span_id: None,
+            parent_global_span_id: None,
 
             run_id: env_or_none("OPENMLS_PROFILE_RUN_ID"),
             scenario: env_or_none("OPENMLS_PROFILE_SCENARIO"),
             scenario_seed: env_u64_or_none("OPENMLS_PROFILE_SCENARIO_SEED"),
             node_name: env_or_none("OPENMLS_PROFILE_NODE"),
             pod_name: env_or_none("OPENMLS_PROFILE_POD"),
+            device_kind: env_or_none("OPENMLS_PROFILE_DEVICE_KIND"),
+            execution_backend: env_or_none("OPENMLS_PROFILE_EXECUTION_BACKEND"),
+
+            benchmark_plateau_index: None,
+            benchmark_target_size: None,
+            benchmark_active_size: None,
+            benchmark_phase: None,
+            benchmark_operation: None,
+            benchmark_operation_seq: None,
+            benchmark_payload_size: None,
+            configured_payload_label: None,
+        };
+
+        COMMIT_RECEIVE_CONTEXT.with(|slot| {
+            if let Some(ctx) = slot.borrow().as_ref() {
+                event.commit_create_op = ctx.commit_create_op.clone();
+                event.commit_receive_sampling_policy = ctx.commit_receive_sampling_policy.clone();
+                event.commit_receive_sampling_seed = ctx.commit_receive_sampling_seed;
+                event.commit_receive_sample_index = ctx.commit_receive_sample_index;
+                event.commit_receive_sample_count = ctx.commit_receive_sample_count;
+                event.commit_receive_population_size = ctx.commit_receive_population_size;
+                event.commit_id = ctx.commit_id.clone();
+                event.group_epoch = ctx.group_epoch;
+                event.tree_size = ctx.tree_size;
+                event.member_count = ctx.member_count;
+                event.ciphersuite = ctx.ciphersuite.clone();
+            }
+        });
+
+        BENCHMARK_CONTEXT.with(|slot| {
+            if let Some(ctx) = slot.borrow().as_ref() {
+                event.benchmark_plateau_index = ctx.benchmark_plateau_index;
+                event.benchmark_target_size = ctx.benchmark_target_size;
+                event.benchmark_active_size = ctx.benchmark_active_size;
+                event.benchmark_phase = ctx.benchmark_phase.clone();
+                event.benchmark_operation = ctx.benchmark_operation.clone();
+                event.benchmark_operation_seq = ctx.benchmark_operation_seq;
+                event.benchmark_payload_size = ctx.benchmark_payload_size;
+                event.configured_payload_label = ctx.configured_payload_label.clone();
+                if ctx.device_kind.is_some() {
+                    event.device_kind = ctx.device_kind.clone();
+                }
+                if ctx.execution_backend.is_some() {
+                    event.execution_backend = ctx.execution_backend.clone();
+                }
+                if ctx.ciphersuite.is_some() {
+                    event.ciphersuite = ctx.ciphersuite.clone();
+                }
+            }
+        });
+
+        WORKER_ID.with(|slot| {
+            if let Some(worker_id) = slot.borrow().as_ref() {
+                event.worker_id = Some(worker_id.clone());
+                event.global_span_id = Some(format!("{}:{}", worker_id, event.span_id));
+                event.parent_global_span_id = event
+                    .parent_span_id
+                    .map(|pid| format!("{}:{}", worker_id, pid));
+            }
+        });
+
+        if event.worker_id.is_none() {
+            if let Some(wid) = env_or_none("OPENMLS_PROFILE_WORKER_ID") {
+                event.worker_id = Some(wid.clone());
+                event.global_span_id = Some(format!("{}:{}", wid, event.span_id));
+                event.parent_global_span_id = event
+                    .parent_span_id
+                    .map(|pid| format!("{}:{}", wid, pid));
+            }
         }
+
+        event
     }
 }
 

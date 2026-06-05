@@ -159,6 +159,8 @@ pub struct SignalProfileEvent {
     pub scenario_seed: Option<u64>,
     pub node_name: Option<String>,
     pub pod_name: Option<String>,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

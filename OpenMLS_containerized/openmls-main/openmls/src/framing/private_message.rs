@@ -108,7 +108,7 @@ impl PrivateMessage {
         ciphersuite: Ciphersuite,
         message_secrets: &mut MessageSecrets,
         padding_size: usize,
-    ) -> Result<(PrivateMessage, u32), MessageEncryptionError<T>> {
+    ) -> Result<PrivateMessage, MessageEncryptionError<T>> {
         Self::encrypt_content(
             crypto,
             rand,
@@ -118,6 +118,7 @@ impl PrivateMessage {
             message_secrets,
             padding_size,
         )
+        .map(|(message, _generation)| message)
     }
 
     #[cfg(test)]
@@ -129,7 +130,7 @@ impl PrivateMessage {
         header: MlsMessageHeader,
         message_secrets: &mut MessageSecrets,
         padding_size: usize,
-    ) -> Result<(PrivateMessage, u32), MessageEncryptionError<T>> {
+    ) -> Result<PrivateMessage, MessageEncryptionError<T>> {
         Self::encrypt_content(
             crypto,
             rand,
@@ -139,6 +140,7 @@ impl PrivateMessage {
             message_secrets,
             padding_size,
         )
+        .map(|(message, _generation)| message)
     }
 
     /// Internal function to encrypt content. The extra message header is only used
@@ -274,39 +276,84 @@ impl PrivateMessage {
         let sender_data_scope =
             ProfileScope::start("application_message_create.sender_data_encrypt", "openmls");
         // Derive the sender data key + nonce, then AEAD encrypt sender data.
-        let sender_data_key = message_secrets
-            .sender_data_secret()
-            .derive_aead_key(crypto, ciphersuite, &ciphertext)
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        let sender_data_nonce = message_secrets
-            .sender_data_secret()
-            .derive_aead_nonce(ciphersuite, crypto, &ciphertext)
-            .map_err(LibraryError::unexpected_crypto_error)?;
-        let mls_sender_data_aad = MlsSenderDataAad::new(
-            header.group_id.clone(),
-            header.epoch,
-            public_message.content().content_type(),
-        );
-        let mls_sender_data_aad_bytes = mls_sender_data_aad
-            .tls_serialize_detached()
-            .map_err(LibraryError::missing_bound_check)?;
-        let sender_data = MlsSenderData::from_sender(header.sender, generation, reuse_guard);
-        let encrypted_sender_data = sender_data_key
-            .aead_seal(
-                crypto,
-                &sender_data
-                    .tls_serialize_detached()
-                    .map_err(LibraryError::missing_bound_check)?,
-                &mls_sender_data_aad_bytes,
-                &sender_data_nonce,
+        #[cfg(feature = "profiling-json")]
+        let (encrypted_sender_data, sender_data_allocation_info) = {
+            let mut measured: Option<Result<_, LibraryError>> = None;
+            let ai = measure(|| {
+                measured = Some((|| {
+                    let sender_data_key = message_secrets
+                        .sender_data_secret()
+                        .derive_aead_key(crypto, ciphersuite, &ciphertext)
+                        .map_err(LibraryError::unexpected_crypto_error)?;
+                    let sender_data_nonce = message_secrets
+                        .sender_data_secret()
+                        .derive_aead_nonce(ciphersuite, crypto, &ciphertext)
+                        .map_err(LibraryError::unexpected_crypto_error)?;
+                    let mls_sender_data_aad = MlsSenderDataAad::new(
+                        header.group_id.clone(),
+                        header.epoch,
+                        public_message.content().content_type(),
+                    );
+                    let mls_sender_data_aad_bytes = mls_sender_data_aad
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?;
+                    let sender_data =
+                        MlsSenderData::from_sender(header.sender, generation, reuse_guard);
+                    sender_data_key
+                        .aead_seal(
+                            crypto,
+                            &sender_data
+                                .tls_serialize_detached()
+                                .map_err(LibraryError::missing_bound_check)?,
+                            &mls_sender_data_aad_bytes,
+                            &sender_data_nonce,
+                        )
+                        .map_err(LibraryError::unexpected_crypto_error)
+                })());
+            });
+            (
+                measured.expect("measure closure did not run")?,
+                ai,
             )
-            .map_err(LibraryError::unexpected_crypto_error)?;
+        };
+        #[cfg(not(feature = "profiling-json"))]
+        let encrypted_sender_data = {
+            let sender_data_key = message_secrets
+                .sender_data_secret()
+                .derive_aead_key(crypto, ciphersuite, &ciphertext)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            let sender_data_nonce = message_secrets
+                .sender_data_secret()
+                .derive_aead_nonce(ciphersuite, crypto, &ciphertext)
+                .map_err(LibraryError::unexpected_crypto_error)?;
+            let mls_sender_data_aad = MlsSenderDataAad::new(
+                header.group_id.clone(),
+                header.epoch,
+                public_message.content().content_type(),
+            );
+            let mls_sender_data_aad_bytes = mls_sender_data_aad
+                .tls_serialize_detached()
+                .map_err(LibraryError::missing_bound_check)?;
+            let sender_data = MlsSenderData::from_sender(header.sender, generation, reuse_guard);
+            sender_data_key
+                .aead_seal(
+                    crypto,
+                    &sender_data
+                        .tls_serialize_detached()
+                        .map_err(LibraryError::missing_bound_check)?,
+                    &mls_sender_data_aad_bytes,
+                    &sender_data_nonce,
+                )
+                .map_err(LibraryError::unexpected_crypto_error)?
+        };
 
         #[cfg(feature = "profiling-json")]
         if let Some(s) = sender_data_scope {
             let mut event = s.finish();
             event.sender_leaf_index = Some(sender_index.u32());
             event.group_epoch = Some(header.epoch.as_u64());
+            event.alloc_bytes = Some(sender_data_allocation_info.bytes_total as u64);
+            event.alloc_count = Some(sender_data_allocation_info.count_total as u64);
             emit_event(&event);
         }
 

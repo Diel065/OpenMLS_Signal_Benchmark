@@ -160,7 +160,7 @@ impl MlsGroup {
         #[cfg(feature = "profiling-json")]
         {
             let parent_scope = ProfileScope::start("join_from_welcome_protocol", "openmls");
-            let mut allocation_info = allocation_counter::AllocationInfo::default();
+            let mut allocation_info: allocation_counter::AllocationInfo;
 
             // Step 1: Decrypt and parse Welcome (HPKE, GroupSecrets, GroupInfo)
             let processed_welcome = {
@@ -188,6 +188,13 @@ impl MlsGroup {
                 processed
             };
 
+            // Determine ratchet tree delivery mode from GroupInfo extensions
+            let ratchet_tree_embedded = processed_welcome
+                .unverified_group_info()
+                .extensions()
+                .ratchet_tree()
+                .is_some();
+
             // Step 2: Ratchet tree parsing and validation, key schedule
             // PublicGroup metadata is unavailable until after into_staged_welcome,
             // and StagedWelcome's internals are crate-private. Tree metadata
@@ -209,6 +216,15 @@ impl MlsGroup {
                 if let Some(s) = child_scope {
                     let mut event = s.finish();
                     event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
+                    event.ratchet_tree_included = Some(ratchet_tree_embedded);
+                    event.ratchet_tree_delivery_mode = Some(
+                        if ratchet_tree_embedded {
+                            "welcome_extension"
+                        } else {
+                            "not_in_welcome"
+                        }
+                        .to_string(),
+                    );
                     event.alloc_bytes = Some(ai.bytes_total as u64);
                     event.alloc_count = Some(ai.count_total as u64);
                     emit_event(&event);
@@ -247,6 +263,15 @@ impl MlsGroup {
                     event.member_count = Some(group.members().count());
                     event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
                     event.joiner_leaf_index = Some(joiner_leaf.u32());
+                    event.ratchet_tree_included = Some(ratchet_tree_embedded);
+                    event.ratchet_tree_delivery_mode = Some(
+                        if ratchet_tree_embedded {
+                            "welcome_extension"
+                        } else {
+                            "not_in_welcome"
+                        }
+                        .to_string(),
+                    );
                     event.alloc_bytes = Some(ai.bytes_total as u64);
                     event.alloc_count = Some(ai.count_total as u64);
                     emit_event(&event);
@@ -279,6 +304,15 @@ impl MlsGroup {
                 event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
                 event.welcome_plus_ratchet_tree_bytes =
                     Some(welcome_bytes.len() + ratchet_tree_bytes.len());
+                event.ratchet_tree_included = Some(ratchet_tree_embedded);
+                event.ratchet_tree_delivery_mode = Some(
+                    if ratchet_tree_embedded {
+                        "welcome_extension"
+                    } else {
+                        "not_in_welcome"
+                    }
+                    .to_string(),
+                );
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
                 emit_event(&event);
@@ -289,6 +323,15 @@ impl MlsGroup {
                 event.group_epoch = Some(group.context().epoch().as_u64());
                 event.tree_size = Some(group.treesync().tree_size().u32());
                 event.member_count = Some(group.members().count());
+                event.ratchet_tree_included = Some(ratchet_tree_embedded);
+                event.ratchet_tree_delivery_mode = Some(
+                    if ratchet_tree_embedded {
+                        "welcome_extension"
+                    } else {
+                        "not_in_welcome"
+                    }
+                    .to_string(),
+                );
                 emit_event(event);
             }
 
@@ -296,6 +339,15 @@ impl MlsGroup {
                 event.group_epoch = Some(group.context().epoch().as_u64());
                 event.tree_size = Some(group.treesync().tree_size().u32());
                 event.member_count = Some(group.members().count());
+                event.ratchet_tree_included = Some(ratchet_tree_embedded);
+                event.ratchet_tree_delivery_mode = Some(
+                    if ratchet_tree_embedded {
+                        "welcome_extension"
+                    } else {
+                        "not_in_welcome"
+                    }
+                    .to_string(),
+                );
                 emit_event(event);
             }
 
@@ -407,6 +459,33 @@ impl ProcessedWelcome {
             return Err(e);
         }
 
+        #[cfg(feature = "profiling-json")]
+        let group_secrets = {
+            let scope =
+                ProfileScope::start("join_from_welcome.group_secrets_hpke_decrypt", "openmls");
+            let mut measured: Option<Result<GroupSecrets, _>> = None;
+            let allocation_info = measure(|| {
+                measured = Some(GroupSecrets::try_from_ciphertext(
+                    key_package_bundle.init_private_key(),
+                    egs.encrypted_group_secrets(),
+                    welcome.encrypted_group_info(),
+                    ciphersuite,
+                    provider.crypto(),
+                ));
+            });
+            let group_secrets =
+                measured.expect("allocation_counter measure closure did not run")?;
+            if let Some(scope) = scope {
+                let mut event = scope.finish();
+                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                event.hpke_decrypt_count = Some(event.hpke_decrypt_count.unwrap_or(1).max(1));
+                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
+                event.alloc_count = Some(allocation_info.count_total as u64);
+                emit_event(&event);
+            }
+            group_secrets
+        };
+        #[cfg(not(feature = "profiling-json"))]
         let group_secrets = GroupSecrets::try_from_ciphertext(
             key_package_bundle.init_private_key(),
             egs.encrypted_group_secrets(),

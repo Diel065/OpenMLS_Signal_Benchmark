@@ -18,6 +18,8 @@ pub struct LocalLaunchConfig {
     pub run_id: String,
     pub scenario: String,
     pub output_dir: String,
+    pub device_kind: Option<String>,
+    pub execution_backend: Option<String>,
 }
 
 pub struct LocalDeployment {
@@ -131,6 +133,14 @@ pub fn launch_local_stack(config: &LocalLaunchConfig) -> Result<LocalDeployment>
             .env("SIGNAL_PROFILE_PATH", profile_path.as_os_str())
             .env("SIGNAL_PROFILE_RUN_ID", &config.run_id)
             .env("SIGNAL_PROFILE_SCENARIO", &config.scenario)
+            .env(
+                "SIGNAL_PROFILE_DEVICE_KIND",
+                config.device_kind.clone().unwrap_or_default(),
+            )
+            .env(
+                "SIGNAL_PROFILE_EXECUTION_BACKEND",
+                config.execution_backend.clone().unwrap_or_default(),
+            )
             .stdout(Stdio::from(worker_log))
             .stderr(Stdio::from(worker_log_err))
             .spawn()
