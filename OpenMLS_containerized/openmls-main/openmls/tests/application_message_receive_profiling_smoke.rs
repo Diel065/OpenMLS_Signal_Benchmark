@@ -221,11 +221,6 @@ fn application_message_receive_profiling_comprehensive() {
         let welcome_bytes = welcome_option
             .tls_serialize_detached()
             .expect("serialize welcome");
-        let tree_bytes = alice_sweep
-            .export_ratchet_tree()
-            .tls_serialize_detached()
-            .expect("serialize tree");
-
         let join_config = MlsGroupJoinConfig::builder()
             .use_ratchet_tree_extension(true)
             .build();
@@ -234,7 +229,6 @@ fn application_message_receive_profiling_comprehensive() {
             bob_sweep_provider,
             &join_config,
             &welcome_bytes,
-            &tree_bytes,
         )
         .expect("bob_sweep join");
 

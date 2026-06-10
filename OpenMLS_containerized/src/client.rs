@@ -1,9 +1,22 @@
 use anyhow::{anyhow, Result};
 use openmls::prelude::*;
-use openmls::treesync::RatchetTreeIn;
+use openmls::profiling::{
+    wrap_add_commit_total, finish_and_emit,
+    clear_commit_receive_op_context, set_commit_receive_op_context,
+    clear_app_message_create_context, set_app_message_create_context,
+    clear_app_message_receive_context, set_app_message_receive_context,
+    clear_update_commit_create_context, set_update_commit_create_context,
+    clear_remove_commit_create_context, set_remove_commit_create_context,
+    clear_key_package_create_context, set_key_package_create_context,
+    clear_welcome_receive_context, set_welcome_receive_context,
+    AppMessageCreateContext, AppMessageReceiveContext,
+    CommitReceiveOpContext, ProfileScope,
+    UpdateCommitCreateContext, RemoveCommitCreateContext,
+    KeyPackageCreateContext, WelcomeReceiveContext,
+};
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
-use tls_codec::{Deserialize, Serialize};
+use tls_codec::{Deserialize, Serialize, Size};
 
 use crate::debug::{debug_logs_enabled, print_bytes};
 
@@ -27,7 +40,6 @@ pub enum CommitReceiveOutcome {
         self_removed: bool,
         welcome_recipients: Vec<String>,
         welcome_bytes: Option<Vec<u8>>,
-        ratchet_tree_bytes: Option<Vec<u8>>,
     },
     ExternalCommitApplied {
         self_removed: bool,
@@ -122,7 +134,9 @@ impl Client {
     }
 
     pub fn create_group(&mut self) -> Result<()> {
-        let group_config = MlsGroupCreateConfig::default();
+        let group_config = MlsGroupCreateConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
 
         let group = MlsGroup::new(
             &self.crypto,
@@ -145,23 +159,32 @@ impl Client {
     }
 
     pub fn generate_key_package(&mut self) -> Result<Vec<u8>> {
-        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        set_key_package_create_context(KeyPackageCreateContext::new());
+        let total_scope = ProfileScope::start("key_package_create_total_local", "openmls");
 
-        let key_package_bundle = KeyPackage::builder().build(
-            ciphersuite,
-            &self.crypto,
-            &self.signature_keypair,
-            self.credential_with_key.clone(),
-        )?;
+        let result = (|| -> Result<Vec<u8>, anyhow::Error> {
+            let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+            let key_package_bundle = KeyPackage::builder().build(
+                ciphersuite,
+                &self.crypto,
+                &self.signature_keypair,
+                self.credential_with_key.clone(),
+            )?;
+            let key_package = key_package_bundle.key_package().clone();
+            let key_package_bytes = key_package
+                .tls_serialize_detached()
+                .map_err(|_| anyhow!("Could not serialize KeyPackage"))?;
+            print_bytes(&format!("{} KeyPackage", self.name), &key_package_bytes);
+            Ok(key_package_bytes)
+        })();
 
-        let key_package = key_package_bundle.key_package().clone();
-
-        let key_package_bytes = key_package
-            .tls_serialize_detached()
-            .map_err(|_| anyhow!("Could not serialize KeyPackage"))?;
-        print_bytes(&format!("{} KeyPackage", self.name), &key_package_bytes);
-
-        Ok(key_package_bytes)
+        finish_and_emit(total_scope, |event| {
+            if let Ok(bytes) = &result {
+                event.artifact_size_bytes = Some(bytes.len());
+            }
+        });
+        clear_key_package_create_context();
+        result
     }
 
     fn clear_pending_local_state(&mut self) {
@@ -229,6 +252,17 @@ impl Client {
             ));
         }
 
+        let member_count_before = self
+            .group
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
+        let added_members_count = key_package_bytes_list.len();
+        let member_count_after = member_count_before
+            .checked_add(added_members_count)
+            .ok_or_else(|| anyhow!("AddCommit member count overflow"))?;
+
         let mut key_packages = Vec::with_capacity(key_package_bytes_list.len());
 
         for key_package_bytes in key_package_bytes_list {
@@ -244,18 +278,36 @@ impl Client {
             key_packages.push(key_package);
         }
 
-        let group = self
-            .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("Client is not in a group"))?;
+        // Canonical publication total: local AddCommit create + stage + serialization +
+        // pending-output preparation. Network publication and remote processing happen later.
+        wrap_add_commit_total(
+            member_count_before,
+            member_count_after,
+            added_members_count,
+            || {
+                let (commit_message, welcome_message, group_info) = self
+                    .group
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("Client is not in a group"))?
+                    .add_members(&self.crypto, &self.signature_keypair, &key_packages)?;
+                let group_info = group_info
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("AddCommit did not produce GroupInfo"))?;
+                let ratchet_tree = group_info.extensions().ratchet_tree().ok_or_else(|| {
+                    anyhow!("AddCommit GroupInfo is missing the ratchet tree extension")
+                })?;
+                if ratchet_tree.ratchet_tree().tls_serialized_len() == 0 {
+                    return Err(anyhow!(
+                        "AddCommit GroupInfo contains an empty ratchet tree extension"
+                    ));
+                }
 
-        let (commit_message, welcome_message, _group_info) =
-            group.add_members(&self.crypto, &self.signature_keypair, &key_packages)?;
-
-        self.store_pending_epoch_change(
-            commit_message,
-            Some(welcome_message),
-            member_names.to_vec(),
+                self.store_pending_epoch_change(
+                    commit_message,
+                    Some(welcome_message),
+                    member_names.to_vec(),
+                )
+            },
         )
     }
 
@@ -284,34 +336,65 @@ impl Client {
     }
 
     pub fn remove_members(&mut self, target_names: &[String]) -> Result<EpochChangeOutput> {
-        let target_indices = self.find_member_indices_by_name(target_names)?;
-
-        let group = self
+        let member_count_before = self
             .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
+        let removed_count = target_names.len();
 
-        let (commit_message, _welcome_option, _group_info) =
-            group.remove_members(&self.crypto, &self.signature_keypair, &target_indices)?;
+        set_remove_commit_create_context(
+            RemoveCommitCreateContext::new(member_count_before, removed_count)
+        );
+        let total_scope = ProfileScope::start("remove_commit_create_total_local", "openmls");
 
-        self.store_pending_epoch_change(commit_message, None, Vec::new())
+        let result = (|| -> Result<EpochChangeOutput, anyhow::Error> {
+            let target_indices = self.find_member_indices_by_name(target_names)?;
+            let group = self
+                .group
+                .as_mut()
+                .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            let (commit_message, _welcome_option, _group_info) =
+                group.remove_members(&self.crypto, &self.signature_keypair, &target_indices)?;
+            self.store_pending_epoch_change(commit_message, None, Vec::new())
+        })();
+
+        finish_and_emit(total_scope, |_| {});
+        clear_remove_commit_create_context();
+        result
     }
 
     pub fn self_update(&mut self) -> Result<EpochChangeOutput> {
-        let group = self
+        let member_count = self
             .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
 
-        let message_bundle = group.self_update(
-            &self.crypto,
-            &self.signature_keypair,
-            LeafNodeParameters::default(),
-        )?;
+        set_update_commit_create_context(
+            UpdateCommitCreateContext::new(member_count)
+        );
+        let total_scope = ProfileScope::start("update_commit_create_total_local", "openmls");
 
-        let (commit_message, _welcome_option, _group_info) = message_bundle.into_contents();
+        let result = (|| -> Result<EpochChangeOutput, anyhow::Error> {
+            let group = self
+                .group
+                .as_mut()
+                .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            let message_bundle = group.self_update(
+                &self.crypto,
+                &self.signature_keypair,
+                LeafNodeParameters::default(),
+            )?;
+            let (commit_message, _welcome_option, _group_info) = message_bundle.into_contents();
+            self.store_pending_epoch_change(commit_message, None, Vec::new())
+        })();
 
-        self.store_pending_epoch_change(commit_message, None, Vec::new())
+        finish_and_emit(total_scope, |_| {});
+        clear_update_commit_create_context();
+        result
     }
 
     pub fn rollback_pending_commit(&mut self) -> Result<()> {
@@ -329,37 +412,65 @@ impl Client {
         Ok(())
     }
 
-    pub fn join_from_welcome(
-        &mut self,
-        welcome_bytes: &[u8],
-        ratchet_tree_bytes: &[u8],
-    ) -> Result<()> {
-        let join_config = MlsGroupJoinConfig::default();
+    pub fn join_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
+        let welcome_len = welcome_bytes.len();
+        set_welcome_receive_context(WelcomeReceiveContext::new(0));
+        let total_scope = ProfileScope::start("welcome_receive_total_local", "openmls");
 
-        let group = MlsGroup::join_from_welcome_bytes_profiled(
-            &self.crypto,
-            &join_config,
-            welcome_bytes,
-            ratchet_tree_bytes,
-        )?;
+        let result = (|| -> Result<usize, anyhow::Error> {
+            let join_config = MlsGroupJoinConfig::builder()
+                .use_ratchet_tree_extension(true)
+                .build();
+            let group =
+                MlsGroup::join_from_welcome_bytes_profiled(&self.crypto, &join_config, welcome_bytes)?;
+            let member_count = group.members().count();
+            self.group = Some(group);
+            Ok(member_count)
+        })();
 
-        self.group = Some(group);
-        Ok(())
+        finish_and_emit(total_scope, |event| {
+            if let Ok(member_count) = &result {
+                event.member_count = Some(*member_count);
+                event.member_count_before = Some(0);
+                event.member_count_after = Some(*member_count);
+            }
+            event.welcome_bytes = Some(welcome_len);
+        });
+        clear_welcome_receive_context();
+        result.map(|_| ())
     }
 
     pub fn send_application_message(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let group = self
+        let member_count = self
             .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
 
-        let message = group.create_message(&self.crypto, &self.signature_keypair, plaintext)?;
+        set_app_message_create_context(
+            AppMessageCreateContext::new(member_count)
+        );
+        let total_scope = ProfileScope::start("application_message_create_total_local", "openmls");
 
-        let message_bytes = message
-            .tls_serialize_detached()
-            .map_err(|_| anyhow!("Could not serialize application message"))?;
+        let result = (|| -> Result<Vec<u8>, anyhow::Error> {
+            let group = self
+                .group
+                .as_mut()
+                .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-        Ok(message_bytes)
+            let message = group.create_message(&self.crypto, &self.signature_keypair, plaintext)?;
+
+            let message_bytes = message
+                .tls_serialize_detached()
+                .map_err(|_| anyhow!("Could not serialize application message"))?;
+
+            Ok(message_bytes)
+        })();
+
+        finish_and_emit(total_scope, |_| {});
+        clear_app_message_create_context();
+        result
     }
 
     pub fn receive_application_message(
@@ -367,20 +478,38 @@ impl Client {
         message_bytes: &[u8],
         profile: bool,
     ) -> Result<Vec<u8>> {
-        let group = self
+        let member_count = self
             .group
-            .as_mut()
-            .ok_or_else(|| anyhow!("Client is not in a group"))?;
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
 
-        let processed_message =
-            group.process_message_from_bytes_profiled(&self.crypto, message_bytes, profile)?;
+        set_app_message_receive_context(
+            AppMessageReceiveContext::new(member_count)
+        );
+        let total_scope = ProfileScope::start("application_message_receive_total_local", "openmls");
 
-        match processed_message.into_content() {
-            ProcessedMessageContent::ApplicationMessage(application_message) => {
-                Ok(application_message.into_bytes())
+        let result = (|| -> Result<Vec<u8>, anyhow::Error> {
+            let group = self
+                .group
+                .as_mut()
+                .ok_or_else(|| anyhow!("Client is not in a group"))?;
+
+            let processed_message =
+                group.process_message_from_bytes_profiled(&self.crypto, message_bytes, profile)?;
+
+            match processed_message.into_content() {
+                ProcessedMessageContent::ApplicationMessage(application_message) => {
+                    Ok(application_message.into_bytes())
+                }
+                _ => Err(anyhow!("Expected an application message")),
             }
-            _ => Err(anyhow!("Expected an application message")),
-        }
+        })();
+
+        finish_and_emit(total_scope, |_| {});
+        clear_app_message_receive_context();
+        result
     }
 
     pub fn receive_commit(
@@ -395,7 +524,7 @@ impl Client {
             .unwrap_or(false);
 
         if is_own_pending_commit {
-            let (welcome_recipients, welcome_bytes, ratchet_tree_bytes) = {
+            let (welcome_recipients, welcome_bytes) = {
                 let group = self
                     .group
                     .as_mut()
@@ -408,18 +537,7 @@ impl Client {
                 let welcome_recipients = std::mem::take(&mut self.pending_welcome_recipients);
                 let welcome_bytes = self.pending_welcome_bytes.take();
 
-                let ratchet_tree_bytes = if welcome_bytes.is_some() {
-                    let ratchet_tree: RatchetTreeIn = group.export_ratchet_tree().into();
-                    let bytes = ratchet_tree
-                        .tls_serialize_detached()
-                        .map_err(|_| anyhow!("Could not serialize ratchet tree"))?;
-                    print_bytes(&format!("{} ratchet tree", self.name), &bytes);
-                    Some(bytes)
-                } else {
-                    None
-                };
-
-                (welcome_recipients, welcome_bytes, ratchet_tree_bytes)
+                (welcome_recipients, welcome_bytes)
             };
 
             self.pending_commit_bytes = None;
@@ -429,17 +547,28 @@ impl Client {
                 self_removed,
                 welcome_recipients,
                 welcome_bytes,
-                ratchet_tree_bytes,
             });
         }
 
-        {
+        let member_count_before = self
+            .group
+            .as_ref()
+            .ok_or_else(|| anyhow!("Client is not in a group"))?
+            .members()
+            .count();
+
+        set_commit_receive_op_context(
+            CommitReceiveOpContext::new(member_count_before, member_count_before)
+        );
+        let total_scope = ProfileScope::start("commit_receive_total_local", "openmls");
+
+        let process_result = (|| -> Result<(), anyhow::Error> {
             let group = self
                 .group
                 .as_mut()
                 .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-            let processed_message = if profile.enabled {
+            let processed = if profile.enabled {
                 group.process_commit_message_from_bytes_profiled(
                     &self.crypto,
                     commit_bytes,
@@ -459,7 +588,7 @@ impl Client {
                 group.process_message(&self.crypto, protocol_message)?
             };
 
-            match processed_message.into_content() {
+            match processed.into_content() {
                 ProcessedMessageContent::StagedCommitMessage(staged_commit) => {
                     group
                         .merge_staged_commit(&self.crypto, *staged_commit)
@@ -467,7 +596,13 @@ impl Client {
                 }
                 _ => return Err(anyhow!("Expected a staged commit message")),
             }
-        }
+
+            Ok(())
+        })();
+
+        finish_and_emit(total_scope, |_| {});
+        clear_commit_receive_op_context();
+        process_result?;
 
         let self_removed = self.cleanup_if_removed()?;
 

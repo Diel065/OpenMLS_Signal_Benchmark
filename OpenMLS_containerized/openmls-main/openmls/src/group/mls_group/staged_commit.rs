@@ -6,7 +6,7 @@ use openmls_traits::storage::StorageProvider as _;
 use serde::{Deserialize, Serialize};
 use tls_codec::Serialize as _;
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, update_commit_receive_op_context, ProfileScope};
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 
@@ -290,6 +290,14 @@ impl MlsGroup {
                 #[cfg(feature = "profiling-json")]
                 let up_scope = ProfileScope::start("commit_receive.update_path_validate", "openmls");
                 #[cfg(feature = "profiling-json")]
+                let update_path_profiling = {
+                    let fdp_len = path.nodes().len();
+                    let sum_copath = path.nodes().iter()
+                        .map(|n| n.encrypted_path_secret_count())
+                        .sum::<usize>();
+                    (fdp_len, sum_copath)
+                };
+                #[cfg(feature = "profiling-json")]
                 let update_path_allocation_info = {
                     let mut measured_result = None;
                     let allocation_info = measure(|| {
@@ -319,6 +327,12 @@ impl MlsGroup {
                     event.update_path_present = Some(true);
                     event.alloc_bytes = Some(update_path_allocation_info.bytes_total as u64);
                     event.alloc_count = Some(update_path_allocation_info.count_total as u64);
+
+                    update_commit_receive_op_context(|ctx| {
+                        ctx.filtered_direct_path_len = Some(update_path_profiling.0);
+                        ctx.sum_copath_resolution_sizes = Some(update_path_profiling.1);
+                    });
+
                     emit_event(&event);
                 }
 

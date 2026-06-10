@@ -344,8 +344,10 @@ impl TreeSyncDiff<'_> {
             event.update_path_nodes_count = Some(path_len);
             event.path_secret_derivation_count = Some(path_len as u64);
             event.node_secret_derivation_count = Some(path_len as u64);
-            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-            event.alloc_count = Some(allocation_info.count_total as u64);
+            event.set_current_thread_allocations(
+                allocation_info.bytes_total as u64,
+                allocation_info.count_total as u64,
+            );
             event.ciphersuite = Some(format!("{:?}", ciphersuite));
         });
 
@@ -529,8 +531,10 @@ impl TreeSyncDiff<'_> {
                 event.tree_size = Some(self.diff.size().u32());
                 event.filtered_direct_path_len = Some(path_len);
                 event.update_path_nodes_count = Some(path_len);
-                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.set_current_thread_allocations(
+                    allocation_info.bytes_total as u64,
+                    allocation_info.count_total as u64,
+                );
                 event.ciphersuite = Some(format!("{:?}", ciphersuite));
             });
         }

@@ -38,6 +38,7 @@ fn commit_add_profiling_smoke() {
 
     let mls_group_create_config = MlsGroupCreateConfig::builder()
         .ciphersuite(ciphersuite)
+        .use_ratchet_tree_extension(true)
         .build();
 
     let mut alice_group = MlsGroup::new(
@@ -143,8 +144,19 @@ fn commit_add_profiling_smoke() {
                     event["ratchet_tree_bytes"].as_u64().unwrap_or_default() > 0,
                     "GroupInfo AEAD span must carry ratchet-tree artifact bytes"
                 );
-                assert_eq!(event["ratchet_tree_included"].as_bool(), Some(false));
-                assert_eq!(event["ratchet_tree_delivery_mode"].as_str(), Some("out_of_band"));
+                assert_eq!(event["ratchet_tree_included"].as_bool(), Some(true));
+                assert_eq!(
+                    event["ratchet_tree_delivery_mode"].as_str(),
+                    Some("welcome_extension")
+                );
+                assert_eq!(
+                    event["group_info_plaintext_bytes"].as_u64(),
+                    event["group_info_bytes"].as_u64()
+                );
+                assert_eq!(
+                    event["group_info_ciphertext_bytes"].as_u64(),
+                    event["encrypted_group_info_bytes"].as_u64()
+                );
                 assert!(
                     event["alloc_bytes"].as_u64().is_some(),
                     "GroupInfo AEAD span must record allocation bytes"
@@ -157,14 +169,15 @@ fn commit_add_profiling_smoke() {
             Some("welcome_create_protocol") => {
                 if event["ratchet_tree_bytes"].as_u64().unwrap_or_default() > 0 {
                     saw_welcome_with_tree_metadata = true;
-                    assert_eq!(event["ratchet_tree_included"].as_bool(), Some(false));
-                    assert_eq!(event["ratchet_tree_delivery_mode"].as_str(), Some("out_of_band"));
-                    assert!(
-                        event["welcome_plus_ratchet_tree_bytes"]
-                            .as_u64()
-                            .unwrap_or_default()
-                            > event["welcome_bytes"].as_u64().unwrap_or_default(),
-                        "Welcome plus ratchet tree bytes must include both artifacts"
+                    assert_eq!(event["ratchet_tree_included"].as_bool(), Some(true));
+                    assert_eq!(
+                        event["ratchet_tree_delivery_mode"].as_str(),
+                        Some("welcome_extension")
+                    );
+                    assert_eq!(
+                        event["welcome_plus_ratchet_tree_bytes"].as_u64(),
+                        event["welcome_bytes"].as_u64(),
+                        "the serialized Welcome already contains the ratchet tree extension"
                     );
                 }
             }

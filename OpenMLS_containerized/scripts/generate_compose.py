@@ -413,6 +413,12 @@ class ClientLayoutEntry:
             "profile_enabled": self.profile_enabled,
             "command_url": self.command_url,
             "health_url": self.health_url,
+            "execution_backend": "docker_container",
+            "device_kind": "scratch_container",
+            "transport": "docker_bridge",
+            "access_backend": "docker",
+            "arch": "x86_64",
+            "rust_target": "x86_64-unknown-linux-musl",
         }
 
 
@@ -440,6 +446,12 @@ class PhysicalWorkerEntry:
             "client_ids": self.client_ids,
             "base_url": self.base_url,
             "profile_enabled_client_ids": self.profile_enabled_client_ids,
+            "execution_backend": "docker_container",
+            "device_kind": "scratch_container",
+            "transport": "docker_bridge",
+            "access_backend": "docker",
+            "arch": "x86_64",
+            "rust_target": "x86_64-unknown-linux-musl",
         }
         data.update(self.resource_limits)
         return data

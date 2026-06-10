@@ -10,6 +10,8 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
+use openmls::profiling::{set_benchmark_context, set_worker_id, BenchmarkContext};
+
 use crate::client::{Client, CommitReceiveOutcome, CommitReceiveProfileOptions, EpochChangeOutput};
 use crate::http_retry::{
     is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
@@ -135,6 +137,16 @@ pub struct CommandRequestEnvelope {
     #[serde(default)]
     pub benchmark_payload_size: Option<usize>,
     #[serde(default)]
+    pub membership_batch_requested: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_effective: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_group_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_transition_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_source: Option<String>,
+    #[serde(default)]
     pub device_kind: Option<String>,
     #[serde(default)]
     pub execution_backend: Option<String>,
@@ -158,6 +170,11 @@ pub struct BenchmarkContextFields {
     pub benchmark_operation: Option<String>,
     pub benchmark_operation_seq: Option<usize>,
     pub benchmark_payload_size: Option<usize>,
+    pub membership_batch_requested: Option<usize>,
+    pub membership_batch_effective: Option<usize>,
+    pub membership_batch_group_cap: Option<usize>,
+    pub membership_batch_transition_cap: Option<usize>,
+    pub membership_batch_source: Option<String>,
     pub device_kind: Option<String>,
     pub execution_backend: Option<String>,
     pub ciphersuite: Option<String>,
@@ -187,6 +204,11 @@ impl IncomingCommandRequest {
                     benchmark_operation: envelope.benchmark_operation,
                     benchmark_operation_seq: envelope.benchmark_operation_seq,
                     benchmark_payload_size: envelope.benchmark_payload_size,
+                    membership_batch_requested: envelope.membership_batch_requested,
+                    membership_batch_effective: envelope.membership_batch_effective,
+                    membership_batch_group_cap: envelope.membership_batch_group_cap,
+                    membership_batch_transition_cap: envelope.membership_batch_transition_cap,
+                    membership_batch_source: envelope.membership_batch_source,
                     device_kind: envelope.device_kind,
                     execution_backend: envelope.execution_backend,
                     ciphersuite: envelope.ciphersuite,
@@ -252,6 +274,16 @@ pub struct BatchCommandItem {
     pub benchmark_operation_seq: Option<usize>,
     #[serde(default)]
     pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_requested: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_effective: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_group_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_transition_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_source: Option<String>,
     #[serde(default)]
     pub device_kind: Option<String>,
     #[serde(default)]
@@ -367,11 +399,15 @@ pub enum PendingIntent {
     AddMembers {
         members: Vec<String>,
         key_package_bytes_list: Vec<Vec<u8>>,
+        benchmark_context: BenchmarkContext,
     },
     RemoveMembers {
         members: Vec<String>,
+        benchmark_context: BenchmarkContext,
     },
-    SelfUpdate,
+    SelfUpdate {
+        benchmark_context: BenchmarkContext,
+    },
 }
 
 #[cfg(test)]
@@ -996,9 +1032,25 @@ pub async fn try_start_intent(
         PendingIntent::AddMembers {
             members,
             key_package_bytes_list,
-        } => client.add_members(key_package_bytes_list, members)?,
-        PendingIntent::RemoveMembers { members } => client.remove_members(members)?,
-        PendingIntent::SelfUpdate => client.self_update()?,
+            benchmark_context,
+        } => {
+            set_worker_id(client.name.clone());
+            set_benchmark_context(benchmark_context.clone());
+            client.add_members(key_package_bytes_list, members)?
+        }
+        PendingIntent::RemoveMembers {
+            members,
+            benchmark_context,
+        } => {
+            set_worker_id(client.name.clone());
+            set_benchmark_context(benchmark_context.clone());
+            client.remove_members(members)?
+        }
+        PendingIntent::SelfUpdate { benchmark_context } => {
+            set_worker_id(client.name.clone());
+            set_benchmark_context(benchmark_context.clone());
+            client.self_update()?
+        }
     };
 
     match publish_epoch_change(client, ds_url, result).await? {
@@ -1030,13 +1082,13 @@ pub async fn maybe_retry_pending_intent(
                         members
                     )
                 }
-                PendingIntent::RemoveMembers { members } => {
+                PendingIntent::RemoveMembers { members, .. } => {
                     format!(
                         "queued remove_members for {:?} was retried and published",
                         members
                     )
                 }
-                PendingIntent::SelfUpdate => {
+                PendingIntent::SelfUpdate { .. } => {
                     "queued self_update was retried and published".to_string()
                 }
             };
@@ -1053,13 +1105,23 @@ pub async fn maybe_retry_pending_intent(
     }
 }
 
+fn restore_profiling_context(client: &Client, benchmark_context: &BenchmarkContext) {
+    // Tokio may resume this command on another worker thread after an await.
+    // OpenMLS profiling context is thread-local, so restore it immediately
+    // before every synchronous operation that can emit profiling events.
+    set_worker_id(client.name.clone());
+    set_benchmark_context(benchmark_context.clone());
+}
+
 async fn apply_commit_bytes(
     client: &mut Client,
     ds_url: &str,
     queued_intent: &mut Option<PendingIntent>,
     commit_bytes: &[u8],
     profile: CommitReceiveProfileOptions,
+    benchmark_context: &BenchmarkContext,
 ) -> Result<String> {
+    restore_profiling_context(client, benchmark_context);
     match client.receive_commit(commit_bytes, profile)? {
         CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
             if self_removed {
@@ -1088,18 +1150,16 @@ async fn apply_commit_bytes(
             self_removed,
             welcome_recipients,
             welcome_bytes,
-            ratchet_tree_bytes,
         } => {
             if self_removed {
                 *queued_intent = None;
                 Ok("own commit accepted from DS; this client was removed and local group state was cleared".to_string())
             } else {
-                if let (Some(welcome), Some(tree)) = (welcome_bytes, ratchet_tree_bytes) {
+                if let Some(welcome) = welcome_bytes {
                     let client_id = client.name.clone();
                     let publish_tasks = welcome_recipients.iter().map(|recipient| {
                         let recipient = recipient.clone();
                         let welcome = welcome.clone();
-                        let tree = tree.clone();
                         let client_id = client_id.clone();
                         async move {
                             let welcome_path = format!("/welcome/{recipient}");
@@ -1110,16 +1170,6 @@ async fn apply_commit_bytes(
                                 "store_welcome",
                                 &client_id,
                             )
-                            .await?;
-
-                            let tree_path = format!("/ratchet-tree/{recipient}");
-                            ds_post_bytes(
-                                ds_url,
-                                &tree_path,
-                                tree.clone(),
-                                "store_ratchet_tree",
-                                &client_id,
-                            )
                             .await
                         }
                     });
@@ -1128,7 +1178,7 @@ async fn apply_commit_bytes(
 
                 update_ds_group_state(client, ds_url).await?;
                 Ok(
-                    "own commit accepted from DS; local state updated and welcome/tree published"
+                    "own commit accepted from DS; local state updated and welcome published"
                         .to_string(),
                 )
             }
@@ -1167,6 +1217,7 @@ async fn receive_commit_delivery(
     queued_intent: &mut Option<PendingIntent>,
     expected_epoch: Option<u64>,
     profile: CommitReceiveProfileOptions,
+    benchmark_context: BenchmarkContext,
 ) -> Result<String> {
     let mut stale_acked = 0usize;
 
@@ -1235,6 +1286,7 @@ async fn receive_commit_delivery(
             queued_intent,
             &commit_bytes,
             profile.clone(),
+            &benchmark_context,
         )
         .await?;
         ack_commit_delivery_best_effort(ds_url, &client.name, &delivery.id, delivery.epoch).await;
@@ -1275,6 +1327,7 @@ async fn receive_application_delivery(
     client: &mut Client,
     relay_url: &str,
     profile: bool,
+    benchmark_context: &BenchmarkContext,
 ) -> Result<String> {
     let delivery = relay_get_pending_application_message(relay_url, &client.name).await?;
     let message_bytes = hex::decode(&delivery.message_hex).with_context(|| {
@@ -1284,6 +1337,7 @@ async fn receive_application_delivery(
         )
     })?;
 
+    restore_profiling_context(client, benchmark_context);
     match client.receive_application_message(&message_bytes, profile) {
         Ok(plaintext) => {
             ack_application_message_best_effort(
@@ -1331,6 +1385,7 @@ async fn process_pending(
     max_messages: Option<usize>,
     expected_epoch: Option<u64>,
     profile_opts: CommitReceiveProfileOptions,
+    benchmark_context: BenchmarkContext,
 ) -> Result<String> {
     let kinds = kinds.unwrap_or_else(|| {
         vec![
@@ -1364,6 +1419,7 @@ async fn process_pending(
                 queued_intent,
                 &commit_bytes,
                 profile_opts.clone(),
+                &benchmark_context,
             )
             .await
             {
@@ -1384,13 +1440,11 @@ async fn process_pending(
 
     if remaining > 0 && kinds.contains(&PendingKind::Welcomes) {
         let welcome_path = format!("/welcome/{}", client.name);
-        let tree_path = format!("/ratchet-tree/{}", client.name);
 
         match ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name).await {
             Ok(welcome_bytes) => {
-                let ratchet_tree_bytes =
-                    ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name).await?;
-                client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
+                restore_profiling_context(client, &benchmark_context);
+                client.join_from_welcome(&welcome_bytes)?;
                 welcomes_processed += 1;
                 remaining = remaining.saturating_sub(1);
             }
@@ -1404,7 +1458,7 @@ async fn process_pending(
     }
 
     if remaining > 0 && kinds.contains(&PendingKind::ApplicationMessages) {
-        match receive_application_delivery(client, relay_url, false).await {
+        match receive_application_delivery(client, relay_url, false, &benchmark_context).await {
             Ok(_) => {
                 application_messages_processed += 1;
             }
@@ -1458,6 +1512,7 @@ pub async fn handle_command(
     queued_intent: &mut Option<PendingIntent>,
     command: Command,
     expected_epoch: Option<u64>,
+    benchmark_context: BenchmarkContext,
 ) -> Result<String> {
     match command {
         Command::CreateGroup => {
@@ -1496,6 +1551,7 @@ pub async fn handle_command(
             let intent = PendingIntent::AddMembers {
                 members: members.clone(),
                 key_package_bytes_list,
+                benchmark_context,
             };
 
             match try_start_intent(client, ds_url, &intent).await? {
@@ -1515,14 +1571,12 @@ pub async fn handle_command(
 
         Command::JoinFromWelcome => {
             let welcome_path = format!("/welcome/{}", client.name);
-            let tree_path = format!("/ratchet-tree/{}", client.name);
 
             let welcome_bytes =
                 ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name).await?;
-            let ratchet_tree_bytes =
-                ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name).await?;
 
-            client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
+            restore_profiling_context(client, &benchmark_context);
+            client.join_from_welcome(&welcome_bytes)?;
 
             Ok(format!("{} joined from welcome", client.name))
         }
@@ -1548,11 +1602,11 @@ pub async fn handle_command(
         }
 
         Command::ReceiveApplicationMessage { profile } => {
-            receive_application_delivery(client, relay_url, profile).await
+            receive_application_delivery(client, relay_url, profile, &benchmark_context).await
         }
 
         Command::SelfUpdate => {
-            let intent = PendingIntent::SelfUpdate;
+            let intent = PendingIntent::SelfUpdate { benchmark_context };
 
             match try_start_intent(client, ds_url, &intent).await? {
                 DsPostResult::Ok => Ok("self_update commit published to group".to_string()),
@@ -1569,6 +1623,7 @@ pub async fn handle_command(
         Command::RemoveMembers { members } => {
             let intent = PendingIntent::RemoveMembers {
                 members: members.clone(),
+                benchmark_context,
             };
 
             match try_start_intent(client, ds_url, &intent).await? {
@@ -1604,8 +1659,15 @@ pub async fn handle_command(
                 commit_receive_sample_count,
                 commit_receive_population_size,
             };
-            receive_commit_delivery(client, ds_url, queued_intent, expected_epoch, profile_opts)
-                .await
+            receive_commit_delivery(
+                client,
+                ds_url,
+                queued_intent,
+                expected_epoch,
+                profile_opts,
+                benchmark_context,
+            )
+            .await
         }
 
         Command::ProcessPending {
@@ -1638,6 +1700,7 @@ pub async fn handle_command(
                 max_messages,
                 expected_epoch,
                 profile_opts,
+                benchmark_context,
             )
             .await
         }

@@ -84,7 +84,7 @@ struct CommitProfilingData {
     group_epoch: u64,
     tree_size: u32,
     invitee_count: isize,
-    member_count: usize,
+    member_count_before: usize,
     ciphersuite: String,
     profile_span_prefix: &'static str,
     protocol_event: Option<ProfileEvent>,
@@ -133,11 +133,13 @@ fn emit_commit_serialize_event(
             Some(parent_operation_for_span_prefix(profiling.profile_span_prefix).to_string());
         event.parent_span_id = profiling.protocol_event.as_ref().map(|event| event.span_id);
         event.tree_size = Some(profiling.tree_size);
-        event.member_count = Some(profiling.member_count);
+        event.member_count_before = Some(profiling.member_count_before);
         event.invitee_count = Some(profiling.invitee_count);
         event.ciphersuite = Some(profiling.ciphersuite.clone());
-        event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-        event.alloc_count = Some(allocation_info.count_total as u64);
+        event.set_current_thread_allocations(
+            allocation_info.bytes_total as u64,
+            allocation_info.count_total as u64,
+        );
         event.artifact_size_bytes = serialized_len.flatten();
         event.commit_size_bytes = serialized_len.flatten();
         event.update_path_size_bytes = profiling.update_path_size_bytes;
@@ -831,7 +833,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 finish_and_emit(proposal_apply_scope, |event| {
                     event.group_epoch = Some(group.context().epoch().as_u64());
                     event.tree_size = Some(proposal_apply_tree_size_before);
-                    event.member_count = Some(member_count_before);
+                    event.member_count_before = Some(member_count_before);
                     event.added_members_count = Some(add_count);
                     event.removed_members_count = Some(remove_count);
                     event.removed_leaf_indices = Some(proposal_apply_removed_indices.clone());
@@ -852,8 +854,10 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                     event.tree_node_count_before = Some(proposal_apply_tree_size_before);
                     event.tree_node_count_after = Some(proposal_apply_tree_size_after);
                     event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                    event.alloc_bytes = Some(proposal_apply_allocation_info.bytes_total as u64);
-                    event.alloc_count = Some(proposal_apply_allocation_info.count_total as u64);
+                    event.set_current_thread_allocations(
+                        proposal_apply_allocation_info.bytes_total as u64,
+                        proposal_apply_allocation_info.count_total as u64,
+                    );
                 });
             }
             if apply_proposals_values.self_removed && !is_external_commit {
@@ -1179,7 +1183,8 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                     event.tree_height = Some(tree_height);
                     event.group_epoch = Some(diff.group_context().epoch().as_u64());
                     event.tree_size = Some(diff.tree_size().u32());
-                    event.member_count = Some(member_count_after);
+                    // AddCommit member_count is always the before-commit group size.
+                    event.member_count_before = Some(member_count_before);
                     event.added_members_count = Some(add_count);
                     event.removed_members_count = Some(remove_count);
                     event.filtered_direct_path_len = update_path_profile
@@ -1189,8 +1194,10 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         .as_ref()
                         .map(|p| p.update_path_size_bytes);
                     event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                    event.alloc_bytes = Some(key_schedule_allocation_info.bytes_total as u64);
-                    event.alloc_count = Some(key_schedule_allocation_info.count_total as u64);
+                    event.set_current_thread_allocations(
+                        key_schedule_allocation_info.bytes_total as u64,
+                        key_schedule_allocation_info.count_total as u64,
+                    );
                 });
             }
 
@@ -1205,19 +1212,17 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             let (welcome_option, group_info) = if !needs_group_info {
                 (None, None)
             } else {
-                #[cfg(feature = "profiling-json")]
-                let ratchet_tree_artifact_bytes = {
-                    let ratchet_tree = diff.export_ratchet_tree();
-                    Some(ratchet_tree.tls_serialized_len())
-                };
-
                 // Create the ratchet tree extension if necessary
                 let mut extensions_list = vec![];
-                if use_ratchet_tree_extension {
-                    extensions_list.push(Extension::RatchetTree(RatchetTreeExtension::new(
-                        diff.export_ratchet_tree(),
-                    )));
-                };
+                let ratchet_tree_extension = use_ratchet_tree_extension
+                    .then(|| RatchetTreeExtension::new(diff.export_ratchet_tree()));
+                #[cfg(feature = "profiling-json")]
+                let ratchet_tree_artifact_bytes = ratchet_tree_extension
+                    .as_ref()
+                    .map(|extension| extension.tls_serialized_len());
+                if let Some(ratchet_tree_extension) = ratchet_tree_extension {
+                    extensions_list.push(Extension::RatchetTree(ratchet_tree_extension));
+                }
                 // Append rest of extensions
                 extensions_list.extend(other_extensions);
 
@@ -1251,6 +1256,36 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         };
 
                         #[cfg(feature = "profiling-json")]
+                        let fill_group_info_event =
+                            |event: &mut ProfileEvent,
+                             plaintext_bytes: Option<usize>,
+                             ciphertext_bytes: Option<usize>| {
+                                event.group_info_bytes = plaintext_bytes;
+                                event.group_info_plaintext_bytes = plaintext_bytes;
+                                event.group_info_ciphertext_bytes = ciphertext_bytes;
+                                event.encrypted_group_info_bytes = ciphertext_bytes;
+                                event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                                event.ratchet_tree_included = Some(use_ratchet_tree_extension);
+                                event.ratchet_tree_delivery_mode = Some(
+                                    if use_ratchet_tree_extension {
+                                        "welcome_extension"
+                                    } else {
+                                        "not_in_welcome"
+                                    }
+                                    .to_string(),
+                                );
+                                event.added_members_count = Some(invitation_count);
+                                event.welcome_recipient_count = Some(invitation_count);
+                                event.group_epoch = Some(group_epoch);
+                                event.tree_size = Some(tree_size);
+                                event.member_count_before = Some(member_count_before);
+                                event.ciphersuite = Some(format!("{:?}", ciphersuite));
+                                event.tree_height = Some(tree_height);
+                                event.tree_leaf_count = Some(tree_leaf_count);
+                                event.tree_node_count = Some(tree_node_count);
+                            };
+
+                        #[cfg(feature = "profiling-json")]
                         let mut measured_result: Option<
                             Result<(Welcome, usize, usize, usize), CreateCommitError>,
                         > = None;
@@ -1259,16 +1294,104 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         let allocation_info = measure(|| {
                             measured_result =
                                 Some((|| -> Result<(Welcome, usize, usize, usize), CreateCommitError> {
-                                    let group_info_tbs = {
-                                        GroupInfoTBS::new(
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_tbs_scope = ProfileScope::start(
+                                        format!("{profile_span_prefix}.group_info.build_tbs"),
+                                        "openmls",
+                                    );
+                                    #[cfg(feature = "profiling-json")]
+                                    let mut group_info_tbs_result = None;
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_tbs_allocation_info = measure(|| {
+                                        group_info_tbs_result = Some(GroupInfoTBS::new(
                                             diff.group_context().clone(),
                                             extensions.clone(),
                                             confirmation_tag.clone(),
                                             own_leaf_index,
-                                        )?
-                                    };
+                                        ));
+                                    });
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_tbs = group_info_tbs_result
+                                        .expect("allocation_counter measure closure did not run")?;
+                                    #[cfg(feature = "profiling-json")]
+                                    finish_and_emit(group_info_tbs_scope, |event| {
+                                        fill_group_info_event(event, None, None);
+                                        event.set_current_thread_allocations(
+                                            group_info_tbs_allocation_info.bytes_total as u64,
+                                            group_info_tbs_allocation_info.count_total as u64,
+                                        );
+                                    });
+                                    #[cfg(not(feature = "profiling-json"))]
+                                    let group_info_tbs = GroupInfoTBS::new(
+                                        diff.group_context().clone(),
+                                        extensions.clone(),
+                                        confirmation_tag.clone(),
+                                        own_leaf_index,
+                                    )?;
+
                                     // Sign to-be-signed group info.
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_sign_scope = ProfileScope::start(
+                                        format!("{profile_span_prefix}.group_info.sign"),
+                                        "openmls",
+                                    );
+                                    #[cfg(feature = "profiling-json")]
+                                    let mut group_info_result = None;
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_sign_allocation_info = measure(|| {
+                                        group_info_result = Some(group_info_tbs.sign(old_signer));
+                                    });
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info = group_info_result
+                                        .expect("allocation_counter measure closure did not run")?;
+                                    #[cfg(feature = "profiling-json")]
+                                    finish_and_emit(group_info_sign_scope, |event| {
+                                        fill_group_info_event(event, None, None);
+                                        event.set_current_thread_allocations(
+                                            group_info_sign_allocation_info.bytes_total as u64,
+                                            group_info_sign_allocation_info.count_total as u64,
+                                        );
+                                    });
+                                    #[cfg(not(feature = "profiling-json"))]
                                     let group_info = group_info_tbs.sign(old_signer)?;
+
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_serialize_scope = ProfileScope::start(
+                                        format!(
+                                            "{profile_span_prefix}.group_info.serialize_plaintext"
+                                        ),
+                                        "openmls",
+                                    );
+                                    #[cfg(feature = "profiling-json")]
+                                    let mut group_info_plaintext_result = None;
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_serialize_allocation_info = measure(|| {
+                                        group_info_plaintext_result =
+                                            Some(group_info.tls_serialize_detached());
+                                    });
+                                    #[cfg(feature = "profiling-json")]
+                                    let group_info_plaintext = group_info_plaintext_result
+                                        .expect("allocation_counter measure closure did not run")
+                                        .map_err(LibraryError::missing_bound_check)?;
+                                    #[cfg(not(feature = "profiling-json"))]
+                                    let group_info_plaintext = group_info
+                                        .tls_serialize_detached()
+                                        .map_err(LibraryError::missing_bound_check)?;
+                                    let group_info_plaintext_bytes = group_info_plaintext.len();
+                                    #[cfg(feature = "profiling-json")]
+                                    finish_and_emit(group_info_serialize_scope, |event| {
+                                        fill_group_info_event(
+                                            event,
+                                            Some(group_info_plaintext_bytes),
+                                            None,
+                                        );
+                                        event.artifact_size_bytes =
+                                            Some(group_info_plaintext_bytes);
+                                        event.set_current_thread_allocations(
+                                            group_info_serialize_allocation_info.bytes_total as u64,
+                                            group_info_serialize_allocation_info.count_total as u64,
+                                        );
+                                    });
 
                                     // Encrypt GroupInfo object
                                     let (welcome_key, welcome_nonce) = welcome_secret
@@ -1281,73 +1404,42 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                         "openmls",
                                     );
                                     #[cfg(feature = "profiling-json")]
-                                    let mut group_info_aead_result: Option<
-                                        Result<(Vec<u8>, usize), CreateCommitError>,
-                                    > = None;
+                                    let mut group_info_aead_result = None;
                                     #[cfg(feature = "profiling-json")]
                                     let group_info_aead_allocation_info = measure(|| {
-                                        group_info_aead_result = Some((|| {
-                                            let group_info_plaintext = group_info
-                                                .tls_serialize_detached()
-                                                .map_err(LibraryError::missing_bound_check)?;
-                                            let group_info_bytes = group_info_plaintext.len();
-                                            let encrypted_group_info = welcome_key
-                                                .aead_seal(
-                                                    crypto,
-                                                    group_info_plaintext.as_slice(),
-                                                    &[],
-                                                    &welcome_nonce,
-                                                )
-                                                .map_err(LibraryError::unexpected_crypto_error)?;
-                                            Ok((encrypted_group_info, group_info_bytes))
-                                        })());
+                                        group_info_aead_result = Some(welcome_key.aead_seal(
+                                            crypto,
+                                            group_info_plaintext.as_slice(),
+                                            &[],
+                                            &welcome_nonce,
+                                        ));
                                     });
                                     #[cfg(feature = "profiling-json")]
-                                    let (encrypted_group_info, group_info_bytes) =
-                                        group_info_aead_result
-                                            .expect("allocation_counter measure closure did not run")?;
+                                    let encrypted_group_info = group_info_aead_result
+                                        .expect("allocation_counter measure closure did not run")
+                                        .map_err(LibraryError::unexpected_crypto_error)?;
                                     #[cfg(feature = "profiling-json")]
                                     let encrypted_group_info_bytes = encrypted_group_info.len();
                                     #[cfg(feature = "profiling-json")]
                                     finish_and_emit(group_info_aead_scope, |event| {
-                                        event.artifact_size_bytes = Some(group_info_bytes);
-                                        event.group_info_bytes = Some(group_info_bytes);
-                                        event.encrypted_group_info_bytes =
-                                            Some(encrypted_group_info_bytes);
-                                        event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
-                                        event.ratchet_tree_included =
-                                            Some(use_ratchet_tree_extension);
-                                        event.ratchet_tree_delivery_mode = Some(
-                                            if use_ratchet_tree_extension {
-                                                "welcome_extension"
-                                            } else {
-                                                "out_of_band"
-                                            }
-                                            .to_string(),
+                                        fill_group_info_event(
+                                            event,
+                                            Some(group_info_plaintext_bytes),
+                                            Some(encrypted_group_info_bytes),
                                         );
-                                        event.added_members_count = Some(invitation_count);
-                                        event.welcome_recipient_count = Some(invitation_count);
-                                        event.group_epoch = Some(group_epoch);
-                                        event.tree_size = Some(tree_size);
-                                        event.member_count = Some(member_count_after);
-                                        event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                                        event.tree_height = Some(tree_height);
-                                        event.tree_leaf_count = Some(tree_leaf_count);
-                                        event.tree_node_count = Some(tree_node_count);
-                                        event.alloc_bytes =
-                                            Some(group_info_aead_allocation_info.bytes_total as u64);
-                                        event.alloc_count =
-                                            Some(group_info_aead_allocation_info.count_total as u64);
+                                        event.artifact_size_bytes =
+                                            Some(encrypted_group_info_bytes);
+                                        event.set_current_thread_allocations(
+                                            group_info_aead_allocation_info.bytes_total as u64,
+                                            group_info_aead_allocation_info.count_total as u64,
+                                        );
                                     });
 
                                     #[cfg(not(feature = "profiling-json"))]
                                     let encrypted_group_info = welcome_key
                                         .aead_seal(
                                             crypto,
-                                            group_info
-                                                .tls_serialize_detached()
-                                                .map_err(LibraryError::missing_bound_check)?
-                                                .as_slice(),
+                                            group_info_plaintext.as_slice(),
                                             &[],
                                             &welcome_nonce,
                                         )
@@ -1389,15 +1481,17 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                     )?;
                                     #[cfg(feature = "profiling-json")]
                                     finish_and_emit(welcome_encrypt_scope, |event| {
-                                        event.added_members_count = Some(invitation_count);
-                                        event.welcome_recipient_count = Some(invitation_count);
+                                        fill_group_info_event(
+                                            event,
+                                            Some(group_info_plaintext_bytes),
+                                            Some(encrypted_group_info_bytes),
+                                        );
                                         event.encrypted_secrets_count = Some(encrypted_secrets.len());
                                         event.hpke_encrypt_count = Some(invitation_count as u64);
-                                        event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                                        event.alloc_bytes =
-                                            Some(welcome_encrypt_allocation_info.bytes_total as u64);
-                                        event.alloc_count =
-                                            Some(welcome_encrypt_allocation_info.count_total as u64);
+                                        event.set_current_thread_allocations(
+                                            welcome_encrypt_allocation_info.bytes_total as u64,
+                                            welcome_encrypt_allocation_info.count_total as u64,
+                                        );
                                     });
 
                                     #[cfg(not(feature = "profiling-json"))]
@@ -1406,8 +1500,8 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
                                     // Create welcome message
                                     #[cfg(feature = "profiling-json")]
-                                    let welcome_build_scope = ProfileScope::start(
-                                        format!("{profile_span_prefix}.welcome_build"),
+                                    let welcome_new_scope = ProfileScope::start(
+                                        format!("{profile_span_prefix}.welcome.new"),
                                         "openmls",
                                     );
                                     let welcome = Welcome::new(
@@ -1416,17 +1510,19 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                                         encrypted_group_info,
                                     );
                                     #[cfg(feature = "profiling-json")]
-                                    finish_and_emit(welcome_build_scope, |event| {
+                                    finish_and_emit(welcome_new_scope, |event| {
+                                        fill_group_info_event(
+                                            event,
+                                            Some(group_info_plaintext_bytes),
+                                            Some(encrypted_group_info_bytes),
+                                        );
                                         event.encrypted_secrets_count = Some(encrypted_secrets_count);
-                                        event.welcome_recipient_count = Some(encrypted_secrets_count);
-                                        event.added_members_count = Some(invitation_count);
-                                        event.ciphersuite = Some(format!("{:?}", ciphersuite));
                                     });
 
                                     #[cfg(feature = "profiling-json")]
                                     return Ok((
                                         welcome,
-                                        group_info_bytes,
+                                        group_info_plaintext_bytes,
                                         encrypted_group_info_bytes,
                                         encrypted_secrets_count,
                                     ));
@@ -1439,7 +1535,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         #[cfg(feature = "profiling-json")]
                         let (
                             welcome,
-                            group_info_bytes,
+                            group_info_plaintext_bytes,
                             encrypted_group_info_bytes,
                             encrypted_secrets_count,
                         ) =
@@ -1449,39 +1545,19 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         let mut welcome_protocol_event = welcome_scope.map(|scope| {
                             let mut event = scope.finish();
 
-                            event.encrypted_group_info_bytes = Some(encrypted_group_info_bytes);
-                            event.group_info_bytes = Some(group_info_bytes);
-                            event.encrypted_secrets_count = Some(encrypted_secrets_count);
-                            event.welcome_recipient_count = Some(encrypted_secrets_count);
-                            event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
-                            event.welcome_plus_ratchet_tree_bytes = event
-                                .welcome_bytes
-                                .zip(event.ratchet_tree_bytes)
-                                .map(|(welcome, tree)| welcome + tree);
-                            event.ratchet_tree_included = Some(use_ratchet_tree_extension);
-                            event.ratchet_tree_delivery_mode = Some(
-                                if use_ratchet_tree_extension {
-                                    "welcome_extension"
-                                } else {
-                                    "out_of_band"
-                                }
-                                .to_string(),
+                            fill_group_info_event(
+                                &mut event,
+                                Some(group_info_plaintext_bytes),
+                                Some(encrypted_group_info_bytes),
                             );
+                            event.encrypted_secrets_count = Some(encrypted_secrets_count);
 
                             event.invitee_count = Some(invitee_count);
-                            if invitee_count > 0 {
-                                event.added_members_count = Some(invitee_count as usize);
-                            }
-                            event.group_epoch = Some(group_epoch);
-                            event.tree_size = Some(tree_size);
-                            event.member_count = Some(member_count_after);
-                            event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                            event.tree_height = Some(tree_height);
-                            event.tree_leaf_count = Some(tree_leaf_count);
-                            event.tree_node_count = Some(tree_node_count);
 
-                            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                            event.alloc_count = Some(allocation_info.count_total as u64);
+                            event.set_current_thread_allocations(
+                                allocation_info.bytes_total as u64,
+                                allocation_info.count_total as u64,
+                            );
 
                             event
                         });
@@ -1501,59 +1577,32 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
                             if let Some(scope) = serialize_scope {
                                 let mut event = scope.finish();
+                                fill_group_info_event(
+                                    &mut event,
+                                    Some(group_info_plaintext_bytes),
+                                    Some(encrypted_group_info_bytes),
+                                );
                                 event.artifact_size_bytes = serialized_len.flatten();
                                 event.welcome_bytes = serialized_len.flatten();
-                                event.encrypted_group_info_bytes =
-                                    Some(encrypted_group_info_bytes);
-                                event.group_info_bytes = Some(group_info_bytes);
                                 event.encrypted_secrets_count = Some(encrypted_secrets_count);
-                                event.welcome_recipient_count = Some(encrypted_secrets_count);
-                                event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
-                                event.welcome_plus_ratchet_tree_bytes = event
-                                    .welcome_bytes
-                                    .zip(event.ratchet_tree_bytes)
-                                    .map(|(welcome, tree)| welcome + tree);
-                                event.ratchet_tree_included = Some(use_ratchet_tree_extension);
-                                event.ratchet_tree_delivery_mode = Some(
-                                    if use_ratchet_tree_extension {
-                                        "welcome_extension"
-                                    } else {
-                                        "out_of_band"
-                                    }
-                                    .to_string(),
-                                );
+                                // The ratchet tree is already part of the serialized Welcome.
+                                event.welcome_plus_ratchet_tree_bytes = event.welcome_bytes;
                                 event.invitee_count = Some(invitee_count);
-                                if invitee_count > 0 {
-                                    event.added_members_count = Some(invitee_count as usize);
+                                event.set_current_thread_allocations(
+                                    serialize_allocation_info.bytes_total as u64,
+                                    serialize_allocation_info.count_total as u64,
+                                );
+                                if profile_span_prefix == "commit_add" {
+                                    event.span_name = "commit_add.welcome_serialize".to_string();
+                                    event.op = "commit_add.welcome_serialize".to_string();
                                 }
-                                event.group_epoch = Some(group_epoch);
-                                event.tree_size = Some(tree_size);
-                                event.member_count = Some(member_count_after);
-                                event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                                event.tree_height = Some(tree_height);
-                                event.tree_leaf_count = Some(tree_leaf_count);
-                                event.tree_node_count = Some(tree_node_count);
-                                event.alloc_bytes =
-                                    Some(serialize_allocation_info.bytes_total as u64);
-                                event.alloc_count =
-                                    Some(serialize_allocation_info.count_total as u64);
                                 emit_event(&event);
-
-                                let add_serialize_event = ProfileEvent {
-                                    span_name: format!("{profile_span_prefix}.welcome_serialize"),
-                                    op: format!("{profile_span_prefix}.welcome_serialize"),
-                                    ..event
-                                };
-                                emit_event(&add_serialize_event);
                             }
 
                             if let Some(event) = welcome_protocol_event.as_mut() {
                                 event.artifact_size_bytes = serialized_len.flatten();
                                 event.welcome_bytes = serialized_len.flatten();
-                                event.welcome_plus_ratchet_tree_bytes = event
-                                    .welcome_bytes
-                                    .zip(event.ratchet_tree_bytes)
-                                    .map(|(welcome, tree)| welcome + tree);
+                                event.welcome_plus_ratchet_tree_bytes = event.welcome_bytes;
                                 emit_event(event);
                             }
                         }
@@ -1686,7 +1735,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         group_epoch: final_group_epoch,
                         tree_size: final_tree_size,
                         invitee_count,
-                        member_count: member_count_before,
+                        member_count_before: member_count_before,
                         ciphersuite: final_ciphersuite.clone(),
                         profile_span_prefix,
                         protocol_event: None,
@@ -1742,27 +1791,6 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
 
         #[cfg(feature = "profiling-json")]
         {
-            let mut measured_result: Option<
-                Result<
-                    (
-                        CommitBuilder<'a, Complete, G>,
-                        &'static str,
-                        u64,
-                        u32,
-                        String,
-                        isize,
-                        usize,
-                        Option<usize>,
-                        Option<UpdatePathProfilingData>,
-                    ),
-                    CreateCommitError,
-                >,
-            > = None;
-
-            let allocation_info = measure(|| {
-                measured_result = Some(build_commit());
-            });
-
             let (
                 mut result_builder,
                 final_commit_op,
@@ -1773,14 +1801,14 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 member_count_before,
                 commit_artifact_size_bytes,
                 update_path_profile,
-            ) = measured_result.expect("allocation_counter measure closure did not run")?;
+            ) = build_commit()?;
 
             if let Some(scope) = commit_scope {
                 let mut event = scope.finish();
                 event.op = final_commit_op.to_string();
                 event.group_epoch = Some(final_group_epoch);
                 event.tree_size = Some(final_tree_size);
-                event.member_count = Some(member_count_before);
+                event.member_count_before = Some(member_count_before);
                 event.ciphersuite = Some(final_ciphersuite);
                 event.invitee_count = Some(invitee_count);
                 if invitee_count > 0 {
@@ -1790,8 +1818,6 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 }
                 event.artifact_size_bytes = commit_artifact_size_bytes;
                 event.commit_size_bytes = commit_artifact_size_bytes;
-                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                event.alloc_count = Some(allocation_info.count_total as u64);
                 if let Some(profiling) = result_builder.stage.profiling.as_mut() {
                     event.add_commit_mode = Some(profiling.add_commit_mode.clone());
                     event.remove_commit_mode = Some(profiling.remove_commit_mode.clone());

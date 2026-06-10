@@ -8,6 +8,7 @@ ADB/SSH backend tests require actual devices and are skipped in CI.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -16,14 +17,98 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import external_devices
+import run_compose_benchmark
 from external_devices import (
     validate_run_id,
     load_devices_config,
     DeviceConfig,
     create_backend,
     SshDeviceBackend,
+    DeviceBackend,
     build_external_device_layout_entry,
 )
+
+
+class FakePerfBackend(DeviceBackend):
+    def __init__(self, value: int | None):
+        self.value = value
+        self.set_values: list[int] = []
+
+    def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess:
+        output = f"{self.value}\n" if self.value is not None else "not available\n"
+        return subprocess.CompletedProcess(command, 0, output, "")
+
+    def _set_perf_event_paranoid(self, value: int) -> None:
+        self.set_values.append(value)
+        self.value = value
+
+
+def test_perf_event_access_is_enforced():
+    backend = FakePerfBackend(4)
+    backend.ensure_perf_event_access()
+    assert backend.value == 2
+    assert backend.set_values == [2]
+
+    already_allowed = FakePerfBackend(1)
+    already_allowed.ensure_perf_event_access()
+    assert already_allowed.set_values == []
+
+    no_sysctl = FakePerfBackend(None)
+    no_sysctl.ensure_perf_event_access()
+    assert no_sysctl.set_values == []
+    print("PASS: external perf-event access is enforced")
+
+
+def test_host_runner_layout_rewrites_only_execution_endpoints():
+    layout = {
+        "clients": [
+            {
+                "client_id": "00001",
+                "physical_worker_id": "worker-00001",
+                "execution_backend": "docker_container",
+                "command_url": "http://worker-00001:8080/client/00001",
+                "health_url": "http://worker-00001:8080/client/00001/health",
+            },
+            {
+                "client_id": "00002",
+                "physical_worker_id": "worker-pack-000",
+                "execution_backend": "docker_container",
+                "command_url": "http://worker-pack-000:8080/client/00002",
+                "health_url": "http://worker-pack-000:8080/client/00002/health",
+            },
+            {
+                "client_id": "pico-plus-00001",
+                "physical_worker_id": "luckfox-pico-plus-01",
+                "execution_backend": "real_device",
+                "command_url": "http://172.32.0.93:8080",
+                "health_url": "http://172.32.0.93:8080/health",
+            },
+        ],
+        "physical_workers": [
+            {"physical_worker_id": "worker-00001", "base_url": "http://worker-00001:8080"},
+            {"physical_worker_id": "worker-pack-000", "base_url": "http://worker-pack-000:8080"},
+            {"physical_worker_id": "luckfox-pico-plus-01", "base_url": "http://172.32.0.93:8080"},
+        ],
+    }
+    host_layout = run_compose_benchmark.build_host_runner_layout(
+        layout,
+        [
+            "00001=http://127.0.0.1:8081",
+            "pico-plus-00001=http://172.32.0.93:8080",
+            "00002=http://127.0.0.1:8082",
+        ],
+    )
+
+    clients = {client["client_id"]: client for client in host_layout["clients"]}
+    assert clients["00001"]["command_url"] == "http://127.0.0.1:8081/client/00001"
+    assert clients["00002"]["health_url"] == "http://127.0.0.1:8082/client/00002/health"
+    assert clients["pico-plus-00001"]["command_url"] == "http://172.32.0.93:8080"
+    assert layout["clients"][0]["command_url"] == "http://worker-00001:8080/client/00001"
+
+    workers = {worker["physical_worker_id"]: worker for worker in host_layout["physical_workers"]}
+    assert workers["worker-00001"]["base_url"] == "http://127.0.0.1:8081"
+    assert workers["worker-pack-000"]["base_url"] == "http://127.0.0.1:8082"
+    print("PASS: host-runner layout uses host-reachable mixed worker endpoints")
 
 
 def test_validate_run_id_accepts_valid():
@@ -254,6 +339,8 @@ def main() -> int:
             ("build_external_device_layout_entry", lambda: test_build_external_device_layout_entry()),
             ("config defaults", lambda: test_config_defaults()),
             ("ssh password config", lambda: test_ssh_password_config_defaults_to_password_backend(tmp_dir)),
+            ("perf-event access", lambda: test_perf_event_access_is_enforced()),
+            ("host-runner mixed layout", lambda: test_host_runner_layout_rewrites_only_execution_endpoints()),
         ]
 
         passed = 0

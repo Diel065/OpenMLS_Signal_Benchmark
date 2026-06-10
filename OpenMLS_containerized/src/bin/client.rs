@@ -89,6 +89,7 @@ async fn main() -> Result<()> {
             &mut queued_intent,
             command,
             None,
+            openmls::profiling::BenchmarkContext::default(),
         )
         .await
         {

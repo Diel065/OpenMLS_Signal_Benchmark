@@ -158,8 +158,10 @@ impl PublicGroupDiff<'_> {
                 event.group_epoch = Some(self.group_context().epoch().as_u64());
                 event.tree_size = Some(self.diff.tree_size().u32());
                 event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                event.alloc_count = Some(allocation_info.count_total as u64);
+                event.set_current_thread_allocations(
+                    allocation_info.bytes_total as u64,
+                    allocation_info.count_total as u64,
+                );
                 fill_update_path_event(event, &profile);
             });
             profile
@@ -262,8 +264,10 @@ impl PublicGroupDiff<'_> {
                 event.tree_node_count = Some(self.diff.tree_size().u32());
                 event.committer_leaf_index = Some(leaf_index.u32());
                 event.ciphersuite = Some(format!("{:?}", ciphersuite));
-                event.alloc_bytes = Some(tree_hash_allocation_info.bytes_total as u64);
-                event.alloc_count = Some(tree_hash_allocation_info.count_total as u64);
+                event.set_current_thread_allocations(
+                    tree_hash_allocation_info.bytes_total as u64,
+                    tree_hash_allocation_info.count_total as u64,
+                );
             });
         }
         update_group_context_result?;

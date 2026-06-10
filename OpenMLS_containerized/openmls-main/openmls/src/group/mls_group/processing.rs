@@ -29,7 +29,9 @@ use super::{errors::ProcessMessageError, *};
 
 #[cfg(feature = "profiling-json")]
 use crate::profiling::{
-    clear_commit_receive_context, emit_event, set_commit_receive_context, CommitReceiveContext,
+    clear_commit_receive_context, emit_event, set_commit_receive_context,
+    update_app_message_receive_context, update_commit_receive_op_context,
+    CommitReceiveContext,
     ProfileScope,
 };
 #[cfg(feature = "profiling-json")]
@@ -176,7 +178,6 @@ impl MlsGroup {
             commit_id: Some(commit_id.clone()),
             group_epoch: Some(group_epoch),
             tree_size: Some(tree_size),
-            member_count: Some(member_count),
             ciphersuite: Some(ciphersuite.clone()),
         });
         let mut measured_result: Option<
@@ -209,12 +210,12 @@ impl MlsGroup {
             event.committer_leaf_index = sender_leaf;
             event.receiver_is_committer = sender_leaf.map(|leaf| leaf == receiver_leaf);
             event.commit_create_op = commit_create_op.map(ToOwned::to_owned);
-            event.commit_kind = commit_kind;
+            event.commit_kind = commit_kind.clone();
             event.commit_id = Some(commit_id);
 
             event.group_epoch = Some(group_epoch);
             event.tree_size = Some(tree_size);
-            event.member_count = Some(member_count);
+            event.member_count_before = Some(member_count);
             event.ciphersuite = Some(ciphersuite);
 
             event.commit_receive_sampled = Some(true);
@@ -267,6 +268,20 @@ impl MlsGroup {
                         None
                     }
                 });
+
+                update_commit_receive_op_context(|ctx| {
+                    ctx.member_count_after = member_count.saturating_add(add_count).saturating_sub(remove_count);
+                    ctx.added_members_count = Some(add_count);
+                    ctx.removed_members_count = Some(remove_count);
+                    ctx.proposal_count = Some(proposal_count);
+                    ctx.add_proposal_count = Some(add_count);
+                    ctx.remove_proposal_count = Some(remove_count);
+                    ctx.update_proposal_count = Some(update_count);
+                    ctx.commit_kind = commit_kind.clone();
+                    ctx.update_path_present = Some(has_path);
+                    ctx.committer_leaf_index = sender_leaf;
+                    ctx.receiver_is_committer = sender_leaf.map(|leaf| leaf == receiver_leaf);
+                });
             }
             emit_event(&event);
         }
@@ -305,7 +320,7 @@ impl MlsGroup {
                 let mut event = scope.finish();
                 event.group_epoch = Some(group_epoch);
                 event.tree_size = Some(tree_size);
-                event.member_count = Some(member_count);
+                event.member_count_before = Some(member_count);
                 event.ciphersuite = Some(ciphersuite);
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
@@ -332,6 +347,23 @@ impl MlsGroup {
                     event.generation_gap = Some(gap);
                     event.out_of_order_message = Some(ooo);
                 }
+
+                update_app_message_receive_context(|ctx| {
+                    ctx.receiver_leaf_index = Some(self.own_leaf_index().u32());
+                    ctx.sender_leaf_index = sender_leaf;
+                    ctx.sender_generation = sender_gen;
+                    ctx.app_msg_plaintext_bytes = Some(application_message.as_slice().len());
+                    ctx.app_msg_ciphertext_bytes = crate::profiling::LAST_CIPHERTEXT_BYTES.get();
+                    ctx.aad_bytes = Some(processed_message.aad().len());
+                    if let (Some(ep), Some(sx), Some(sg)) = (Some(group_epoch), sender_leaf, sender_gen) {
+                        let (first, gap, ooo) = crate::profiling::compute_receive_sequence(
+                            self.group_id().as_slice(), ep, sx, sg
+                        );
+                        ctx.generation_gap = Some(gap);
+                        ctx.out_of_order_message = Some(ooo);
+                        ctx.first_receive_from_sender = Some(first);
+                    }
+                });
 
                 emit_event(&event);
             }
@@ -414,7 +446,7 @@ impl MlsGroup {
             if let Some(mut event) = deserialize_event {
                 event.group_epoch = Some(self.context().epoch().as_u64());
                 event.tree_size = Some(self.treesync().tree_size().u32());
-                event.member_count = Some(self.members().count());
+                event.member_count_before = Some(self.members().count());
                 event.ciphersuite = Some(format!("{:?}", self.ciphersuite()));
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);

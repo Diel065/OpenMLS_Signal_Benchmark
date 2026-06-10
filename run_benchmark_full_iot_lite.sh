@@ -102,7 +102,7 @@ run_openmls() {
   cd "$SCRIPT_DIR/OpenMLS_containerized"
 
   local -a _args=(
-    --workers 512
+    --workers 128
     --ds-port 3001
     --relay-port 4001
     --scenario-seed "$SCENARIO_SEED"
@@ -149,9 +149,9 @@ run_openmls() {
     --teardown-batch-size 64
     --teardown-batch-sleep-seconds 0.1
     --min-size 2
-    --max-size 512
+    --max-size 128
     --step-size '[1,32]'
-    --roundtrips 2
+    --roundtrips 4
     --update-rounds 8
     --app-rounds 8
     --max-update-samples-per-plateau 8

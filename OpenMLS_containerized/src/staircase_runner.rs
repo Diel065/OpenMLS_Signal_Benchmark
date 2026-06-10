@@ -40,10 +40,12 @@ const FANOUT_LATENCY_SPIKE_P95_MS: u128 = 5_000;
 const FANOUT_STABLE_INCREASE_AFTER: usize = 20;
 const DEFAULT_FANOUT_ERROR_RATE_THRESHOLD: f64 = 0.02;
 const DEFAULT_RUNNER_HTTP_CONNECT_TIMEOUT_MS: u64 = 2_000;
-const DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS: u64 = 60_000;
+const DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS: u64 = 200_000;
 const DEFAULT_FANOUT_RETRY_PASSES: usize = 1;
-const SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE: usize = 16;
 const MAX_RANDOM_MEMBERSHIP_BATCH_SIZE: usize = 8;
+const ADD_BATCH_SEED_DOMAIN: u64 = 0x4144_4442_4154_4348;
+const REMOVE_BATCH_SEED_DOMAIN: u64 = 0x524d_5642_4154_4348;
+const EXTERNAL_BATCH_SEED_DOMAIN: u64 = 0x4558_5442_4154_4348;
 
 static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -277,6 +279,16 @@ pub struct WorkerSpec {
     pub device_kind: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProfilingCapabilities {
+    #[serde(default)]
+    client_exists: Option<bool>,
+    #[serde(default)]
+    profiling_enabled: bool,
+    #[serde(default)]
+    l1d_cache_counters_available: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerLayoutClient {
     pub client_id: String,
@@ -410,6 +422,11 @@ struct BenchmarkCursor {
     operation: String,
     operation_seq: Option<usize>,
     payload_size: Option<usize>,
+    membership_batch_requested: Option<usize>,
+    membership_batch_effective: Option<usize>,
+    membership_batch_group_cap: Option<usize>,
+    membership_batch_transition_cap: Option<usize>,
+    membership_batch_source: Option<String>,
 }
 
 impl BenchmarkCursor {
@@ -428,12 +445,26 @@ impl BenchmarkCursor {
             operation: operation.to_string(),
             operation_seq: None,
             payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         }
     }
 
     fn at_operation(mut self, operation_seq: usize, payload_size: Option<usize>) -> Self {
         self.operation_seq = Some(operation_seq);
         self.payload_size = payload_size;
+        self
+    }
+
+    fn with_membership_batch(mut self, decision: &MembershipBatchDecision) -> Self {
+        self.membership_batch_requested = Some(decision.requested);
+        self.membership_batch_effective = Some(decision.effective);
+        self.membership_batch_group_cap = Some(decision.group_cap);
+        self.membership_batch_transition_cap = Some(decision.transition_cap);
+        self.membership_batch_source = Some(decision.source.to_string());
         self
     }
 }
@@ -458,6 +489,11 @@ struct RunnerEvent {
     benchmark_operation: String,
     benchmark_operation_seq: Option<usize>,
     benchmark_payload_size: Option<usize>,
+    membership_batch_requested: Option<usize>,
+    membership_batch_effective: Option<usize>,
+    membership_batch_group_cap: Option<usize>,
+    membership_batch_transition_cap: Option<usize>,
+    membership_batch_source: Option<String>,
     configured_payload_label: Option<String>,
 }
 
@@ -498,7 +534,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 5,
+            profile_schema_version: 10,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -516,6 +552,11 @@ impl RunnerEventLog {
             benchmark_operation: cursor.operation.clone(),
             benchmark_operation_seq: cursor.operation_seq,
             benchmark_payload_size: cursor.payload_size,
+            membership_batch_requested: cursor.membership_batch_requested,
+            membership_batch_effective: cursor.membership_batch_effective,
+            membership_batch_group_cap: cursor.membership_batch_group_cap,
+            membership_batch_transition_cap: cursor.membership_batch_transition_cap,
+            membership_batch_source: cursor.membership_batch_source.clone(),
             configured_payload_label: cursor.payload_size.map(|s| s.to_string()),
         };
         let mut out = OpenOptions::new()
@@ -869,10 +910,22 @@ struct ProfileEvent {
     #[serde(default)]
     benchmark_payload_size: Option<usize>,
     #[serde(default)]
+    membership_batch_requested: Option<usize>,
+    #[serde(default)]
+    membership_batch_effective: Option<usize>,
+    #[serde(default)]
+    membership_batch_group_cap: Option<usize>,
+    #[serde(default)]
+    membership_batch_transition_cap: Option<usize>,
+    #[serde(default)]
+    membership_batch_source: Option<String>,
+    #[serde(default)]
     configured_payload_label: Option<String>,
     implementation: String,
     wall_ns: u128,
     cpu_thread_ns: Option<u128>,
+    #[serde(default)]
+    cpu_process_ns: u128,
     #[serde(default)]
     cpu_envelope_utilization: Option<f64>,
     #[serde(default)]
@@ -880,9 +933,21 @@ struct ProfileEvent {
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     #[serde(default)]
+    alloc_measurement_scope: Option<String>,
+    #[serde(default)]
     l1d_cache_accesses: Option<u64>,
     #[serde(default)]
     l1d_cache_misses: Option<u64>,
+    #[serde(default)]
+    l1d_measurement_scope: Option<String>,
+    #[serde(default)]
+    l1d_cache_status: Option<String>,
+    #[serde(default)]
+    l1d_measured_thread_count: Option<usize>,
+    #[serde(default)]
+    l1d_discovered_thread_count: Option<usize>,
+    #[serde(default)]
+    l1d_multiplexed_thread_count: Option<usize>,
     #[serde(default)]
     ram_rss_delta_bytes: Option<i64>,
     #[serde(default)]
@@ -896,6 +961,10 @@ struct ProfileEvent {
     welcome_plus_ratchet_tree_bytes: Option<usize>,
     #[serde(default)]
     group_info_bytes: Option<usize>,
+    #[serde(default)]
+    group_info_plaintext_bytes: Option<usize>,
+    #[serde(default)]
+    group_info_ciphertext_bytes: Option<usize>,
     encrypted_group_info_bytes: Option<usize>,
     encrypted_secrets_count: Option<usize>,
     group_epoch: Option<u64>,
@@ -906,7 +975,13 @@ struct ProfileEvent {
     tree_leaf_count: Option<u32>,
     #[serde(default)]
     tree_node_count: Option<u32>,
+    #[serde(default)]
+    operation_family: Option<String>,
     member_count: Option<usize>,
+    #[serde(default)]
+    member_count_before: Option<usize>,
+    #[serde(default)]
+    member_count_after: Option<usize>,
     invitee_count: Option<isize>,
     #[serde(default)]
     added_members_count: Option<usize>,
@@ -1067,6 +1142,10 @@ struct ProfileEvent {
     scenario_seed: Option<u64>,
     node_name: Option<String>,
     pod_name: Option<String>,
+    #[serde(default)]
+    device_kind: Option<String>,
+    #[serde(default)]
+    execution_backend: Option<String>,
 }
 
 struct Progress {
@@ -1243,34 +1322,110 @@ impl FanoutController {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MembershipBatchDecision {
+    requested: usize,
+    effective: usize,
+    group_cap: usize,
+    transition_cap: usize,
+    source: &'static str,
+}
+
+#[derive(Debug)]
 struct MembershipBatchPlanner {
-    plateau_size: Option<usize>,
-    single_member_batch_required: bool,
+    rng: StdRng,
+    cycle: VecDeque<usize>,
+    cycle_cap: usize,
 }
 
 impl MembershipBatchPlanner {
-    fn enter_plateau(&mut self, plateau_size: usize) {
-        if self.plateau_size != Some(plateau_size) {
-            self.plateau_size = Some(plateau_size);
-            self.single_member_batch_required = true;
+    fn new(seed: u64) -> Self {
+        Self {
+            rng: StdRng::seed_from_u64(seed),
+            cycle: VecDeque::new(),
+            cycle_cap: 0,
         }
     }
 
-    fn next_batch_size(&mut self, current_group_size: usize, max_allowed: usize) -> usize {
+    fn next_batch(
+        &mut self,
+        current_group_size: usize,
+        max_allowed: usize,
+        source: &'static str,
+    ) -> MembershipBatchDecision {
         if max_allowed == 0 {
-            return 0;
+            return MembershipBatchDecision {
+                requested: 0,
+                effective: 0,
+                group_cap: 0,
+                transition_cap: 0,
+                source,
+            };
         }
 
-        let batch_size = if self.single_member_batch_required {
-            self.single_member_batch_required = false;
-            1
-        } else {
-            calculate_batch_size(current_group_size)
-        };
+        let group_cap = membership_batch_group_cap(current_group_size);
+        let feasible_cap = group_cap.min(max_allowed);
+        if self.cycle.is_empty() || self.cycle_cap != feasible_cap {
+            let mut values = (1..=feasible_cap).collect::<Vec<_>>();
+            values.shuffle(&mut self.rng);
+            self.cycle = values.into();
+            self.cycle_cap = feasible_cap;
+        }
+        let requested = self.cycle.pop_front().unwrap_or(1);
+        let effective = requested;
 
-        batch_size.min(max_allowed).max(1)
+        MembershipBatchDecision {
+            requested,
+            effective,
+            group_cap,
+            transition_cap: max_allowed,
+            source,
+        }
     }
+}
+
+#[derive(Debug)]
+struct MembershipBatchPlans {
+    regular: MembershipBatchPlanner,
+    external: HashMap<String, MembershipBatchPlanner>,
+    external_seed: u64,
+}
+
+impl MembershipBatchPlans {
+    fn new(seed: u64) -> Self {
+        Self {
+            regular: MembershipBatchPlanner::new(seed),
+            external: HashMap::new(),
+            external_seed: seed ^ EXTERNAL_BATCH_SEED_DOMAIN,
+        }
+    }
+
+    fn next_batch(
+        &mut self,
+        current_group_size: usize,
+        max_allowed: usize,
+        external_actor_id: Option<&str>,
+    ) -> MembershipBatchDecision {
+        if let Some(actor_id) = external_actor_id {
+            let actor_seed = self.external_seed ^ stable_string_seed(actor_id);
+            self.external
+                .entry(actor_id.to_string())
+                .or_insert_with(|| MembershipBatchPlanner::new(actor_seed))
+                .next_batch(current_group_size, max_allowed, "balanced_seeded_external")
+        } else {
+            self.regular
+                .next_batch(current_group_size, max_allowed, "balanced_seeded_regular")
+        }
+    }
+}
+
+fn stable_string_seed(value: &str) -> u64 {
+    value
+        .as_bytes()
+        .iter()
+        .fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
+        })
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1493,7 +1648,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             "[sampling] external coverage lane enabled; active external devices are protected from random removal and scheduled as app/update/add/remove actors"
         );
     }
-    let mut membership_batches = MembershipBatchPlanner::default();
+    let mut add_membership_batches =
+        MembershipBatchPlans::new(config.scenario_seed ^ ADD_BATCH_SEED_DOMAIN);
+    let mut remove_membership_batches =
+        MembershipBatchPlans::new(config.scenario_seed ^ REMOVE_BATCH_SEED_DOMAIN);
 
     create_group(&http, &leader, &mut progress).await?;
     let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
@@ -1511,15 +1669,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             plateau_sequence.len(),
             target_size
         );
-        membership_batches.enter_plateau(target_size);
-
         transition_to_size(
             &http,
             &mut active,
             &mut idle,
             target_size,
             &mut fanout,
-            &mut membership_batches,
+            &mut add_membership_batches,
+            &mut remove_membership_batches,
             &mut progress,
             config.process_pending_fanout,
             config.external_coverage_lane,
@@ -1775,6 +1932,7 @@ async fn wait_for_all_workers_healthy(
         let healthy_count = workers.len().saturating_sub(still_unhealthy.len());
 
         if still_unhealthy.is_empty() {
+            verify_publication_profiling_capabilities(http, workers, max_parallelism).await?;
             let (p50, p95, p99, max) = latency_percentiles(latencies);
             eprintln!(
                 "[preflight] all {} workers are healthy after {}",
@@ -1890,6 +2048,85 @@ async fn wait_for_all_workers_healthy(
     ))
 }
 
+async fn verify_publication_profiling_capabilities(
+    http: &reqwest::Client,
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+) -> Result<()> {
+    let publication_workers = workers
+        .iter()
+        .filter(|worker| worker.profile_enabled && !worker.device_kind.is_empty())
+        .collect::<Vec<_>>();
+    if publication_workers.is_empty() {
+        return Ok(());
+    }
+
+    let mut probes = stream::iter(publication_workers.into_iter())
+        .map(|worker| async move {
+            let url = format!(
+                "{}/profiling-capabilities",
+                worker.url.trim_end_matches('/')
+            );
+            let response = http.get(&url).send().await.with_context(|| {
+                format!("profiling capability request failed for {}", worker.id)
+            })?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "profiling capability endpoint for {} returned {}",
+                    worker.id,
+                    status
+                ));
+            }
+            let capabilities = response
+                .json::<ProfilingCapabilities>()
+                .await
+                .with_context(|| {
+                    format!("invalid profiling capability response for {}", worker.id)
+                })?;
+            if capabilities.client_exists == Some(false) {
+                return Err(anyhow!(
+                    "profiling capability endpoint did not find client {}",
+                    worker.id
+                ));
+            }
+            if !capabilities.profiling_enabled {
+                return Err(anyhow!(
+                    "profiling is disabled for publication worker {}",
+                    worker.id
+                ));
+            }
+            if !capabilities.l1d_cache_counters_available {
+                if worker.device_kind.to_lowercase().contains("luckfox") {
+                    eprintln!(
+                        "[preflight] WARNING: L1D hardware counters are unavailable for publication worker {} ({}); proceeding without L1D metrics for this device",
+                        worker.id,
+                        worker.device_kind
+                    );
+                } else {
+                    return Err(anyhow!(
+                        "L1D hardware counters are unavailable for publication worker {} ({})",
+                        worker.id,
+                        worker.device_kind
+                    ));
+                }
+            }
+            Ok::<_, anyhow::Error>(worker.id.clone())
+        })
+        .buffer_unordered(max_parallelism.max(1));
+
+    let mut verified = 0usize;
+    while let Some(result) = probes.next().await {
+        result?;
+        verified += 1;
+    }
+    eprintln!(
+        "[preflight] verified profiling and L1D hardware counters on {} publication workers",
+        verified
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct WorkerCommandContext {
     request_id: String,
@@ -1902,6 +2139,11 @@ struct WorkerCommandContext {
     benchmark_operation: Option<String>,
     benchmark_operation_seq: Option<usize>,
     benchmark_payload_size: Option<usize>,
+    membership_batch_requested: Option<usize>,
+    membership_batch_effective: Option<usize>,
+    membership_batch_group_cap: Option<usize>,
+    membership_batch_transition_cap: Option<usize>,
+    membership_batch_source: Option<String>,
     device_kind: Option<String>,
     execution_backend: Option<String>,
     ciphersuite: Option<String>,
@@ -1939,6 +2181,11 @@ impl WorkerCommandContext {
             benchmark_operation: cursor.map(|c| c.operation.clone()),
             benchmark_operation_seq: cursor.and_then(|c| c.operation_seq),
             benchmark_payload_size: cursor.and_then(|c| c.payload_size),
+            membership_batch_requested: cursor.and_then(|c| c.membership_batch_requested),
+            membership_batch_effective: cursor.and_then(|c| c.membership_batch_effective),
+            membership_batch_group_cap: cursor.and_then(|c| c.membership_batch_group_cap),
+            membership_batch_transition_cap: cursor.and_then(|c| c.membership_batch_transition_cap),
+            membership_batch_source: cursor.and_then(|c| c.membership_batch_source.clone()),
             device_kind: if worker.device_kind.is_empty() {
                 None
             } else {
@@ -2106,6 +2353,11 @@ async fn send_command_with_context(
         benchmark_operation: context.benchmark_operation.clone(),
         benchmark_operation_seq: context.benchmark_operation_seq,
         benchmark_payload_size: context.benchmark_payload_size,
+        membership_batch_requested: context.membership_batch_requested,
+        membership_batch_effective: context.membership_batch_effective,
+        membership_batch_group_cap: context.membership_batch_group_cap,
+        membership_batch_transition_cap: context.membership_batch_transition_cap,
+        membership_batch_source: context.membership_batch_source.clone(),
         device_kind: context.device_kind.clone(),
         execution_backend: context.execution_backend.clone(),
         ciphersuite: context.ciphersuite.clone(),
@@ -3509,6 +3761,11 @@ async fn batch_fanout_collect_physical(
             benchmark_operation: c.benchmark_operation.clone(),
             benchmark_operation_seq: c.benchmark_operation_seq,
             benchmark_payload_size: c.benchmark_payload_size,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
             device_kind: None,
             execution_backend: None,
             ciphersuite: None,
@@ -3781,15 +4038,10 @@ fn cap_count(raw: usize, cap: usize) -> usize {
     }
 }
 
-fn calculate_batch_size(current_group_size: usize) -> usize {
-    if current_group_size <= SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE {
-        return 1;
-    }
-
-    let max_batch = (current_group_size / 4)
-        .max(1)
-        .min(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
-    thread_rng().gen_range(1..=max_batch)
+fn membership_batch_group_cap(_current_group_size: usize) -> usize {
+    // AddCommit permits k > N. An N-dependent ceiling systematically starved
+    // larger k values, so the publication sampler uses a fixed configured cap.
+    MAX_RANDOM_MEMBERSHIP_BATCH_SIZE
 }
 
 fn update_ops_for_plateau(
@@ -4049,7 +4301,7 @@ async fn add_n_members(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
-    batch_size: usize,
+    mut batch_decision: MembershipBatchDecision,
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
@@ -4061,6 +4313,7 @@ async fn add_n_members(
     commit_receive_sampling_seed: u64,
     runner_events: &RunnerEventLog,
 ) -> Result<()> {
+    let batch_size = batch_decision.effective;
     let timeout = Duration::from_secs(30);
 
     if active.is_empty() {
@@ -4126,6 +4379,9 @@ async fn add_n_members(
         return Ok(());
     }
     let joiners = prepared_joiners;
+    // OOM attrition can shrink a planned batch. Persist the actual commit k,
+    // while retaining the requested value and caps for sampling diagnostics.
+    batch_decision.effective = joiners.len();
     let joiner_ids: Vec<String> = joiners.iter().map(|joiner| joiner.id.clone()).collect();
 
     let actor_before = show_group_state(http, &actor).await?;
@@ -4140,15 +4396,25 @@ async fn add_n_members(
         active.len(),
         "membership_add",
         "add_commit",
-    );
+    )
+    .with_membership_batch(&batch_decision);
 
-    send_cmd_expect_ok_fragment(
+    let add_command = Command::AddMembers {
+        members: joiner_ids.clone(),
+    };
+    let add_context = WorkerCommandContext::with_metadata(
+        &actor,
+        &add_command,
+        None,
+        Some("add_member.create"),
+        Some(&cursor),
+    );
+    send_cmd_expect_ok_fragment_with_context(
         http,
         &actor,
-        &Command::AddMembers {
-            members: joiner_ids.clone(),
-        },
+        &add_command,
         "added locally in one commit",
+        &add_context,
     )
     .await?;
     if process_pending_fanout {
@@ -4318,7 +4584,7 @@ async fn remove_n_members(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
-    batch_size: usize,
+    batch_decision: MembershipBatchDecision,
     fanout: &mut FanoutController,
     progress: &mut Progress,
     process_pending_fanout: bool,
@@ -4329,6 +4595,7 @@ async fn remove_n_members(
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
 ) -> Result<()> {
+    let batch_size = batch_decision.effective;
     if active.len() <= 1 {
         return Err(anyhow!("Cannot remove the last remaining member"));
     }
@@ -4383,7 +4650,8 @@ async fn remove_n_members(
         active.len(),
         "membership_remove",
         "remove_commit",
-    );
+    )
+    .with_membership_batch(&batch_decision);
 
     send_cmd_expect_ok_fragment(
         http,
@@ -4694,7 +4962,8 @@ async fn transition_to_size(
     idle: &mut VecDeque<WorkerSpec>,
     target_size: usize,
     fanout: &mut FanoutController,
-    membership_batches: &mut MembershipBatchPlanner,
+    add_membership_batches: &mut MembershipBatchPlans,
+    remove_membership_batches: &mut MembershipBatchPlans,
     progress: &mut Progress,
     process_pending_fanout: bool,
     external_coverage_lane: bool,
@@ -4713,6 +4982,7 @@ async fn transition_to_size(
     } else {
         Vec::new()
     };
+    external_add_actor_ids.shuffle(rng);
 
     while active.len() < target_size {
         let remaining = target_size - active.len();
@@ -4729,16 +4999,20 @@ async fn transition_to_size(
             .iter()
             .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
             .map(|pos| external_add_actor_ids.remove(pos));
-        let batch_size = if forced_actor_id.is_some() {
-            1
-        } else {
-            membership_batches.next_batch_size(active.len(), max_allowed)
-        };
+        let reserved_for_external = external_add_actor_ids
+            .len()
+            .min(max_allowed.saturating_sub(1));
+        let decision_cap = max_allowed.saturating_sub(reserved_for_external).max(1);
+        let batch_decision = add_membership_batches.next_batch(
+            active.len(),
+            decision_cap,
+            forced_actor_id.as_deref(),
+        );
         add_n_members(
             http,
             active,
             idle,
-            batch_size,
+            batch_decision,
             fanout,
             progress,
             process_pending_fanout,
@@ -4762,6 +5036,7 @@ async fn transition_to_size(
     } else {
         Vec::new()
     };
+    external_remove_actor_ids.shuffle(rng);
 
     while active.len() > target_size {
         let remaining = active.len() - target_size;
@@ -4773,16 +5048,20 @@ async fn transition_to_size(
             .iter()
             .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
             .map(|pos| external_remove_actor_ids.remove(pos));
-        let batch_size = if forced_actor_id.is_some() {
-            1
-        } else {
-            membership_batches.next_batch_size(active.len(), max_allowed)
-        };
+        let reserved_for_external = external_remove_actor_ids
+            .len()
+            .min(max_allowed.saturating_sub(1));
+        let decision_cap = max_allowed.saturating_sub(reserved_for_external).max(1);
+        let batch_decision = remove_membership_batches.next_batch(
+            active.len(),
+            decision_cap,
+            forced_actor_id.as_deref(),
+        );
         remove_n_members(
             http,
             active,
             idle,
-            batch_size,
+            batch_decision,
             fanout,
             progress,
             process_pending_fanout,
@@ -5540,16 +5819,28 @@ pub fn aggregate_csv(
         benchmark_operation: Option<String>,
         benchmark_operation_seq: Option<usize>,
         benchmark_payload_size: Option<usize>,
+        membership_batch_requested: Option<usize>,
+        membership_batch_effective: Option<usize>,
+        membership_batch_group_cap: Option<usize>,
+        membership_batch_transition_cap: Option<usize>,
+        membership_batch_source: Option<String>,
         configured_payload_label: Option<String>,
         implementation: String,
         wall_ns: u128,
         cpu_thread_ns: Option<u128>,
+        cpu_process_ns: u128,
         cpu_envelope_utilization: Option<f64>,
         cpu_throttled_time_ratio: Option<f64>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
+        alloc_measurement_scope: Option<String>,
         l1d_cache_accesses: Option<u64>,
         l1d_cache_misses: Option<u64>,
+        l1d_measurement_scope: Option<String>,
+        l1d_cache_status: Option<String>,
+        l1d_measured_thread_count: Option<usize>,
+        l1d_discovered_thread_count: Option<usize>,
+        l1d_multiplexed_thread_count: Option<usize>,
         ram_rss_delta_bytes: Option<i64>,
         ram_rss_utilization: Option<f64>,
         artifact_size_bytes: Option<usize>,
@@ -5557,6 +5848,8 @@ pub fn aggregate_csv(
         ratchet_tree_bytes: Option<usize>,
         welcome_plus_ratchet_tree_bytes: Option<usize>,
         group_info_bytes: Option<usize>,
+        group_info_plaintext_bytes: Option<usize>,
+        group_info_ciphertext_bytes: Option<usize>,
         encrypted_group_info_bytes: Option<usize>,
         encrypted_secrets_count: Option<usize>,
         group_epoch: Option<u64>,
@@ -5564,7 +5857,10 @@ pub fn aggregate_csv(
         tree_height: Option<u32>,
         tree_leaf_count: Option<u32>,
         tree_node_count: Option<u32>,
+        operation_family: Option<String>,
         member_count: Option<usize>,
+        member_count_before: Option<usize>,
+        member_count_after: Option<usize>,
         invitee_count: Option<isize>,
         added_members_count: Option<usize>,
         removed_members_count: Option<usize>,
@@ -5724,18 +6020,18 @@ pub fn aggregate_csv(
                 container_mode: non_empty_or(meta.map(|m| m.container_mode.as_str()), "singleton"),
                 execution_backend: non_empty_or(
                     meta.map(|m| m.execution_backend.as_str()),
-                    "docker_container",
+                    non_empty_or(event.execution_backend.as_deref(), "local_process"),
                 ),
                 device_kind: non_empty_or(
                     meta.map(|m| m.device_kind.as_str()),
-                    "scratch_container",
+                    non_empty_or(event.device_kind.as_deref(), "local_process"),
                 ),
-                transport: non_empty_or(meta.map(|m| m.transport.as_str()), "docker_bridge"),
-                access_backend: non_empty_or(meta.map(|m| m.access_backend.as_str()), "docker"),
+                transport: non_empty_or(meta.map(|m| m.transport.as_str()), "loopback"),
+                access_backend: non_empty_or(meta.map(|m| m.access_backend.as_str()), "local"),
                 arch: non_empty_or(meta.map(|m| m.arch.as_str()), "x86_64"),
                 rust_target: non_empty_or(
                     meta.map(|m| m.rust_target.as_str()),
-                    "x86_64-unknown-linux-musl",
+                    "x86_64-unknown-linux-gnu",
                 ),
                 profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
@@ -5764,16 +6060,28 @@ pub fn aggregate_csv(
                 benchmark_operation: event.benchmark_operation,
                 benchmark_operation_seq: event.benchmark_operation_seq,
                 benchmark_payload_size: event.benchmark_payload_size,
+                membership_batch_requested: event.membership_batch_requested,
+                membership_batch_effective: event.membership_batch_effective,
+                membership_batch_group_cap: event.membership_batch_group_cap,
+                membership_batch_transition_cap: event.membership_batch_transition_cap,
+                membership_batch_source: event.membership_batch_source,
                 configured_payload_label: event.configured_payload_label,
                 implementation: event.implementation,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
+                cpu_process_ns: event.cpu_process_ns,
                 cpu_envelope_utilization: event.cpu_envelope_utilization,
                 cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
+                alloc_measurement_scope: event.alloc_measurement_scope,
                 l1d_cache_accesses: event.l1d_cache_accesses,
                 l1d_cache_misses: event.l1d_cache_misses,
+                l1d_measurement_scope: event.l1d_measurement_scope,
+                l1d_cache_status: event.l1d_cache_status,
+                l1d_measured_thread_count: event.l1d_measured_thread_count,
+                l1d_discovered_thread_count: event.l1d_discovered_thread_count,
+                l1d_multiplexed_thread_count: event.l1d_multiplexed_thread_count,
                 ram_rss_delta_bytes: event.ram_rss_delta_bytes,
                 ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
@@ -5781,6 +6089,8 @@ pub fn aggregate_csv(
                 ratchet_tree_bytes: event.ratchet_tree_bytes,
                 welcome_plus_ratchet_tree_bytes: event.welcome_plus_ratchet_tree_bytes,
                 group_info_bytes: event.group_info_bytes,
+                group_info_plaintext_bytes: event.group_info_plaintext_bytes,
+                group_info_ciphertext_bytes: event.group_info_ciphertext_bytes,
                 encrypted_group_info_bytes: event.encrypted_group_info_bytes,
                 encrypted_secrets_count: event.encrypted_secrets_count,
                 group_epoch: event.group_epoch,
@@ -5788,7 +6098,10 @@ pub fn aggregate_csv(
                 tree_height: event.tree_height,
                 tree_leaf_count: event.tree_leaf_count,
                 tree_node_count: event.tree_node_count,
+                operation_family: event.operation_family,
                 member_count: event.member_count,
+                member_count_before: event.member_count_before,
+                member_count_after: event.member_count_after,
                 invitee_count: event.invitee_count,
                 added_members_count: event.added_members_count,
                 removed_members_count: event.removed_members_count,
@@ -5953,51 +6266,47 @@ mod membership_batch_tests {
     use super::*;
 
     #[test]
-    fn calculate_batch_size_keeps_small_groups_single_member() {
-        for current_group_size in 1..=SINGLE_MEMBER_BATCH_MAX_GROUP_SIZE {
-            for _ in 0..32 {
-                assert_eq!(calculate_batch_size(current_group_size), 1);
-            }
-        }
+    fn membership_batch_group_cap_is_independent_of_group_size() {
+        assert_eq!(membership_batch_group_cap(1), 8);
+        assert_eq!(membership_batch_group_cap(7), 8);
+        assert_eq!(membership_batch_group_cap(8), 8);
+        assert_eq!(membership_batch_group_cap(16), 8);
+        assert_eq!(membership_batch_group_cap(32), 8);
+        assert_eq!(membership_batch_group_cap(256), 8);
     }
 
     #[test]
-    fn calculate_batch_size_caps_large_group_random_batches() {
-        for current_group_size in [17usize, 24, 32, 64, 256] {
-            let max_batch = (current_group_size / 4).min(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
-
-            for _ in 0..128 {
-                let batch_size = calculate_batch_size(current_group_size);
-                assert!(batch_size >= 1);
-                assert!(batch_size <= max_batch);
-            }
-        }
+    fn membership_batch_planner_covers_every_k_once_per_cycle() {
+        let mut planner = MembershipBatchPlanner::new(0x1234);
+        let mut observed = (0..8)
+            .map(|_| planner.next_batch(32, 8, "test").requested)
+            .collect::<Vec<_>>();
+        observed.sort_unstable();
+        assert_eq!(observed, (1..=8).collect::<Vec<_>>());
     }
 
     #[test]
-    fn membership_batch_planner_forces_one_single_member_op_per_plateau() {
-        let mut planner = MembershipBatchPlanner::default();
-
-        planner.enter_plateau(32);
-        assert_eq!(planner.next_batch_size(64, 8), 1);
-
-        let followup = planner.next_batch_size(64, 8);
-        assert!((1..=8).contains(&followup));
-
-        planner.enter_plateau(64);
-        assert_eq!(planner.next_batch_size(64, 8), 1);
+    fn membership_batch_planner_is_seed_reproducible() {
+        let sequence = |seed| {
+            let mut planner = MembershipBatchPlanner::new(seed);
+            (0..24)
+                .map(|_| planner.next_batch(32, 8, "test").requested)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sequence(91), sequence(91));
+        assert_ne!(sequence(91), sequence(92));
     }
 
     #[test]
     fn membership_batch_planner_respects_transition_cap() {
-        let mut planner = MembershipBatchPlanner::default();
-
-        planner.enter_plateau(128);
-        assert_eq!(planner.next_batch_size(256, 3), 1);
-
+        let mut planner = MembershipBatchPlanner::new(7);
         for _ in 0..128 {
-            let batch_size = planner.next_batch_size(256, 3);
-            assert!((1..=3).contains(&batch_size));
+            let decision = planner.next_batch(256, 3, "test");
+            assert!((1..=3).contains(&decision.requested));
+            assert!((1..=3).contains(&decision.effective));
+            assert_eq!(decision.effective, decision.requested);
+            assert_eq!(decision.group_cap, 8);
+            assert_eq!(decision.transition_cap, 3);
         }
     }
 }
@@ -6054,7 +6363,7 @@ mod aggregate_csv_resource_tests {
         )
         .expect("write layout");
 
-        let event = serde_json::json!({
+        let mut event = serde_json::json!({
             "profile_schema_version": 3,
             "ts_unix_ns": 1u128,
             "op": "create_group",
@@ -6067,6 +6376,7 @@ mod aggregate_csv_resource_tests {
             "span_inclusive": true,
             "wall_ns": 10u128,
             "cpu_thread_ns": 9u128,
+            "cpu_process_ns": 11u128,
             "cpu_envelope_utilization": 0.9,
             "cpu_throttled_time_ratio": 0.1,
             "alloc_bytes": 42u64,
@@ -6078,6 +6388,11 @@ mod aggregate_csv_resource_tests {
             "tree_height": 3u32,
             "tree_leaf_count": 8u32,
             "tree_node_count": 15u32,
+            "operation_family": "add_commit_create",
+            "member_count": 7usize,
+            "member_count_before": 7usize,
+            "member_count_after": 8usize,
+            "added_members_count": 1usize,
             "direct_path_len": 3usize,
             "filtered_direct_path_len": 3usize,
             "encrypted_path_secret_count": 7usize,
@@ -6091,6 +6406,25 @@ mod aggregate_csv_resource_tests {
             "scenario": "unit-test",
             "scenario_seed": 1u64
         });
+        let event_object = event.as_object_mut().expect("fixture must be an object");
+        event_object.insert("group_info_bytes".to_string(), serde_json::json!(256usize));
+        event_object.insert(
+            "group_info_plaintext_bytes".to_string(),
+            serde_json::json!(256usize),
+        );
+        event_object.insert(
+            "group_info_ciphertext_bytes".to_string(),
+            serde_json::json!(272usize),
+        );
+        event_object.insert(
+            "encrypted_group_info_bytes".to_string(),
+            serde_json::json!(272usize),
+        );
+        event_object.insert(
+            "ratchet_tree_bytes".to_string(),
+            serde_json::json!(128usize),
+        );
+        event_object.insert("ratchet_tree_included".to_string(), serde_json::json!(true));
         std::fs::write(
             run_dir.join("client-00001.jsonl"),
             serde_json::to_string(&event).expect("event json") + "\n",
@@ -6115,6 +6449,16 @@ mod aggregate_csv_resource_tests {
         };
 
         assert_eq!(value("resource_limit_cpus"), "0.25");
+        assert_eq!(value("cpu_process_ns"), "11");
+        assert_eq!(value("operation_family"), "add_commit_create");
+        assert_eq!(value("member_count"), "7");
+        assert_eq!(value("member_count_before"), "7");
+        assert_eq!(value("member_count_after"), "8");
+        assert_eq!(value("added_members_count"), "1");
+        assert_eq!(value("group_info_plaintext_bytes"), "256");
+        assert_eq!(value("group_info_ciphertext_bytes"), "272");
+        assert_eq!(value("ratchet_tree_bytes"), "128");
+        assert_eq!(value("ratchet_tree_included"), "true");
         assert_eq!(value("resource_limit_memory"), "128m");
         assert_eq!(value("resource_limit_memory_bytes"), "134217728");
         assert_eq!(value("resource_limit_memory_swap"), "128m");

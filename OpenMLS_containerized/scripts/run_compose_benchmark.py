@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import argparse
+import copy
 import csv
 import datetime as dt
 import glob
@@ -358,7 +359,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Guarantee active external devices are sampled as application, update, "
-            "add/welcome, and remove actors while keeping packed clients unprofiled."
+            "add/welcome, and remove actors while keeping packed clients unprofiled. "
+            "This is enabled automatically when external devices are requested."
         ),
     )
     p.add_argument(
@@ -724,6 +726,40 @@ def read_worker_lines(path: Path) -> list[str]:
     return lines
 
 
+def build_host_runner_layout(layout_data: dict, worker_lines: list[str]) -> dict:
+    """Return a layout whose command endpoints are reachable from the host."""
+    worker_urls: dict[str, str] = {}
+    for line in worker_lines:
+        worker_id, worker_url = line.split("=", 1)
+        worker_urls[worker_id] = worker_url.rstrip("/")
+
+    host_layout = copy.deepcopy(layout_data)
+    physical_host_urls: dict[str, str] = {}
+    for client in host_layout.get("clients", []):
+        client_id = str(client.get("client_id", ""))
+        base_url = worker_urls.get(client_id)
+        if not base_url:
+            continue
+
+        if client.get("execution_backend") == "docker_container":
+            command_url = f"{base_url}/client/{client_id}"
+        else:
+            command_url = base_url
+
+        client["command_url"] = command_url
+        client["health_url"] = f"{command_url}/health"
+        physical_worker_id = str(client.get("physical_worker_id", ""))
+        if physical_worker_id:
+            physical_host_urls.setdefault(physical_worker_id, base_url)
+
+    for worker in host_layout.get("physical_workers", []):
+        physical_worker_id = str(worker.get("physical_worker_id", ""))
+        if physical_worker_id in physical_host_urls:
+            worker["base_url"] = physical_host_urls[physical_worker_id]
+
+    return host_layout
+
+
 def validate_artifacts(run_dir: Path, layout_mode: str) -> None:
     csv_path = run_dir / "events.csv"
     layout_path = run_dir / "worker_layout.json"
@@ -744,6 +780,24 @@ def validate_artifacts(run_dir: Path, layout_mode: str) -> None:
     non_empty_jsonl = [p for p in jsonl_files if p.stat().st_size > 0]
     if not non_empty_jsonl:
         raise RuntimeError(f"All per-worker JSONL files are empty in {run_dir}")
+
+
+def run_strict_output_validation(root: Path, run_dir: Path) -> None:
+    validator = root / "scripts" / "validate_benchmark_outputs.py"
+    result = subprocess.run(
+        [sys.executable, str(validator), str(run_dir)],
+        cwd=str(root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.stdout:
+        print(result.stdout, end="", flush=True)
+    if result.returncode != 0:
+        details = result.stderr.strip() or result.stdout.strip()
+        raise RuntimeError(
+            "Strict OpenMLS publication validation failed after the run.\n" + details
+        )
 
 
 def copy_if_exists(src: Path, dst: Path) -> None:
@@ -2286,6 +2340,9 @@ def launch_external_devices(
         print(f"[device] {dev_id}: checking clock...", flush=True)
         backend.ensure_clock_synchronized()
 
+        print(f"[device] {dev_id}: checking perf-event access...", flush=True)
+        backend.ensure_perf_event_access()
+
         transport = dev_config.transport
         device_ip = transport.get("device_ip", "172.32.0.93")
         host_ip = transport.get("host_ip", "172.32.0.98")
@@ -2725,6 +2782,10 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.enable_external_devices:
+        # External runs are publication inputs, so device coverage is mandatory rather
+        # than an opt-in sampling mode.
+        args.external_coverage_lane = True
     root = repo_root()
 
     if args.workers < 1:
@@ -3184,6 +3245,18 @@ def main() -> int:
             if combined_internal.exists():
                 effective_workers_internal_tmp = combined_internal
 
+        if not args.runner_in_docker and layout_tmp.exists():
+            host_layout_path = run_dir / "worker_layout.host.json"
+            host_layout_data = build_host_runner_layout(
+                json.loads(layout_tmp.read_text(encoding="utf-8")),
+                read_worker_lines(effective_workers_host_tmp),
+            )
+            host_layout_path.write_text(
+                json.dumps(host_layout_data, indent=2),
+                encoding="utf-8",
+            )
+            effective_layout_tmp = host_layout_path
+
         layout_path_for_runner = f"/results/{run_id}/worker_layout.json" if args.runner_in_docker else str(effective_layout_tmp)
         workers_file_for_docker_runner = (
             f"/results/{run_id}/workers.combined.txt"
@@ -3369,6 +3442,7 @@ def main() -> int:
 
         if not args.preflight_only:
             validate_artifacts(run_dir, args.worker_layout_mode)
+            run_strict_output_validation(root, run_dir)
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 

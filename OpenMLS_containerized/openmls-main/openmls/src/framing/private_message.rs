@@ -12,7 +12,7 @@ use crate::{
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, update_app_message_create_context, ProfileScope};
 
 use super::*;
 
@@ -209,6 +209,12 @@ impl PrivateMessage {
                 event.group_epoch = Some(header.epoch.as_u64());
                 event.alloc_bytes = Some(ai.bytes_total as u64);
                 event.alloc_count = Some(ai.count_total as u64);
+
+                update_app_message_create_context(|ctx| {
+                    ctx.sender_leaf_index = Some(sender_index.u32());
+                    ctx.sender_generation = Some(result.0 as u64);
+                });
+
                 emit_event(&event);
             }
             result
@@ -266,6 +272,11 @@ impl PrivateMessage {
                 event.app_msg_ciphertext_bytes = Some(result.len());
                 event.alloc_bytes = Some(ai.bytes_total as u64);
                 event.alloc_count = Some(ai.count_total as u64);
+
+                update_app_message_create_context(|ctx| {
+                    ctx.app_msg_ciphertext_bytes = Some(result.len());
+                });
+
                 emit_event(&event);
             }
             result
@@ -354,6 +365,11 @@ impl PrivateMessage {
             event.group_epoch = Some(header.epoch.as_u64());
             event.alloc_bytes = Some(sender_data_allocation_info.bytes_total as u64);
             event.alloc_count = Some(sender_data_allocation_info.count_total as u64);
+
+            update_app_message_create_context(|ctx| {
+                ctx.sender_leaf_index = Some(sender_index.u32());
+            });
+
             emit_event(&event);
         }
 

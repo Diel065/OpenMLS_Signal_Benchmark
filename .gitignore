@@ -1,4 +1,5 @@
 /OpenMLS_containerized/target/
+/OpenMLS_containerized/**/target/
 /OpenMLS_containerized/benchmark_output/target/
 /OpenMLS_containerized/benchmark_output/
 /OpenMLS_containerized/.venv/
@@ -6,9 +7,7 @@
 /Signal_containerized/benchmark_output/target/
 /Signal_containerized/benchmark_output/
 /Signal_containerized/.venv/
-/statistics/
-/statistics/analysis_output
-
-
-
-statistics/
+/statistics/*
+!/statistics/statistics_analysis_openmls_v8.R
+**/__pycache__/
+*.pyc

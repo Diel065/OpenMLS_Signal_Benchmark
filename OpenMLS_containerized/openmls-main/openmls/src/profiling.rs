@@ -12,6 +12,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
+use allocation_counter::{process_snapshot, ProcessAllocationSnapshot};
 use cpu_time::{ProcessTime, ThreadTime};
 use l1d_cache_counter::L1DCacheCounterScope;
 use serde::Serialize;
@@ -44,6 +45,21 @@ thread_local! {
     pub(crate) static LAST_OUT_OF_ORDER: Cell<Option<bool>> = const { Cell::new(None) };
     static COMMIT_RECEIVE_CONTEXT: RefCell<Option<CommitReceiveContext>> = const { RefCell::new(None) };
     static BENCHMARK_CONTEXT: RefCell<Option<BenchmarkContext>> = const { RefCell::new(None) };
+    static ADD_COMMIT_CONTEXT: RefCell<Option<AddCommitContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for CommitReceive child spans.
+    static COMMIT_RECEIVE_OP_CONTEXT: RefCell<Option<CommitReceiveOpContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for ApplicationMessageCreate child spans.
+    static APP_MESSAGE_CREATE_CONTEXT: RefCell<Option<AppMessageCreateContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for ApplicationMessageReceive child spans.
+    static APP_MESSAGE_RECEIVE_CONTEXT: RefCell<Option<AppMessageReceiveContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for UpdateCommitCreate (self_update) child spans.
+    static UPDATE_COMMIT_CREATE_CONTEXT: RefCell<Option<UpdateCommitCreateContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for RemoveCommitCreate (remove_members) child spans.
+    static REMOVE_COMMIT_CREATE_CONTEXT: RefCell<Option<RemoveCommitCreateContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for KeyPackageCreate child spans.
+    static KEY_PACKAGE_CREATE_CONTEXT: RefCell<Option<KeyPackageCreateContext>> = const { RefCell::new(None) };
+    /// Operation-level metadata for WelcomeReceive (join_from_welcome) child spans.
+    static WELCOME_RECEIVE_CONTEXT: RefCell<Option<WelcomeReceiveContext>> = const { RefCell::new(None) };
     /// Worker/client ID for span identity.
     /// Set before each command by the benchmark runner.
     pub(crate) static WORKER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -61,7 +77,6 @@ pub struct CommitReceiveContext {
     pub commit_id: Option<String>,
     pub group_epoch: Option<u64>,
     pub tree_size: Option<u32>,
-    pub member_count: Option<usize>,
     pub ciphersuite: Option<String>,
 }
 
@@ -75,12 +90,454 @@ pub struct BenchmarkContext {
     pub benchmark_operation: Option<String>,
     pub benchmark_operation_seq: Option<usize>,
     pub benchmark_payload_size: Option<usize>,
+    pub membership_batch_requested: Option<usize>,
+    pub membership_batch_effective: Option<usize>,
+    pub membership_batch_group_cap: Option<usize>,
+    pub membership_batch_transition_cap: Option<usize>,
+    pub membership_batch_source: Option<String>,
     /// Human-readable label for the configured payload size (e.g. "32", "256").
     /// Distinct from actual measured sizes like app_msg_plaintext_bytes.
     pub configured_payload_label: Option<String>,
     pub device_kind: Option<String>,
     pub execution_backend: Option<String>,
     pub ciphersuite: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct AddCommitContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub added_members_count: usize,
+}
+
+impl AddCommitContext {
+    pub fn new(
+        member_count_before: usize,
+        member_count_after: usize,
+        added_members_count: usize,
+    ) -> Self {
+        Self {
+            operation_family: "add_commit_create".to_string(),
+            benchmark_operation: "add_commit".to_string(),
+            member_count_before,
+            member_count_after,
+            added_members_count,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+#[allow(missing_docs)]
+pub struct CommitReceiveOpContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub added_members_count: Option<usize>,
+    pub removed_members_count: Option<usize>,
+    pub commit_kind: Option<String>,
+    pub commit_bytes: Option<usize>,
+    pub receiver_is_committer: Option<bool>,
+    pub committer_leaf_index: Option<u32>,
+    pub proposal_count: Option<usize>,
+    pub add_proposal_count: Option<usize>,
+    pub remove_proposal_count: Option<usize>,
+    pub update_proposal_count: Option<usize>,
+    pub update_path_present: Option<bool>,
+    pub filtered_direct_path_len: Option<usize>,
+    pub sum_copath_resolution_sizes: Option<usize>,
+}
+
+impl CommitReceiveOpContext {
+    pub fn new(
+        member_count_before: usize,
+        member_count_after: usize,
+    ) -> Self {
+        Self {
+            operation_family: "commit_receive".to_string(),
+            benchmark_operation: "commit_receive".to_string(),
+            member_count_before,
+            member_count_after,
+            added_members_count: None,
+            removed_members_count: None,
+            commit_kind: None,
+            commit_bytes: None,
+            receiver_is_committer: None,
+            committer_leaf_index: None,
+            proposal_count: None,
+            add_proposal_count: None,
+            remove_proposal_count: None,
+            update_proposal_count: None,
+            update_path_present: None,
+            filtered_direct_path_len: None,
+            sum_copath_resolution_sizes: None,
+        }
+    }
+}
+
+/// Runs `f` inside a canonical CommitReceive total span with stable metadata.
+pub fn wrap_commit_receive_total<T>(
+    member_count_before: usize,
+    member_count_after: usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    let total_scope = ProfileScope::start("commit_receive_total_local", "openmls");
+    let ctx = CommitReceiveOpContext::new(member_count_before, member_count_after);
+    with_commit_receive_op_context(ctx, || {
+        let result = f();
+        finish_and_emit(total_scope, |_| {});
+        result
+    })
+}
+
+/// Runs `f` with stable metadata for one local CommitReceive operation.
+pub fn with_commit_receive_op_context<T>(ctx: CommitReceiveOpContext, f: impl FnOnce() -> T) -> T {
+    struct RestoreCommitReceiveOpContext(Option<CommitReceiveOpContext>);
+
+    impl Drop for RestoreCommitReceiveOpContext {
+        fn drop(&mut self) {
+            COMMIT_RECEIVE_OP_CONTEXT.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    let previous = COMMIT_RECEIVE_OP_CONTEXT.with(|slot| slot.borrow_mut().replace(ctx));
+    let _restore = RestoreCommitReceiveOpContext(previous);
+    f()
+}
+
+/// Updates fields on the active CommitReceiveOpContext thread-local.
+/// Used by the processing code to fill in metadata that becomes known
+/// only after commit processing completes (e.g. proposal counts, path metadata).
+pub fn update_commit_receive_op_context<F>(f: F)
+where
+    F: FnOnce(&mut CommitReceiveOpContext),
+{
+    COMMIT_RECEIVE_OP_CONTEXT.with(|slot| {
+        if let Some(ref mut ctx) = *slot.borrow_mut() {
+            f(ctx);
+        }
+    });
+}
+
+/// Persistently set the CommitReceiveOpContext thread-local.
+pub fn set_commit_receive_op_context(ctx: CommitReceiveOpContext) {
+    COMMIT_RECEIVE_OP_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+/// Clear the CommitReceiveOpContext thread-local.
+pub fn clear_commit_receive_op_context() {
+    COMMIT_RECEIVE_OP_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+// ── ApplicationMessageCreate context ────────────────────────────────────────
+
+#[derive(Clone, Debug, Default)]
+#[allow(missing_docs)]
+pub struct AppMessageCreateContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub sender_leaf_index: Option<u32>,
+    pub sender_generation: Option<u64>,
+    pub app_msg_plaintext_bytes: Option<usize>,
+    pub app_msg_ciphertext_bytes: Option<usize>,
+    pub aad_bytes: Option<usize>,
+}
+
+impl AppMessageCreateContext {
+    pub fn new(member_count: usize) -> Self {
+        Self {
+            operation_family: "application_message_create".to_string(),
+            benchmark_operation: "application_message_create".to_string(),
+            member_count_before: member_count,
+            member_count_after: member_count,
+            ..Default::default()
+        }
+    }
+}
+
+/// Persistently set the AppMessageCreateContext thread-local.
+pub fn set_app_message_create_context(ctx: AppMessageCreateContext) {
+    APP_MESSAGE_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+/// Clear the AppMessageCreateContext thread-local.
+pub fn clear_app_message_create_context() {
+    APP_MESSAGE_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+/// Updates fields on the active AppMessageCreateContext thread-local.
+pub fn update_app_message_create_context<F>(f: F)
+where
+    F: FnOnce(&mut AppMessageCreateContext),
+{
+    APP_MESSAGE_CREATE_CONTEXT.with(|slot| {
+        if let Some(ref mut ctx) = *slot.borrow_mut() {
+            f(ctx);
+        }
+    });
+}
+
+// ── ApplicationMessageReceive context ───────────────────────────────────────
+
+#[derive(Clone, Debug, Default)]
+#[allow(missing_docs)]
+pub struct AppMessageReceiveContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub receiver_leaf_index: Option<u32>,
+    pub sender_leaf_index: Option<u32>,
+    pub sender_generation: Option<u64>,
+    pub app_msg_plaintext_bytes: Option<usize>,
+    pub app_msg_ciphertext_bytes: Option<usize>,
+    pub aad_bytes: Option<usize>,
+    pub generation_gap: Option<u64>,
+    pub out_of_order_message: Option<bool>,
+    pub first_receive_from_sender: Option<bool>,
+}
+
+impl AppMessageReceiveContext {
+    pub fn new(member_count: usize) -> Self {
+        Self {
+            operation_family: "application_message_receive".to_string(),
+            benchmark_operation: "application_message_receive".to_string(),
+            member_count_before: member_count,
+            member_count_after: member_count,
+            ..Default::default()
+        }
+    }
+}
+
+/// Persistently set the AppMessageReceiveContext thread-local.
+pub fn set_app_message_receive_context(ctx: AppMessageReceiveContext) {
+    APP_MESSAGE_RECEIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+/// Clear the AppMessageReceiveContext thread-local.
+pub fn clear_app_message_receive_context() {
+    APP_MESSAGE_RECEIVE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+// ── UpdateCommitCreate context ──────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct UpdateCommitCreateContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub added_members_count: usize,
+    pub removed_members_count: usize,
+}
+
+impl UpdateCommitCreateContext {
+    pub fn new(member_count: usize) -> Self {
+        Self {
+            operation_family: "update_commit_create".to_string(),
+            benchmark_operation: "update_commit".to_string(),
+            member_count_before: member_count,
+            member_count_after: member_count,
+            added_members_count: 0,
+            removed_members_count: 0,
+        }
+    }
+}
+
+pub fn set_update_commit_create_context(ctx: UpdateCommitCreateContext) {
+    UPDATE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+pub fn clear_update_commit_create_context() {
+    UPDATE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+// ── RemoveCommitCreate context ──────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct RemoveCommitCreateContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub added_members_count: usize,
+    pub removed_members_count: usize,
+}
+
+impl RemoveCommitCreateContext {
+    pub fn new(member_count_before: usize, removed_members_count: usize) -> Self {
+        let member_count_after = member_count_before.saturating_sub(removed_members_count);
+        Self {
+            operation_family: "remove_commit_create".to_string(),
+            benchmark_operation: "remove_commit".to_string(),
+            member_count_before,
+            member_count_after,
+            added_members_count: 0,
+            removed_members_count,
+        }
+    }
+}
+
+pub fn set_remove_commit_create_context(ctx: RemoveCommitCreateContext) {
+    REMOVE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+pub fn clear_remove_commit_create_context() {
+    REMOVE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+// ── KeyPackageCreate context ────────────────────────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct KeyPackageCreateContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+}
+
+impl Default for KeyPackageCreateContext {
+    fn default() -> Self {
+        Self {
+            operation_family: "key_package_create".to_string(),
+            benchmark_operation: "key_package_create".to_string(),
+        }
+    }
+}
+
+impl KeyPackageCreateContext {
+    pub fn new() -> Self { Self::default() }
+}
+
+pub fn set_key_package_create_context(ctx: KeyPackageCreateContext) {
+    KEY_PACKAGE_CREATE_CONTEXT.with(|slot| { *slot.borrow_mut() = Some(ctx); });
+}
+
+pub fn clear_key_package_create_context() {
+    KEY_PACKAGE_CREATE_CONTEXT.with(|slot| { *slot.borrow_mut() = None; });
+}
+
+// ── WelcomeReceive (join_from_welcome) context ──────────────────────────────
+
+#[derive(Clone, Debug)]
+pub struct WelcomeReceiveContext {
+    pub operation_family: String,
+    pub benchmark_operation: String,
+    pub member_count_before: usize,
+    pub member_count_after: usize,
+    pub welcome_bytes: Option<usize>,
+    pub encrypted_group_secrets_count: Option<usize>,
+    pub welcome_recipient_count: Option<usize>,
+    pub ratchet_tree_bytes: Option<usize>,
+    pub tree_node_count: Option<u32>,
+    pub tree_size: Option<u32>,
+}
+
+impl WelcomeReceiveContext {
+    pub fn new(member_count: usize) -> Self {
+        Self {
+            operation_family: "welcome_receive".to_string(),
+            benchmark_operation: "welcome_receive".to_string(),
+            member_count_before: 0,
+            member_count_after: member_count,
+            welcome_bytes: None,
+            encrypted_group_secrets_count: None,
+            welcome_recipient_count: None,
+            ratchet_tree_bytes: None,
+            tree_node_count: None,
+            tree_size: None,
+        }
+    }
+}
+
+pub fn set_welcome_receive_context(ctx: WelcomeReceiveContext) {
+    WELCOME_RECEIVE_CONTEXT.with(|slot| { *slot.borrow_mut() = Some(ctx); });
+}
+
+pub fn clear_welcome_receive_context() {
+    WELCOME_RECEIVE_CONTEXT.with(|slot| { *slot.borrow_mut() = None; });
+}
+
+pub fn update_welcome_receive_context<F>(f: F)
+where F: FnOnce(&mut WelcomeReceiveContext)
+{
+    WELCOME_RECEIVE_CONTEXT.with(|slot| {
+        if let Some(ref mut ctx) = *slot.borrow_mut() { f(ctx); }
+    });
+}
+
+/// Updates fields on the active AppMessageReceiveContext thread-local.
+pub fn update_app_message_receive_context<F>(f: F)
+where
+    F: FnOnce(&mut AppMessageReceiveContext),
+{
+    APP_MESSAGE_RECEIVE_CONTEXT.with(|slot| {
+        if let Some(ref mut ctx) = *slot.borrow_mut() {
+            f(ctx);
+        }
+    });
+}
+
+/// Runs `f` inside a canonical AddCommit total span with stable metadata.
+pub fn wrap_add_commit_total<T>(
+    member_count_before: usize,
+    member_count_after: usize,
+    added_members_count: usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    let total_scope = ProfileScope::start("add_commit_total_local", "openmls");
+    let ctx = AddCommitContext::new(
+        member_count_before,
+        member_count_after,
+        added_members_count,
+    );
+    with_add_commit_context(ctx, || {
+        let result = f();
+        finish_and_emit(total_scope, |_| {});
+        result
+    })
+}
+
+/// Runs `f` with stable metadata for one local AddCommit creation operation.
+pub fn with_add_commit_context<T>(ctx: AddCommitContext, f: impl FnOnce() -> T) -> T {
+    struct RestoreAddCommitContext(Option<AddCommitContext>);
+
+    impl Drop for RestoreAddCommitContext {
+        fn drop(&mut self) {
+            ADD_COMMIT_CONTEXT.with(|slot| {
+                *slot.borrow_mut() = self.0.take();
+            });
+        }
+    }
+
+    let previous = ADD_COMMIT_CONTEXT.with(|slot| slot.borrow_mut().replace(ctx));
+    let _restore = RestoreAddCommitContext(previous);
+    f()
 }
 
 pub fn set_benchmark_context(ctx: BenchmarkContext) {
@@ -592,8 +1049,13 @@ fn bounded_i64_delta(start: u64, end: u64) -> i64 {
     delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
-pub(crate) fn profiling_enabled() -> bool {
+pub fn profiling_enabled() -> bool {
     writer().is_some()
+}
+
+/// Returns whether this process can open and read L1D hardware counters.
+pub fn l1d_cache_counters_available() -> bool {
+    L1DCacheCounterScope::counters_available()
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -666,8 +1128,8 @@ pub(crate) fn count_hpke_decrypt(count: u64) {
     HPKE_DECRYPT_COUNT.fetch_add(count, Ordering::Relaxed);
 }
 
-#[derive(Serialize, Debug)]
-pub(crate) struct ProfileEvent {
+#[derive(Clone, Serialize, Debug)]
+pub struct ProfileEvent {
     pub profile_schema_version: u32,
     pub ts_unix_ns: u128,
     pub op: String,
@@ -683,13 +1145,20 @@ pub(crate) struct ProfileEvent {
 
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
+    pub cpu_process_ns: u128,
     pub cpu_envelope_utilization: Option<f64>,
     pub cpu_throttled_time_ratio: Option<f64>,
 
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
+    pub alloc_measurement_scope: Option<String>,
     pub l1d_cache_accesses: Option<u64>,
     pub l1d_cache_misses: Option<u64>,
+    pub l1d_measurement_scope: Option<String>,
+    pub l1d_cache_status: String,
+    pub l1d_measured_thread_count: Option<usize>,
+    pub l1d_discovered_thread_count: Option<usize>,
+    pub l1d_multiplexed_thread_count: Option<usize>,
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
 
@@ -698,6 +1167,8 @@ pub(crate) struct ProfileEvent {
     pub ratchet_tree_bytes: Option<usize>,
     pub welcome_plus_ratchet_tree_bytes: Option<usize>,
     pub group_info_bytes: Option<usize>,
+    pub group_info_plaintext_bytes: Option<usize>,
+    pub group_info_ciphertext_bytes: Option<usize>,
     pub encrypted_group_info_bytes: Option<usize>,
     pub encrypted_secrets_count: Option<usize>,
 
@@ -706,7 +1177,11 @@ pub(crate) struct ProfileEvent {
     pub tree_height: Option<u32>,
     pub tree_leaf_count: Option<u32>,
     pub tree_node_count: Option<u32>,
+    pub operation_family: Option<String>,
+    /// Stable group size at operation start. For AddCommit this is always N.
     pub member_count: Option<usize>,
+    pub member_count_before: Option<usize>,
+    pub member_count_after: Option<usize>,
     pub invitee_count: Option<isize>,
     pub added_members_count: Option<usize>,
     pub removed_members_count: Option<usize>,
@@ -819,9 +1294,23 @@ pub(crate) struct ProfileEvent {
     pub benchmark_operation_seq: Option<usize>,
     pub benchmark_payload_size: Option<usize>,
     pub configured_payload_label: Option<String>,
+    pub membership_batch_requested: Option<usize>,
+    pub membership_batch_effective: Option<usize>,
+    pub membership_batch_group_cap: Option<usize>,
+    pub membership_batch_transition_cap: Option<usize>,
+    pub membership_batch_source: Option<String>,
 }
 
-pub(crate) fn emit_event(event: &ProfileEvent) {
+impl ProfileEvent {
+    /// Override the process-wide allocation delta with an exact serial measurement.
+    pub fn set_current_thread_allocations(&mut self, bytes: u64, count: u64) {
+        self.alloc_bytes = Some(bytes);
+        self.alloc_count = Some(count);
+        self.alloc_measurement_scope = Some("current_thread".to_string());
+    }
+}
+
+pub fn emit_event(event: &ProfileEvent) {
     let Some(lock) = writer().as_ref() else {
         return;
     };
@@ -830,14 +1319,261 @@ pub(crate) fn emit_event(event: &ProfileEvent) {
         return;
     };
 
-    if let Ok(line) = serde_json::to_string(event) {
+    let mut event = event.clone();
+    ADD_COMMIT_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            event.operation_family = Some(ctx.operation_family.clone());
+            event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            event.member_count = Some(ctx.member_count_before);
+            event.member_count_before = Some(ctx.member_count_before);
+            event.member_count_after = Some(ctx.member_count_after);
+            event.added_members_count = Some(ctx.added_members_count);
+        }
+    });
+    COMMIT_RECEIVE_OP_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_before);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.added_members_count.is_none() {
+                event.added_members_count = ctx.added_members_count;
+            }
+            if event.removed_members_count.is_none() {
+                event.removed_members_count = ctx.removed_members_count;
+            }
+            if event.commit_kind.is_none() {
+                event.commit_kind = ctx.commit_kind.clone();
+            }
+            if event.commit_size_bytes.is_none() {
+                event.commit_size_bytes = ctx.commit_bytes;
+            }
+            if event.receiver_is_committer.is_none() {
+                event.receiver_is_committer = ctx.receiver_is_committer;
+            }
+            if event.committer_leaf_index.is_none() {
+                event.committer_leaf_index = ctx.committer_leaf_index;
+            }
+            if event.proposal_count.is_none() {
+                event.proposal_count = ctx.proposal_count;
+            }
+            if event.add_proposal_count.is_none() {
+                event.add_proposal_count = ctx.add_proposal_count;
+            }
+            if event.remove_proposal_count.is_none() {
+                event.remove_proposal_count = ctx.remove_proposal_count;
+            }
+            if event.update_proposal_count.is_none() {
+                event.update_proposal_count = ctx.update_proposal_count;
+            }
+            if event.update_path_present.is_none() {
+                event.update_path_present = ctx.update_path_present;
+            }
+            if event.filtered_direct_path_len.is_none() {
+                event.filtered_direct_path_len = ctx.filtered_direct_path_len;
+            }
+            if event.sum_copath_resolution_sizes.is_none() {
+                event.sum_copath_resolution_sizes = ctx.sum_copath_resolution_sizes;
+            }
+        }
+    });
+    APP_MESSAGE_CREATE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_before);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.sender_leaf_index.is_none() {
+                event.sender_leaf_index = ctx.sender_leaf_index;
+            }
+            if event.sender_generation.is_none() {
+                event.sender_generation = ctx.sender_generation;
+            }
+            if event.app_msg_plaintext_bytes.is_none() {
+                event.app_msg_plaintext_bytes = ctx.app_msg_plaintext_bytes;
+            }
+            if event.app_msg_ciphertext_bytes.is_none() {
+                event.app_msg_ciphertext_bytes = ctx.app_msg_ciphertext_bytes;
+            }
+            if event.aad_bytes.is_none() {
+                event.aad_bytes = ctx.aad_bytes;
+            }
+        }
+    });
+    APP_MESSAGE_RECEIVE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_before);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.receiver_leaf_index.is_none() {
+                event.receiver_leaf_index = ctx.receiver_leaf_index;
+            }
+            if event.sender_leaf_index.is_none() {
+                event.sender_leaf_index = ctx.sender_leaf_index;
+            }
+            if event.sender_generation.is_none() {
+                event.sender_generation = ctx.sender_generation;
+            }
+            if event.app_msg_plaintext_bytes.is_none() {
+                event.app_msg_plaintext_bytes = ctx.app_msg_plaintext_bytes;
+            }
+            if event.app_msg_ciphertext_bytes.is_none() {
+                event.app_msg_ciphertext_bytes = ctx.app_msg_ciphertext_bytes;
+            }
+            if event.aad_bytes.is_none() {
+                event.aad_bytes = ctx.aad_bytes;
+            }
+            if event.generation_gap.is_none() {
+                event.generation_gap = ctx.generation_gap;
+            }
+            if event.out_of_order_message.is_none() {
+                event.out_of_order_message = ctx.out_of_order_message;
+            }
+            if event.first_receive_from_sender.is_none() {
+                event.first_receive_from_sender = ctx.first_receive_from_sender;
+            }
+        }
+    });
+    UPDATE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_before);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.added_members_count.is_none() {
+                event.added_members_count = Some(ctx.added_members_count);
+            }
+            if event.removed_members_count.is_none() {
+                event.removed_members_count = Some(ctx.removed_members_count);
+            }
+        }
+    });
+    REMOVE_COMMIT_CREATE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_before);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.added_members_count.is_none() {
+                event.added_members_count = Some(ctx.added_members_count);
+            }
+            if event.removed_members_count.is_none() {
+                event.removed_members_count = Some(ctx.removed_members_count);
+            }
+        }
+    });
+    KEY_PACKAGE_CREATE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+        }
+    });
+    WELCOME_RECEIVE_CONTEXT.with(|slot| {
+        if let Some(ctx) = slot.borrow().as_ref() {
+            if event.operation_family.is_none() {
+                event.operation_family = Some(ctx.operation_family.clone());
+            }
+            if event.benchmark_operation.is_none() {
+                event.benchmark_operation = Some(ctx.benchmark_operation.clone());
+            }
+            if event.member_count_before.is_none() {
+                event.member_count_before = Some(ctx.member_count_before);
+            }
+            if event.member_count.is_none() {
+                event.member_count = Some(ctx.member_count_after);
+            }
+            if event.member_count_after.is_none() {
+                event.member_count_after = Some(ctx.member_count_after);
+            }
+            if event.welcome_bytes.is_none() {
+                event.welcome_bytes = ctx.welcome_bytes;
+            }
+            if event.ratchet_tree_bytes.is_none() {
+                event.ratchet_tree_bytes = ctx.ratchet_tree_bytes;
+            }
+            if event.welcome_recipient_count.is_none() {
+                event.welcome_recipient_count = ctx.welcome_recipient_count;
+            }
+            if event.tree_node_count.is_none() {
+                event.tree_node_count = ctx.tree_node_count;
+            }
+            if event.tree_size.is_none() {
+                event.tree_size = ctx.tree_size;
+            }
+        }
+    });
+    if event.member_count.is_none() {
+        event.member_count = event.member_count_before;
+    }
+
+    if let Ok(line) = serde_json::to_string(&event) {
         let _ = guard.write_all(line.as_bytes());
         let _ = guard.write_all(b"\n");
         let _ = guard.flush();
     }
 }
 
-pub(crate) struct ProfileScope {
+pub struct ProfileScope {
     op: String,
     implementation: String,
     wall_start: Instant,
@@ -845,6 +1581,9 @@ pub(crate) struct ProfileScope {
     resource_start: ResourceSnapshot,
     structural_start: StructuralCounterSnapshot,
     l1d_cache_start: Option<L1DCacheCounterScope>,
+    l1d_cache_available: bool,
+    l1d_measurement_scope: &'static str,
+    process_allocation_start: ProcessAllocationSnapshot,
     span_id: u64,
     parent_span_id: Option<u64>,
     parent_operation: Option<String>,
@@ -852,25 +1591,51 @@ pub(crate) struct ProfileScope {
 }
 
 impl ProfileScope {
-    pub(crate) fn start(op: impl Into<String>, implementation: impl Into<String>) -> Option<Self> {
+    pub fn start(op: impl Into<String>, implementation: impl Into<String>) -> Option<Self> {
         if !profiling_enabled() {
             return None;
         }
-        let _ = L1DCacheCounterScope::counters_available();
         let span_id = next_span_id();
         let op_name: String = op.into();
         let parent_span_id = current_parent_span_id();
         let parent_operation = current_parent_operation();
         push_span_id(span_id, op_name.clone());
 
+        let use_process_l1d_scope = op_name == "add_commit_total_local"
+            || op_name.ends_with(".path_hpke_encrypt");
+        #[cfg(not(target_arch = "wasm32"))]
+        if use_process_l1d_scope {
+            // Ensure the global Rayon pool exists before process TIDs are enumerated.
+            let _ = rayon::current_num_threads();
+        }
+        let l1d_cache_available = L1DCacheCounterScope::counters_available();
+        let l1d_cache_start = if use_process_l1d_scope {
+            L1DCacheCounterScope::start_process_threads()
+        } else {
+            L1DCacheCounterScope::start_current_thread()
+        };
+        let l1d_measurement_scope = if use_process_l1d_scope {
+            "process_threads_at_span_start"
+        } else {
+            "current_thread"
+        };
+        let process_allocation_start = process_snapshot();
+        let structural_start = StructuralCounterSnapshot::capture();
+        let resource_start = ResourceSnapshot::capture_start();
+        let cpu_start = Some(ThreadTime::now());
+        let wall_start = Instant::now();
+
         Some(Self {
             op: op_name,
             implementation: implementation.into(),
-            wall_start: Instant::now(),
-            cpu_start: Some(ThreadTime::now()),
-            resource_start: ResourceSnapshot::capture_start(),
-            structural_start: StructuralCounterSnapshot::capture(),
-            l1d_cache_start: L1DCacheCounterScope::start(),
+            wall_start,
+            cpu_start,
+            resource_start,
+            structural_start,
+            l1d_cache_start,
+            l1d_cache_available,
+            l1d_measurement_scope,
+            process_allocation_start,
             span_id,
             parent_span_id,
             parent_operation,
@@ -881,6 +1646,19 @@ impl ProfileScope {
     pub(crate) fn finish(mut self) -> ProfileEvent {
         let op = self.op.clone();
         let implementation = self.implementation.clone();
+        // Capture primary timing endpoints before profiler teardown work.
+        let wall_ns = self.wall_start.elapsed().as_nanos();
+        let cpu_thread_ns = self
+            .cpu_start
+            .as_ref()
+            .map(|start| start.elapsed().as_nanos());
+        let cpu_process_ns = self
+            .resource_start
+            .process_cpu_start
+            .as_ref()
+            .map(|start| start.elapsed().as_nanos())
+            .unwrap_or(0);
+        let process_allocation = process_snapshot().delta_since(self.process_allocation_start);
         let structural_counters =
             StructuralCounterSnapshot::capture().delta_since(self.structural_start);
         let l1d_cache_counts = self
@@ -888,25 +1666,42 @@ impl ProfileScope {
             .take()
             .map(L1DCacheCounterScope::finish)
             .unwrap_or_default();
-        let wall_ns = self.wall_start.elapsed().as_nanos();
-        let cpu_thread_ns = self
-            .cpu_start
-            .as_ref()
-            .map(|start| start.elapsed().as_nanos());
-        let resource_end = ResourceSnapshot::capture_end();
-        let process_cpu_ns = self
-            .resource_start
-            .process_cpu_start
-            .as_ref()
-            .map(|start| start.elapsed().as_nanos());
-        let effective_cpu_limit = effective_cpu_limit_cores().unwrap_or(1.0);
-        let cpu_envelope_utilization = process_cpu_ns.and_then(|cpu_ns| {
-            if wall_ns > 0 && effective_cpu_limit > 0.0 {
-                Some(cpu_ns as f64 / (wall_ns as f64 * effective_cpu_limit))
+        let l1d_cache_status = if l1d_cache_counts.accesses.is_some()
+            && l1d_cache_counts.misses.is_some()
+        {
+            if self.l1d_measurement_scope == "current_thread" {
+                if l1d_cache_counts.multiplexed_thread_count > 0 {
+                    "available_current_thread_scaled_for_multiplexing"
+                } else {
+                    "available_current_thread"
+                }
+            } else if l1d_cache_counts.measured_thread_count
+                == l1d_cache_counts.discovered_thread_count
+            {
+                if l1d_cache_counts.multiplexed_thread_count > 0 {
+                    "available_all_process_threads_scaled_for_multiplexing"
+                } else {
+                    "available_all_process_threads"
+                }
             } else {
-                None
+                if l1d_cache_counts.multiplexed_thread_count > 0 {
+                    "available_partial_process_threads_scaled_for_multiplexing"
+                } else {
+                    "available_partial_process_threads"
+                }
             }
-        });
+        } else if self.l1d_cache_available {
+            "counter_start_or_read_failed"
+        } else {
+            "unsupported_or_permission_denied"
+        };
+        let resource_end = ResourceSnapshot::capture_end();
+        let effective_cpu_limit = effective_cpu_limit_cores().unwrap_or(1.0);
+        let cpu_envelope_utilization = if wall_ns > 0 && effective_cpu_limit > 0.0 {
+            Some(cpu_process_ns as f64 / (wall_ns as f64 * effective_cpu_limit))
+        } else {
+            None
+        };
         let cpu_throttled_time_ratio =
             match (self.resource_start.throttled_ns, resource_end.throttled_ns) {
                 (Some(start), Some(end)) if wall_ns > 0 && end >= start => {
@@ -933,7 +1728,7 @@ impl ProfileScope {
         pop_span_id(self.span_id);
 
         let mut event = ProfileEvent {
-            profile_schema_version: 6,
+            profile_schema_version: 10,
             ts_unix_ns: unix_timestamp_ns(),
             measurement_class: measurement_class_for_op(&op).to_string(),
             measurement_plane: measurement_plane_for_op(&op).to_string(),
@@ -948,13 +1743,22 @@ impl ProfileScope {
 
             wall_ns,
             cpu_thread_ns,
+            cpu_process_ns,
             cpu_envelope_utilization,
             cpu_throttled_time_ratio,
 
-            alloc_bytes: None,
-            alloc_count: None,
+            alloc_bytes: Some(process_allocation.bytes_total),
+            alloc_count: Some(process_allocation.count_total),
+            alloc_measurement_scope: Some("process_all_threads".to_string()),
             l1d_cache_accesses: l1d_cache_counts.accesses,
             l1d_cache_misses: l1d_cache_counts.misses,
+            l1d_measurement_scope: Some(self.l1d_measurement_scope.to_string()),
+            l1d_cache_status: l1d_cache_status.to_string(),
+            l1d_measured_thread_count: (l1d_cache_counts.measured_thread_count > 0)
+                .then_some(l1d_cache_counts.measured_thread_count),
+            l1d_discovered_thread_count: (l1d_cache_counts.discovered_thread_count > 0)
+                .then_some(l1d_cache_counts.discovered_thread_count),
+            l1d_multiplexed_thread_count: Some(l1d_cache_counts.multiplexed_thread_count),
             ram_rss_delta_bytes,
             ram_rss_utilization,
 
@@ -963,6 +1767,8 @@ impl ProfileScope {
             ratchet_tree_bytes: None,
             welcome_plus_ratchet_tree_bytes: None,
             group_info_bytes: None,
+            group_info_plaintext_bytes: None,
+            group_info_ciphertext_bytes: None,
             encrypted_group_info_bytes: None,
             encrypted_secrets_count: None,
 
@@ -971,7 +1777,10 @@ impl ProfileScope {
             tree_height: None,
             tree_leaf_count: None,
             tree_node_count: None,
+            operation_family: None,
             member_count: None,
+            member_count_before: None,
+            member_count_after: None,
             invitee_count: None,
             added_members_count: None,
             removed_members_count: None,
@@ -1082,6 +1891,11 @@ impl ProfileScope {
             benchmark_operation_seq: None,
             benchmark_payload_size: None,
             configured_payload_label: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         };
 
         COMMIT_RECEIVE_CONTEXT.with(|slot| {
@@ -1095,7 +1909,6 @@ impl ProfileScope {
                 event.commit_id = ctx.commit_id.clone();
                 event.group_epoch = ctx.group_epoch;
                 event.tree_size = ctx.tree_size;
-                event.member_count = ctx.member_count;
                 event.ciphersuite = ctx.ciphersuite.clone();
             }
         });
@@ -1110,6 +1923,11 @@ impl ProfileScope {
                 event.benchmark_operation_seq = ctx.benchmark_operation_seq;
                 event.benchmark_payload_size = ctx.benchmark_payload_size;
                 event.configured_payload_label = ctx.configured_payload_label.clone();
+                event.membership_batch_requested = ctx.membership_batch_requested;
+                event.membership_batch_effective = ctx.membership_batch_effective;
+                event.membership_batch_group_cap = ctx.membership_batch_group_cap;
+                event.membership_batch_transition_cap = ctx.membership_batch_transition_cap;
+                event.membership_batch_source = ctx.membership_batch_source.clone();
                 if ctx.device_kind.is_some() {
                     event.device_kind = ctx.device_kind.clone();
                 }
@@ -1154,7 +1972,7 @@ impl Drop for ProfileScope {
     }
 }
 
-pub(crate) fn finish_and_emit(scope: Option<ProfileScope>, fill: impl FnOnce(&mut ProfileEvent)) {
+pub fn finish_and_emit(scope: Option<ProfileScope>, fill: impl FnOnce(&mut ProfileEvent)) {
     let Some(scope) = scope else {
         return;
     };

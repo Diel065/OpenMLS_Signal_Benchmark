@@ -42,6 +42,7 @@ fn create_group_with_n_members(
 ) -> MlsGroup {
     let mls_group_create_config = MlsGroupCreateConfig::builder()
         .ciphersuite(ciphersuite)
+        .use_ratchet_tree_extension(true)
         .build();
 
     let mut alice_group = MlsGroup::new(provider, signer, &mls_group_create_config, credential)
@@ -120,6 +121,7 @@ fn join_from_welcome_profiling_smoke() {
 
     let mls_group_create_config = MlsGroupCreateConfig::builder()
         .ciphersuite(ciphersuite)
+        .use_ratchet_tree_extension(true)
         .build();
 
     let mut alice_group = MlsGroup::new(
@@ -148,17 +150,13 @@ fn join_from_welcome_profiling_smoke() {
     let welcome_bytes = welcome_msg
         .tls_serialize_detached()
         .expect("serialize welcome");
-    let ratchet_tree: RatchetTreeIn = alice_group.export_ratchet_tree().into();
-    let ratchet_tree_bytes = ratchet_tree
-        .tls_serialize_detached()
-        .expect("serialize ratchet tree");
-
-    let bob_join_config = MlsGroupJoinConfig::default();
+    let bob_join_config = MlsGroupJoinConfig::builder()
+        .use_ratchet_tree_extension(true)
+        .build();
     let bob_group = MlsGroup::join_from_welcome_bytes_profiled(
         bob_provider,
         &bob_join_config,
         &welcome_bytes,
-        &ratchet_tree_bytes,
     )
     .expect("Error joining from welcome");
 
@@ -230,18 +228,14 @@ fn join_from_welcome_n_sweep() {
         let welcome_bytes = welcome_option
             .tls_serialize_detached()
             .expect("serialize welcome");
-        let ratchet_tree: RatchetTreeIn = alice_group.export_ratchet_tree().into();
-        let ratchet_tree_bytes = ratchet_tree
-            .tls_serialize_detached()
-            .expect("serialize ratchet tree");
-
-        let join_config = MlsGroupJoinConfig::default();
+        let join_config = MlsGroupJoinConfig::builder()
+            .use_ratchet_tree_extension(true)
+            .build();
 
         let joiner_group = MlsGroup::join_from_welcome_bytes_profiled(
             joiner_provider,
             &join_config,
             &welcome_bytes,
-            &ratchet_tree_bytes,
         )
         .expect("Error joining from welcome");
 

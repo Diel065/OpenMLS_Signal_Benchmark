@@ -1,4 +1,5 @@
 target
+**/target
 benchmark_output
 .git
 .gitignore

@@ -21,7 +21,10 @@ use mls_playground::worker_api::{
     handle_command, BenchmarkContextFields, Command, CommandResponse, CompletedCommandCache,
     IncomingCommandRequest, PendingIntent,
 };
-use openmls::profiling::{set_benchmark_context, set_worker_id, BenchmarkContext};
+use openmls::profiling::{
+    l1d_cache_counters_available, profiling_enabled, set_benchmark_context, set_worker_id,
+    BenchmarkContext,
+};
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_PACKED_INTERNAL_PARALLELISM: usize = 4;
@@ -59,6 +62,11 @@ struct WorkerCommandEnvelope {
     benchmark_operation: Option<String>,
     benchmark_operation_seq: Option<usize>,
     benchmark_payload_size: Option<usize>,
+    membership_batch_requested: Option<usize>,
+    membership_batch_effective: Option<usize>,
+    membership_batch_group_cap: Option<usize>,
+    membership_batch_transition_cap: Option<usize>,
+    membership_batch_source: Option<String>,
     device_kind: Option<String>,
     execution_backend: Option<String>,
     ciphersuite: Option<String>,
@@ -100,6 +108,16 @@ struct BatchCommandItem {
     pub benchmark_operation_seq: Option<usize>,
     #[serde(default)]
     pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_requested: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_effective: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_group_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_transition_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_source: Option<String>,
     #[serde(default)]
     pub device_kind: Option<String>,
     #[serde(default)]
@@ -217,6 +235,25 @@ fn parse_args() -> Result<(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+async fn profiling_capabilities() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "profiling_enabled": profiling_enabled(),
+        "l1d_cache_counters_available": l1d_cache_counters_available(),
+    }))
+}
+
+async fn client_profiling_capabilities(
+    Path(client_id): Path<String>,
+    State(state): State<Arc<WorkerProcessState>>,
+) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "client_id": client_id,
+        "client_exists": state.client_handles.contains_key(&client_id),
+        "profiling_enabled": profiling_enabled(),
+        "l1d_cache_counters_available": l1d_cache_counters_available(),
+    }))
 }
 
 async fn client_health(
@@ -380,6 +417,11 @@ async fn run_batch_command(
                 benchmark_operation: item.benchmark_operation,
                 benchmark_operation_seq: item.benchmark_operation_seq,
                 benchmark_payload_size: item.benchmark_payload_size,
+                membership_batch_requested: item.membership_batch_requested,
+                membership_batch_effective: item.membership_batch_effective,
+                membership_batch_group_cap: item.membership_batch_group_cap,
+                membership_batch_transition_cap: item.membership_batch_transition_cap,
+                membership_batch_source: item.membership_batch_source,
                 device_kind: item.device_kind,
                 execution_backend: item.execution_backend,
                 ciphersuite: item.ciphersuite,
@@ -441,6 +483,11 @@ async fn send_to_client_actor(
         benchmark_operation: benchmark_ctx.benchmark_operation,
         benchmark_operation_seq: benchmark_ctx.benchmark_operation_seq,
         benchmark_payload_size: benchmark_ctx.benchmark_payload_size,
+        membership_batch_requested: benchmark_ctx.membership_batch_requested,
+        membership_batch_effective: benchmark_ctx.membership_batch_effective,
+        membership_batch_group_cap: benchmark_ctx.membership_batch_group_cap,
+        membership_batch_transition_cap: benchmark_ctx.membership_batch_transition_cap,
+        membership_batch_source: benchmark_ctx.membership_batch_source,
         device_kind: benchmark_ctx.device_kind,
         execution_backend: benchmark_ctx.execution_backend,
         ciphersuite: benchmark_ctx.ciphersuite,
@@ -529,23 +576,29 @@ async fn client_command_actor(
         // Clear stale benchmark context and worker ID, then set current command's context.
         set_benchmark_context(BenchmarkContext::default());
         set_worker_id(client_id.clone());
-        if envelope.benchmark_phase.is_some()
+        let has_benchmark_context = envelope.benchmark_phase.is_some()
             || envelope.benchmark_operation.is_some()
-            || envelope.benchmark_plateau_index.is_some()
-        {
-            set_benchmark_context(BenchmarkContext {
-                benchmark_plateau_index: envelope.benchmark_plateau_index,
-                benchmark_target_size: envelope.benchmark_target_size,
-                benchmark_active_size: envelope.benchmark_active_size,
-                benchmark_phase: envelope.benchmark_phase,
-                benchmark_operation: envelope.benchmark_operation,
-                benchmark_operation_seq: envelope.benchmark_operation_seq,
-                benchmark_payload_size: envelope.benchmark_payload_size,
-                configured_payload_label: envelope.benchmark_payload_size.map(|s| s.to_string()),
-                device_kind: envelope.device_kind,
-                execution_backend: envelope.execution_backend,
-                ciphersuite: envelope.ciphersuite,
-            });
+            || envelope.benchmark_plateau_index.is_some();
+        let benchmark_context = BenchmarkContext {
+            benchmark_plateau_index: envelope.benchmark_plateau_index,
+            benchmark_target_size: envelope.benchmark_target_size,
+            benchmark_active_size: envelope.benchmark_active_size,
+            benchmark_phase: envelope.benchmark_phase,
+            benchmark_operation: envelope.benchmark_operation,
+            benchmark_operation_seq: envelope.benchmark_operation_seq,
+            benchmark_payload_size: envelope.benchmark_payload_size,
+            membership_batch_requested: envelope.membership_batch_requested,
+            membership_batch_effective: envelope.membership_batch_effective,
+            membership_batch_group_cap: envelope.membership_batch_group_cap,
+            membership_batch_transition_cap: envelope.membership_batch_transition_cap,
+            membership_batch_source: envelope.membership_batch_source,
+            configured_payload_label: envelope.benchmark_payload_size.map(|s| s.to_string()),
+            device_kind: envelope.device_kind,
+            execution_backend: envelope.execution_backend,
+            ciphersuite: envelope.ciphersuite,
+        };
+        if has_benchmark_context {
+            set_benchmark_context(benchmark_context.clone());
         }
 
         let result = handle_command(
@@ -555,6 +608,7 @@ async fn client_command_actor(
             &mut slot.queued_intent,
             envelope.command,
             envelope.expected_epoch,
+            benchmark_context,
         )
         .await;
 
@@ -725,8 +779,13 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/profiling-capabilities", get(profiling_capabilities))
         .route("/clients", get(list_clients))
         .route("/client/{client_id}/health", get(client_health))
+        .route(
+            "/client/{client_id}/profiling-capabilities",
+            get(client_profiling_capabilities),
+        )
         .route("/command", post(run_command))
         .route("/client/{client_id}/command", post(run_command_for_client))
         .route("/batch-command", post(run_batch_command))

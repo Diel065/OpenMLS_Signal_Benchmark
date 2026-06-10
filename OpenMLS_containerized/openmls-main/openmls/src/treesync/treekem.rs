@@ -15,9 +15,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use tls_codec::{TlsDeserialize, TlsDeserializeBytes, TlsSerialize, TlsSize};
 
-#[cfg(feature = "profiling-json")]
-use allocation_counter::measure;
-
 use super::{
     diff::TreeSyncDiff,
     errors::UpdatePathError,
@@ -100,21 +97,6 @@ impl TreeSyncDiff<'_> {
             u32::BITS - (leaf_count - 1).leading_zeros()
         };
 
-        #[cfg(feature = "profiling-json")]
-        let mut measured_result = None;
-        #[cfg(feature = "profiling-json")]
-        let allocation_info = measure(|| {
-            measured_result = Some(
-                resolved_path
-                    .map(|(node, resolution)| {
-                        node.encrypt(crypto, ciphersuite, resolution, group_context)
-                    })
-                    .collect::<Result<Vec<UpdatePathNode>, LibraryError>>(),
-            );
-        });
-        #[cfg(feature = "profiling-json")]
-        let result = measured_result.expect("allocation_counter measure closure did not run");
-        #[cfg(not(feature = "profiling-json"))]
         let result = resolved_path
             .map(|(node, resolution)| node.encrypt(crypto, ciphersuite, resolution, group_context))
             .collect::<Result<Vec<UpdatePathNode>, LibraryError>>();
@@ -129,8 +111,6 @@ impl TreeSyncDiff<'_> {
             event.sum_copath_resolution_sizes = Some(encrypted_path_secret_count);
             event.max_copath_resolution_size = Some(max_copath_resolution_size);
             event.hpke_encrypt_count = Some(encrypted_path_secret_count as u64);
-            event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-            event.alloc_count = Some(allocation_info.count_total as u64);
             event.ciphersuite = Some(format!("{:?}", ciphersuite));
         });
 

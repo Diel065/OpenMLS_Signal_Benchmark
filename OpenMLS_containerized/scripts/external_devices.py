@@ -194,6 +194,35 @@ class DeviceBackend:
     def stop_worker(self) -> None:
         raise NotImplementedError
 
+    def _set_perf_event_paranoid(self, value: int) -> None:
+        raise NotImplementedError
+
+    def ensure_perf_event_access(self, maximum_paranoid: int = 2) -> None:
+        path = "/proc/sys/kernel/perf_event_paranoid"
+        result = self.shell(f"cat {path}", check=False)
+        try:
+            current = int(result.stdout.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            print(
+                "[device] kernel.perf_event_paranoid is unavailable; "
+                "deferring to the worker's live perf-event capability probe",
+                flush=True,
+            )
+            return
+        if current > maximum_paranoid:
+            self._set_perf_event_paranoid(maximum_paranoid)
+            verify = self.shell(f"cat {path}", check=False)
+            try:
+                current = int(verify.stdout.strip().splitlines()[-1])
+            except (ValueError, IndexError) as exc:
+                raise RuntimeError("Could not verify kernel.perf_event_paranoid") from exc
+        if current > maximum_paranoid:
+            raise RuntimeError(
+                f"kernel.perf_event_paranoid={current} blocks worker hardware counters; "
+                f"required <= {maximum_paranoid}"
+            )
+        print(f"[device] perf_event access ok (kernel.perf_event_paranoid={current})", flush=True)
+
     def wait_health(self, url: str, timeout_s: float = 30.0) -> None:
         deadline = time.time() + timeout_s
         while time.time() < deadline:
@@ -310,6 +339,19 @@ class AdbDeviceBackend(DeviceBackend):
     def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess:
         self._ensure_selected()
         return self._adb(["shell", command], check=check, timeout=120)
+
+    def _set_perf_event_paranoid(self, value: int) -> None:
+        path = "/proc/sys/kernel/perf_event_paranoid"
+        result = self.shell(f"echo {int(value)} > {path}", check=False)
+        if result.returncode != 0:
+            result = self.shell(
+                f"su -c {shlex.quote(f'echo {int(value)} > {path}')}",
+                check=False,
+            )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Unable to lower kernel.perf_event_paranoid on the ADB device"
+            )
 
     def push(self, local: Path, remote: str) -> None:
         self._ensure_selected()
@@ -589,6 +631,16 @@ class SshDeviceBackend(DeviceBackend):
     def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess:
         self._ensure_selected()
         return self._ssh(command, check=check, timeout=120)
+
+    def _set_perf_event_paranoid(self, value: int) -> None:
+        result = self.shell(
+            f"sudo -S sysctl -w kernel.perf_event_paranoid={int(value)}",
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Unable to lower kernel.perf_event_paranoid on the SSH device"
+            )
 
     def _scp_cmd(self, src: str, dst: str, *, recursive: bool = False) -> list[str]:
         cmd = ["scp"]

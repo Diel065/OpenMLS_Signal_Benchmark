@@ -17,7 +17,7 @@ use crate::{
 };
 
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, update_app_message_receive_context, ProfileScope};
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 
@@ -164,6 +164,12 @@ impl PrivateMessageIn {
                 event.sender_data_decrypt_count = Some(1);
                 event.alloc_bytes = Some(sender_data_allocation_info.bytes_total as u64);
                 event.alloc_count = Some(sender_data_allocation_info.count_total as u64);
+
+                update_app_message_receive_context(|ctx| {
+                    ctx.sender_leaf_index = Some(sender_data.leaf_index.u32());
+                    ctx.sender_generation = Some(sender_data.generation as u64);
+                });
+
                 emit_event(&event);
             }
         }
@@ -291,6 +297,12 @@ impl PrivateMessageIn {
             event.sender_generation = Some(sender_data.generation as u64);
             event.alloc_bytes = Some(secret_tree_allocation_info.bytes_total as u64);
             event.alloc_count = Some(secret_tree_allocation_info.count_total as u64);
+
+            update_app_message_receive_context(|ctx| {
+                ctx.sender_leaf_index = Some(sender_index.u32());
+                ctx.sender_generation = Some(sender_data.generation as u64);
+            });
+
             emit_event(&event);
         }
 
@@ -324,6 +336,11 @@ impl PrivateMessageIn {
                 event.aead_decrypt_count = Some(1);
                 event.alloc_bytes = Some(content_decrypt_allocation_info.bytes_total as u64);
                 event.alloc_count = Some(content_decrypt_allocation_info.count_total as u64);
+
+                update_app_message_receive_context(|ctx| {
+                    ctx.app_msg_ciphertext_bytes = Some(ct_len);
+                });
+
                 emit_event(&event);
             }
         }

@@ -30,10 +30,12 @@ use crate::{
 #[cfg(doc)]
 use crate::key_packages::KeyPackage;
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, update_welcome_receive_context, ProfileScope};
 #[cfg(feature = "profiling-json")]
 use allocation_counter::measure;
 use tls_codec::Deserialize as _;
+#[cfg(feature = "profiling-json")]
+use tls_codec::Size as _;
 
 impl MlsGroup {
     // === Group creation ===
@@ -82,13 +84,12 @@ impl MlsGroup {
             )
     }
 
-    /// Deserialize a Welcome and ratchet tree, then join the group. Profiling
-    /// builds separate events for input deserialization and protocol work.
+    /// Deserialize a Welcome with an embedded ratchet tree, then join the group.
+    /// Profiling builds separate events for input deserialization and protocol work.
     pub fn join_from_welcome_bytes_profiled<Provider: OpenMlsProvider>(
         provider: &Provider,
         mls_group_config: &MlsGroupJoinConfig,
         welcome_bytes: &[u8],
-        ratchet_tree_bytes: &[u8],
     ) -> Result<Self, WelcomeError<Provider::StorageError>> {
         #[cfg(feature = "profiling-json")]
         let (welcome, mut welcome_deserialize_event) = {
@@ -115,6 +116,13 @@ impl MlsGroup {
                 event
             });
 
+            let encrypted_secrets_count = welcome.secrets().len();
+
+            update_welcome_receive_context(|ctx| {
+                ctx.welcome_bytes = Some(welcome_bytes.len());
+                ctx.welcome_recipient_count = Some(encrypted_secrets_count);
+            });
+
             (welcome, deserialize_event)
         };
 
@@ -127,35 +135,6 @@ impl MlsGroup {
                 _ => return Err(WelcomeError::NotAWelcomeMessage),
             }
         };
-
-        #[cfg(feature = "profiling-json")]
-        let (ratchet_tree, mut ratchet_tree_deserialize_event) = {
-            let scope =
-                ProfileScope::start("join_from_welcome_deserialize_ratchet_tree", "openmls");
-            let mut measured_result: Option<Result<RatchetTreeIn, tls_codec::Error>> = None;
-            let allocation_info = measure(|| {
-                measured_result = Some(RatchetTreeIn::tls_deserialize_exact(ratchet_tree_bytes));
-            });
-            let deserialize_event = scope.map(|scope| scope.finish());
-            let ratchet_tree = measured_result
-                .expect("allocation_counter measure closure did not run")
-                .map_err(LibraryError::missing_bound_check)?;
-
-            let deserialize_event = deserialize_event.map(|mut event| {
-                event.artifact_size_bytes = Some(ratchet_tree_bytes.len());
-                event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
-                event.ciphersuite = Some(format!("{:?}", welcome.ciphersuite()));
-                event.alloc_bytes = Some(allocation_info.bytes_total as u64);
-                event.alloc_count = Some(allocation_info.count_total as u64);
-                event
-            });
-
-            (ratchet_tree, deserialize_event)
-        };
-
-        #[cfg(not(feature = "profiling-json"))]
-        let ratchet_tree = RatchetTreeIn::tls_deserialize_exact(ratchet_tree_bytes)
-            .map_err(LibraryError::missing_bound_check)?;
 
         #[cfg(feature = "profiling-json")]
         {
@@ -189,11 +168,12 @@ impl MlsGroup {
             };
 
             // Determine ratchet tree delivery mode from GroupInfo extensions
-            let ratchet_tree_embedded = processed_welcome
+            let ratchet_tree_artifact_bytes = processed_welcome
                 .unverified_group_info()
                 .extensions()
                 .ratchet_tree()
-                .is_some();
+                .map(|extension| extension.ratchet_tree().tls_serialized_len());
+            let ratchet_tree_embedded = ratchet_tree_artifact_bytes.is_some();
 
             // Step 2: Ratchet tree parsing and validation, key schedule
             // PublicGroup metadata is unavailable until after into_staged_welcome,
@@ -206,8 +186,7 @@ impl MlsGroup {
                 );
                 let mut measured: Option<Result<_, WelcomeError<Provider::StorageError>>> = None;
                 let ai = measure(|| {
-                    measured =
-                        Some(processed_welcome.into_staged_welcome(provider, Some(ratchet_tree)));
+                    measured = Some(processed_welcome.into_staged_welcome(provider, None));
                 });
                 allocation_info.bytes_total += ai.bytes_total;
                 allocation_info.count_total += ai.count_total;
@@ -215,7 +194,7 @@ impl MlsGroup {
 
                 if let Some(s) = child_scope {
                     let mut event = s.finish();
-                    event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
+                    event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
                     event.ratchet_tree_included = Some(ratchet_tree_embedded);
                     event.ratchet_tree_delivery_mode = Some(
                         if ratchet_tree_embedded {
@@ -227,6 +206,11 @@ impl MlsGroup {
                     );
                     event.alloc_bytes = Some(ai.bytes_total as u64);
                     event.alloc_count = Some(ai.count_total as u64);
+
+                    update_welcome_receive_context(|ctx| {
+                        ctx.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                    });
+
                     emit_event(&event);
                 }
                 staged
@@ -260,7 +244,7 @@ impl MlsGroup {
                     event.tree_leaf_count = Some(leaf_count);
                     event.tree_node_count = Some(tree_size_u32);
                     event.tree_height = Some(tree_height);
-                    event.member_count = Some(group.members().count());
+                    event.member_count_before = Some(group.members().count());
                     event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
                     event.joiner_leaf_index = Some(joiner_leaf.u32());
                     event.ratchet_tree_included = Some(ratchet_tree_embedded);
@@ -274,6 +258,13 @@ impl MlsGroup {
                     );
                     event.alloc_bytes = Some(ai.bytes_total as u64);
                     event.alloc_count = Some(ai.count_total as u64);
+
+                    update_welcome_receive_context(|ctx| {
+                        ctx.member_count_after = group.members().count();
+                        ctx.tree_node_count = Some(tree_size_u32);
+                        ctx.tree_size = Some(tree_size_u32);
+                    });
+
                     emit_event(&event);
                 }
                 group
@@ -296,14 +287,14 @@ impl MlsGroup {
                 event.tree_leaf_count = Some(leaf_count);
                 event.tree_node_count = Some(tree_size_u32);
                 event.tree_height = Some(tree_height);
-                event.member_count = Some(group.members().count());
+                event.member_count_before = Some(group.members().count());
                 event.joiner_leaf_index = Some(joiner_leaf.u32());
                 event.ciphersuite = Some(format!("{:?}", group.ciphersuite()));
-                event.artifact_size_bytes = Some(welcome_bytes.len() + ratchet_tree_bytes.len());
+                event.artifact_size_bytes = Some(welcome_bytes.len());
                 event.welcome_bytes = Some(welcome_bytes.len());
-                event.ratchet_tree_bytes = Some(ratchet_tree_bytes.len());
-                event.welcome_plus_ratchet_tree_bytes =
-                    Some(welcome_bytes.len() + ratchet_tree_bytes.len());
+                event.ratchet_tree_bytes = ratchet_tree_artifact_bytes;
+                // The tree is already inside the Welcome's encrypted GroupInfo.
+                event.welcome_plus_ratchet_tree_bytes = Some(welcome_bytes.len());
                 event.ratchet_tree_included = Some(ratchet_tree_embedded);
                 event.ratchet_tree_delivery_mode = Some(
                     if ratchet_tree_embedded {
@@ -322,23 +313,7 @@ impl MlsGroup {
             if let Some(event) = welcome_deserialize_event.as_mut() {
                 event.group_epoch = Some(group.context().epoch().as_u64());
                 event.tree_size = Some(group.treesync().tree_size().u32());
-                event.member_count = Some(group.members().count());
-                event.ratchet_tree_included = Some(ratchet_tree_embedded);
-                event.ratchet_tree_delivery_mode = Some(
-                    if ratchet_tree_embedded {
-                        "welcome_extension"
-                    } else {
-                        "not_in_welcome"
-                    }
-                    .to_string(),
-                );
-                emit_event(event);
-            }
-
-            if let Some(event) = ratchet_tree_deserialize_event.as_mut() {
-                event.group_epoch = Some(group.context().epoch().as_u64());
-                event.tree_size = Some(group.treesync().tree_size().u32());
-                event.member_count = Some(group.members().count());
+                event.member_count_before = Some(group.members().count());
                 event.ratchet_tree_included = Some(ratchet_tree_embedded);
                 event.ratchet_tree_delivery_mode = Some(
                     if ratchet_tree_embedded {
@@ -360,7 +335,7 @@ impl MlsGroup {
                 provider,
                 mls_group_config,
                 welcome,
-                Some(ratchet_tree),
+                None,
             )?
             .into_group(provider)
         }

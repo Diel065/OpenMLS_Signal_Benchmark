@@ -9,7 +9,7 @@ use super::{errors::CreateMessageError, *};
 use allocation_counter::measure;
 
 #[cfg(feature = "profiling-json")]
-use crate::profiling::{emit_event, ProfileScope};
+use crate::profiling::{emit_event, update_app_message_create_context, ProfileScope};
 
 impl MlsGroup {
     // === Application messages ===
@@ -60,6 +60,13 @@ impl MlsGroup {
 
         #[cfg(feature = "profiling-json")]
         let sender_leaf = self.own_leaf_index();
+
+        #[cfg(feature = "profiling-json")]
+        update_app_message_create_context(|ctx| {
+            ctx.app_msg_plaintext_bytes = Some(plaintext_len);
+            ctx.aad_bytes = Some(aad_len);
+            ctx.sender_leaf_index = Some(sender_leaf.u32());
+        });
 
         #[cfg(feature = "profiling-json")]
         let mut measured_result: Option<Result<(MlsMessageOut, u32), CreateMessageError>> = None;
@@ -113,7 +120,7 @@ impl MlsGroup {
                     let mut event = s.finish();
                     event.group_epoch = Some(group_epoch);
                     event.tree_size = Some(tree_size);
-                    event.member_count = Some(member_count);
+                    event.member_count_before = Some(member_count);
                     event.ciphersuite = Some(ciphersuite.clone());
                     event.sender_leaf_index = Some(sender_leaf.u32());
                     event.sender_generation = Some(generation as u64);
@@ -141,7 +148,7 @@ impl MlsGroup {
                 let mut event = scope.finish();
                 event.group_epoch = Some(group_epoch);
                 event.tree_size = Some(tree_size);
-                event.member_count = Some(member_count);
+                event.member_count_before = Some(member_count);
                 event.ciphersuite = Some(ciphersuite.clone());
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);
@@ -169,6 +176,15 @@ impl MlsGroup {
             if let Some(event) = protocol_event.as_mut() {
                 event.artifact_size_bytes = serialized_len.flatten();
                 event.app_msg_ciphertext_bytes = event.artifact_size_bytes;
+
+                update_app_message_create_context(|ctx| {
+                    ctx.sender_leaf_index = Some(sender_leaf.u32());
+                    ctx.sender_generation = Some(generation as u64);
+                    ctx.app_msg_plaintext_bytes = Some(plaintext_len);
+                    ctx.app_msg_ciphertext_bytes = event.artifact_size_bytes;
+                    ctx.aad_bytes = Some(aad_len);
+                });
+
                 emit_event(event);
             }
 
@@ -176,7 +192,7 @@ impl MlsGroup {
                 let mut event = scope.finish();
                 event.group_epoch = Some(group_epoch);
                 event.tree_size = Some(tree_size);
-                event.member_count = Some(member_count);
+                event.member_count_before = Some(member_count);
                 event.ciphersuite = Some(ciphersuite);
                 event.alloc_bytes = Some(serialize_allocation_info.bytes_total as u64);
                 event.alloc_count = Some(serialize_allocation_info.count_total as u64);
