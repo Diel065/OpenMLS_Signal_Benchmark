@@ -1053,6 +1053,11 @@ pub fn profiling_enabled() -> bool {
     writer().is_some()
 }
 
+/// Returns whether L1D profiling is enabled by configuration.
+pub fn l1d_cache_profiling_enabled() -> bool {
+    L1DCacheCounterScope::profiling_enabled()
+}
+
 /// Returns whether this process can open and read L1D hardware counters.
 pub fn l1d_cache_counters_available() -> bool {
     L1DCacheCounterScope::counters_available()
@@ -1581,6 +1586,7 @@ pub struct ProfileScope {
     resource_start: ResourceSnapshot,
     structural_start: StructuralCounterSnapshot,
     l1d_cache_start: Option<L1DCacheCounterScope>,
+    l1d_profiling_enabled: bool,
     l1d_cache_available: bool,
     l1d_measurement_scope: &'static str,
     process_allocation_start: ProcessAllocationSnapshot,
@@ -1603,13 +1609,16 @@ impl ProfileScope {
 
         let use_process_l1d_scope = op_name == "add_commit_total_local"
             || op_name.ends_with(".path_hpke_encrypt");
+        let l1d_profiling_enabled = l1d_cache_profiling_enabled();
         #[cfg(not(target_arch = "wasm32"))]
-        if use_process_l1d_scope {
+        if l1d_profiling_enabled && use_process_l1d_scope {
             // Ensure the global Rayon pool exists before process TIDs are enumerated.
             let _ = rayon::current_num_threads();
         }
         let l1d_cache_available = L1DCacheCounterScope::counters_available();
-        let l1d_cache_start = if use_process_l1d_scope {
+        let l1d_cache_start = if !l1d_profiling_enabled {
+            None
+        } else if use_process_l1d_scope {
             L1DCacheCounterScope::start_process_threads()
         } else {
             L1DCacheCounterScope::start_current_thread()
@@ -1633,6 +1642,7 @@ impl ProfileScope {
             resource_start,
             structural_start,
             l1d_cache_start,
+            l1d_profiling_enabled,
             l1d_cache_available,
             l1d_measurement_scope,
             process_allocation_start,
@@ -1666,7 +1676,9 @@ impl ProfileScope {
             .take()
             .map(L1DCacheCounterScope::finish)
             .unwrap_or_default();
-        let l1d_cache_status = if l1d_cache_counts.accesses.is_some()
+        let l1d_cache_status = if !self.l1d_profiling_enabled {
+            "disabled"
+        } else if l1d_cache_counts.accesses.is_some()
             && l1d_cache_counts.misses.is_some()
         {
             if self.l1d_measurement_scope == "current_thread" {
@@ -1752,13 +1764,17 @@ impl ProfileScope {
             alloc_measurement_scope: Some("process_all_threads".to_string()),
             l1d_cache_accesses: l1d_cache_counts.accesses,
             l1d_cache_misses: l1d_cache_counts.misses,
-            l1d_measurement_scope: Some(self.l1d_measurement_scope.to_string()),
+            l1d_measurement_scope: self
+                .l1d_profiling_enabled
+                .then(|| self.l1d_measurement_scope.to_string()),
             l1d_cache_status: l1d_cache_status.to_string(),
             l1d_measured_thread_count: (l1d_cache_counts.measured_thread_count > 0)
                 .then_some(l1d_cache_counts.measured_thread_count),
             l1d_discovered_thread_count: (l1d_cache_counts.discovered_thread_count > 0)
                 .then_some(l1d_cache_counts.discovered_thread_count),
-            l1d_multiplexed_thread_count: Some(l1d_cache_counts.multiplexed_thread_count),
+            l1d_multiplexed_thread_count: self
+                .l1d_profiling_enabled
+                .then_some(l1d_cache_counts.multiplexed_thread_count),
             ram_rss_delta_bytes,
             ram_rss_utilization,
 

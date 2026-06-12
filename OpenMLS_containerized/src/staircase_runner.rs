@@ -288,8 +288,14 @@ struct ProfilingCapabilities {
     client_exists: Option<bool>,
     #[serde(default)]
     profiling_enabled: bool,
+    #[serde(default = "default_true")]
+    l1d_cache_profiling_enabled: bool,
     #[serde(default)]
     l1d_cache_counters_available: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2179,7 +2185,12 @@ async fn verify_publication_profiling_capabilities(
                     worker.id
                 ));
             }
-            if !capabilities.l1d_cache_counters_available {
+            if !capabilities.l1d_cache_profiling_enabled {
+                eprintln!(
+                    "[preflight] L1D profiling is disabled for publication worker {}; continuing without L1D metrics",
+                    worker.id
+                );
+            } else if !capabilities.l1d_cache_counters_available {
                 if worker.device_kind.to_lowercase().contains("luckfox") {
                     eprintln!(
                         "[preflight] WARNING: L1D hardware counters are unavailable for publication worker {} ({}); proceeding without L1D metrics for this device",
@@ -2204,7 +2215,7 @@ async fn verify_publication_profiling_capabilities(
         verified += 1;
     }
     eprintln!(
-        "[preflight] verified profiling and L1D hardware counters on {} publication workers",
+        "[preflight] verified profiling capabilities on {} publication workers; L1D counters were required only where enabled",
         verified
     );
     Ok(())

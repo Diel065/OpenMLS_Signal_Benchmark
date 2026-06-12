@@ -1003,6 +1003,7 @@ def generate_compose_text(
     lines.append(f"    OPENMLS_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO: {args.scenario}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
+    lines.append("    OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}")
     lines.append("    MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}")
     lines.append("    OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}")
     lines.append("    OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}")
@@ -1112,6 +1113,7 @@ def generate_compose_text(
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
+        lines.append('      OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}')
 
         if affinity_result.get("rayon_num_threads"):
             lines.append(f'      RAYON_NUM_THREADS: "{affinity_result["rayon_num_threads"]}"')

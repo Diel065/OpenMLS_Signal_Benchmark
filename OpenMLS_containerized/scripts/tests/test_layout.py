@@ -270,7 +270,11 @@ def test_worker_compose_enables_perf_event_access():
     assert "- PERFMON" in worker_common
     assert "security_opt:" in worker_common
     assert "- seccomp=unconfined" in worker_common
-    print("PASS: worker containers enable perf_event_open access")
+    assert (
+        "OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}"
+        in compose
+    )
+    print("PASS: worker containers retain perf access with reversible L1D profiling disabled")
 
 
 def main() -> int:

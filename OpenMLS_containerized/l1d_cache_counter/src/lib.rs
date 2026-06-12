@@ -8,6 +8,9 @@ use std::{
 };
 
 static L1D_CACHE_COUNTERS_AVAILABLE: OnceLock<bool> = OnceLock::new();
+static L1D_PROFILING_ENABLED: OnceLock<bool> = OnceLock::new();
+
+const L1D_PROFILING_ENV: &str = "OPENMLS_L1D_PROFILING_ENABLED";
 
 thread_local! {
     static PROCESS_COUNTER_SESSION: RefCell<Weak<Mutex<ProcessPerfSession>>> =
@@ -199,7 +202,24 @@ fn perf_event_open(
 }
 
 impl L1DCacheCounterScope {
+    pub fn profiling_enabled() -> bool {
+        *L1D_PROFILING_ENABLED.get_or_init(|| {
+            std::env::var(L1D_PROFILING_ENV)
+                .ok()
+                .map(|value| {
+                    matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "1" | "true" | "yes" | "on"
+                    )
+                })
+                .unwrap_or(false)
+        })
+    }
+
     pub fn counters_available() -> bool {
+        if !Self::profiling_enabled() {
+            return false;
+        }
         *L1D_CACHE_COUNTERS_AVAILABLE.get_or_init(Self::probe_available)
     }
 

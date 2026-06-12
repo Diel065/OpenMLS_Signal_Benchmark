@@ -234,6 +234,21 @@ class TestValidator(unittest.TestCase):
         result = validate_run(str(write_run(self.temp_dir, rows)))
         self.assertTrue(result.success, result.errors)
 
+    def test_accepts_explicitly_disabled_l1d(self):
+        rows = valid_add_rows()
+        for row in rows:
+            row.update({
+                "l1d_cache_status": "disabled",
+                "l1d_cache_accesses": "",
+                "l1d_cache_misses": "",
+                "l1d_measurement_scope": "",
+                "l1d_measured_thread_count": "",
+                "l1d_discovered_thread_count": "",
+                "l1d_multiplexed_thread_count": "",
+            })
+        result = validate_run(str(write_run(self.temp_dir, rows)))
+        self.assertTrue(result.success, result.errors)
+
 
 if __name__ == "__main__":
     unittest.main()

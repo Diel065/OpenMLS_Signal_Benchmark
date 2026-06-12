@@ -250,6 +250,8 @@ def validate_run(
         l1_status = row.get("l1d_cache_status", "")
         if not l1_status:
             result.add_error(f"row {row_number} ({row.get('op')}): missing l1d_cache_status")
+        elif l1_status == "disabled":
+            pass
         elif l1_status.startswith("available_"):
             accesses = validate_numeric_nonnegative(
                 result, row, row_number, "l1d_cache_accesses"
@@ -265,7 +267,7 @@ def validate_run(
             # Luckfox and local processes are exempt from L1D requirements if missing
             pass
 
-        if row.get("op") in PROCESS_L1D_SPANS:
+        if row.get("op") in PROCESS_L1D_SPANS and l1_status != "disabled":
             if any(kind in row.get("device_kind", "").lower() for kind in ["luckfox", "local_process"]):
                 pass
             else:
@@ -357,7 +359,10 @@ def validate_run(
     for row_number, row in enumerate(
         [row for row in add_rows if row.get("op") in plotted_l1d_ops], start=1
     ):
-        if not row.get("l1d_cache_status", "").startswith("available_"):
+        l1_status = row.get("l1d_cache_status", "")
+        if l1_status == "disabled":
+            continue
+        if not l1_status.startswith("available_"):
             if any(kind in row.get("device_kind", "").lower() for kind in ["luckfox", "local_process"]):
                 result.add_warning(
                     f"AddCommit L1D row {row_number} ({row.get('op')}): L1D missing for {row.get('device_kind')}, got {row.get('l1d_cache_status')!r}"

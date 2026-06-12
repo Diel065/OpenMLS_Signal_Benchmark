@@ -60,12 +60,18 @@ fn canonical_add_commit_total_and_metadata_are_stable() {
     assert_eq!(total["member_count_after"], 3);
     assert_eq!(total["added_members_count"], 2);
     assert_eq!(total["alloc_measurement_scope"], "process_all_threads");
-    assert_eq!(
-        total["l1d_measurement_scope"],
-        "process_threads_at_span_start"
-    );
     assert!(total["cpu_process_ns"].as_u64().is_some());
-    assert!(total["l1d_cache_status"].as_str().is_some());
+    if total["l1d_cache_status"] == "disabled" {
+        assert!(total["l1d_measurement_scope"].is_null());
+        assert!(total["l1d_cache_accesses"].is_null());
+        assert!(total["l1d_cache_misses"].is_null());
+    } else {
+        assert_eq!(
+            total["l1d_measurement_scope"],
+            "process_threads_at_span_start"
+        );
+        assert!(total["l1d_cache_status"].as_str().is_some());
+    }
 
     let add_events = events
         .iter()
