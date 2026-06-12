@@ -3,7 +3,7 @@
 # Resource experiment benchmark runner — Scientific threshold mode
 # ---------------------------------------------------------------------------
 # Tests exactly ONE resource profile per benchmark invocation.
-# Single profiled singleton with stop-on-profiled-failure policy.
+# One profiled singleton container; all other clients are densely packed.
 # Loops over RAM sweep indices 0-5 and CPU matrix indices 0-11.
 #
 # Usage:
@@ -56,9 +56,16 @@ cleanup_docker() {
 PYTHON_BIN="$(python_for "$SCRIPT_DIR/OpenMLS_containerized")"
 OPENMLS_DIR="$SCRIPT_DIR/OpenMLS_containerized"
 
-# Scientific threshold mode: one profiled singleton per run
+# Scientific threshold mode: one profiled singleton per run.
+# The runner requires a positive singleton fraction, so 1/4096 plus a minimum
+# of one pins the hybrid layout to exactly one singleton at this worker count.
+LOGICAL_WORKERS=4096
 PROFILED_SINGLETON_COUNT=1
+SINGLETON_FRACTION=0.000244140625
+PACKED_CLIENTS_PER_CONTAINER=192
+PACKED_WORKER_INTERNAL_PARALLELISM=32
 AFFINITY_SAMPLE_SECONDS=20
+BUILD_IMAGES_NEXT_RUN=1
 
 # Results tracking
 declare -a RUN_RESULTS
@@ -69,7 +76,8 @@ FAIL_COUNT=0
 echo "============================================================"
 echo " Resource experiment threshold sweep - $DATE_TAG"
 echo " OpenMLS: 6 RAM + 12 CPU = 18 single-profile runs"
-echo " Mode : scientific threshold (1 profiled singleton / run)"
+echo " Layout: 4096 clients, 1 profiled singleton + 22 packed containers"
+echo " Mode : scientific threshold (1 profiled container / run)"
 echo " Policy: stop-on-profiled-failure"
 echo "============================================================"
 echo ""
@@ -78,23 +86,21 @@ echo ""
 # Common OpenMLS flags for scientific production runs
 # ==================================================================
 COMMON_ARGS=(
-  --workers 128
+  --workers "$LOGICAL_WORKERS"
   --ds-port 3001
   --relay-port 4001
   --output-dir benchmark_output
   --worker-layout-mode hybrid
-  --singleton-min-count 12
-  --singleton-fraction 0.0625
-  --singleton-selection-strategy evenly-spaced
+  --singleton-min-count 1
+  --singleton-fraction "$SINGLETON_FRACTION"
   --profiled-singleton-count "$PROFILED_SINGLETON_COUNT"
   --cpu-affinity-mode profiled-nor-background
   --cpu-affinity-sample-seconds "$AFFINITY_SAMPLE_SECONDS"
   --resource-failure-policy stop-on-profiled-failure
   --resource-monitor-interval-ms 250
-  --packed-clients-per-container 48
-  --packed-worker-internal-parallelism 16
+  --packed-clients-per-container "$PACKED_CLIENTS_PER_CONTAINER"
+  --packed-worker-internal-parallelism "$PACKED_WORKER_INTERNAL_PARALLELISM"
   --bridge-count 4
-  --build-images
   --force-cleanup-mls-ports
   --runner-in-docker
   --ds-delivery-mode group-log
@@ -123,8 +129,8 @@ COMMON_ARGS=(
   --teardown-batch-size 64
   --teardown-batch-sleep-seconds 0.1
   --min-size 2
-  --max-size 128
-  --step-size '[1,32]'
+  --max-size "$LOGICAL_WORKERS"
+  --step-size '[1,32]
   --roundtrips 2
   --update-rounds 8
   --app-rounds 8
@@ -169,14 +175,19 @@ run_profile() {
   shift 4
   local extra_args=("$@")
 
-  local scenario_seed singleton_selection_seed
+  local scenario_seed
   scenario_seed="$(shuf -i 1-2147483647 -n 1)"
-  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
+
+  local -a build_args=()
+  if [ "$BUILD_IMAGES_NEXT_RUN" -eq 1 ]; then
+    build_args=(--build-images)
+    BUILD_IMAGES_NEXT_RUN=0
+  fi
 
   echo ""
   echo "========== [$label] run-id: $run_id =========="
   echo "  experiment=$experiment profile_index=$profile_idx"
-  echo "  scenario_seed=$scenario_seed singleton_seed=$singleton_selection_seed"
+  echo "  scenario_seed=$scenario_seed"
   echo ""
 
   cd "$OPENMLS_DIR"
@@ -186,13 +197,13 @@ run_profile() {
     --resource-experiment "$experiment"
     --resource-profile-index "$profile_idx"
     --scenario-seed "$scenario_seed"
-    --singleton-selection-seed "$singleton_selection_seed"
+    "${build_args[@]}"
     "${extra_args[@]}"
     --run-id "$run_id"
   )
 
   local exit_code=0
-  OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=256 \
+  OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   "$PYTHON_BIN" scripts/run_compose_benchmark.py "${_args[@]}" || exit_code=$?
 
   cd "$SCRIPT_DIR"
