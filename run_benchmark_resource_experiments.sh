@@ -130,7 +130,7 @@ COMMON_ARGS=(
   --teardown-batch-sleep-seconds 0.1
   --min-size 2
   --max-size "$LOGICAL_WORKERS"
-  --step-size '[1,32]
+  --step-size '[1,32]'
   --roundtrips 2
   --update-rounds 8
   --app-rounds 8
