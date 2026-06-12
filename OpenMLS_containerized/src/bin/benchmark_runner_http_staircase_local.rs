@@ -154,6 +154,7 @@ fn main() -> Result<()> {
         profile_only_singletons: false,
         external_coverage_lane: false,
         no_aggregate: false,
+        failure_experiment: false,
         worker_layout: None,
         run_id: args.run_id,
         scenario: args.scenario,

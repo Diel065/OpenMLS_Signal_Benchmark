@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 #
-# OpenMLS benchmark runner — NO external devices / NO resource constraints
+# Failure-experiment benchmark runner (lite) — NO external devices
 # -----------------------------------------
-# Runs 16 OpenMLS iterations. Signal is intentionally disabled in the main loop
-# for the current OpenMLS-only profiling/statistics refactor.
+# Runs 16 OpenMLS iterations with smaller worker counts.
+# Each profiled singleton receives a randomized CPU/RAM cap from the
+# failure-experiment grid. Packed background workers are unconstrained.
+# Signal is disabled.
 #
 # Usage:
 #   chmod +x run_benchmark_no_iot_lite.sh
@@ -72,9 +74,9 @@ trap cleanup_docker EXIT
 
 
 echo "============================================================"
-echo " OpenMLS benchmark suite (no IoT devices) - $DATE_TAG"
-echo " OpenMLS: 16 x 512 workers, no resource constraints, no external devices"
-echo " Signal : disabled for this OpenMLS-only refactor run"
+echo " Failure-experiment benchmark suite (lite) - $DATE_TAG"
+echo " OpenMLS: 16 x 512 workers, failure-experiment grid, no external devices"
+echo " Signal : disabled"
 echo "============================================================"
 echo ""
 
@@ -95,7 +97,7 @@ run_openmls() {
   echo ""
   echo "========== [OpenMLS iteration $ITER / 16] run-id: $RUN_ID =========="
   echo "  scenario_seed=$SCENARIO_SEED singleton_selection_seed=$SINGLETON_SELECTION_SEED"
-  echo "  singleton_resource_envelope=unconstrained"
+  echo "  resource_envelope=failure_experiment_grid"
   echo "  external_devices=none"
   echo ""
 
@@ -112,9 +114,7 @@ run_openmls() {
     --singleton-min-count 12
     --singleton-fraction 0.0625
     --singleton-selection-strategy evenly-spaced
-#    --singleton-cpus 0.25
-#    --singleton-memory 256m
-#    --singleton-memory-swap 256m
+    --failure-experiment
     --resource-monitor-interval-ms 250
     --packed-clients-per-container 48
     --packed-worker-internal-parallelism 16
@@ -177,95 +177,95 @@ run_openmls() {
 }
 
 # ------------------------------------------------------------------
-# Signal benchmark command
+# Signal benchmark command (disabled — OpenMLS failure-experiment only)
 # ------------------------------------------------------------------
-run_signal() {
-  local ITER="$1"
-  local RUN_ID="signal_run_${ITER}_${DATE_TAG}"
-  local SINGLETON_SELECTION_SEED
-  local PYTHON_BIN
-
-  SINGLETON_SELECTION_SEED="$(shuf -i 1-2147483647 -n 1)"
-  PYTHON_BIN="$(python_for "$SCRIPT_DIR/Signal_containerized")"
-
-  echo ""
-  echo "========== [Signal iteration $ITER / 16] run-id: $RUN_ID =========="
-  echo "  singleton_selection_seed=$SINGLETON_SELECTION_SEED"
-  echo "  singleton_resource_envelope=unconstrained"
-  echo "  external_devices=none"
-  echo ""
-
-  cd "$SCRIPT_DIR/Signal_containerized"
-
-  local -a _args=(
-    --workers 512
-    --kr-port 3001
-    --relay-port 4001
-    --singleton-selection-seed "$SINGLETON_SELECTION_SEED"
-    --output-dir benchmark_output
-    --worker-layout-mode hybrid
-    --singleton-min-count 12
-    --singleton-fraction 0.06125
-    --singleton-selection-strategy evenly-spaced
-#    --singleton-cpus 0.5
-#    --singleton-memory 256m
-#    --singleton-memory-swap 256m
-#    --singleton-pids-limit 256
-    --resource-monitor-interval-ms 250
-    --packed-clients-per-container 64
-    --packed-worker-internal-parallelism 16
-    --bridge-count 4
-    --build-images
-#    $BUILD_EXTERNAL_FLAG
-    --force-cleanup-signal-ports
-    --runner-in-docker
-    --fanout-adaptive
-    --max-fanout-parallelism 64
-    --min-fanout-parallelism 8
-    --fanout-error-rate-threshold 0.02
-    --fanout-p95-threshold-ms 8000
-    --http-pool-max-idle-per-host 64
-    --runner-http-connect-timeout-ms 5000
-    --runner-http-request-timeout-ms 120000
-    --worker-http-pool-max-idle-per-host 64
-    --worker-http-connect-timeout-ms 5000
-    --worker-http-request-timeout-ms 45000
-    --worker-outbound-http-permits 32
-    --compose-parallel-limit 48
-    --startup-batch-size 64
-    --startup-batch-sleep-seconds 0.5
-    --post-startup-settle-seconds 10
-    --health-timeout-seconds 240
-    --health-poll-seconds 0.5
-    --worker-health-timeout-seconds 600
-    --worker-health-poll-ms 250
-    --compose-down-timeout-seconds 2
-    --teardown-batch-size 64
-    --teardown-batch-sleep-seconds 0.1
-    --min-size 2
-    --max-size 512
-    --step-size '[1,32]'
-    --roundtrips 2
-    --app-rounds 8
-    --max-app-samples-per-payload 8
-    --payload-sizes '[16,4096]'
-#    --devices-file devices.yaml
-#    --enable-external-devices
-#    --external-device luckfox-pico-plus-01
-#    --external-device raspberry-pi-01
-#    --wipe-device-run-dirs
-    --run-id "$RUN_ID"
-  )
-
-  SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
-  "$PYTHON_BIN" scripts/run_compose_benchmark.py "${_args[@]}"
-
-  cd "$SCRIPT_DIR"
-
-  echo ""
-  echo "-------- Signal iteration $ITER done. Cleaning up. --------"
-  cleanup_docker
-}
+# run_signal() {
+#   local ITER="$1"
+#   local RUN_ID="signal_run_${ITER}_${DATE_TAG}"
+#   local SINGLETON_SELECTION_SEED
+#   local PYTHON_BIN
+# 
+#   SINGLETON_SELECTION_SEED="$(shuf -i 1-2147483647 -n 1)"
+#   PYTHON_BIN="$(python_for "$SCRIPT_DIR/Signal_containerized")"
+# 
+#   echo ""
+#   echo "========== [Signal iteration $ITER / 16] run-id: $RUN_ID =========="
+#   echo "  singleton_selection_seed=$SINGLETON_SELECTION_SEED"
+#   echo "  singleton_resource_envelope=unconstrained"
+#   echo "  external_devices=none"
+#   echo ""
+# 
+#   cd "$SCRIPT_DIR/Signal_containerized"
+# 
+#   local -a _args=(
+#     --workers 512
+#     --kr-port 3001
+#     --relay-port 4001
+#     --singleton-selection-seed "$SINGLETON_SELECTION_SEED"
+#     --output-dir benchmark_output
+#     --worker-layout-mode hybrid
+#     --singleton-min-count 12
+#     --singleton-fraction 0.06125
+#     --singleton-selection-strategy evenly-spaced
+# #    --singleton-cpus 0.5
+# #    --singleton-memory 256m
+# #    --singleton-memory-swap 256m
+# #    --singleton-pids-limit 256
+#     --resource-monitor-interval-ms 250
+#     --packed-clients-per-container 64
+#     --packed-worker-internal-parallelism 16
+#     --bridge-count 4
+#     --build-images
+# #    $BUILD_EXTERNAL_FLAG
+#     --force-cleanup-signal-ports
+#     --runner-in-docker
+#     --fanout-adaptive
+#     --max-fanout-parallelism 64
+#     --min-fanout-parallelism 8
+#     --fanout-error-rate-threshold 0.02
+#     --fanout-p95-threshold-ms 8000
+#     --http-pool-max-idle-per-host 64
+#     --runner-http-connect-timeout-ms 5000
+#     --runner-http-request-timeout-ms 120000
+#     --worker-http-pool-max-idle-per-host 64
+#     --worker-http-connect-timeout-ms 5000
+#     --worker-http-request-timeout-ms 45000
+#     --worker-outbound-http-permits 32
+#     --compose-parallel-limit 48
+#     --startup-batch-size 64
+#     --startup-batch-sleep-seconds 0.5
+#     --post-startup-settle-seconds 10
+#     --health-timeout-seconds 240
+#     --health-poll-seconds 0.5
+#     --worker-health-timeout-seconds 600
+#     --worker-health-poll-ms 250
+#     --compose-down-timeout-seconds 2
+#     --teardown-batch-size 64
+#     --teardown-batch-sleep-seconds 0.1
+#     --min-size 2
+#     --max-size 512
+#     --step-size '[1,32]'
+#     --roundtrips 2
+#     --app-rounds 8
+#     --max-app-samples-per-payload 8
+#     --payload-sizes '[16,4096]'
+# #    --devices-file devices.yaml
+# #    --enable-external-devices
+# #    --external-device luckfox-pico-plus-01
+# #    --external-device raspberry-pi-01
+# #    --wipe-device-run-dirs
+#     --run-id "$RUN_ID"
+#   )
+# 
+#   SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
+#   "$PYTHON_BIN" scripts/run_compose_benchmark.py "${_args[@]}"
+# 
+#   cd "$SCRIPT_DIR"
+# 
+#   echo ""
+#   echo "-------- Signal iteration $ITER done. Cleaning up. --------"
+#   cleanup_docker
+# }
 
 # ==================================================================
 # Main loop: 16 OpenMLS iterations.
@@ -281,5 +281,5 @@ done
 
 echo ""
 echo "============================================================"
-echo " All 16 OpenMLS runs complete ($DATE_TAG)"
+echo " All 16 OpenMLS failure-experiment runs complete ($DATE_TAG)"
 echo "============================================================"

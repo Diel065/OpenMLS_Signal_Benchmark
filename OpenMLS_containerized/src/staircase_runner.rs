@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -49,6 +49,8 @@ const EXTERNAL_BATCH_SEED_DOMAIN: u64 = 0x4558_5442_4154_4348;
 
 static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+static FAILURE_EXPERIMENT_MODE: AtomicBool = AtomicBool::new(false);
+
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
     pub preflight_only: bool,
@@ -82,6 +84,7 @@ pub struct StaircaseConfig {
     pub external_coverage_lane: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
+    pub failure_experiment: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -375,6 +378,20 @@ pub struct WorkerLayout {
     pub arch: String,
     #[serde(default)]
     pub rust_target: String,
+    #[serde(default)]
+    pub failure_experiment: Option<FailureExperimentConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FailureExperimentConfig {
+    pub mode: String,
+    pub seed: u64,
+    pub cpu_caps: Vec<f64>,
+    pub ram_caps: Vec<String>,
+    pub grid_cells: usize,
+    pub swap_equals_ram: bool,
+    #[serde(default)]
+    pub interpretation: String,
 }
 
 impl WorkerSpec {
@@ -578,6 +595,66 @@ impl RunnerEventLog {
         eprintln!(
             "[oom-attrition] worker={} physical_worker={} phase={} operation={} action={}",
             worker.id, worker.physical_worker_id, cursor.phase, cursor.operation, action
+        );
+        Ok(())
+    }
+
+    fn record_failure(
+        &self,
+        cursor: &BenchmarkCursor,
+        worker: &WorkerSpec,
+        error: &anyhow::Error,
+        failure_class: &str,
+        failure_evidence_source: Option<&str>,
+        failure_evidence_detail: Option<&str>,
+        action: &str,
+        reassigned_to: Option<&WorkerSpec>,
+    ) -> Result<()> {
+        let event = RunnerEvent {
+            profile_schema_version: 10,
+            ts_unix_ns: unix_time_ns(),
+            event_kind: "worker_failure".to_string(),
+            failed_worker_id: worker.id.clone(),
+            failed_physical_worker_id: worker.physical_worker_id.clone(),
+            failure_class: failure_class.to_string(),
+            failure_detail: format!("{:#}", error),
+            failure_evidence_source: failure_evidence_source.map(|s| s.to_string()),
+            failure_evidence_detail: failure_evidence_detail.map(|s| s.to_string()),
+            failure_action: action.to_string(),
+            reassigned_to_worker_id: reassigned_to.map(|candidate| candidate.id.clone()),
+            benchmark_plateau_index: cursor.plateau_index,
+            benchmark_target_size: cursor.target_size,
+            benchmark_active_size: cursor.active_size,
+            benchmark_phase: cursor.phase.clone(),
+            benchmark_operation: cursor.operation.clone(),
+            benchmark_operation_seq: cursor.operation_seq,
+            benchmark_payload_size: cursor.payload_size,
+            membership_batch_requested: cursor.membership_batch_requested,
+            membership_batch_effective: cursor.membership_batch_effective,
+            membership_batch_group_cap: cursor.membership_batch_group_cap,
+            membership_batch_transition_cap: cursor.membership_batch_transition_cap,
+            membership_batch_source: cursor.membership_batch_source.clone(),
+            configured_payload_label: cursor.payload_size.map(|s| s.to_string()),
+        };
+        let mut out = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .with_context(|| format!("Failed to open runner event log {}", self.path.display()))?;
+        serde_json::to_writer(&mut out, &event)?;
+        writeln!(out)?;
+        let profile_path = self.run_dir.join(format!("client-{}.jsonl", worker.id));
+        if let Err(profile_error) = append_profile_event(&profile_path, &event.to_profile_event()) {
+            eprintln!(
+                "[failure-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
+                worker.id,
+                profile_error,
+                self.path.display()
+            );
+        }
+        eprintln!(
+            "[failure-attrition] worker={} physical_worker={} class={} phase={} operation={} action={}",
+            worker.id, worker.physical_worker_id, failure_class, cursor.phase, cursor.operation, action
         );
         Ok(())
     }
@@ -1520,6 +1597,12 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
 }
 
 async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
+    FAILURE_EXPERIMENT_MODE.store(config.failure_experiment, Ordering::Relaxed);
+    if config.failure_experiment {
+        eprintln!(
+            "[failure-experiment] enabled: profiled singleton failures will be recorded but the run will continue"
+        );
+    }
     let max_size = validate_config(&config, config.workers.len())?;
 
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
@@ -2264,11 +2347,29 @@ async fn record_worker_oom_if_evidenced(
     action: &str,
     reassigned_to: Option<&WorkerSpec>,
 ) -> Result<bool> {
-    let Some(evidence) = runner_events.find_oom_evidence(worker).await else {
-        return Ok(false);
-    };
-    runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
-    Ok(true)
+    if let Some(evidence) = runner_events.find_oom_evidence(worker).await {
+        runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
+        return Ok(true);
+    }
+    let failure_experiment = FAILURE_EXPERIMENT_MODE.load(Ordering::Relaxed);
+    if failure_experiment
+        && worker.profile_enabled
+        && worker.container_mode == ContainerMode::Singleton
+    {
+        let failure_class = classify_worker_error(error);
+        runner_events.record_failure(
+            cursor,
+            worker,
+            error,
+            failure_class,
+            None,
+            None,
+            action,
+            reassigned_to,
+        )?;
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 fn reqwest_error_diagnostic(err: &reqwest::Error) -> String {
@@ -3178,7 +3279,7 @@ async fn record_batch_oom_failures(
     let Some(batch_error) = error.downcast_ref::<BatchFanoutError>() else {
         return Ok(None);
     };
-    let mut oom_workers = Vec::new();
+    let mut dead_workers = Vec::new();
     for failure in &batch_error.failures {
         if !record_worker_oom_if_evidenced(
             runner_events,
@@ -3192,9 +3293,40 @@ async fn record_batch_oom_failures(
         {
             return Ok(None);
         }
-        oom_workers.push(failure.worker.clone());
+        dead_workers.push(failure.worker.clone());
     }
-    Ok(Some(oom_workers))
+    Ok(Some(dead_workers))
+}
+
+fn classify_worker_error(error: &anyhow::Error) -> &'static str {
+    if let Some(req_err) = error.downcast_ref::<reqwest::Error>() {
+        if req_err.is_connect() {
+            if let Some(src) = req_err.source() {
+                let src_str = format!("{}", src);
+                if src_str.contains("Connection refused") || src_str.contains("connection refused") {
+                    return "container_exit";
+                }
+            }
+            return "worker_unreachable";
+        }
+        if req_err.is_timeout() {
+            return "cpu_starvation_timeout";
+        }
+        if req_err.is_body() || req_err.is_decode() {
+            return "protocol_failure";
+        }
+    }
+    let error_str = format!("{:#}", error).to_lowercase();
+    if error_str.contains("connection refused") {
+        return "container_exit";
+    }
+    if error_str.contains("timeout") || error_str.contains("deadline") || error_str.contains("timed out") {
+        return "cpu_starvation_timeout";
+    }
+    if error_str.contains("connect") {
+        return "worker_unreachable";
+    }
+    "infrastructure_failure"
 }
 
 #[derive(Debug)]
@@ -5730,27 +5862,6 @@ pub fn aggregate_csv(
         worker_ids.iter().map(|s| s.as_str()).collect()
     };
 
-    let logical_worker_count = layout
-        .as_ref()
-        .map(|l| l.logical_worker_count)
-        .unwrap_or(worker_ids.len());
-    let physical_worker_count = layout
-        .as_ref()
-        .map(|l| l.physical_worker_count)
-        .unwrap_or(worker_ids.len());
-    let singleton_count = layout
-        .as_ref()
-        .map(|l| l.clients.iter().filter(|c| c.profile_enabled).count())
-        .unwrap_or(worker_ids.len());
-    let packed_clients_per_container = layout
-        .as_ref()
-        .map(|l| l.packed_clients_per_container)
-        .unwrap_or(1);
-    let layout_mode = layout
-        .as_ref()
-        .map(|l| l.layout_mode.as_str())
-        .unwrap_or("one-container-per-client");
-
     // Build per-client metadata lookup from layout clients
     let mut client_meta: std::collections::HashMap<&str, &WorkerLayoutClient> =
         std::collections::HashMap::new();
@@ -5784,20 +5895,12 @@ pub fn aggregate_csv(
     struct CsvRow<'a> {
         client_id: &'a str,
         worker_id: &'a str,
-        physical_worker_id: &'a str,
         container_mode: &'a str,
         execution_backend: &'a str,
         device_kind: &'a str,
-        transport: &'a str,
-        access_backend: &'a str,
-        arch: &'a str,
-        rust_target: &'a str,
         profile_schema_version: Option<u32>,
         ts_unix_ns: u128,
         op: String,
-        measurement_class: Option<String>,
-        measurement_plane: Option<String>,
-        span_kind: Option<String>,
         span_name: Option<String>,
         span_id: Option<u64>,
         parent_span_id: Option<u64>,
@@ -5825,7 +5928,6 @@ pub fn aggregate_csv(
         membership_batch_transition_cap: Option<usize>,
         membership_batch_source: Option<String>,
         configured_payload_label: Option<String>,
-        implementation: String,
         wall_ns: u128,
         cpu_thread_ns: Option<u128>,
         cpu_process_ns: u128,
@@ -5949,13 +6051,6 @@ pub fn aggregate_csv(
         run_id: Option<String>,
         scenario: Option<String>,
         scenario_seed: Option<u64>,
-        node_name: Option<String>,
-        pod_name: Option<String>,
-        logical_worker_count: usize,
-        physical_worker_count: usize,
-        singleton_count: usize,
-        packed_clients_per_container: usize,
-        layout_mode: &'a str,
         resource_limit_cpus: Option<f64>,
         resource_limit_memory: Option<&'a str>,
         resource_limit_memory_bytes: Option<u64>,
@@ -6016,7 +6111,6 @@ pub fn aggregate_csv(
             let row = CsvRow {
                 client_id: worker_id,
                 worker_id: physical_worker_id,
-                physical_worker_id,
                 container_mode: non_empty_or(meta.map(|m| m.container_mode.as_str()), "singleton"),
                 execution_backend: non_empty_or(
                     meta.map(|m| m.execution_backend.as_str()),
@@ -6026,19 +6120,9 @@ pub fn aggregate_csv(
                     meta.map(|m| m.device_kind.as_str()),
                     non_empty_or(event.device_kind.as_deref(), "local_process"),
                 ),
-                transport: non_empty_or(meta.map(|m| m.transport.as_str()), "loopback"),
-                access_backend: non_empty_or(meta.map(|m| m.access_backend.as_str()), "local"),
-                arch: non_empty_or(meta.map(|m| m.arch.as_str()), "x86_64"),
-                rust_target: non_empty_or(
-                    meta.map(|m| m.rust_target.as_str()),
-                    "x86_64-unknown-linux-gnu",
-                ),
                 profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
-                measurement_class: event.measurement_class,
-                measurement_plane: event.measurement_plane,
-                span_kind: event.span_kind,
                 span_name: event.span_name,
                 span_id: event.span_id,
                 parent_span_id: event.parent_span_id,
@@ -6066,7 +6150,6 @@ pub fn aggregate_csv(
                 membership_batch_transition_cap: event.membership_batch_transition_cap,
                 membership_batch_source: event.membership_batch_source,
                 configured_payload_label: event.configured_payload_label,
-                implementation: event.implementation,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
                 cpu_process_ns: event.cpu_process_ns,
@@ -6192,13 +6275,6 @@ pub fn aggregate_csv(
                 run_id: event.run_id,
                 scenario: event.scenario,
                 scenario_seed: event.scenario_seed,
-                node_name: event.node_name,
-                pod_name: event.pod_name,
-                logical_worker_count,
-                physical_worker_count,
-                singleton_count,
-                packed_clients_per_container,
-                layout_mode,
                 resource_limit_cpus: phys.and_then(|m| m.resource_limit_cpus),
                 resource_limit_memory: phys.and_then(|m| m.resource_limit_memory.as_deref()),
                 resource_limit_memory_bytes: phys.and_then(|m| m.resource_limit_memory_bytes),
@@ -6368,8 +6444,6 @@ mod aggregate_csv_resource_tests {
             "ts_unix_ns": 1u128,
             "op": "create_group",
             "implementation": "openmls",
-            "measurement_plane": "openmls_implementation",
-            "span_kind": "openmls_api",
             "span_name": "create_group",
             "span_id": 44u64,
             "parent_span_id": 43u64,
@@ -6474,8 +6548,6 @@ mod aggregate_csv_resource_tests {
         assert_eq!(value("l1d_cache_misses"), "25");
         assert_eq!(value("ram_rss_delta_bytes"), "4096");
         assert_eq!(value("ram_rss_utilization"), "0.25");
-        assert_eq!(value("measurement_plane"), "openmls_implementation");
-        assert_eq!(value("span_kind"), "openmls_api");
         assert_eq!(value("span_name"), "create_group");
         assert_eq!(value("span_id"), "44");
         assert_eq!(value("parent_span_id"), "43");
@@ -7031,5 +7103,275 @@ mod tests {
         .expect("synthetic fanout should succeed");
 
         assert_eq!(later_started_before_slow_finished.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[cfg(test)]
+mod failure_experiment_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static TEST_COUNTER: AtomicUsize = AtomicUsize::new(1);
+
+    fn temp_dir() -> PathBuf {
+        let n = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("mls_failure_experiment_test")
+            .join(format!("test_{}_{}", std::process::id(), n));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn classify_worker_error_detects_container_exit() {
+        let err = anyhow!("Connection refused (os error 111)");
+        assert_eq!(classify_worker_error(&err), "container_exit");
+    }
+
+    #[test]
+    fn classify_worker_error_detects_timeout() {
+        let err = anyhow!("request timeout after 30s");
+        assert_eq!(classify_worker_error(&err), "cpu_starvation_timeout");
+    }
+
+    #[test]
+    fn classify_worker_error_detects_connect_failure() {
+        let err = anyhow!("client error: connect failure");
+        assert_eq!(classify_worker_error(&err), "worker_unreachable");
+    }
+
+    #[test]
+    fn classify_worker_error_defaults_to_infrastructure() {
+        let err = anyhow!("unknown internal error");
+        assert_eq!(classify_worker_error(&err), "infrastructure_failure");
+    }
+
+    #[tokio::test]
+    async fn record_failure_writes_runner_event_and_profile() {
+        let run_dir = temp_dir();
+        let events = RunnerEventLog::new(&run_dir);
+
+        let worker = WorkerSpec::legacy("test-001".to_string(), "http://127.0.0.1:9999".to_string());
+        let cursor = BenchmarkCursor::new(0, 4, 4, "transition", "add_members");
+        let err = anyhow!("simulated container exit");
+
+        events
+            .record_failure(
+                &cursor,
+                &worker,
+                &err,
+                "container_exit",
+                Some("runner_inference"),
+                Some("Connection refused after 10 retries"),
+                "evict_singleton_and_continue",
+                None,
+            )
+            .unwrap();
+
+        let runner_jsonl = run_dir.join("runner-events.jsonl");
+        assert!(runner_jsonl.exists());
+
+        let content = fs::read_to_string(&runner_jsonl).unwrap();
+        let first_line = content.lines().next().unwrap();
+        let event: RunnerEvent = serde_json::from_str(first_line).unwrap();
+        assert_eq!(event.event_kind, "worker_failure");
+        assert_eq!(event.failure_class, "container_exit");
+        assert_eq!(event.failed_worker_id, "test-001");
+        assert_eq!(event.benchmark_phase, "transition");
+        assert_eq!(event.benchmark_operation, "add_members");
+        assert_eq!(event.failure_evidence_source, Some("runner_inference".to_string()));
+
+        let profile_path = run_dir.join("client-test-001.jsonl");
+        assert!(profile_path.exists());
+
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn record_failure_includes_resource_profile_in_csv() {
+        let run_dir = temp_dir();
+        fs::create_dir_all(&run_dir).unwrap();
+
+        let layout = WorkerLayout {
+            version: 2,
+            logical_worker_count: 4,
+            physical_worker_count: 3,
+            layout_mode: "hybrid".to_string(),
+            singleton_min_count: 2,
+            singleton_fraction: 0.5,
+            packed_clients_per_container: 2,
+            singleton_selection_seed: 1,
+            profile_policy: "singletons_only".to_string(),
+            clients: vec![
+                WorkerLayoutClient {
+                    client_id: "00001".to_string(),
+                    physical_worker_id: "worker-00001".to_string(),
+                    container_mode: "singleton".to_string(),
+                    profile_enabled: true,
+                    command_url: "http://worker-00001:8080/client/00001".to_string(),
+                    health_url: "http://worker-00001:8080/client/00001/health".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+                WorkerLayoutClient {
+                    client_id: "00002".to_string(),
+                    physical_worker_id: "worker-pack-000".to_string(),
+                    container_mode: "packed".to_string(),
+                    profile_enabled: false,
+                    command_url: "http://worker-pack-000:8080/client/00002".to_string(),
+                    health_url: "http://worker-pack-000:8080/client/00002/health".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+                WorkerLayoutClient {
+                    client_id: "00003".to_string(),
+                    physical_worker_id: "worker-pack-000".to_string(),
+                    container_mode: "packed".to_string(),
+                    profile_enabled: false,
+                    command_url: "http://worker-pack-000:8080/client/00003".to_string(),
+                    health_url: "http://worker-pack-000:8080/client/00003/health".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+                WorkerLayoutClient {
+                    client_id: "00004".to_string(),
+                    physical_worker_id: "worker-00004".to_string(),
+                    container_mode: "singleton".to_string(),
+                    profile_enabled: true,
+                    command_url: "http://worker-00004:8080/client/00004".to_string(),
+                    health_url: "http://worker-00004:8080/client/00004/health".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+            ],
+            physical_workers: vec![
+                WorkerLayoutPhysicalWorker {
+                    physical_worker_id: "worker-00001".to_string(),
+                    container_mode: "singleton".to_string(),
+                    client_ids: vec!["00001".to_string()],
+                    base_url: "http://worker-00001:8080".to_string(),
+                    profile_enabled_client_ids: vec!["00001".to_string()],
+                    resource_limit_cpus: Some(0.125),
+                    resource_limit_memory: Some("64m".to_string()),
+                    resource_limit_memory_bytes: None,
+                    resource_limit_memory_swap: Some("64m".to_string()),
+                    resource_limit_memory_swap_bytes: None,
+                    resource_limit_pids: None,
+                    resource_profile: "failure-experiment-resource-envelope_cpus-0.125_memory-64m".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+                WorkerLayoutPhysicalWorker {
+                    physical_worker_id: "worker-pack-000".to_string(),
+                    container_mode: "packed".to_string(),
+                    client_ids: vec!["00002".to_string(), "00003".to_string()],
+                    base_url: "http://worker-pack-000:8080".to_string(),
+                    profile_enabled_client_ids: vec![],
+                    resource_limit_cpus: None,
+                    resource_limit_memory: None,
+                    resource_limit_memory_bytes: None,
+                    resource_limit_memory_swap: None,
+                    resource_limit_memory_swap_bytes: None,
+                    resource_limit_pids: None,
+                    resource_profile: "".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+                WorkerLayoutPhysicalWorker {
+                    physical_worker_id: "worker-00004".to_string(),
+                    container_mode: "singleton".to_string(),
+                    client_ids: vec!["00004".to_string()],
+                    base_url: "http://worker-00004:8080".to_string(),
+                    profile_enabled_client_ids: vec!["00004".to_string()],
+                    resource_limit_cpus: Some(2.0),
+                    resource_limit_memory: Some("1g".to_string()),
+                    resource_limit_memory_bytes: None,
+                    resource_limit_memory_swap: Some("1g".to_string()),
+                    resource_limit_memory_swap_bytes: None,
+                    resource_limit_pids: None,
+                    resource_profile: "failure-experiment-resource-envelope_cpus-2.0_memory-1g".to_string(),
+                    execution_backend: "docker_container".to_string(),
+                    device_kind: "scratch_container".to_string(),
+                    transport: "".to_string(),
+                    access_backend: "".to_string(),
+                    arch: "".to_string(),
+                    rust_target: "".to_string(),
+                },
+            ],
+            execution_backend: String::new(),
+            device_kind: String::new(),
+            transport: String::new(),
+            access_backend: String::new(),
+            arch: String::new(),
+            rust_target: String::new(),
+            failure_experiment: Some(FailureExperimentConfig {
+                mode: "failure_experiment".to_string(),
+                seed: 1,
+                cpu_caps: vec![0.125, 0.25, 0.5, 1.0, 2.0],
+                ram_caps: vec!["64m","96m","128m","192m","256m","384m","512m","768m","1g"].into_iter().map(|s| s.to_string()).collect(),
+                grid_cells: 45,
+                swap_equals_ram: true,
+                interpretation: String::new(),
+            }),
+        };
+
+        let layout_json = serde_json::to_string(&layout).unwrap();
+        let layout_path = run_dir.join("worker_layout.json");
+        fs::write(&layout_path, &layout_json).unwrap();
+
+        let events = RunnerEventLog::new(&run_dir);
+        let worker = WorkerSpec::legacy("00001".to_string(), "http://worker-00001:8080".to_string());
+        let cursor = BenchmarkCursor::new(1, 8, 8, "update", "self_update");
+        let err = anyhow!("container OOM killed");
+
+        let evidence = OomEvidence {
+            ts_unix_ns: Some(1000),
+            source: "docker_cgroup".to_string(),
+            worker_id: Some("00001".to_string()),
+            physical_worker_id: Some("worker-00001".to_string()),
+            detail: Some("oom_kill counter incremented".to_string()),
+        };
+
+        events
+            .record_oom_failure(&cursor, &worker, &err, &evidence, "evict_and_retry", None)
+            .unwrap();
+
+        let runner_jsonl = run_dir.join("runner-events.jsonl");
+        let content = fs::read_to_string(&runner_jsonl).unwrap();
+        let first_line = content.lines().next().unwrap();
+        let event: RunnerEvent = serde_json::from_str(first_line).unwrap();
+        assert_eq!(event.failure_class, "oom_kill");
+        assert_eq!(event.failed_worker_id, "00001");
+        assert_eq!(event.benchmark_plateau_index, 1);
+        assert_eq!(event.benchmark_target_size, 8);
+
+        let profile_path = run_dir.join("client-00001.jsonl");
+        assert!(profile_path.exists());
+
+        let _ = fs::remove_dir_all(&run_dir);
     }
 }

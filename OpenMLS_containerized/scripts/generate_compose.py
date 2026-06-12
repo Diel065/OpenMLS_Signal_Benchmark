@@ -142,6 +142,69 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Docker pids_limit for every singleton worker service.",
     )
 
+    p.add_argument(
+        "--failure-experiment",
+        action="store_true",
+        help=(
+            "Failure-experiment mode: assign a reproducible randomized grid of "
+            "CPU/RAM caps to profiled singleton workers (packed workers remain "
+            "unconstrained). The grid is a Cartesian product of CPU caps (0.125, "
+            "0.25, 0.5, 1.0, 2.0) and RAM caps (64m, 96m, 128m, 192m, 256m, "
+            "384m, 512m, 768m, 1g), swap=RAM. Overrides --singleton-cpus and "
+            "--singleton-memory. Only applies in hybrid layout mode."
+        ),
+    )
+
+    # ── Resource experiment flags ──────────────────────────────────────
+    p.add_argument(
+        "--resource-experiment",
+        choices=["none", "ram-sweep-singleton", "cpu-matrix-singleton"],
+        default="none",
+        help="Resource experiment mode for simulated IoT container profiling",
+    )
+    p.add_argument(
+        "--affinity-plan-file",
+        default=None,
+        help="Path to a pre-computed cpu_affinity_plan.json file for this run",
+    )
+    p.add_argument(
+        "--resource-profiles-file",
+        default=None,
+        help="Path to a pre-computed resource_profiles.csv or JSON file for this run",
+    )
+    p.add_argument(
+        "--profiled-singleton-count",
+        type=int,
+        default=1,
+        help="Number of profiled singleton workers in resource experiment mode",
+    )
+    p.add_argument(
+        "--ram-sweep-values",
+        default="32m,64m,128m,256m,512m,1g",
+        help="Comma-separated list of Docker memory limits for RAM sweep",
+    )
+    p.add_argument(
+        "--ram-sweep-cpu-count",
+        type=int,
+        default=10,
+        help="Number of CPUs assigned to each singleton in RAM sweep",
+    )
+    p.add_argument(
+        "--cpu-matrix-core-counts",
+        default="1,2,4",
+        help="Comma-separated list of CPU core counts for CPU matrix",
+    )
+    p.add_argument(
+        "--cpu-matrix-capacity-fractions",
+        default="0.25,0.50,0.75,1.00",
+        help="Comma-separated list of capacity fractions for CPU matrix",
+    )
+    p.add_argument(
+        "--resource-experiment-output-dir",
+        default=None,
+        help="Directory to write resource experiment sidecar files",
+    )
+
     return p
 
 
@@ -182,6 +245,40 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--ds-port must be between 1 and 65535")
     if not (1 <= args.relay_port <= 65535):
         raise SystemExit("--relay-port must be between 1 and 65535")
+
+    resource_experiment = getattr(args, "resource_experiment", "none")
+    if resource_experiment != "none":
+        if args.worker_layout_mode != "hybrid":
+            raise SystemExit(
+                "--resource-experiment requires --worker-layout-mode hybrid"
+            )
+        if getattr(args, "failure_experiment", False):
+            raise SystemExit(
+                "--resource-experiment and --failure-experiment are mutually exclusive"
+            )
+        if (
+            args.singleton_cpus is not None
+            or args.singleton_memory is not None
+        ):
+            raise SystemExit(
+                "--resource-experiment overrides manual resource flags"
+            )
+
+    if getattr(args, "failure_experiment", False):
+        if args.worker_layout_mode != "hybrid":
+            raise SystemExit(
+                "--failure-experiment requires --worker-layout-mode hybrid"
+            )
+        if (
+            args.singleton_cpus is not None
+            or args.singleton_memory is not None
+            or args.singleton_memory_swap is not None
+        ):
+            raise SystemExit(
+                "--failure-experiment overrides --singleton-cpus, "
+                "--singleton-memory, and --singleton-memory-swap. "
+                "Do not set those flags together with --failure-experiment."
+            )
 
     if args.publish_workers:
         last_port = args.base_worker_port + args.workers - 1
@@ -322,6 +419,49 @@ def empty_resource_limits() -> dict:
         "resource_limit_memory_swap_bytes": None,
         "resource_limit_pids": None,
         "resource_profile": "",
+    }
+
+
+# ── Failure-experiment grid ────────────────────────────────────────────
+
+FAILURE_EXPERIMENT_CPU_CAPS = [0.125, 0.25, 0.5, 1.0, 2.0]
+FAILURE_EXPERIMENT_RAM_CAPS = [
+    "64m", "96m", "128m", "192m", "256m", "384m", "512m", "768m", "1g",
+]
+FAILURE_EXPERIMENT_GRID_SEED_DOMAIN = 0x4641494C_47524944
+
+
+def build_failure_experiment_grid(
+    seed: int,
+) -> list[tuple[float, str, str]]:
+    rng = random.Random(seed ^ FAILURE_EXPERIMENT_GRID_SEED_DOMAIN)
+    grid: list[tuple[float, str, str]] = []
+    for cpus in FAILURE_EXPERIMENT_CPU_CAPS:
+        for ram in FAILURE_EXPERIMENT_RAM_CAPS:
+            grid.append((cpus, ram, ram))
+    rng.shuffle(grid)
+    return grid
+
+
+def failure_experiment_resource_limits(
+    cpus: float,
+    memory: str,
+    memory_swap: str,
+) -> dict:
+    profile = (
+        f"failure-experiment-resource-envelope"
+        f"_cpus-{cpus}"
+        f"_memory-{memory}"
+    )
+    return {
+        "resource_limit_cpus": cpus,
+        "resource_limit_memory": memory,
+        "resource_limit_memory_bytes": None,
+        "resource_limit_memory_swap": memory_swap,
+        "resource_limit_memory_swap_bytes": None,
+        "resource_limit_pids": None,
+        "resource_profile": profile,
+        "failure_experiment": True,
     }
 
 
@@ -468,8 +608,14 @@ def build_hybrid_layout(
     physical_workers: list[PhysicalWorkerEntry] = []
     configured_singleton_limits = singleton_resource_limits(args)
 
+    failure_grid = None
+    failure_grid_rng = None
+    if getattr(args, "failure_experiment", False):
+        failure_grid = build_failure_experiment_grid(args.singleton_selection_seed)
+        failure_grid_rng = random.Random(args.singleton_selection_seed ^ 0x4641494C_524E47)
+
     singleton_counter = 0
-    for cid in singleton_ids:
+    for idx, cid in enumerate(singleton_ids):
         sid = f"worker-{cid}"
         base_url = f"http://{sid}:8080"
         clients.append(ClientLayoutEntry(
@@ -480,13 +626,21 @@ def build_hybrid_layout(
             command_url=f"{base_url}/client/{cid}",
             health_url=f"{base_url}/client/{cid}/health",
         ))
+
+        if failure_grid and failure_grid_rng:
+            grid_idx = idx % len(failure_grid)
+            cpus_val, mem_val, swap_val = failure_grid[grid_idx]
+            worker_limits = failure_experiment_resource_limits(cpus_val, mem_val, swap_val)
+        else:
+            worker_limits = configured_singleton_limits
+
         physical_workers.append(PhysicalWorkerEntry(
             physical_worker_id=sid,
             container_mode="singleton",
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
-            resource_limits=configured_singleton_limits,
+            resource_limits=worker_limits,
         ))
         singleton_counter += 1
 
@@ -565,9 +719,26 @@ def generate_worker_layout_json(
             "resource_limit_memory_swap",
             "resource_limit_pids",
         )
-    )
+    ) or getattr(args, "failure_experiment", False)
+
+    failure_experiment_grid = None
+    if getattr(args, "failure_experiment", False):
+        failure_experiment_grid = {
+            "mode": "failure_experiment",
+            "seed": args.singleton_selection_seed,
+            "cpu_caps": FAILURE_EXPERIMENT_CPU_CAPS,
+            "ram_caps": FAILURE_EXPERIMENT_RAM_CAPS,
+            "grid_cells": len(FAILURE_EXPERIMENT_CPU_CAPS) * len(FAILURE_EXPERIMENT_RAM_CAPS),
+            "swap_equals_ram": True,
+            "interpretation": (
+                "Each profiled singleton receives one cell from the cartesian grid. "
+                "Packed workers are unconstrained. Swap is locked to RAM so memory "
+                "failures are easier to interpret."
+            ),
+        }
+
     return {
-        "version": 1,
+        "version": 2,
         "logical_worker_count": args.workers,
         "physical_worker_count": len(physical_workers),
         "layout_mode": args.worker_layout_mode,
@@ -576,6 +747,7 @@ def generate_worker_layout_json(
         "packed_clients_per_container": args.packed_clients_per_container,
         "singleton_selection_seed": args.singleton_selection_seed,
         "profile_policy": "singletons_only" if args.worker_layout_mode == "hybrid" else "all",
+        "failure_experiment": failure_experiment_grid,
         "singleton_resource_envelope": {
             "enabled": envelope_enabled,
             "applies_to": "all_containerized_singletons",
@@ -584,9 +756,7 @@ def generate_worker_layout_json(
             ),
             "cpus": singleton_limits["resource_limit_cpus"],
             "memory": singleton_limits["resource_limit_memory"],
-            "memory_bytes": singleton_limits["resource_limit_memory_bytes"],
             "memory_swap": singleton_limits["resource_limit_memory_swap"],
-            "memory_swap_bytes": singleton_limits["resource_limit_memory_swap_bytes"],
             "memory_swap_defaulted_to_memory": getattr(
                 args, "singleton_memory_swap_defaulted", False
             ),
@@ -814,6 +984,9 @@ def physical_worker_bridge_index(
 def generate_compose_text(
     args: argparse.Namespace,
     physical_workers: list[PhysicalWorkerEntry],
+    affinity_plan: dict | None = None,
+    resource_profiles: list | None = None,
+    resource_experiment: str = "none",
 ) -> str:
     lines: list[str] = []
     bridges = bridges_from_args(args)
@@ -848,6 +1021,12 @@ def generate_compose_text(
     lines.append("")
     lines.append("services:")
 
+    bg_cpuset = None
+    if affinity_plan and resource_experiment != "none":
+        bg_cpus = affinity_plan.get("background_cpus", [])
+        if bg_cpus:
+            bg_cpuset = ",".join(str(c) for c in sorted(bg_cpus))
+
     lines.append("  ds:")
     lines.append("    image: mls-ds")
     lines.append(f'    command: ["--listen-addr", "0.0.0.0:{args.ds_port}"]')
@@ -856,6 +1035,8 @@ def generate_compose_text(
     lines.append("      OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT: ${OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT:-128}")
     lines.append("    ports:")
     lines.append(f'      - "{args.ds_port}:{args.ds_port}"')
+    if bg_cpuset:
+        lines.append(f'    cpuset: "{bg_cpuset}"')
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
@@ -869,6 +1050,8 @@ def generate_compose_text(
     lines.append("      OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT: ${OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT:-128}")
     lines.append("    ports:")
     lines.append(f'      - "{args.relay_port}:{args.relay_port}"')
+    if bg_cpuset:
+        lines.append(f'    cpuset: "{bg_cpuset}"')
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
@@ -876,21 +1059,33 @@ def generate_compose_text(
 
     total_physical = len(physical_workers)
     next_host_port = args.base_worker_port
+    singleton_idx = 0
 
     for pw_idx, pw in enumerate(physical_workers):
         lines.append("")
         lines.append(f"  {pw.physical_worker_id}:")
         lines.append("    <<: *worker-common")
+        affinity_result = {}
         if pw.container_mode == "singleton":
-            limits = pw.resource_limits
-            if limits.get("resource_limit_cpus") is not None:
-                lines.append(f'    cpus: "{args.singleton_cpus}"')
-            if limits.get("resource_limit_memory") is not None:
-                lines.append(f'    mem_limit: "{limits["resource_limit_memory"]}"')
-            if limits.get("resource_limit_memory_swap") is not None:
-                lines.append(f'    memswap_limit: "{limits["resource_limit_memory_swap"]}"')
-            if limits.get("resource_limit_pids") is not None:
-                lines.append(f'    pids_limit: {limits["resource_limit_pids"]}')
+            if resource_experiment != "none" and affinity_plan:
+                affinity_result = apply_affinity_to_compose(
+                    lines, pw.physical_worker_id, pw.container_mode,
+                    affinity_plan, resource_profiles, singleton_idx, args,
+                ) or {}
+                singleton_idx += 1
+            else:
+                limits = pw.resource_limits
+                if limits.get("resource_limit_cpus") is not None:
+                    lines.append(f'    cpus: "{limits["resource_limit_cpus"]}"')
+                if limits.get("resource_limit_memory") is not None:
+                    lines.append(f'    mem_limit: "{limits["resource_limit_memory"]}"')
+                if limits.get("resource_limit_memory_swap") is not None:
+                    lines.append(f'    memswap_limit: "{limits["resource_limit_memory_swap"]}"')
+                if limits.get("resource_limit_pids") is not None:
+                    lines.append(f'    pids_limit: {limits["resource_limit_pids"]}')
+        else:
+            if bg_cpuset:
+                lines.append(f'    cpuset: "{bg_cpuset}"')
         lines.append("    command:")
         lines.append('      - "--name"')
         lines.append(f'      - "{pw.physical_worker_id}"')
@@ -917,6 +1112,9 @@ def generate_compose_text(
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
+
+        if affinity_result.get("rayon_num_threads"):
+            lines.append(f'      RAYON_NUM_THREADS: "{affinity_result["rayon_num_threads"]}"')
 
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
             profile_csv = ",".join(pw.profile_enabled_client_ids)
@@ -1019,6 +1217,77 @@ def write_text(path: Path, text: str) -> None:
     path.write_text(text, encoding="utf-8")
 
 
+def load_affinity_plan(args: argparse.Namespace) -> dict | None:
+    """Load a pre-computed affinity plan JSON file."""
+    plan_file = getattr(args, "affinity_plan_file", None)
+    if not plan_file:
+        return None
+    try:
+        with open(plan_file) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[warn] Could not load affinity plan from {plan_file}: {e}", flush=True)
+        return None
+
+
+def load_resource_profiles(args: argparse.Namespace) -> list | None:
+    """Load pre-computed resource profiles from a JSON file."""
+    profiles_file = getattr(args, "resource_profiles_file", None)
+    if not profiles_file:
+        return None
+    try:
+        with open(profiles_file) as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[warn] Could not load resource profiles from {profiles_file}: {e}", flush=True)
+        return None
+
+
+def apply_affinity_to_compose(
+    lines: list[str],
+    physical_worker_id: str,
+    container_mode: str,
+    affinity_plan: dict | None,
+    resource_profiles: list | None,
+    profile_idx: int,
+    args: argparse.Namespace,
+) -> dict | None:
+    """Apply cpuset and resource limits to compose service lines.
+    Returns a dict with 'rayon_num_threads' and 'cpuset' info for later environment emission.
+    """
+    result = {}
+    if affinity_plan is None:
+        return result
+
+    if container_mode == "singleton":
+        found_in_plan = False
+        for pa in affinity_plan.get("profiled_assignments", []):
+            if pa.get("container_name") == physical_worker_id:
+                cpus = pa.get("assigned_cpus", [])
+                if cpus:
+                    cpuset_str = ",".join(str(c) for c in sorted(cpus))
+                    lines.append(f'    cpuset: "{cpuset_str}"')
+                    result["cpuset"] = cpuset_str
+                rayon = pa.get("rayon_num_threads", 0)
+                if rayon > 0:
+                    result["rayon_num_threads"] = rayon
+                found_in_plan = True
+                break
+
+        if resource_profiles and profile_idx < len(resource_profiles):
+            rp = resource_profiles[profile_idx]
+            if rp.get("cpu_limit_cpus") is not None:
+                lines.append(f'    cpus: "{rp["cpu_limit_cpus"]}"')
+            if rp.get("memory_limit"):
+                lines.append(f'    mem_limit: "{rp["memory_limit"]}"')
+            if rp.get("memory_swap"):
+                lines.append(f'    memswap_limit: "{rp["memory_swap"]}"')
+            if not found_in_plan and rp.get("rayon_num_threads", 0) > 0:
+                result["rayon_num_threads"] = rp["rayon_num_threads"]
+
+    return result
+
+
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
@@ -1028,6 +1297,13 @@ def main() -> None:
     workers_out = Path(args.workers_out)
     workers_host_out = Path(args.workers_host_out)
     layout_out = Path(args.worker_layout_out)
+
+    resource_experiment = getattr(args, "resource_experiment", "none")
+    affinity_plan = load_affinity_plan(args) if resource_experiment != "none" else None
+    resource_profiles = load_resource_profiles(args) if resource_experiment != "none" else None
+
+    if resource_experiment != "none" and affinity_plan:
+        print(f"[affinity] Loaded affinity plan with {len(affinity_plan.get('profiled_assignments',[]))} profiled assignments", flush=True)
 
     if args.worker_layout_mode == "hybrid":
         layout_info = compute_hybrid_layout(
@@ -1071,7 +1347,13 @@ def main() -> None:
     layout_json = generate_worker_layout_json(args, clients, physical_workers)
     write_text(layout_out, json.dumps(layout_json, indent=2) + "\n")
 
-    write_text(compose_out, generate_compose_text(args, physical_workers))
+    compose_text = generate_compose_text(
+        args, physical_workers,
+        affinity_plan=affinity_plan,
+        resource_profiles=resource_profiles,
+        resource_experiment=resource_experiment,
+    )
+    write_text(compose_out, compose_text)
     write_text(workers_out, generate_workers_internal(args, clients))
     write_text(workers_host_out, generate_workers_host(args, physical_workers))
 
@@ -1093,6 +1375,13 @@ def main() -> None:
         print(
             "- Singleton resource envelope: "
             f"{profile} (host-specific proxy, not hardware emulation)"
+        )
+    if getattr(args, "failure_experiment", False):
+        grid_cells = len(FAILURE_EXPERIMENT_CPU_CAPS) * len(FAILURE_EXPERIMENT_RAM_CAPS)
+        print(
+            f"- Failure-experiment grid: {len(FAILURE_EXPERIMENT_CPU_CAPS)} CPU caps "
+            f"x {len(FAILURE_EXPERIMENT_RAM_CAPS)} RAM caps = {grid_cells} cells, "
+            f"seed={args.singleton_selection_seed}"
         )
     print(f"- Workers distributed across {args.bridge_count} Docker bridge network(s)")
     print("- workers.txt for an in-network runner")

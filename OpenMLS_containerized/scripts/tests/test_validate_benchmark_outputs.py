@@ -28,7 +28,6 @@ def valid_add_rows(run_id="test-run", k=2):
                 "profile_schema_version": "10",
                 "run_id": run_id,
                 "op": op,
-                "implementation": "openmls",
                 "client_id": "client-1",
                 "worker_id": "client-1",
                 "device_kind": "",

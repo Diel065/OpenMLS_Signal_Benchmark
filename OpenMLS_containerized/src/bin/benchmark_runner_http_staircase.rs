@@ -122,6 +122,9 @@ struct Args {
 
     #[arg(long, action = ArgAction::SetTrue)]
     no_aggregate: bool,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    failure_experiment: bool,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -228,6 +231,7 @@ fn main() -> Result<()> {
         profile_only_singletons: args.profile_only_singletons,
         external_coverage_lane: args.external_coverage_lane,
         no_aggregate: args.no_aggregate,
+        failure_experiment: args.failure_experiment,
         worker_layout,
     })
 }
