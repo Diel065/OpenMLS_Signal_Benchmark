@@ -185,7 +185,22 @@ def run_preflight(
 
         docker_cpuset = run_docker_inspect_cpuset(container_name)
 
-        if not docker_cpuset and expected_cpuset:
+        if not expected_cpuset:
+            results.append({
+                "check_name": "profiled_cpuset_plan_empty",
+                "container_name": container_name,
+                "container_role": pc.get("container_role", "profiled_singleton"),
+                "expected_cpuset": "",
+                "docker_cpuset": docker_cpuset or "",
+                "host_pid": "",
+                "proc_cpus_allowed_list": "",
+                "thread_cpus_allowed_lists": "",
+                "observed_psr_cpus": "",
+                "status": "FAIL",
+                "message": f"Profiled container {container_name} has no CPU assigned in the affinity plan",
+            })
+            has_fail = True
+        elif not docker_cpuset:
             results.append({
                 "check_name": "profiled_cpuset_missing",
                 "container_name": container_name,
@@ -235,7 +250,7 @@ def run_preflight(
 
         if expected_rayon is not None:
             actual_rayon = get_container_env_var(container_name, "RAYON_NUM_THREADS")
-            if actual_rayon is not None and str(actual_rayon) != str(expected_rayon):
+            if actual_rayon is None or str(actual_rayon) != str(expected_rayon):
                 results.append({
                     "check_name": "rayon_num_threads_mismatch",
                     "container_name": container_name,
@@ -247,7 +262,7 @@ def run_preflight(
                     "thread_cpus_allowed_lists": "",
                     "observed_psr_cpus": "",
                     "status": "FAIL",
-                    "message": f"RAYON_NUM_THREADS={actual_rayon} but expected {expected_rayon}",
+                    "message": f"RAYON_NUM_THREADS={actual_rayon!r} but expected {expected_rayon}",
                 })
                 has_fail = True
 
@@ -259,7 +274,7 @@ def run_preflight(
 
                 if expected_cpuset:
                     expected_set_for_pid = parse_cpuset_to_set(expected_cpuset)
-                    if not expected_set_for_pid.issubset(proc_set):
+                    if expected_set_for_pid != proc_set:
                         results.append({
                             "check_name": "proc_cpus_allowed_conflict",
                             "container_name": container_name,
@@ -280,7 +295,7 @@ def run_preflight(
                 if tcpus and expected_cpuset:
                     tset = parse_cpuset_to_set(tcpus)
                     expected_set_for_tid = parse_cpuset_to_set(expected_cpuset)
-                    if not expected_set_for_tid.issubset(tset):
+                    if expected_set_for_tid != tset:
                         results.append({
                             "check_name": "thread_cpus_allowed_conflict",
                             "container_name": container_name,
@@ -299,8 +314,41 @@ def run_preflight(
     for bc in background_containers:
         container_name = bc["container_name"]
         docker_cpuset = run_docker_inspect_cpuset(container_name)
-        if docker_cpuset:
+        expected_background_cpuset = bc.get("expected_cpuset", "")
+        if expected_background_cpuset and not docker_cpuset:
+            results.append({
+                "check_name": "background_cpuset_missing",
+                "container_name": container_name,
+                "container_role": bc.get("container_role", "background"),
+                "expected_cpuset": expected_background_cpuset,
+                "docker_cpuset": docker_cpuset or "",
+                "host_pid": "",
+                "proc_cpus_allowed_list": "",
+                "thread_cpus_allowed_lists": "",
+                "observed_psr_cpus": "",
+                "status": "FAIL",
+                "message": f"Background container {container_name} has no cpuset but expected '{expected_background_cpuset}'",
+            })
+            has_fail = True
+        elif docker_cpuset:
             docker_set = parse_cpuset_to_set(docker_cpuset)
+            expected_set = parse_cpuset_to_set(expected_background_cpuset)
+            cpuset_matches = not expected_set or docker_set == expected_set
+            if not cpuset_matches:
+                results.append({
+                    "check_name": "background_cpuset_mismatch",
+                    "container_name": container_name,
+                    "container_role": bc.get("container_role", "background"),
+                    "expected_cpuset": expected_background_cpuset,
+                    "docker_cpuset": docker_cpuset,
+                    "host_pid": "",
+                    "proc_cpus_allowed_list": "",
+                    "thread_cpus_allowed_lists": "",
+                    "observed_psr_cpus": "",
+                    "status": "FAIL",
+                    "message": f"Background container {container_name} cpuset '{docker_cpuset}' differs from expected '{expected_background_cpuset}'",
+                })
+                has_fail = True
             overlap = docker_set & profiled_cpu_set
             if overlap:
                 results.append({
@@ -317,7 +365,7 @@ def run_preflight(
                     "message": f"Background container {container_name} cpuset '{docker_cpuset}' overlaps profiled CPUs {sorted(overlap)}",
                 })
                 has_fail = True
-            else:
+            elif cpuset_matches:
                 results.append({
                     "check_name": "background_cpuset_clean",
                     "container_name": container_name,

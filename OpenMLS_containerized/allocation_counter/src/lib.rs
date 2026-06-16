@@ -1,4 +1,5 @@
 mod allocator;
+pub mod embedded_heap_budget;
 
 /// Allocation totals measured by a thread-local `measure` scope.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]

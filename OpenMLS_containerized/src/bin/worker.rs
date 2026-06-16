@@ -17,6 +17,10 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use mls_playground::client::Client;
 use mls_playground::debug::{debug_logs_enabled, worker_debug_logs_enabled};
+use mls_playground::embedded_heap_budget::{
+    begin_operation as begin_heap_budget_operation, operation_family_for_command,
+    EmbeddedHeapBudgetConfig, OperationAttribution,
+};
 use mls_playground::worker_api::{
     handle_command, BenchmarkContextFields, Command, CommandResponse, CompletedCommandCache,
     IncomingCommandRequest, PendingIntent,
@@ -48,6 +52,7 @@ struct WorkerProcessState {
     internal_parallelism: usize,
     client_ids: Vec<String>,
     profile_enabled_ids: Vec<String>,
+    embedded_heap_budget: EmbeddedHeapBudgetConfig,
 }
 
 struct WorkerCommandEnvelope {
@@ -522,6 +527,7 @@ async fn client_command_actor(
     mut slot: ClientSlot,
     ds_url: String,
     relay_url: String,
+    embedded_heap_budget: EmbeddedHeapBudgetConfig,
 ) {
     while let Some(envelope) = rx.recv().await {
         let request_id = envelope.request_id.as_deref().unwrap_or("-");
@@ -558,6 +564,7 @@ async fn client_command_actor(
         } else {
             None
         };
+        let before_member_count = slot.client.member_names().ok().map(|members| members.len());
 
         if slot.debug_enabled {
             eprintln!(
@@ -603,7 +610,33 @@ async fn client_command_actor(
             set_benchmark_context(benchmark_context.clone());
         }
 
-        let result = handle_command(
+        let heap_budget_guard = if slot.profile_enabled && embedded_heap_budget.enabled {
+            let operation_family = operation_family_for_command(
+                command_name,
+                benchmark_context.benchmark_operation.as_deref(),
+            );
+            let benchmark_operation = benchmark_context
+                .benchmark_operation
+                .clone()
+                .unwrap_or_else(|| operation_family.clone());
+            Some(begin_heap_budget_operation(OperationAttribution {
+                operation_family,
+                benchmark_operation,
+                span_or_phase: phase.to_string(),
+                member_count: before_member_count,
+                epoch: before_epoch,
+                worker_id: client_id.clone(),
+                resource_profile_id: embedded_heap_budget.resource_profile_id.clone(),
+                resource_profile_index: embedded_heap_budget.resource_profile_index,
+                app_heap_budget: embedded_heap_budget.app_heap_budget.clone(),
+                app_heap_budget_bytes: embedded_heap_budget.app_heap_budget_bytes,
+            }))
+            .flatten()
+        } else {
+            None
+        };
+
+        let mut result = handle_command(
             &mut slot.client,
             &ds_url,
             &relay_url,
@@ -613,6 +646,13 @@ async fn client_command_actor(
             benchmark_context,
         )
         .await;
+
+        if let Some(guard) = heap_budget_guard.as_ref() {
+            if let Some(failure) = guard.failure_if_exceeded() {
+                result = Err(anyhow!(failure.to_worker_error_message()));
+            }
+        }
+        drop(heap_budget_guard);
 
         let response = match result {
             Ok(message) => CommandResponse::ok(message),
@@ -667,6 +707,15 @@ async fn debug_layout(State(state): State<Arc<WorkerProcessState>>) -> Json<serd
         "ds_url": state.ds_url,
         "relay_url": state.relay_url,
         "internal_parallelism": state.internal_parallelism,
+        "embedded_heap_budget": {
+            "enabled": state.embedded_heap_budget.enabled,
+            "memory_model": state.embedded_heap_budget.memory_model.clone(),
+            "app_heap_budget": state.embedded_heap_budget.app_heap_budget.clone(),
+            "app_heap_budget_bytes": state.embedded_heap_budget.app_heap_budget_bytes,
+            "docker_memory_limit": state.embedded_heap_budget.docker_memory_limit.clone(),
+            "resource_profile_id": state.embedded_heap_budget.resource_profile_id.clone(),
+            "resource_profile_index": state.embedded_heap_budget.resource_profile_index,
+        },
         "clients": clients_info,
     }))
 }
@@ -722,6 +771,7 @@ async fn main() -> Result<()> {
         .collect();
 
     let profile_template = profile_path_template_opt;
+    let embedded_heap_budget = mls_playground::embedded_heap_budget::configure_from_env();
 
     let queue_capacity = command_queue_capacity();
     let cache_size = idempotency_cache_size();
@@ -761,8 +811,16 @@ async fn main() -> Result<()> {
         let ds = worker_ds_url.clone();
         let relay = worker_relay_url.clone();
         let cid = client_id.clone();
+        let budget_config = embedded_heap_budget.clone();
 
-        tokio::spawn(client_command_actor(cid, command_rx, slot, ds, relay));
+        tokio::spawn(client_command_actor(
+            cid,
+            command_rx,
+            slot,
+            ds,
+            relay,
+            budget_config,
+        ));
         client_ids_list.push(client_id.clone());
         if is_profile_enabled {
             profile_enabled_ids_list.push(client_id.clone());
@@ -777,6 +835,7 @@ async fn main() -> Result<()> {
         internal_parallelism,
         client_ids: client_ids_list,
         profile_enabled_ids: profile_enabled_ids_list,
+        embedded_heap_budget,
     });
 
     let app = Router::new()

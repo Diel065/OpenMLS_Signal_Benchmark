@@ -1,6 +1,7 @@
 pub mod client;
 pub mod debug;
 pub mod delivery_service;
+pub mod embedded_heap_budget;
 pub mod http_retry;
 pub mod service_metrics;
 pub mod worker_api;

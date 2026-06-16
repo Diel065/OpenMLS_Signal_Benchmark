@@ -54,15 +54,15 @@ cleanup_generated_compose() {
 cleanup_docker() {
   echo "===== Cleaning up leftover benchmark containers / networks ====="
 
-  if [ -f "$SCRIPT_DIR/OpenMLS_containerized/docker-compose.yml" ]; then
-    docker compose -f "$SCRIPT_DIR/OpenMLS_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
+  if [ -f "$SCRIPT_DIR/../OpenMLS_containerized/docker-compose.yml" ]; then
+    docker compose -f "$SCRIPT_DIR/../OpenMLS_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
   fi
-  if [ -f "$SCRIPT_DIR/Signal_containerized/docker-compose.yml" ]; then
-    docker compose -f "$SCRIPT_DIR/Signal_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
+  if [ -f "$SCRIPT_DIR/../Signal_containerized/docker-compose.yml" ]; then
+    docker compose -f "$SCRIPT_DIR/../Signal_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
   fi
 
-  cleanup_generated_compose "$SCRIPT_DIR/OpenMLS_containerized"
-  cleanup_generated_compose "$SCRIPT_DIR/Signal_containerized"
+  cleanup_generated_compose "$SCRIPT_DIR/../OpenMLS_containerized"
+  cleanup_generated_compose "$SCRIPT_DIR/../Signal_containerized"
 
   docker container ls -aq --filter "name=mls-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
   docker container ls -aq --filter "name=signal-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
@@ -92,7 +92,7 @@ run_openmls() {
 
   SCENARIO_SEED="$(shuf -i 1-2147483647 -n 1)"
   SINGLETON_SELECTION_SEED="$(shuf -i 1-2147483647 -n 1)"
-  PYTHON_BIN="$(python_for "$SCRIPT_DIR/OpenMLS_containerized")"
+  PYTHON_BIN="$(python_for "$SCRIPT_DIR/../OpenMLS_containerized")"
 
   echo ""
   echo "========== [OpenMLS iteration $ITER / 16] run-id: $RUN_ID =========="
@@ -101,7 +101,7 @@ run_openmls() {
   echo "  external_devices=none"
   echo ""
 
-  cd "$SCRIPT_DIR/OpenMLS_containerized"
+  cd "$SCRIPT_DIR/../OpenMLS_containerized"
 
   local -a _args=(
     --workers 512
@@ -186,7 +186,7 @@ run_openmls() {
 #   local PYTHON_BIN
 # 
 #   SINGLETON_SELECTION_SEED="$(shuf -i 1-2147483647 -n 1)"
-#   PYTHON_BIN="$(python_for "$SCRIPT_DIR/Signal_containerized")"
+#   PYTHON_BIN="$(python_for "$SCRIPT_DIR/../Signal_containerized")"
 # 
 #   echo ""
 #   echo "========== [Signal iteration $ITER / 16] run-id: $RUN_ID =========="
@@ -195,7 +195,7 @@ run_openmls() {
 #   echo "  external_devices=none"
 #   echo ""
 # 
-#   cd "$SCRIPT_DIR/Signal_containerized"
+#   cd "$SCRIPT_DIR/../Signal_containerized"
 # 
 #   local -a _args=(
 #     --workers 512

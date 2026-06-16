@@ -48,9 +48,9 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         _ => panic!("Alice should own-commit"),
     };
 
-    bob.join_from_welcome(&welcome_bytes)
-        .expect("Bob joins");
-    charlie.join_from_welcome(&welcome_bytes)
+    bob.join_from_welcome(&welcome_bytes).expect("Bob joins");
+    charlie
+        .join_from_welcome(&welcome_bytes)
         .expect("Charlie joins");
 
     // ── UpdateCommitCreate (self_update) ──
@@ -82,7 +82,11 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["op"] == "update_commit_create_total_local")
         .collect();
-    assert_eq!(update_totals.len(), 1, "exactly one update_commit_create_total_local");
+    assert_eq!(
+        update_totals.len(),
+        1,
+        "exactly one update_commit_create_total_local"
+    );
     let total = &update_totals[0];
     assert_eq!(total["operation_family"], "update_commit_create");
     assert_eq!(total["benchmark_operation"], "update_commit");
@@ -96,7 +100,10 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["operation_family"] == "update_commit_create")
         .collect();
-    assert!(!update_events.is_empty(), "self_update child spans must carry operation_family");
+    assert!(
+        !update_events.is_empty(),
+        "self_update child spans must carry operation_family"
+    );
     for event in &update_events {
         assert_eq!(event["benchmark_operation"], "update_commit");
         assert_eq!(event["member_count_before"], event["member_count"]);
@@ -108,7 +115,10 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["op"] == "commit_create_protocol_update")
         .collect();
-    assert!(!protocol.is_empty(), "commit_create_protocol_update must exist");
+    assert!(
+        !protocol.is_empty(),
+        "commit_create_protocol_update must exist"
+    );
     for event in &protocol {
         assert!(event["filtered_direct_path_len"].as_u64().is_some());
         assert!(event["sum_copath_resolution_sizes"].as_u64().is_some());
@@ -120,7 +130,11 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["op"] == "remove_commit_create_total_local")
         .collect();
-    assert_eq!(remove_totals.len(), 1, "exactly one remove_commit_create_total_local");
+    assert_eq!(
+        remove_totals.len(),
+        1,
+        "exactly one remove_commit_create_total_local"
+    );
     let total = &remove_totals[0];
     assert_eq!(total["operation_family"], "remove_commit_create");
     assert_eq!(total["benchmark_operation"], "remove_commit");
@@ -139,7 +153,10 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["operation_family"] == "remove_commit_create")
         .collect();
-    assert!(!remove_events.is_empty(), "remove_members child spans must carry operation_family");
+    assert!(
+        !remove_events.is_empty(),
+        "remove_members child spans must carry operation_family"
+    );
     for event in &remove_events {
         assert_eq!(event["benchmark_operation"], "remove_commit");
         assert_eq!(event["member_count_before"], event["member_count"]);
@@ -150,7 +167,10 @@ fn canonical_update_and_remove_commit_metadata_are_stable() {
         .iter()
         .filter(|e| e["op"] == "commit_create_protocol_remove")
         .collect();
-    assert!(!protocol.is_empty(), "commit_create_protocol_remove must exist");
+    assert!(
+        !protocol.is_empty(),
+        "commit_create_protocol_remove must exist"
+    );
     for event in &protocol {
         assert!(event["filtered_direct_path_len"].as_u64().is_some());
         assert!(event["sum_copath_resolution_sizes"].as_u64().is_some());

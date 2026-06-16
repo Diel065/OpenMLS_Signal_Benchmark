@@ -4,7 +4,7 @@
 # ---------------------------------------------------------------------------
 # Tests exactly ONE resource profile per benchmark invocation.
 # One profiled singleton container; all other clients are densely packed.
-# Loops over RAM sweep indices 0-5 and CPU matrix indices 0-11.
+# Loops over every configured RAM sweep and CPU matrix profile.
 #
 # Usage:
 #   chmod +x run_benchmark_resource_experiments.sh
@@ -53,19 +53,57 @@ cleanup_docker() {
   docker network ls -q --filter "name=mls-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
 }
 
-PYTHON_BIN="$(python_for "$SCRIPT_DIR/OpenMLS_containerized")"
-OPENMLS_DIR="$SCRIPT_DIR/OpenMLS_containerized"
+PYTHON_BIN="$(python_for "$SCRIPT_DIR/../OpenMLS_containerized")"
+OPENMLS_DIR="$(cd "$SCRIPT_DIR/../OpenMLS_containerized" && pwd)"
 
 # Scientific threshold mode: one profiled singleton per run.
-# The runner requires a positive singleton fraction, so 1/4096 plus a minimum
-# of one pins the hybrid layout to exactly one singleton at this worker count.
-LOGICAL_WORKERS=4096
-PROFILED_SINGLETON_COUNT=1
-SINGLETON_FRACTION=0.000244140625
-PACKED_CLIENTS_PER_CONTAINER=192
-PACKED_WORKER_INTERNAL_PARALLELISM=32
-AFFINITY_SAMPLE_SECONDS=20
-BUILD_IMAGES_NEXT_RUN=1
+# The runner requires a positive singleton fraction. The default is 1/4096;
+# override SINGLETON_FRACTION when changing LOGICAL_WORKERS if needed.
+HOST_CPU_COUNT="$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf '1')"
+DEFAULT_RAM_CPU_COUNT=$((HOST_CPU_COUNT / 2))
+[ "$DEFAULT_RAM_CPU_COUNT" -lt 1 ] && DEFAULT_RAM_CPU_COUNT=1
+[ "$DEFAULT_RAM_CPU_COUNT" -gt 10 ] && DEFAULT_RAM_CPU_COUNT=10
+
+LOGICAL_WORKERS="${LOGICAL_WORKERS:-4096}"
+PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-1}"
+SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000244140625}"
+PACKED_CLIENTS_PER_CONTAINER="${PACKED_CLIENTS_PER_CONTAINER:-192}"
+PACKED_WORKER_INTERNAL_PARALLELISM="${PACKED_WORKER_INTERNAL_PARALLELISM:-32}"
+AFFINITY_SAMPLE_SECONDS="${AFFINITY_SAMPLE_SECONDS:-20}"
+RAM_SWEEP_CPU_COUNT="${RAM_SWEEP_CPU_COUNT:-$DEFAULT_RAM_CPU_COUNT}"
+RAM_SWEEP_VALUES="${RAM_SWEEP_VALUES:-32m,64m,128m,256m,512m,1g}"
+CPU_MATRIX_CORE_COUNTS="${CPU_MATRIX_CORE_COUNTS:-1,2,4}"
+CPU_MATRIX_CAPACITY_FRACTIONS="${CPU_MATRIX_CAPACITY_FRACTIONS:-0.25,0.50,0.75,1.00}"
+MIN_SIZE="${MIN_SIZE:-2}"
+MAX_SIZE="${MAX_SIZE:-$LOGICAL_WORKERS}"
+STEP_SIZE="${STEP_SIZE:-[1,32]}"
+PLATEAU_ORDER="${PLATEAU_ORDER:-randomized}"
+ROUNDTRIPS="${ROUNDTRIPS:-2}"
+UPDATE_ROUNDS="${UPDATE_ROUNDS:-8}"
+APP_ROUNDS="${APP_ROUNDS:-8}"
+MAX_UPDATE_SAMPLES="${MAX_UPDATE_SAMPLES:-8}"
+MAX_APP_SAMPLES="${MAX_APP_SAMPLES:-8}"
+PAYLOAD_SIZES="${PAYLOAD_SIZES:-[16,4096]}"
+POST_STARTUP_SETTLE_SECONDS="${POST_STARTUP_SETTLE_SECONDS:-10}"
+HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-240}"
+WORKER_HEALTH_TIMEOUT_SECONDS="${WORKER_HEALTH_TIMEOUT_SECONDS:-600}"
+RUNNER_HTTP_REQUEST_TIMEOUT_MS="${RUNNER_HTTP_REQUEST_TIMEOUT_MS:-120000}"
+WORKER_HTTP_REQUEST_TIMEOUT_MS="${WORKER_HTTP_REQUEST_TIMEOUT_MS:-45000}"
+BUILD_IMAGES_NEXT_RUN="${BUILD_IMAGES_NEXT_RUN:-1}"
+RUN_RAM_SWEEP="${RUN_RAM_SWEEP:-1}"
+RUN_CPU_MATRIX="${RUN_CPU_MATRIX:-1}"
+
+if [[ "$PAYLOAD_SIZES" =~ ^\[([0-9]+)\]$ ]]; then
+  PAYLOAD_SIZES="${BASH_REMATCH[1]}"
+fi
+
+IFS=',' read -r -a RAM_VALUES <<< "$RAM_SWEEP_VALUES"
+IFS=',' read -r -a CPU_CORE_VALUES <<< "$CPU_MATRIX_CORE_COUNTS"
+IFS=',' read -r -a CPU_FRACTION_VALUES <<< "$CPU_MATRIX_CAPACITY_FRACTIONS"
+RAM_RUN_COUNT="${#RAM_VALUES[@]}"
+CPU_RUN_COUNT=$(( ${#CPU_CORE_VALUES[@]} * ${#CPU_FRACTION_VALUES[@]} ))
+[ "$RUN_RAM_SWEEP" -eq 1 ] || RAM_RUN_COUNT=0
+[ "$RUN_CPU_MATRIX" -eq 1 ] || CPU_RUN_COUNT=0
 
 # Results tracking
 declare -a RUN_RESULTS
@@ -75,8 +113,9 @@ FAIL_COUNT=0
 
 echo "============================================================"
 echo " Resource experiment threshold sweep - $DATE_TAG"
-echo " OpenMLS: 6 RAM + 12 CPU = 18 single-profile runs"
-echo " Layout: 4096 clients, 1 profiled singleton + 22 packed containers"
+echo " OpenMLS: $RAM_RUN_COUNT RAM + $CPU_RUN_COUNT CPU single-profile runs"
+echo " Layout: $LOGICAL_WORKERS clients, $PROFILED_SINGLETON_COUNT profiled singleton"
+echo " RAM CPUs: $RAM_SWEEP_CPU_COUNT reserved CPU thread(s)"
 echo " Mode : scientific threshold (1 profiled container / run)"
 echo " Policy: stop-on-profiled-failure"
 echo "============================================================"
@@ -112,31 +151,32 @@ COMMON_ARGS=(
   --fanout-p95-threshold-ms 8000
   --http-pool-max-idle-per-host 64
   --runner-http-connect-timeout-ms 5000
-  --runner-http-request-timeout-ms 120000
+  --runner-http-request-timeout-ms "$RUNNER_HTTP_REQUEST_TIMEOUT_MS"
   --worker-http-pool-max-idle-per-host 64
   --worker-http-connect-timeout-ms 5000
-  --worker-http-request-timeout-ms 45000
+  --worker-http-request-timeout-ms "$WORKER_HTTP_REQUEST_TIMEOUT_MS"
   --worker-outbound-http-permits 32
   --compose-parallel-limit 48
   --startup-batch-size 64
   --startup-batch-sleep-seconds 0.5
-  --post-startup-settle-seconds 10
-  --health-timeout-seconds 240
+  --post-startup-settle-seconds "$POST_STARTUP_SETTLE_SECONDS"
+  --health-timeout-seconds "$HEALTH_TIMEOUT_SECONDS"
   --health-poll-seconds 0.5
-  --worker-health-timeout-seconds 600
+  --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT_SECONDS"
   --worker-health-poll-ms 250
   --compose-down-timeout-seconds 2
   --teardown-batch-size 64
   --teardown-batch-sleep-seconds 0.1
-  --min-size 2
-  --max-size "$LOGICAL_WORKERS"
-  --step-size '[1,32]'
-  --roundtrips 2
-  --update-rounds 8
-  --app-rounds 8
-  --max-update-samples-per-plateau 8
-  --max-app-samples-per-payload 8
-  --payload-sizes '[16,4096]'
+  --min-size "$MIN_SIZE"
+  --max-size "$MAX_SIZE"
+  --step-size "$STEP_SIZE"
+  --plateau-order "$PLATEAU_ORDER"
+  --roundtrips "$ROUNDTRIPS"
+  --update-rounds "$UPDATE_ROUNDS"
+  --app-rounds "$APP_ROUNDS"
+  --max-update-samples-per-plateau "$MAX_UPDATE_SAMPLES"
+  --max-app-samples-per-payload "$MAX_APP_SAMPLES"
+  --payload-sizes "$PAYLOAD_SIZES"
 )
 
 # ==================================================================
@@ -159,7 +199,12 @@ run_r_analysis() {
   local analysis_dir="${run_dir}/resource_analysis"
   if command -v Rscript &>/dev/null; then
     if [ -f "$rscript" ]; then
-      Rscript "$rscript" -d "$run_dir" -o "$analysis_dir" 2>&1 || true
+      if Rscript -e 'quit(status = if (requireNamespace("optparse", quietly = TRUE)) 0 else 1)' \
+          >/dev/null 2>&1; then
+        Rscript "$rscript" -d "$run_dir" -o "$analysis_dir" 2>&1 || true
+      else
+        echo "[analysis] Skipping R analysis: package 'optparse' is not installed"
+      fi
     fi
   fi
 }
@@ -242,40 +287,43 @@ run_profile() {
 }
 
 # ==================================================================
-# RAM sweep: 6 profiles (indices 0-5)
+# RAM sweep
 # ==================================================================
 # Default RAM values: 32m, 64m, 128m, 256m, 512m, 1g
 # Generated by: generate_ram_sweep_profiles with ram_sweep_cpu_count=10
-RAM_VALUES=(32m 64m 128m 256m 512m 1g)
 echo ""
-echo "### RAM sweep — 6 profiles ###"
+echo "### RAM sweep — $RAM_RUN_COUNT profiles ###"
 
-for IDX in 0 1 2 3 4 5; do
-  run_profile \
-    "RAM-${RAM_VALUES[$IDX]}" \
-    "ram-sweep-singleton" \
-    "$IDX" \
-    "openmls_ram_sweep_idx${IDX}_${DATE_TAG}" \
-    --ram-sweep-values 32m,64m,128m,256m,512m,1g \
-    --ram-sweep-cpu-count 10
-done
+if [ "$RUN_RAM_SWEEP" -eq 1 ]; then
+  for IDX in "${!RAM_VALUES[@]}"; do
+    run_profile \
+      "RAM-${RAM_VALUES[$IDX]}" \
+      "ram-sweep-singleton" \
+      "$IDX" \
+      "openmls_ram_sweep_idx${IDX}_${DATE_TAG}" \
+      --ram-sweep-values "$RAM_SWEEP_VALUES" \
+      --ram-sweep-cpu-count "$RAM_SWEEP_CPU_COUNT"
+  done
+fi
 
 # ==================================================================
-# CPU matrix: 12 profiles (indices 0-11)
+# CPU matrix
 # ==================================================================
 # Default matrix: 1,2,4 cores × 0.25,0.50,0.75,1.00 fractions
 echo ""
-echo "### CPU matrix — 12 profiles ###"
+echo "### CPU matrix — $CPU_RUN_COUNT profiles ###"
 
-for IDX in 0 1 2 3 4 5 6 7 8 9 10 11; do
-  run_profile \
-    "CPU-matrix-idx${IDX}" \
-    "cpu-matrix-singleton" \
-    "$IDX" \
-    "openmls_cpu_matrix_idx${IDX}_${DATE_TAG}" \
-    --cpu-matrix-core-counts 1,2,4 \
-    --cpu-matrix-capacity-fractions 0.25,0.50,0.75,1.00
-done
+if [ "$RUN_CPU_MATRIX" -eq 1 ]; then
+  for ((IDX = 0; IDX < CPU_RUN_COUNT; IDX++)); do
+    run_profile \
+      "CPU-matrix-idx${IDX}" \
+      "cpu-matrix-singleton" \
+      "$IDX" \
+      "openmls_cpu_matrix_idx${IDX}_${DATE_TAG}" \
+      --cpu-matrix-core-counts "$CPU_MATRIX_CORE_COUNTS" \
+      --cpu-matrix-capacity-fractions "$CPU_MATRIX_CAPACITY_FRACTIONS"
+  done
+fi
 
 # ==================================================================
 # Final summary
@@ -298,6 +346,10 @@ echo ""
 echo "Summary written to: $SUMMARY_FILE"
 echo ""
 echo "All resource experiment runs complete ($DATE_TAG)"
-echo "  6 × RAM sweep  (single profile, indices 0-5)"
-echo " 12 × CPU matrix (single profile, indices 0-11)"
+echo " $RAM_RUN_COUNT × RAM sweep  (single profile)"
+echo " $CPU_RUN_COUNT × CPU matrix (single profile)"
 echo "============================================================"
+
+if [ "$FAIL_COUNT" -ne 0 ]; then
+  exit 1
+fi

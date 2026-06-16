@@ -1,7 +1,7 @@
 use std::fs;
 
 use mls_playground::client::{Client, CommitReceiveProfileOptions};
-use openmls::profiling::{set_worker_id, clear_benchmark_context};
+use openmls::profiling::{clear_benchmark_context, set_worker_id};
 use serde_json::Value;
 
 #[test]
@@ -27,7 +27,10 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
     let bob_kp = bob.generate_key_package().expect("Bob key package");
     let charlie_kp = charlie.generate_key_package().expect("Charlie key package");
     let epoch_change = alice
-        .add_members(&[bob_kp.clone(), charlie_kp.clone()], &["bob".to_string(), "charlie".to_string()])
+        .add_members(
+            &[bob_kp.clone(), charlie_kp.clone()],
+            &["bob".to_string(), "charlie".to_string()],
+        )
         .expect("create two-member AddCommit");
 
     // Alice receives her own commit and gets the Welcome for Bob
@@ -49,8 +52,7 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
     };
 
     // Bob joins from the welcome
-    bob.join_from_welcome(&welcome_bytes)
-        .expect("Bob joins");
+    bob.join_from_welcome(&welcome_bytes).expect("Bob joins");
 
     // Create a Remove commit (Alice removes Bob)
     let epoch_change2 = alice
@@ -73,9 +75,9 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
 
     // Verify Bob was removed
     match outcome {
-        mls_playground::client::CommitReceiveOutcome::ExternalCommitApplied {
-            self_removed,
-        } => assert!(self_removed, "Bob should be removed"),
+        mls_playground::client::CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
+            assert!(self_removed, "Bob should be removed")
+        }
         _ => panic!("Bob should get ExternalCommitApplied"),
     }
 
@@ -99,8 +101,7 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
         assert!(total["member_count"].as_u64().is_some());
         assert!(total["cpu_process_ns"].as_u64().is_some());
         assert_eq!(
-            total["member_count"],
-            total["member_count_before"],
+            total["member_count"], total["member_count_before"],
             "member_count must equal member_count_before for CommitReceive"
         );
     }
@@ -113,7 +114,10 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
                 && event["benchmark_operation"] == "commit_receive"
         })
         .collect();
-    assert!(!cr_events.is_empty(), "commit_receive child spans must carry operation metadata");
+    assert!(
+        !cr_events.is_empty(),
+        "commit_receive child spans must carry operation metadata"
+    );
 
     // The Remove commit should have commit_kind = "remove"
     let protocol_events: Vec<_> = events
@@ -143,8 +147,7 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
 
     // Verify proposal_count metadata on relevant events
     for event in &events {
-        if event["op"] == "commit_receive_protocol"
-            && event["operation_family"] == "commit_receive"
+        if event["op"] == "commit_receive_protocol" && event["operation_family"] == "commit_receive"
         {
             assert!(event["proposal_count"].as_u64().is_some());
             assert!(event["confirmation_tag_verified"].as_bool() == Some(true));
@@ -194,8 +197,10 @@ fn canonical_commit_receive_total_and_metadata_are_stable() {
     // Verify the commit_receive_total_local span also has these fields for path-ful commits
     for total in &totals {
         if total["update_path_present"].as_bool() == Some(true) {
-            assert!(total["filtered_direct_path_len"].as_u64().unwrap_or(0) > 0,
-                "commit_receive_total_local must have filtered_direct_path_len when path present");
+            assert!(
+                total["filtered_direct_path_len"].as_u64().unwrap_or(0) > 0,
+                "commit_receive_total_local must have filtered_direct_path_len when path present"
+            );
             assert!(total["sum_copath_resolution_sizes"].as_u64().unwrap_or(0) > 0,
                 "commit_receive_total_local must have sum_copath_resolution_sizes when path present");
         }

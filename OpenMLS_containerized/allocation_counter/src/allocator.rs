@@ -35,6 +35,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let pointer = System.alloc(layout);
         if !pointer.is_null() {
+            crate::embedded_heap_budget::record_alloc(layout.size());
             PROCESS_ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
             PROCESS_ALLOCATION_BYTES.fetch_add(layout.size() as u64, Ordering::Relaxed);
             DO_COUNT.with(|depth| {
@@ -57,6 +58,7 @@ unsafe impl GlobalAlloc for CountingAllocator {
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+        crate::embedded_heap_budget::record_dealloc(layout.size());
         DO_COUNT.with(|depth| {
             if *depth.borrow() == 0 {
                 ALLOCATIONS.with(|info_stack| {

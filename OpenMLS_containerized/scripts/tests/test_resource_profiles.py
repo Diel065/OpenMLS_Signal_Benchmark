@@ -26,10 +26,10 @@ class TestRamSweepProfiles:
         )
         assert len(profiles) == 3
 
-    def test_max_6_values(self):
-        with pytest.raises(ValueError, match="at most 6"):
+    def test_max_32_values(self):
+        with pytest.raises(ValueError, match="at most 32"):
             generate_ram_sweep_profiles(
-                ram_values=["1m", "2m", "3m", "4m", "5m", "6m", "7m"],
+                ram_values=[f"{8 + idx}m" for idx in range(33)],
             )
 
     def test_experiment_kind(self):
@@ -78,6 +78,14 @@ class TestRamSweepProfiles:
         assert len(profiles) == 6
         for p in profiles:
             assert p.memory_swap == p.memory_limit
+
+    def test_accepts_exact_docker_minimum_in_kibibytes(self):
+        profiles = generate_ram_sweep_profiles(["6144k"], assigned_cpu_count=1)
+        assert profiles[0].memory_limit == "6144k"
+
+    def test_rejects_below_docker_minimum(self):
+        with pytest.raises(ValueError, match="below the daemon minimum"):
+            generate_ram_sweep_profiles(["6143k"], assigned_cpu_count=1)
 
 
 class TestCpuMatrixProfiles:
@@ -136,6 +144,14 @@ class TestCpuMatrixProfiles:
         )
         assert profiles[0].memory_limit == "2g"
         assert profiles[0].memory_swap == "2g"
+
+    def test_accepts_minimum_distinct_cpu_quota(self):
+        profiles = generate_cpu_matrix_profiles([1], [0.01])
+        assert profiles[0].cpu_limit_cpus == pytest.approx(0.01)
+
+    def test_rejects_cpu_quota_below_effective_floor(self):
+        with pytest.raises(ValueError, match="minimum distinct Docker CFS quota"):
+            generate_cpu_matrix_profiles([1], [0.001])
 
 
 class TestMemoryValidation:

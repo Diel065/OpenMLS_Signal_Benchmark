@@ -71,24 +71,34 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
         .iter()
         .filter(|event| event["op"] == "application_message_create_total_local")
         .collect();
-    assert!(!create_totals.is_empty(), "application_message_create_total_local must exist");
+    assert!(
+        !create_totals.is_empty(),
+        "application_message_create_total_local must exist"
+    );
 
     for total in &create_totals {
         assert_eq!(total["operation_family"], "application_message_create");
         assert_eq!(total["benchmark_operation"], "application_message_create");
         assert!(total["member_count_before"].as_u64().is_some());
         assert!(total["cpu_process_ns"].as_u64().is_some());
-        assert_eq!(total["member_count"], total["member_count_before"],
-            "member_count must equal member_count_before for app message create");
-        assert_eq!(total["member_count_after"], total["member_count_before"],
-            "member_count_after must equal member_count_before for app message create");
+        assert_eq!(
+            total["member_count"], total["member_count_before"],
+            "member_count must equal member_count_before for app message create"
+        );
+        assert_eq!(
+            total["member_count_after"], total["member_count_before"],
+            "member_count_after must equal member_count_before for app message create"
+        );
     }
 
     let create_events: Vec<_> = events
         .iter()
         .filter(|event| event["operation_family"] == "application_message_create")
         .collect();
-    assert!(!create_events.is_empty(), "app message create child spans must carry operation_family");
+    assert!(
+        !create_events.is_empty(),
+        "app message create child spans must carry operation_family"
+    );
     for event in &create_events {
         assert_eq!(event["benchmark_operation"], "application_message_create");
     }
@@ -96,8 +106,10 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
     // Verify protocol span has payload metadata
     let protocol_spans: Vec<_> = events
         .iter()
-        .filter(|event| event["op"] == "application_message_create_protocol"
-            && event["operation_family"] == "application_message_create")
+        .filter(|event| {
+            event["op"] == "application_message_create_protocol"
+                && event["operation_family"] == "application_message_create"
+        })
         .collect();
     for event in &protocol_spans {
         assert!(event["sender_leaf_index"].as_u64().is_some());
@@ -111,24 +123,34 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
         .iter()
         .filter(|event| event["op"] == "application_message_receive_total_local")
         .collect();
-    assert!(!receive_totals.is_empty(), "application_message_receive_total_local must exist");
+    assert!(
+        !receive_totals.is_empty(),
+        "application_message_receive_total_local must exist"
+    );
 
     for total in &receive_totals {
         assert_eq!(total["operation_family"], "application_message_receive");
         assert_eq!(total["benchmark_operation"], "application_message_receive");
         assert!(total["member_count_before"].as_u64().is_some());
         assert!(total["cpu_process_ns"].as_u64().is_some());
-        assert_eq!(total["member_count"], total["member_count_before"],
-            "member_count must equal member_count_before for app message receive");
-        assert_eq!(total["member_count_after"], total["member_count_before"],
-            "member_count_after must equal member_count_before for app message receive");
+        assert_eq!(
+            total["member_count"], total["member_count_before"],
+            "member_count must equal member_count_before for app message receive"
+        );
+        assert_eq!(
+            total["member_count_after"], total["member_count_before"],
+            "member_count_after must equal member_count_before for app message receive"
+        );
     }
 
     let receive_events: Vec<_> = events
         .iter()
         .filter(|event| event["operation_family"] == "application_message_receive")
         .collect();
-    assert!(!receive_events.is_empty(), "app message receive child spans must carry operation_family");
+    assert!(
+        !receive_events.is_empty(),
+        "app message receive child spans must carry operation_family"
+    );
     for event in &receive_events {
         assert_eq!(event["benchmark_operation"], "application_message_receive");
     }
@@ -136,8 +158,10 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
     // Verify protocol span has receiver metadata
     let recv_protocol_spans: Vec<_> = events
         .iter()
-        .filter(|event| event["op"] == "application_message_receive_protocol"
-            && event["operation_family"] == "application_message_receive")
+        .filter(|event| {
+            event["op"] == "application_message_receive_protocol"
+                && event["operation_family"] == "application_message_receive"
+        })
         .collect();
     for event in &recv_protocol_spans {
         assert!(event["receiver_leaf_index"].as_u64().is_some());
@@ -164,56 +188,83 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
             .filter(|event| event["op"] == *child_op)
             .collect();
         for event in &child_events {
-            assert!(event["operation_family"].as_str().is_some(),
-                "{} must have operation_family set", child_op);
-            assert!(event["benchmark_operation"].as_str().is_some(),
-                "{} must have benchmark_operation set", child_op);
-            assert!(event["cpu_process_ns"].as_u64().is_some(),
-                "{} must have cpu_process_ns", child_op);
+            assert!(
+                event["operation_family"].as_str().is_some(),
+                "{} must have operation_family set",
+                child_op
+            );
+            assert!(
+                event["benchmark_operation"].as_str().is_some(),
+                "{} must have benchmark_operation set",
+                child_op
+            );
+            assert!(
+                event["cpu_process_ns"].as_u64().is_some(),
+                "{} must have cpu_process_ns",
+                child_op
+            );
         }
 
         // Verify specific metadata is propagated on relevant child spans
         match *child_op {
             "application_message_create.content_encrypt" => {
                 for event in &child_events {
-                    assert!(event["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
-                        "content_encrypt must have app_msg_ciphertext_bytes > 0");
+                    assert!(
+                        event["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
+                        "content_encrypt must have app_msg_ciphertext_bytes > 0"
+                    );
                 }
             }
             "application_message_create.secret_tree_derive" => {
                 for event in &child_events {
-                    assert!(event["sender_generation"].as_u64().is_some(),
-                        "secret_tree_derive must have sender_generation");
-                    assert!(event["sender_leaf_index"].as_u64().is_some(),
-                        "secret_tree_derive must have sender_leaf_index");
+                    assert!(
+                        event["sender_generation"].as_u64().is_some(),
+                        "secret_tree_derive must have sender_generation"
+                    );
+                    assert!(
+                        event["sender_leaf_index"].as_u64().is_some(),
+                        "secret_tree_derive must have sender_leaf_index"
+                    );
                 }
             }
             "application_message_create.sender_data_encrypt" => {
                 for event in &child_events {
-                    assert!(event["sender_leaf_index"].as_u64().is_some(),
-                        "sender_data_encrypt must have sender_leaf_index");
+                    assert!(
+                        event["sender_leaf_index"].as_u64().is_some(),
+                        "sender_data_encrypt must have sender_leaf_index"
+                    );
                 }
             }
             "application_message_receive.content_decrypt" => {
                 for event in &child_events {
-                    assert!(event["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
-                        "content_decrypt must have app_msg_ciphertext_bytes > 0");
+                    assert!(
+                        event["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
+                        "content_decrypt must have app_msg_ciphertext_bytes > 0"
+                    );
                 }
             }
             "application_message_receive.sender_data_decrypt" => {
                 for event in &child_events {
-                    assert!(event["sender_leaf_index"].as_u64().is_some(),
-                        "sender_data_decrypt must have sender_leaf_index");
-                    assert!(event["sender_generation"].as_u64().is_some(),
-                        "sender_data_decrypt must have sender_generation");
+                    assert!(
+                        event["sender_leaf_index"].as_u64().is_some(),
+                        "sender_data_decrypt must have sender_leaf_index"
+                    );
+                    assert!(
+                        event["sender_generation"].as_u64().is_some(),
+                        "sender_data_decrypt must have sender_generation"
+                    );
                 }
             }
             "application_message_receive.secret_tree_lookup_or_derive" => {
                 for event in &child_events {
-                    assert!(event["sender_leaf_index"].as_u64().is_some(),
-                        "secret_tree_lookup_or_derive must have sender_leaf_index");
-                    assert!(event["sender_generation"].as_u64().is_some(),
-                        "secret_tree_lookup_or_derive must have sender_generation");
+                    assert!(
+                        event["sender_leaf_index"].as_u64().is_some(),
+                        "secret_tree_lookup_or_derive must have sender_leaf_index"
+                    );
+                    assert!(
+                        event["sender_generation"].as_u64().is_some(),
+                        "secret_tree_lookup_or_derive must have sender_generation"
+                    );
                 }
             }
             _ => {}
@@ -222,16 +273,24 @@ fn canonical_app_message_create_and_receive_metadata_are_stable() {
 
     // Verify total spans carry the propagated metadata
     for total in &create_totals {
-        assert!(total["app_msg_plaintext_bytes"].as_u64().unwrap_or(0) > 0,
-            "create_total must have app_msg_plaintext_bytes > 0");
-        assert!(total["sender_leaf_index"].as_u64().is_some(),
-            "create_total must have sender_leaf_index");
+        assert!(
+            total["app_msg_plaintext_bytes"].as_u64().unwrap_or(0) > 0,
+            "create_total must have app_msg_plaintext_bytes > 0"
+        );
+        assert!(
+            total["sender_leaf_index"].as_u64().is_some(),
+            "create_total must have sender_leaf_index"
+        );
     }
     for total in &receive_totals {
-        assert!(total["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
-            "receive_total must have app_msg_ciphertext_bytes > 0");
-        assert!(total["sender_leaf_index"].as_u64().is_some(),
-            "receive_total must have sender_leaf_index");
+        assert!(
+            total["app_msg_ciphertext_bytes"].as_u64().unwrap_or(0) > 0,
+            "receive_total must have app_msg_ciphertext_bytes > 0"
+        );
+        assert!(
+            total["sender_leaf_index"].as_u64().is_some(),
+            "receive_total must have sender_leaf_index"
+        );
     }
 
     let _ = fs::remove_file(&path);

@@ -37,6 +37,9 @@ from resource_profiles import (
     ResourceProfile,
     generate_ram_sweep_profiles,
     generate_cpu_matrix_profiles,
+    generate_embedded_budget_profiles,
+    get_selected_profile,
+    select_profile,
 )
 from resource_experiment_sidecars import SidecarWriter
 from resource_experiment_failures import (
@@ -64,6 +67,10 @@ class ResourceExperimentIntegration:
         ram_sweep_cpu_count: int = 10,
         cpu_matrix_core_counts: Optional[List[int]] = None,
         cpu_matrix_capacity_fractions: Optional[List[float]] = None,
+        embedded_heap_budgets: Optional[List[str]] = None,
+        embedded_cpu_fractions: Optional[List[float]] = None,
+        embedded_cpu_cores: Optional[List[int]] = None,
+        embedded_docker_memory: str = "256m",
         cpu_affinity_mode: str = "none",
         cpu_affinity_sample_seconds: float = 20.0,
         reserve_smt_siblings: bool = False,
@@ -76,6 +83,10 @@ class ResourceExperimentIntegration:
         self.ram_sweep_cpu_count = ram_sweep_cpu_count
         self.cpu_matrix_core_counts = cpu_matrix_core_counts or [1, 2, 4]
         self.cpu_matrix_capacity_fractions = cpu_matrix_capacity_fractions or [0.25, 0.50, 0.75, 1.00]
+        self.embedded_heap_budgets = embedded_heap_budgets or ["32k", "64k", "128k", "256k", "512k", "1m", "2m"]
+        self.embedded_cpu_fractions = embedded_cpu_fractions or [1.00, 0.50, 0.25, 0.10, 0.05]
+        self.embedded_cpu_cores = embedded_cpu_cores or [1]
+        self.embedded_docker_memory = embedded_docker_memory
         self.cpu_affinity_mode = cpu_affinity_mode
         self.cpu_affinity_sample_seconds = cpu_affinity_sample_seconds
         self.reserve_smt_siblings = reserve_smt_siblings
@@ -90,7 +101,13 @@ class ResourceExperimentIntegration:
 
     @property
     def is_active(self) -> bool:
-        return self.resource_experiment in ("ram-sweep-singleton", "cpu-matrix-singleton")
+        return self.resource_experiment in (
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        )
 
     @property
     def experiment_kind(self) -> str:
@@ -98,6 +115,12 @@ class ResourceExperimentIntegration:
             return "ram_sweep_singleton"
         elif self.resource_experiment == "cpu-matrix-singleton":
             return "cpu_matrix_singleton"
+        elif self.resource_experiment == "embedded-budget-singleton":
+            return "embedded_budget_singleton"
+        elif self.resource_experiment == "ram-app-heap-sweep":
+            return "ram_app_heap_sweep"
+        elif self.resource_experiment == "cpu-quota-sweep":
+            return "cpu_quota_sweep"
         return "none"
 
     def generate_profiles(self) -> List[ResourceProfile]:
@@ -112,6 +135,25 @@ class ResourceExperimentIntegration:
             self.profiles = generate_cpu_matrix_profiles(
                 core_counts=self.cpu_matrix_core_counts,
                 capacity_fractions=self.cpu_matrix_capacity_fractions,
+                run_id=self.run_id,
+            )
+        elif self.resource_experiment == "embedded-budget-singleton":
+            self.profiles = generate_embedded_budget_profiles(
+                heap_budgets=self.embedded_heap_budgets,
+                core_counts=self.embedded_cpu_cores,
+                capacity_fractions=self.embedded_cpu_fractions,
+                docker_memory_limit=self.embedded_docker_memory,
+                run_id=self.run_id,
+            )
+        elif self.resource_experiment == "ram-app-heap-sweep":
+            self.profiles = generate_parallel_ram_sweep_profiles(
+                docker_memory_limit=self.embedded_docker_memory,
+                assigned_cpu_count=1,
+                run_id=self.run_id,
+            )
+        elif self.resource_experiment == "cpu-quota-sweep":
+            self.profiles = generate_parallel_cpu_sweep_profiles(
+                assigned_cpu_count=1,
                 run_id=self.run_id,
             )
         return self.profiles
@@ -132,7 +174,9 @@ class ResourceExperimentIntegration:
             zip(singleton_worker_ids[:self.profiled_singleton_count],
                 singleton_client_ids[:self.profiled_singleton_count])
         ):
-            profile = self.profiles[i % len(self.profiles)] if self.profiles else None
+            profile = get_selected_profile(self.profiles) if self.profiles else None
+            if profile is None and self.profiles:
+                profile = self.profiles[i % len(self.profiles)]
             cpu_count = profile.assigned_cpu_count if profile else 1
 
             profiled_worker_specs.append({
@@ -161,12 +205,14 @@ class ResourceExperimentIntegration:
             profiled_cpu_counts=profiled_cpu_counts,
         )
 
+        selected = get_selected_profile(self.profiles) if self.profiles else None
         for i, pa in enumerate(self.plan.profiled_assignments):
-            if i < len(self.profiles):
-                self.profiles[i].cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
-                self.profiles[i].cpuset_mask_hex = pa.assigned_mask_hex
-                self.profiles[i].rayon_num_threads = pa.rayon_num_threads
-                self.profiles[i].assigned_cpu_count = pa.assigned_cpu_count
+            profile = selected if (i == 0 and selected) else (self.profiles[i] if i < len(self.profiles) else None)
+            if profile:
+                profile.cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
+                profile.cpuset_mask_hex = pa.assigned_mask_hex
+                profile.rayon_num_threads = pa.rayon_num_threads
+                profile.assigned_cpu_count = pa.assigned_cpu_count
 
         return self.plan
 
@@ -259,12 +305,22 @@ class ResourceExperimentIntegration:
         if failure_dicts:
             self.writer.write_worker_failures(self.run_id, failure_dicts)
 
+        selected_profile = get_selected_profile(self.profiles) if self.profiles else None
+
         run_status = build_run_status(
             run_id=self.run_id,
             run_mode=self.resource_experiment,
             experiment_kind=self.experiment_kind,
             run_success=run_success,
             worker_failures=worker_failures,
+            resource_experiment=self.resource_experiment,
+            memory_model=getattr(selected_profile, "memory_model", "") if selected_profile else "",
+            docker_memory_limit=(
+                getattr(selected_profile, "docker_memory_limit", None)
+                or getattr(selected_profile, "memory_limit", "")
+            ) if selected_profile else "",
+            app_heap_budget=getattr(selected_profile, "app_heap_budget", "") if selected_profile else "",
+            app_heap_budget_bytes=getattr(selected_profile, "app_heap_budget_bytes", 0) if selected_profile else 0,
             notes=notes,
         )
         self.writer.write_run_status(self.run_id, run_status)
@@ -301,9 +357,36 @@ def add_resource_experiment_args(parser):
 
     re_group.add_argument(
         "--resource-experiment",
-        choices=["none", "ram-sweep-singleton", "cpu-matrix-singleton"],
+        choices=[
+            "none",
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        ],
         default="none",
         help="Resource experiment mode for simulated IoT container profiling",
+    )
+    re_group.add_argument(
+        "--embedded-heap-budgets",
+        default="32k,64k,128k,256k,512k,1m,2m",
+        help="Comma-separated synthetic application heap budgets for embedded-budget mode",
+    )
+    re_group.add_argument(
+        "--embedded-cpu-fractions",
+        default="1.00,0.50,0.25,0.10,0.05",
+        help="Comma-separated Docker CPU fractions for embedded-budget mode",
+    )
+    re_group.add_argument(
+        "--embedded-cpu-cores",
+        default="1",
+        help="Comma-separated Docker CPU core counts for embedded-budget mode",
+    )
+    re_group.add_argument(
+        "--embedded-docker-memory",
+        default="256m",
+        help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     re_group.add_argument(
         "--profiled-singleton-count",
@@ -372,6 +455,18 @@ def parse_resource_experiment_args(args) -> ResourceExperimentIntegration:
     if isinstance(cpu_fractions, str):
         cpu_fractions = [float(v.strip()) for v in cpu_fractions.split(",") if v.strip()]
 
+    embedded_heap_budgets = getattr(args, "embedded_heap_budgets", "32k,64k,128k,256k,512k,1m,2m")
+    if isinstance(embedded_heap_budgets, str):
+        embedded_heap_budgets = [v.strip() for v in embedded_heap_budgets.split(",") if v.strip()]
+
+    embedded_cpu_fractions = getattr(args, "embedded_cpu_fractions", "1.00,0.50,0.25,0.10,0.05")
+    if isinstance(embedded_cpu_fractions, str):
+        embedded_cpu_fractions = [float(v.strip()) for v in embedded_cpu_fractions.split(",") if v.strip()]
+
+    embedded_cpu_cores = getattr(args, "embedded_cpu_cores", "1")
+    if isinstance(embedded_cpu_cores, str):
+        embedded_cpu_cores = [int(v.strip()) for v in embedded_cpu_cores.split(",") if v.strip()]
+
     return ResourceExperimentIntegration(
         run_id=getattr(args, "run_id", "unknown"),
         run_dir=run_dir,
@@ -381,6 +476,10 @@ def parse_resource_experiment_args(args) -> ResourceExperimentIntegration:
         ram_sweep_cpu_count=getattr(args, "ram_sweep_cpu_count", 10),
         cpu_matrix_core_counts=cpu_cores,
         cpu_matrix_capacity_fractions=cpu_fractions,
+        embedded_heap_budgets=embedded_heap_budgets,
+        embedded_cpu_fractions=embedded_cpu_fractions,
+        embedded_cpu_cores=embedded_cpu_cores,
+        embedded_docker_memory=getattr(args, "embedded_docker_memory", "256m"),
         cpu_affinity_mode=getattr(args, "cpu_affinity_mode", "none"),
         cpu_affinity_sample_seconds=getattr(args, "cpu_affinity_sample_seconds", 20.0),
         reserve_smt_siblings=getattr(args, "reserve_smt_siblings", False),

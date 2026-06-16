@@ -25,11 +25,23 @@ RESOURCE_PROFILES_HEADER = [
     "assigned_cpu_count",
     "memory_limit",
     "memory_swap",
+    "memory_model",
+    "docker_memory_limit",
+    "app_heap_budget",
+    "app_heap_budget_bytes",
     "rayon_num_threads",
     "cpuset_cpus",
     "cpuset_mask_hex",
     "cpuset_role",
     "profile_notes",
+    "sweep_kind",
+    "app_heap_interpretation",
+    "cpu_interpretation",
+    "cpu_period_us",
+    "cpu_quota_us",
+    "group_creator",
+    "group_creator_reason",
+    "strict_cpuset_satisfied",
 ]
 
 
@@ -54,10 +66,20 @@ WORKER_RESOURCE_ASSIGNMENTS_HEADER = [
     "assigned_cpu_count",
     "memory_limit",
     "memory_swap",
+    "memory_model",
+    "docker_memory_limit",
+    "app_heap_budget",
+    "app_heap_budget_bytes",
     "rayon_num_threads",
     "background_cpuset_cpus",
     "background_mask_hex",
     "profile_label",
+    "sweep_kind",
+    "app_heap_interpretation",
+    "cpu_interpretation",
+    "group_creator",
+    "group_creator_reason",
+    "strict_cpuset_satisfied",
 ]
 
 
@@ -117,6 +139,12 @@ WORKER_FAILURES_HEADER = [
     "resource_profile_id",
     "experiment_kind",
     "failure_class",
+    "failure_detail",
+    "failure_evidence_source",
+    "failure_evidence_detail",
+    "failure_action",
+    "attribution_confidence",
+    "attribution_source",
     "failure_timestamp_ns",
     "last_successful_phase",
     "last_successful_operation_family",
@@ -126,8 +154,20 @@ WORKER_FAILURES_HEADER = [
     "current_phase",
     "current_operation_family",
     "current_benchmark_operation",
+    "last_observed_span_name",
+    "last_observed_span_id",
     "current_member_count",
     "current_epoch",
+    "memory_model",
+    "app_heap_budget",
+    "app_heap_budget_bytes",
+    "heap_current_live_bytes",
+    "heap_peak_live_bytes",
+    "heap_operation_peak_live_bytes",
+    "heap_total_allocated_bytes",
+    "heap_allocation_count",
+    "heap_deallocation_count",
+    "heap_failed_allocation_size_bytes",
     "container_exit_code",
     "container_oom_killed",
     "memory_events_oom",
@@ -136,7 +176,13 @@ WORKER_FAILURES_HEADER = [
     "cpu_nr_throttled_delta",
     "cpu_throttled_usec_delta",
     "cpu_throttled_time_fraction",
+    "last_container_status",
     "diagnostic_log_path",
+    "deadline_ns",
+    "wall_ns",
+    "sweep_kind",
+    "cpu_period_us",
+    "cpu_quota_us",
 ]
 
 
@@ -148,9 +194,15 @@ RUN_STATUS_HEADER = [
     "resource_profile_index",
     "resource_profile_id",
     "experiment_kind",
+    "memory_model",
+    "docker_memory_limit",
+    "app_heap_budget",
+    "app_heap_budget_bytes",
     "run_status",
     "completed",
     "valid_for_threshold_analysis",
+    "valid_for_embedded_heap_threshold_analysis",
+    "valid_for_docker_resource_analysis",
     "valid_for_clean_performance_plots",
     "valid_for_churn_recovery_analysis",
     "first_failure_timestamp_ns",
@@ -167,6 +219,8 @@ RUN_STATUS_HEADER = [
     "last_successful_epoch",
     "preflight_passed",
     "resource_output_validation_passed",
+    "sweep_kind",
+    "strict_cpuset_satisfied",
     "notes",
 ]
 
@@ -329,8 +383,68 @@ def get_expected_files() -> List[str]:
         "resource_profiles.json",
         "worker_resource_assignments.csv",
         "resource_samples.jsonl",
+        "profiled-operation-cursors.jsonl",
         "resource_summary.csv",
         "worker_failures.csv",
         "run_status.csv",
         "benchmark_outcome.json",
+        "scenario_plan.json",
+        "aggregation_manifest.json",
+        "events.csv",
     ]
+
+
+def validate_sidecars_exist(run_dir: str, run_success: bool = True) -> Dict[str, Any]:
+    """Validate that expected sidecar files exist in the run directory.
+
+    On success runs, missing sidecars are hard failures.
+    On failure runs, missing sidecars are reported as warnings but the
+    validation result reflects that artifacts are incomplete.
+
+    Returns a dict with keys:
+        valid: bool - True if all expected sidecars exist (success) or
+                      at least the most critical ones exist (failure)
+        missing: List[str] - files that are missing
+        empty: List[str] - files that exist but are empty
+        present: List[str] - files that exist and are non-empty
+    """
+    import os as _os
+    result = {"valid": True, "missing": [], "empty": [], "present": []}
+    expected = get_expected_files()
+
+    for filename in expected:
+        filepath = _os.path.join(run_dir, filename)
+        if not _os.path.exists(filepath):
+            result["missing"].append(filename)
+        elif _os.path.getsize(filepath) == 0:
+            result["empty"].append(filename)
+        else:
+            result["present"].append(filename)
+
+    if run_success:
+        critical = [
+            "events.csv",
+            "resource_profiles.csv",
+            "worker_resource_assignments.csv",
+            "cpu_affinity_plan.json",
+            "scenario_plan.json",
+            "run_status.csv",
+            "aggregation_manifest.json",
+        ]
+        for f in critical:
+            if f in result["missing"]:
+                result["valid"] = False
+                break
+    else:
+        failure_critical = [
+            "events.csv",
+            "aggregation_manifest.json",
+            "run_status.csv",
+            "worker_failures.csv",
+        ]
+        for f in failure_critical:
+            if f in result["missing"] and f not in ("events.csv",):
+                result["valid"] = False
+                break
+
+    return result

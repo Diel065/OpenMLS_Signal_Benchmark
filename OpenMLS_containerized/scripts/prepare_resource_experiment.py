@@ -37,6 +37,10 @@ from cpu_affinity_planner import (
 from resource_profiles import (
     generate_ram_sweep_profiles,
     generate_cpu_matrix_profiles,
+    generate_embedded_budget_profiles,
+    generate_parallel_ram_sweep_profiles,
+    generate_parallel_cpu_sweep_profiles,
+    get_selected_profile,
 )
 from resource_experiment_sidecars import SidecarWriter
 
@@ -45,12 +49,22 @@ def main():
     parser = argparse.ArgumentParser(description="Pre-compute resource experiment affinity plan")
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--resource-experiment", required=True,
-                        choices=["ram-sweep-singleton", "cpu-matrix-singleton"])
+                        choices=[
+                            "ram-sweep-singleton",
+                            "cpu-matrix-singleton",
+                            "embedded-budget-singleton",
+                            "ram-app-heap-sweep",
+                            "cpu-quota-sweep",
+                        ])
     parser.add_argument("--profiled-singleton-count", type=int, required=True)
     parser.add_argument("--ram-sweep-values", default="32m,64m,128m,256m,512m,1g")
     parser.add_argument("--ram-sweep-cpu-count", type=int, default=10)
     parser.add_argument("--cpu-matrix-core-counts", default="1,2,4")
     parser.add_argument("--cpu-matrix-capacity-fractions", default="0.25,0.50,0.75,1.00")
+    parser.add_argument("--embedded-heap-budgets", default="32k,64k,128k,256k,512k,1m,2m")
+    parser.add_argument("--embedded-cpu-fractions", default="1.00,0.50,0.25,0.10,0.05")
+    parser.add_argument("--embedded-cpu-cores", default="1")
+    parser.add_argument("--embedded-docker-memory", default="256m")
     parser.add_argument("--singleton-worker-ids", required=True,
                         help="Comma-separated list of singleton worker IDs")
     parser.add_argument("--singleton-client-ids", required=True,
@@ -85,12 +99,23 @@ def main():
             assigned_cpu_count=args.ram_sweep_cpu_count,
             run_id=args.run_id,
         )
-    else:
+    elif args.resource_experiment == "cpu-matrix-singleton":
         core_counts = [int(v.strip()) for v in args.cpu_matrix_core_counts.split(",") if v.strip()]
         fractions = [float(v.strip()) for v in args.cpu_matrix_capacity_fractions.split(",") if v.strip()]
         profiles = generate_cpu_matrix_profiles(
             core_counts=core_counts,
             capacity_fractions=fractions,
+            run_id=args.run_id,
+        )
+    else:
+        heap_budgets = [v.strip() for v in args.embedded_heap_budgets.split(",") if v.strip()]
+        core_counts = [int(v.strip()) for v in args.embedded_cpu_cores.split(",") if v.strip()]
+        fractions = [float(v.strip()) for v in args.embedded_cpu_fractions.split(",") if v.strip()]
+        profiles = generate_embedded_budget_profiles(
+            heap_budgets=heap_budgets,
+            core_counts=core_counts,
+            capacity_fractions=fractions,
+            docker_memory_limit=args.embedded_docker_memory,
             run_id=args.run_id,
         )
 
@@ -106,7 +131,9 @@ def main():
     profiled_worker_specs = []
     profiled_cpu_counts = {}
     for i, (wid, cid) in enumerate(zip(worker_ids, client_ids)):
-        profile = profiles[i % len(profiles)] if profiles else None
+        profile = get_selected_profile(profiles) if profiles else None
+        if profile is None and profiles:
+            profile = profiles[i % len(profiles)]
         cpu_count = profile.assigned_cpu_count if profile else 1
         profiled_worker_specs.append({
             "worker_id": wid,
@@ -142,10 +169,12 @@ def main():
 
     os.makedirs(args.output_dir, exist_ok=True)
 
+    selected = get_selected_profile(profiles) if profiles else None
     for i, pa in enumerate(plan.profiled_assignments):
-        if i < len(profiles):
-            profiles[i].cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
-            profiles[i].cpuset_mask_hex = pa.assigned_mask_hex
+        profile = selected if (i == 0 and selected) else (profiles[i] if i < len(profiles) else None)
+        if profile:
+            profile.cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
+            profile.cpuset_mask_hex = pa.assigned_mask_hex
 
     plan_path = write_affinity_plan_json(plan, args.output_dir)
 

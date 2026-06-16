@@ -21,6 +21,7 @@ from resource_experiment_sidecars import (
     RUN_STATUS_HEADER,
     BENCHMARK_TIMELINE_HEADER,
     get_expected_files,
+    validate_sidecars_exist,
     VALIDATOR_SCHEMAS,
     _safe_csv_value,
 )
@@ -234,3 +235,44 @@ class TestSchemaHeaders:
     def test_worker_assignments_header(self):
         assert "cpu_affinity_role" in WORKER_RESOURCE_ASSIGNMENTS_HEADER
         assert "container_mode" in WORKER_RESOURCE_ASSIGNMENTS_HEADER
+
+
+class TestSidecarValidation:
+    """Tests for sidecar existence validation."""
+
+    def test_all_present_on_clean_dir(self, tmp_path):
+        expected = get_expected_files()
+        for f in expected:
+            (tmp_path / f).write_text("content")
+        result = validate_sidecars_exist(str(tmp_path), run_success=True)
+        assert result["valid"] is True
+        assert len(result["missing"]) == 0
+
+    def test_missing_critical_on_success_is_invalid(self, tmp_path):
+        for f in get_expected_files():
+            if f != "events.csv":
+                (tmp_path / f).write_text("content")
+        result = validate_sidecars_exist(str(tmp_path), run_success=True)
+        assert result["valid"] is False
+        assert "events.csv" in result["missing"]
+
+    def test_empty_files_reported(self, tmp_path):
+        (tmp_path / "events.csv").write_text("")
+        (tmp_path / "run_status.csv").write_text("status")
+        (tmp_path / "aggregation_manifest.json").write_text("{}")
+        (tmp_path / "worker_failures.csv").write_text("worker_id\n")
+        result = validate_sidecars_exist(str(tmp_path), run_success=False)
+        assert "events.csv" in result["empty"]
+        assert result["valid"] is True
+
+    def test_failure_mode_allows_missing_events(self, tmp_path):
+        (tmp_path / "aggregation_manifest.json").write_text("{}")
+        (tmp_path / "run_status.csv").write_text("failed")
+        (tmp_path / "worker_failures.csv").write_text("id\n")
+        result = validate_sidecars_exist(str(tmp_path), run_success=False)
+        assert result["valid"] is True
+
+    def test_all_missing_detected(self, tmp_path):
+        result = validate_sidecars_exist(str(tmp_path), run_success=True)
+        assert result["valid"] is False
+        assert len(result["missing"]) == len(get_expected_files())

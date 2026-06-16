@@ -32,6 +32,8 @@ try:
         ResourceProfile,
         generate_ram_sweep_profiles,
         generate_cpu_matrix_profiles,
+        generate_embedded_budget_profiles,
+        get_selected_profile,
         profile_to_compose_dict,
     )
     from .resource_experiment_sidecars import SidecarWriter, get_expected_files
@@ -63,6 +65,8 @@ except ImportError:
         ResourceProfile,
         generate_ram_sweep_profiles,
         generate_cpu_matrix_profiles,
+        generate_embedded_budget_profiles,
+        get_selected_profile,
         profile_to_compose_dict,
     )
     from resource_experiment_sidecars import SidecarWriter, get_expected_files
@@ -86,6 +90,10 @@ class ResourceExperimentConfig:
         ram_sweep_cpu_count: int = 10,
         cpu_matrix_core_counts: Optional[List[int]] = None,
         cpu_matrix_capacity_fractions: Optional[List[float]] = None,
+        embedded_heap_budgets: Optional[List[str]] = None,
+        embedded_cpu_fractions: Optional[List[float]] = None,
+        embedded_cpu_cores: Optional[List[int]] = None,
+        embedded_docker_memory: str = "256m",
         cpu_affinity_mode: str = "none",
         cpu_affinity_sample_seconds: float = 20.0,
         reserve_smt_siblings: bool = False,
@@ -98,19 +106,35 @@ class ResourceExperimentConfig:
         self.ram_sweep_cpu_count = ram_sweep_cpu_count
         self.cpu_matrix_core_counts = cpu_matrix_core_counts or [1, 2, 4]
         self.cpu_matrix_capacity_fractions = cpu_matrix_capacity_fractions or [0.25, 0.50, 0.75, 1.00]
+        self.embedded_heap_budgets = embedded_heap_budgets or ["32k", "64k", "128k", "256k", "512k", "1m", "2m"]
+        self.embedded_cpu_fractions = embedded_cpu_fractions or [1.00, 0.50, 0.25, 0.10, 0.05]
+        self.embedded_cpu_cores = embedded_cpu_cores or [1]
+        self.embedded_docker_memory = embedded_docker_memory
         self.cpu_affinity_mode = cpu_affinity_mode
         self.cpu_affinity_sample_seconds = cpu_affinity_sample_seconds
         self.reserve_smt_siblings = reserve_smt_siblings
         self.resource_monitor_interval_ms = resource_monitor_interval_ms
         self.failure_experiment = failure_experiment
 
-        if self.resource_experiment in ("ram-sweep-singleton", "cpu-matrix-singleton"):
+        if self.resource_experiment in (
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        ):
             if self.cpu_affinity_mode == "none":
                 self.cpu_affinity_mode = "profiled-nor-background"
 
     @property
     def is_resource_experiment(self) -> bool:
-        return self.resource_experiment in ("ram-sweep-singleton", "cpu-matrix-singleton")
+        return self.resource_experiment in (
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        )
 
     @property
     def experiment_kind(self) -> str:
@@ -118,6 +142,12 @@ class ResourceExperimentConfig:
             return "ram_sweep_singleton"
         elif self.resource_experiment == "cpu-matrix-singleton":
             return "cpu_matrix_singleton"
+        elif self.resource_experiment == "embedded-budget-singleton":
+            return "embedded_budget_singleton"
+        elif self.resource_experiment == "ram-app-heap-sweep":
+            return "ram_app_heap_sweep"
+        elif self.resource_experiment == "cpu-quota-sweep":
+            return "cpu_quota_sweep"
         return "none"
 
 
@@ -132,6 +162,13 @@ def generate_resource_profiles(config: ResourceExperimentConfig) -> List[Resourc
         return generate_cpu_matrix_profiles(
             core_counts=config.cpu_matrix_core_counts,
             capacity_fractions=config.cpu_matrix_capacity_fractions,
+        )
+    elif config.resource_experiment == "embedded-budget-singleton":
+        return generate_embedded_budget_profiles(
+            heap_budgets=config.embedded_heap_budgets,
+            core_counts=config.embedded_cpu_cores,
+            capacity_fractions=config.embedded_cpu_fractions,
+            docker_memory_limit=config.embedded_docker_memory,
         )
     return []
 
@@ -157,7 +194,9 @@ def build_affinity_plan(
     profiled_cpu_counts = {}
 
     for i, (worker_id, client_id) in enumerate(zip(singleton_worker_ids, singleton_client_ids)):
-        profile = profiles[i % len(profiles)] if profiles else None
+        profile = get_selected_profile(profiles) if profiles else None
+        if profile is None and profiles:
+            profile = profiles[i % len(profiles)]
         cpu_count = profile.assigned_cpu_count if profile else 1
 
         profiled_worker_specs.append({
@@ -194,9 +233,10 @@ def apply_profiles_to_affinity_plan(
     profiles: List[ResourceProfile],
 ) -> AffinityPlan:
     """Update profiles with cpuset information from the affinity plan."""
+    selected = get_selected_profile(profiles) if profiles else None
     for i, pa in enumerate(plan.profiled_assignments):
-        if i < len(profiles):
-            profile = profiles[i]
+        profile = selected if (i == 0 and selected) else (profiles[i] if i < len(profiles) else None)
+        if profile:
             profile.cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
             profile.cpuset_mask_hex = pa.assigned_mask_hex
             profile.rayon_num_threads = pa.rayon_num_threads
@@ -280,7 +320,9 @@ def build_worker_resource_assignments(
     for i, (worker_id, client_id, container_name) in enumerate(
         zip(singleton_worker_ids, singleton_client_ids, singleton_container_names)
     ):
-        profile = profiles[i % len(profiles)] if profiles else None
+        profile = get_selected_profile(profiles) if profiles else None
+        if profile is None and profiles:
+            profile = profiles[i % len(profiles)]
         pa = plan.profiled_assignments[i] if i < len(plan.profiled_assignments) else None
 
         is_selected = False
@@ -309,6 +351,10 @@ def build_worker_resource_assignments(
             "assigned_cpu_count": profile.assigned_cpu_count if profile else 0,
             "memory_limit": profile.memory_limit if profile else "",
             "memory_swap": profile.memory_swap if profile else "",
+            "memory_model": profile.memory_model if profile else "",
+            "docker_memory_limit": profile.docker_memory_limit if profile else "",
+            "app_heap_budget": profile.app_heap_budget if profile else "",
+            "app_heap_budget_bytes": profile.app_heap_budget_bytes if profile else "",
             "rayon_num_threads": profile.rayon_num_threads if profile else 0,
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,
@@ -337,6 +383,10 @@ def build_worker_resource_assignments(
             "assigned_cpu_count": 0,
             "memory_limit": "",
             "memory_swap": "",
+            "memory_model": "",
+            "docker_memory_limit": "",
+            "app_heap_budget": "",
+            "app_heap_budget_bytes": "",
             "rayon_num_threads": 0,
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,
@@ -365,6 +415,10 @@ def build_worker_resource_assignments(
             "assigned_cpu_count": 0,
             "memory_limit": "",
             "memory_swap": "",
+            "memory_model": "",
+            "docker_memory_limit": "",
+            "app_heap_budget": "",
+            "app_heap_budget_bytes": "",
             "rayon_num_threads": 0,
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,

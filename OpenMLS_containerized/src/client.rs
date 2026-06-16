@@ -1,18 +1,15 @@
 use anyhow::{anyhow, Result};
 use openmls::prelude::*;
 use openmls::profiling::{
-    wrap_add_commit_total, finish_and_emit,
-    clear_commit_receive_op_context, set_commit_receive_op_context,
-    clear_app_message_create_context, set_app_message_create_context,
-    clear_app_message_receive_context, set_app_message_receive_context,
-    clear_update_commit_create_context, set_update_commit_create_context,
-    clear_remove_commit_create_context, set_remove_commit_create_context,
-    clear_key_package_create_context, set_key_package_create_context,
-    clear_welcome_receive_context, set_welcome_receive_context,
-    AppMessageCreateContext, AppMessageReceiveContext,
-    CommitReceiveOpContext, ProfileScope,
-    UpdateCommitCreateContext, RemoveCommitCreateContext,
-    KeyPackageCreateContext, WelcomeReceiveContext,
+    clear_app_message_create_context, clear_app_message_receive_context,
+    clear_commit_receive_op_context, clear_key_package_create_context,
+    clear_remove_commit_create_context, clear_update_commit_create_context,
+    clear_welcome_receive_context, finish_and_emit, set_app_message_create_context,
+    set_app_message_receive_context, set_commit_receive_op_context, set_key_package_create_context,
+    set_remove_commit_create_context, set_update_commit_create_context,
+    set_welcome_receive_context, wrap_add_commit_total, AppMessageCreateContext,
+    AppMessageReceiveContext, CommitReceiveOpContext, KeyPackageCreateContext, ProfileScope,
+    RemoveCommitCreateContext, UpdateCommitCreateContext, WelcomeReceiveContext,
 };
 use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
@@ -344,9 +341,10 @@ impl Client {
             .count();
         let removed_count = target_names.len();
 
-        set_remove_commit_create_context(
-            RemoveCommitCreateContext::new(member_count_before, removed_count)
-        );
+        set_remove_commit_create_context(RemoveCommitCreateContext::new(
+            member_count_before,
+            removed_count,
+        ));
         let total_scope = ProfileScope::start("remove_commit_create_total_local", "openmls");
 
         let result = (|| -> Result<EpochChangeOutput, anyhow::Error> {
@@ -373,9 +371,7 @@ impl Client {
             .members()
             .count();
 
-        set_update_commit_create_context(
-            UpdateCommitCreateContext::new(member_count)
-        );
+        set_update_commit_create_context(UpdateCommitCreateContext::new(member_count));
         let total_scope = ProfileScope::start("update_commit_create_total_local", "openmls");
 
         let result = (|| -> Result<EpochChangeOutput, anyhow::Error> {
@@ -421,8 +417,11 @@ impl Client {
             let join_config = MlsGroupJoinConfig::builder()
                 .use_ratchet_tree_extension(true)
                 .build();
-            let group =
-                MlsGroup::join_from_welcome_bytes_profiled(&self.crypto, &join_config, welcome_bytes)?;
+            let group = MlsGroup::join_from_welcome_bytes_profiled(
+                &self.crypto,
+                &join_config,
+                welcome_bytes,
+            )?;
             let member_count = group.members().count();
             self.group = Some(group);
             Ok(member_count)
@@ -448,9 +447,7 @@ impl Client {
             .members()
             .count();
 
-        set_app_message_create_context(
-            AppMessageCreateContext::new(member_count)
-        );
+        set_app_message_create_context(AppMessageCreateContext::new(member_count));
         let total_scope = ProfileScope::start("application_message_create_total_local", "openmls");
 
         let result = (|| -> Result<Vec<u8>, anyhow::Error> {
@@ -485,9 +482,7 @@ impl Client {
             .members()
             .count();
 
-        set_app_message_receive_context(
-            AppMessageReceiveContext::new(member_count)
-        );
+        set_app_message_receive_context(AppMessageReceiveContext::new(member_count));
         let total_scope = ProfileScope::start("application_message_receive_total_local", "openmls");
 
         let result = (|| -> Result<Vec<u8>, anyhow::Error> {
@@ -557,9 +552,10 @@ impl Client {
             .members()
             .count();
 
-        set_commit_receive_op_context(
-            CommitReceiveOpContext::new(member_count_before, member_count_before)
-        );
+        set_commit_receive_op_context(CommitReceiveOpContext::new(
+            member_count_before,
+            member_count_before,
+        ));
         let total_scope = ProfileScope::start("commit_receive_total_local", "openmls");
 
         let process_result = (|| -> Result<(), anyhow::Error> {

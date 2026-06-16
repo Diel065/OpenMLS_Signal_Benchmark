@@ -9,7 +9,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +50,11 @@ const EXTERNAL_BATCH_SEED_DOMAIN: u64 = 0x4558_5442_4154_4348;
 static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static FAILURE_EXPERIMENT_MODE: AtomicBool = AtomicBool::new(false);
+static PROFILED_OPERATION_JOURNAL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+
+fn profiled_operation_journal() -> &'static Mutex<Option<PathBuf>> {
+    PROFILED_OPERATION_JOURNAL.get_or_init(|| Mutex::new(None))
+}
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
@@ -59,6 +64,7 @@ pub struct StaircaseConfig {
     pub min_size: usize,
     pub max_size: Option<usize>,
     pub step_size: StepSize,
+    pub plateau_order: PlateauOrder,
     pub roundtrips: usize,
     pub update_rounds: usize,
     pub app_rounds: usize,
@@ -85,6 +91,36 @@ pub struct StaircaseConfig {
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
     pub failure_experiment: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlateauOrder {
+    Staircase,
+    Randomized,
+}
+
+impl FromStr for PlateauOrder {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "staircase" => Ok(Self::Staircase),
+            "randomized" | "random" => Ok(Self::Randomized),
+            other => Err(format!(
+                "--plateau-order expected 'staircase' or 'randomized', got '{other}'"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for PlateauOrder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Staircase => formatter.write_str("staircase"),
+            Self::Randomized => formatter.write_str("randomized"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +377,26 @@ pub struct WorkerLayoutPhysicalWorker {
     pub resource_limit_pids: Option<u64>,
     #[serde(default)]
     pub resource_profile: String,
+    #[serde(default)]
+    pub resource_profile_id: String,
+    #[serde(default)]
+    pub resource_experiment_type: String,
+    #[serde(default)]
+    pub memory_model: String,
+    #[serde(default)]
+    pub docker_memory_limit: String,
+    #[serde(default)]
+    pub app_heap_budget: String,
+    #[serde(default)]
+    pub app_heap_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub cpu_capacity_fraction: Option<f64>,
+    #[serde(default)]
+    pub assigned_core_count: Option<u32>,
+    #[serde(default)]
+    pub cpuset: Option<String>,
+    #[serde(default)]
+    pub profiled_singleton: bool,
     #[serde(default)]
     pub execution_backend: String,
     #[serde(default)]
@@ -668,7 +724,7 @@ impl RunnerEventLog {
 
 impl RunnerEvent {
     fn to_profile_event(&self) -> ProfileEvent {
-        ProfileEvent {
+        let mut event = ProfileEvent {
             profile_schema_version: Some(self.profile_schema_version),
             ts_unix_ns: self.ts_unix_ns,
             op: "benchmark.worker_failure".to_string(),
@@ -697,8 +753,64 @@ impl RunnerEvent {
             thread_id: "benchmark-runner".to_string(),
             pid: std::process::id(),
             ..ProfileEvent::default()
+        };
+        apply_app_heap_budget_failure_fields(&mut event);
+        event
+    }
+}
+
+fn apply_app_heap_budget_failure_fields(event: &mut ProfileEvent) {
+    let Some(detail) = event.failure_detail.clone() else {
+        return;
+    };
+    if !detail.contains("APP_HEAP_BUDGET_EXCEEDED") {
+        return;
+    }
+    let detail = detail.as_str();
+
+    event.memory_model = app_heap_field(detail, "memory_model");
+    event.app_heap_budget = app_heap_field(detail, "app_heap_budget");
+    event.app_heap_budget_bytes =
+        app_heap_field(detail, "app_heap_budget_bytes").and_then(|value| value.parse::<u64>().ok());
+    event.heap_current_live_bytes = app_heap_field(detail, "current_live_heap_bytes")
+        .and_then(|value| value.parse::<u64>().ok());
+    event.heap_peak_live_bytes =
+        app_heap_field(detail, "peak_live_heap_bytes").and_then(|value| value.parse::<u64>().ok());
+    event.heap_operation_peak_live_bytes = app_heap_field(detail, "operation_peak_live_heap_bytes")
+        .and_then(|value| value.parse::<u64>().ok());
+    event.heap_total_allocated_bytes =
+        app_heap_field(detail, "total_allocated_bytes").and_then(|value| value.parse::<u64>().ok());
+    event.heap_allocation_count =
+        app_heap_field(detail, "allocation_count").and_then(|value| value.parse::<u64>().ok());
+    event.heap_deallocation_count =
+        app_heap_field(detail, "deallocation_count").and_then(|value| value.parse::<u64>().ok());
+    event.heap_failed_allocation_size_bytes =
+        app_heap_field(detail, "failed_allocation_size_bytes")
+            .and_then(|value| value.parse::<u64>().ok());
+
+    if event.operation_family.is_none() {
+        event.operation_family = app_heap_field(detail, "operation_family");
+    }
+    if let Some(member_count) =
+        app_heap_field(detail, "member_count").and_then(|value| value.parse::<usize>().ok())
+    {
+        event.member_count = Some(member_count);
+        event.member_count_before.get_or_insert(member_count);
+    }
+    if event.group_epoch.is_none() {
+        event.group_epoch =
+            app_heap_field(detail, "epoch").and_then(|value| value.parse::<u64>().ok());
+    }
+}
+
+fn app_heap_field(detail: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for token in detail.split_whitespace() {
+        if let Some(value) = token.strip_prefix(&prefix) {
+            return Some(value.trim_matches('"').to_string());
         }
     }
+    None
 }
 
 fn append_profile_event(path: &Path, event: &ProfileEvent) -> Result<()> {
@@ -978,6 +1090,26 @@ struct ProfileEvent {
     failure_action: Option<String>,
     #[serde(default)]
     reassigned_to_worker_id: Option<String>,
+    #[serde(default)]
+    memory_model: Option<String>,
+    #[serde(default)]
+    app_heap_budget: Option<String>,
+    #[serde(default)]
+    app_heap_budget_bytes: Option<u64>,
+    #[serde(default)]
+    heap_current_live_bytes: Option<u64>,
+    #[serde(default)]
+    heap_peak_live_bytes: Option<u64>,
+    #[serde(default)]
+    heap_operation_peak_live_bytes: Option<u64>,
+    #[serde(default)]
+    heap_total_allocated_bytes: Option<u64>,
+    #[serde(default)]
+    heap_allocation_count: Option<u64>,
+    #[serde(default)]
+    heap_deallocation_count: Option<u64>,
+    #[serde(default)]
+    heap_failed_allocation_size_bytes: Option<u64>,
     #[serde(default)]
     benchmark_plateau_index: Option<usize>,
     #[serde(default)]
@@ -1451,6 +1583,13 @@ impl MembershipBatchPlanner {
         if self.cycle.is_empty() || self.cycle_cap != feasible_cap {
             let mut values = (1..=feasible_cap).collect::<Vec<_>>();
             values.shuffle(&mut self.rng);
+            if feasible_cap > 1 {
+                let max_pos = values
+                    .iter()
+                    .position(|value| *value == feasible_cap)
+                    .unwrap_or(0);
+                values.swap(0, max_pos);
+            }
             self.cycle = values.into();
             self.cycle_cap = feasible_cap;
         }
@@ -1613,6 +1752,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
+    configure_profiled_operation_journal(&run_dir);
     let runner_events = RunnerEventLog::new(&run_dir);
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
@@ -1685,13 +1825,49 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     }
 
     let mut plateau_rng = StdRng::seed_from_u64(config.scenario_seed);
-    let plateau_sequence = build_plateau_sequence_for_step_size(
+    let plateau_sequence = build_plateau_sequence_for_order(
         config.min_size,
         max_size,
         &config.step_size,
         config.roundtrips,
+        config.plateau_order,
         &mut plateau_rng,
     );
+
+    #[derive(Serialize)]
+    struct ScenarioPlan<'a> {
+        run_id: &'a str,
+        scenario_seed: u64,
+        plateau_order: PlateauOrder,
+        plateau_sequence: &'a [usize],
+        min_size: usize,
+        max_size: usize,
+        step_size: String,
+        roundtrips: usize,
+        payload_sizes: String,
+        randomized_membership_batches: bool,
+        randomized_actor_selection: bool,
+        randomized_payload_order: bool,
+    }
+
+    let scenario_plan = ScenarioPlan {
+        run_id: &config.run_id,
+        scenario_seed: config.scenario_seed,
+        plateau_order: config.plateau_order,
+        plateau_sequence: &plateau_sequence,
+        min_size: config.min_size,
+        max_size,
+        step_size: config.step_size.to_string(),
+        roundtrips: config.roundtrips,
+        payload_sizes: config.payload_sizes.to_string(),
+        randomized_membership_batches: true,
+        randomized_actor_selection: true,
+        randomized_payload_order: true,
+    };
+    fs::write(
+        run_dir.join("scenario_plan.json"),
+        serde_json::to_vec_pretty(&scenario_plan)?,
+    )?;
 
     let total_units = estimate_total_units(
         &plateau_sequence,
@@ -1709,7 +1885,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     );
 
     eprintln!(
-        "Scenario plan: plateaus={:?}, step_size={}, payload_sizes={}, scenario_seed={}, update_cap={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, scenario_seed={}, update_cap={}, app_cap={}, total_units≈{}",
+        config.plateau_order,
         plateau_sequence,
         config.step_size,
         config.payload_sizes,
@@ -1769,6 +1946,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &mut progress,
             config.process_pending_fanout,
             config.external_coverage_lane,
+            config.profile_only_singletons,
             config.max_commit_receive_samples_per_plateau,
             config.commit_receive_sampling_seed,
             &mut scenario_rng,
@@ -2243,6 +2421,77 @@ struct WorkerCommandContext {
     ciphersuite: Option<String>,
 }
 
+#[derive(Serialize)]
+struct ProfiledOperationCursorEvent<'a> {
+    ts_unix_ns: u128,
+    lifecycle: &'a str,
+    request_id: &'a str,
+    logical_client_id: &'a str,
+    physical_worker_id: &'a str,
+    command: &'a str,
+    benchmark_plateau_index: Option<usize>,
+    benchmark_target_size: Option<usize>,
+    benchmark_active_size: Option<usize>,
+    benchmark_phase: Option<&'a str>,
+    benchmark_operation: Option<&'a str>,
+    benchmark_operation_seq: Option<usize>,
+    benchmark_payload_size: Option<usize>,
+}
+
+fn configure_profiled_operation_journal(run_dir: &Path) {
+    if let Ok(mut path) = profiled_operation_journal().lock() {
+        *path = Some(run_dir.join("profiled-operation-cursors.jsonl"));
+    }
+}
+
+fn record_profiled_operation_cursor(
+    worker: &WorkerSpec,
+    command: &Command,
+    context: &WorkerCommandContext,
+    lifecycle: &str,
+) {
+    if !worker.profile_enabled || worker.container_mode != ContainerMode::Singleton {
+        return;
+    }
+    let Ok(path_guard) = profiled_operation_journal().lock() else {
+        return;
+    };
+    let Some(path) = path_guard.as_ref() else {
+        return;
+    };
+    let event = ProfiledOperationCursorEvent {
+        ts_unix_ns: unix_time_ns(),
+        lifecycle,
+        request_id: &context.request_id,
+        logical_client_id: &worker.id,
+        physical_worker_id: &worker.physical_worker_id,
+        command: command.kind(),
+        benchmark_plateau_index: context.benchmark_plateau_index,
+        benchmark_target_size: context.benchmark_target_size,
+        benchmark_active_size: context.benchmark_active_size,
+        benchmark_phase: context.benchmark_phase.as_deref(),
+        benchmark_operation: context.benchmark_operation.as_deref(),
+        benchmark_operation_seq: context.benchmark_operation_seq,
+        benchmark_payload_size: context.benchmark_payload_size,
+    };
+    let result = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut output| {
+            serde_json::to_writer(&mut output, &event).map_err(io::Error::other)?;
+            writeln!(output)?;
+            output.flush()
+        });
+    if let Err(error) = result {
+        eprintln!(
+            "[failure-attribution] failed to write profiled operation cursor {}: {}",
+            path.display(),
+            error
+        );
+    }
+}
+
 impl WorkerCommandContext {
     fn new(worker: &WorkerSpec, command: &Command) -> Self {
         Self::with_metadata(worker, command, None, None, None)
@@ -2350,7 +2599,7 @@ impl std::fmt::Display for WorkerCommandError {
 
 impl StdError for WorkerCommandError {}
 
-async fn record_worker_oom_if_evidenced(
+async fn record_profiled_worker_failure(
     runner_events: &RunnerEventLog,
     cursor: &BenchmarkCursor,
     worker: &WorkerSpec,
@@ -2358,27 +2607,34 @@ async fn record_worker_oom_if_evidenced(
     action: &str,
     reassigned_to: Option<&WorkerSpec>,
 ) -> Result<bool> {
-    if let Some(evidence) = runner_events.find_oom_evidence(worker).await {
-        runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
-        return Ok(true);
-    }
     let failure_experiment = FAILURE_EXPERIMENT_MODE.load(Ordering::Relaxed);
-    if failure_experiment
-        && worker.profile_enabled
-        && worker.container_mode == ContainerMode::Singleton
-    {
+    if let Some(evidence) = runner_events.find_oom_evidence(worker).await {
+        runner_events.record_oom_failure(
+            cursor,
+            worker,
+            error,
+            &evidence,
+            action,
+            reassigned_to,
+        )?;
+        let must_stop_profiled_singleton =
+            worker.profile_enabled && worker.container_mode == ContainerMode::Singleton;
+        return Ok(failure_experiment || !must_stop_profiled_singleton);
+    }
+    if worker.profile_enabled && worker.container_mode == ContainerMode::Singleton {
         let failure_class = classify_worker_error(error);
+        let evidence_detail = format!("{:#}", error);
         runner_events.record_failure(
             cursor,
             worker,
             error,
             failure_class,
-            None,
-            None,
+            Some("runner_observed_request_failure"),
+            Some(&evidence_detail),
             action,
             reassigned_to,
         )?;
-        return Ok(true);
+        return Ok(failure_experiment);
     }
     Ok(false)
 }
@@ -2474,6 +2730,7 @@ async fn send_command_with_context(
         execution_backend: context.execution_backend.clone(),
         ciphersuite: context.ciphersuite.clone(),
     };
+    record_profiled_operation_cursor(worker, command, context, "started");
 
     for attempt in 1..=WORKER_COMMAND_MAX_ATTEMPTS {
         let response = match http.post(&url).json(&request).send().await {
@@ -2556,7 +2813,10 @@ async fn send_command_with_context(
         }
 
         match response.json::<CommandResponse>().await {
-            Ok(parsed) => return Ok(parsed),
+            Ok(parsed) => {
+                record_profiled_operation_cursor(worker, command, context, "completed");
+                return Ok(parsed);
+            }
             Err(err) if is_transient_reqwest_error(&err) => {
                 let err_text = err.to_string();
                 let diagnostic = reqwest_error_diagnostic(&err);
@@ -3292,7 +3552,7 @@ async fn record_batch_oom_failures(
     };
     let mut dead_workers = Vec::new();
     for failure in &batch_error.failures {
-        if !record_worker_oom_if_evidenced(
+        if !record_profiled_worker_failure(
             runner_events,
             cursor,
             &failure.worker,
@@ -3314,7 +3574,8 @@ fn classify_worker_error(error: &anyhow::Error) -> &'static str {
         if req_err.is_connect() {
             if let Some(src) = req_err.source() {
                 let src_str = format!("{}", src);
-                if src_str.contains("Connection refused") || src_str.contains("connection refused") {
+                if src_str.contains("Connection refused") || src_str.contains("connection refused")
+                {
                     return "container_exit";
                 }
             }
@@ -3328,10 +3589,22 @@ fn classify_worker_error(error: &anyhow::Error) -> &'static str {
         }
     }
     let error_str = format!("{:#}", error).to_lowercase();
+    if error_str.contains("app_heap_budget_exceeded") {
+        return "app_heap_budget_exceeded";
+    }
+    if error_str.contains("app_heap_budget_allocator_abort") {
+        return "app_heap_budget_allocator_abort";
+    }
+    if error_str.contains("embedded_budget_timeout") {
+        return "embedded_budget_timeout";
+    }
     if error_str.contains("connection refused") {
         return "container_exit";
     }
-    if error_str.contains("timeout") || error_str.contains("deadline") || error_str.contains("timed out") {
+    if error_str.contains("timeout")
+        || error_str.contains("deadline")
+        || error_str.contains("timed out")
+    {
         return "cpu_starvation_timeout";
     }
     if error_str.contains("connect") {
@@ -4173,6 +4446,45 @@ fn build_plateau_sequence_for_step_size<R: Rng + ?Sized>(
     sequence
 }
 
+fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
+    min_size: usize,
+    max_size: usize,
+    step_size: &StepSize,
+    roundtrips: usize,
+    plateau_order: PlateauOrder,
+    rng: &mut R,
+) -> Vec<usize> {
+    if plateau_order == PlateauOrder::Staircase {
+        return build_plateau_sequence_for_step_size(
+            min_size, max_size, step_size, roundtrips, rng,
+        );
+    }
+
+    let mut candidates = vec![min_size];
+    let mut current = min_size;
+    while current < max_size {
+        current = current.saturating_add(step_size.sample(rng)).min(max_size);
+        if candidates.last().copied() != Some(current) {
+            candidates.push(current);
+        }
+    }
+
+    let mut sequence = Vec::new();
+    for _ in 0..roundtrips {
+        let mut randomized = candidates.clone();
+        randomized.shuffle(rng);
+        if randomized.len() > 1 && sequence.last() == randomized.first() {
+            randomized.rotate_left(1);
+        }
+        for size in randomized {
+            if sequence.last().copied() != Some(size) {
+                sequence.push(size);
+            }
+        }
+    }
+    sequence
+}
+
 fn cap_count(raw: usize, cap: usize) -> usize {
     if cap == 0 {
         0
@@ -4501,7 +4813,7 @@ async fn add_n_members(
             send_cmd_expect_ok_fragment(http, &joiner, &Command::GenerateKeyPackage, &fragment)
                 .await
         {
-            if record_worker_oom_if_evidenced(
+            if record_profiled_worker_failure(
                 runner_events,
                 &cursor,
                 &joiner,
@@ -4552,14 +4864,26 @@ async fn add_n_members(
         Some("add_member.create"),
         Some(&cursor),
     );
-    send_cmd_expect_ok_fragment_with_context(
+    if let Err(error) = send_cmd_expect_ok_fragment_with_context(
         http,
         &actor,
         &add_command,
         "added locally in one commit",
         &add_context,
     )
-    .await?;
+    .await
+    {
+        let _ = record_profiled_worker_failure(
+            runner_events,
+            &cursor,
+            &actor,
+            &error,
+            "stop_run",
+            None,
+        )
+        .await?;
+        return Err(error);
+    }
     if process_pending_fanout {
         process_pending_commit_expect(
             http,
@@ -4602,7 +4926,7 @@ async fn add_n_members(
                 "membership_add",
                 "join_from_welcome",
             );
-            if record_worker_oom_if_evidenced(
+            if record_profiled_worker_failure(
                 runner_events,
                 &cursor,
                 &joiner,
@@ -4733,10 +5057,12 @@ async fn remove_n_members(
     process_pending_fanout: bool,
     forced_actor_id: Option<&str>,
     protect_external_members: bool,
+    protect_profile_enabled_members: bool,
     plateau_size: usize,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     let batch_size = batch_decision.effective;
     if active.len() <= 1 {
@@ -4758,16 +5084,25 @@ async fn remove_n_members(
         .unwrap_or_else(|| rng.gen_range(0..active.len()));
     let actor = active[actor_idx].clone();
 
-    // Pick random members to remove, but do not let the actor remove itself.
+    // Pick random members to remove, but do not let the actor remove itself or
+    // invalidate a coverage/resource lane by removing its protected clients.
     // Self-removal is possible in MLS-style flows, but it complicates this benchmark's bookkeeping.
-    let mut removable_indices: Vec<usize> = (0..active.len())
-        .filter(|idx| {
-            *idx != actor_idx && (!protect_external_members || !is_external_device(&active[*idx]))
-        })
-        .collect();
+    let removable_indices = removable_member_indices(
+        active,
+        actor_idx,
+        protect_external_members,
+        protect_profile_enabled_members,
+    );
     if removable_indices.len() < batch_size {
-        removable_indices = (0..active.len()).filter(|idx| *idx != actor_idx).collect();
+        return Err(anyhow!(
+            "Cannot remove {} member(s) from {} active members without removing protected clients; actor={}, removable={}",
+            batch_size,
+            active.len(),
+            actor.id,
+            removable_indices.len()
+        ));
     }
+    let mut removable_indices = removable_indices;
     let mut removed = Vec::with_capacity(batch_size);
     for _ in 0..batch_size {
         let candidate_pos = rng.gen_range(0..removable_indices.len());
@@ -4796,15 +5131,36 @@ async fn remove_n_members(
     )
     .with_membership_batch(&batch_decision);
 
-    send_cmd_expect_ok_fragment(
+    let remove_command = Command::RemoveMembers {
+        members: removed_ids.clone(),
+    };
+    let remove_context = WorkerCommandContext::with_metadata(
+        &actor,
+        &remove_command,
+        None,
+        Some("remove_member.create"),
+        Some(&cursor),
+    );
+    if let Err(error) = send_cmd_expect_ok_fragment_with_context(
         http,
         &actor,
-        &Command::RemoveMembers {
-            members: removed_ids.clone(),
-        },
+        &remove_command,
         "removed locally; group commit published",
+        &remove_context,
     )
-    .await?;
+    .await
+    {
+        let _ = record_profiled_worker_failure(
+            runner_events,
+            &cursor,
+            &actor,
+            &error,
+            "stop_run",
+            None,
+        )
+        .await?;
+        return Err(error);
+    }
 
     if process_pending_fanout {
         process_pending_commit_expect(
@@ -4933,6 +5289,21 @@ async fn remove_n_members(
         ),
     );
     Ok(())
+}
+
+fn removable_member_indices(
+    active: &[WorkerSpec],
+    actor_idx: usize,
+    protect_external_members: bool,
+    protect_profile_enabled_members: bool,
+) -> Vec<usize> {
+    (0..active.len())
+        .filter(|idx| {
+            *idx != actor_idx
+                && (!protect_external_members || !is_external_device(&active[*idx]))
+                && (!protect_profile_enabled_members || !active[*idx].profile_enabled)
+        })
+        .collect()
 }
 
 async fn evict_oom_group_members(
@@ -5110,6 +5481,7 @@ async fn transition_to_size(
     progress: &mut Progress,
     process_pending_fanout: bool,
     external_coverage_lane: bool,
+    protect_profile_enabled_members: bool,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
@@ -5138,10 +5510,20 @@ async fn transition_to_size(
             );
             break;
         }
-        let forced_actor_id = external_add_actor_ids
+        let external_actor_id = external_add_actor_ids
             .iter()
             .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
             .map(|pos| external_add_actor_ids.remove(pos));
+        let forced_actor_id = external_actor_id.clone().or_else(|| {
+            protect_profile_enabled_members
+                .then(|| {
+                    active
+                        .iter()
+                        .find(|worker| worker.profile_enabled)
+                        .map(|worker| worker.id.clone())
+                })
+                .flatten()
+        });
         let reserved_for_external = external_add_actor_ids
             .len()
             .min(max_allowed.saturating_sub(1));
@@ -5149,7 +5531,7 @@ async fn transition_to_size(
         let batch_decision = add_membership_batches.next_batch(
             active.len(),
             decision_cap,
-            forced_actor_id.as_deref(),
+            external_actor_id.as_deref(),
         );
         add_n_members(
             http,
@@ -5210,10 +5592,12 @@ async fn transition_to_size(
             process_pending_fanout,
             forced_actor_id.as_deref(),
             external_coverage_lane,
+            protect_profile_enabled_members,
             target_size,
             max_commit_receive_samples_per_plateau,
             commit_receive_sampling_seed,
             rng,
+            runner_events,
         )
         .await?;
     }
@@ -5324,7 +5708,7 @@ async fn run_update_phase(
             Ok(state) => state,
             Err(error) => {
                 let reassigned_to = active.iter().find(|worker| worker.id != actor.id).cloned();
-                if record_worker_oom_if_evidenced(
+                if record_profiled_worker_failure(
                     runner_events,
                     &cursor,
                     &actor,
@@ -5356,16 +5740,25 @@ async fn run_update_phase(
             actor_before.members.clone(),
         );
 
-        if let Err(error) = send_cmd_expect_ok_fragment(
+        let update_command = Command::SelfUpdate;
+        let update_context = WorkerCommandContext::with_metadata(
+            &actor,
+            &update_command,
+            None,
+            Some("update.create"),
+            Some(&cursor),
+        );
+        if let Err(error) = send_cmd_expect_ok_fragment_with_context(
             http,
             &actor,
-            &Command::SelfUpdate,
+            &update_command,
             "self_update commit published to group",
+            &update_context,
         )
         .await
         {
             let reassigned_to = active.iter().find(|worker| worker.id != actor.id).cloned();
-            if record_worker_oom_if_evidenced(
+            if record_profiled_worker_failure(
                 runner_events,
                 &cursor,
                 &actor,
@@ -5413,7 +5806,7 @@ async fn run_update_phase(
         };
         if let Err(error) = actor_commit_result {
             let reassigned_to = active.iter().find(|worker| worker.id != actor.id).cloned();
-            if record_worker_oom_if_evidenced(
+            if record_profiled_worker_failure(
                 runner_events,
                 &cursor,
                 &actor,
@@ -5709,16 +6102,25 @@ async fn run_application_phase(
             )
             .at_operation(seq_no + 1, Some(payload_size));
 
-            if let Err(error) = send_cmd_expect_ok_fragment(
+            let application_command = Command::SendApplicationMessage { message: payload };
+            let application_context = WorkerCommandContext::with_metadata(
+                &actor,
+                &application_command,
+                None,
+                Some("application.create"),
+                Some(&cursor),
+            );
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
                 http,
                 &actor,
-                &Command::SendApplicationMessage { message: payload },
+                &application_command,
                 "application message broadcast to group",
+                &application_context,
             )
             .await
             {
                 let reassigned_to = active.iter().find(|worker| worker.id != actor.id).cloned();
-                if record_worker_oom_if_evidenced(
+                if record_profiled_worker_failure(
                     runner_events,
                     &cursor,
                     &actor,
@@ -5850,7 +6252,8 @@ pub fn aggregate_csv(
     materialize_runner_profile_events(run_dir)?;
 
     let csv_path = run_dir.join("events.csv");
-    let mut wtr = csv::Writer::from_path(&csv_path)?;
+    let tmp_path = run_dir.join("events.csv.tmp");
+    let mut wtr = csv::Writer::from_path(&tmp_path)?;
 
     let layout_path = run_dir.join("worker_layout.json");
     let layout: Option<WorkerLayout> = if let Some(l) = provided_layout {
@@ -5907,8 +6310,8 @@ pub fn aggregate_csv(
         client_id: &'a str,
         worker_id: &'a str,
         container_mode: &'a str,
-        execution_backend: &'a str,
-        device_kind: &'a str,
+        execution_backend: String,
+        device_kind: String,
         profile_schema_version: Option<u32>,
         ts_unix_ns: u128,
         op: String,
@@ -5926,6 +6329,17 @@ pub fn aggregate_csv(
         failure_evidence_detail: Option<String>,
         failure_action: Option<String>,
         reassigned_to_worker_id: Option<String>,
+        memory_model: Option<String>,
+        docker_memory_limit: Option<&'a str>,
+        app_heap_budget: Option<String>,
+        app_heap_budget_bytes: Option<u64>,
+        heap_current_live_bytes: Option<u64>,
+        heap_peak_live_bytes: Option<u64>,
+        heap_operation_peak_live_bytes: Option<u64>,
+        heap_total_allocated_bytes: Option<u64>,
+        heap_allocation_count: Option<u64>,
+        heap_deallocation_count: Option<u64>,
+        heap_failed_allocation_size_bytes: Option<u64>,
         benchmark_plateau_index: Option<usize>,
         benchmark_target_size: Option<usize>,
         benchmark_active_size: Option<usize>,
@@ -6069,6 +6483,12 @@ pub fn aggregate_csv(
         resource_limit_memory_swap_bytes: Option<u64>,
         resource_limit_pids: Option<u64>,
         resource_profile: &'a str,
+        resource_profile_id: &'a str,
+        resource_experiment_type: &'a str,
+        cpu_capacity_fraction: Option<f64>,
+        assigned_core_count: Option<u32>,
+        cpuset: Option<&'a str>,
+        profiled_singleton: bool,
     }
 
     fn non_empty_or<'a>(value: Option<&'a str>, default: &'a str) -> &'a str {
@@ -6078,6 +6498,7 @@ pub fn aggregate_csv(
         }
     }
 
+    let mut rows = Vec::new();
     for worker_id in &aggregate_worker_ids {
         let path = run_dir.join(format!("client-{worker_id}.jsonl"));
 
@@ -6126,11 +6547,13 @@ pub fn aggregate_csv(
                 execution_backend: non_empty_or(
                     meta.map(|m| m.execution_backend.as_str()),
                     non_empty_or(event.execution_backend.as_deref(), "local_process"),
-                ),
+                )
+                .to_string(),
                 device_kind: non_empty_or(
                     meta.map(|m| m.device_kind.as_str()),
                     non_empty_or(event.device_kind.as_deref(), "local_process"),
-                ),
+                )
+                .to_string(),
                 profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
                 op: event.op,
@@ -6148,6 +6571,27 @@ pub fn aggregate_csv(
                 failure_evidence_detail: event.failure_evidence_detail,
                 failure_action: event.failure_action,
                 reassigned_to_worker_id: event.reassigned_to_worker_id,
+                memory_model: event.memory_model.or_else(|| {
+                    phys.and_then(|m| (!m.memory_model.is_empty()).then(|| m.memory_model.clone()))
+                }),
+                docker_memory_limit: phys.and_then(|m| {
+                    (!m.docker_memory_limit.is_empty()).then_some(m.docker_memory_limit.as_str())
+                }),
+                app_heap_budget: event.app_heap_budget.or_else(|| {
+                    phys.and_then(|m| {
+                        (!m.app_heap_budget.is_empty()).then(|| m.app_heap_budget.clone())
+                    })
+                }),
+                app_heap_budget_bytes: event
+                    .app_heap_budget_bytes
+                    .or_else(|| phys.and_then(|m| m.app_heap_budget_bytes)),
+                heap_current_live_bytes: event.heap_current_live_bytes,
+                heap_peak_live_bytes: event.heap_peak_live_bytes,
+                heap_operation_peak_live_bytes: event.heap_operation_peak_live_bytes,
+                heap_total_allocated_bytes: event.heap_total_allocated_bytes,
+                heap_allocation_count: event.heap_allocation_count,
+                heap_deallocation_count: event.heap_deallocation_count,
+                heap_failed_allocation_size_bytes: event.heap_failed_allocation_size_bytes,
                 benchmark_plateau_index: event.benchmark_plateau_index,
                 benchmark_target_size: event.benchmark_target_size,
                 benchmark_active_size: event.benchmark_active_size,
@@ -6295,13 +6739,41 @@ pub fn aggregate_csv(
                     .and_then(|m| m.resource_limit_memory_swap_bytes),
                 resource_limit_pids: phys.and_then(|m| m.resource_limit_pids),
                 resource_profile: non_empty_or(phys.map(|m| m.resource_profile.as_str()), ""),
+                resource_profile_id: non_empty_or(phys.map(|m| m.resource_profile_id.as_str()), ""),
+                resource_experiment_type: non_empty_or(
+                    phys.map(|m| m.resource_experiment_type.as_str()),
+                    "",
+                ),
+                cpu_capacity_fraction: phys.and_then(|m| m.cpu_capacity_fraction),
+                assigned_core_count: phys.and_then(|m| m.assigned_core_count),
+                cpuset: phys.and_then(|m| m.cpuset.as_deref()),
+                profiled_singleton: phys.map(|m| m.profiled_singleton).unwrap_or(false),
             };
 
-            wtr.serialize(row)?;
+            rows.push(row);
         }
     }
 
+    rows.sort_by(|left, right| {
+        left.ts_unix_ns.cmp(&right.ts_unix_ns).then_with(|| {
+            let left_failure = left.runner_event_kind.as_deref() == Some("worker_failure");
+            let right_failure = right.runner_event_kind.as_deref() == Some("worker_failure");
+            left_failure.cmp(&right_failure)
+        })
+    });
+    for row in rows {
+        wtr.serialize(row)?;
+    }
+
     wtr.flush()?;
+    drop(wtr);
+    fs::rename(&tmp_path, &csv_path).with_context(|| {
+        format!(
+            "Failed to rename {} to {}",
+            tmp_path.display(),
+            csv_path.display()
+        )
+    })?;
     Ok(())
 }
 
@@ -6370,6 +6842,14 @@ mod membership_batch_tests {
             .collect::<Vec<_>>();
         observed.sort_unstable();
         assert_eq!(observed, (1..=8).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn membership_batch_planner_uses_largest_feasible_batch_first() {
+        let mut planner = MembershipBatchPlanner::new(0x1234);
+        let decision = planner.next_batch(32, 4, "test");
+        assert_eq!(decision.requested, 4);
+        assert_eq!(decision.effective, 4);
     }
 
     #[test]
@@ -6641,6 +7121,242 @@ mod aggregate_csv_resource_tests {
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }
+
+    #[test]
+    fn aggregate_csv_orders_terminal_failure_after_completed_spans() {
+        let unique = format!(
+            "openmls-terminal-failure-order-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        append_profile_event(
+            &run_dir.join("client-00001.jsonl"),
+            &ProfileEvent {
+                ts_unix_ns: 100,
+                op: "update_commit_create_total_local".to_string(),
+                implementation: "openmls".to_string(),
+                worker_id: Some("00001".to_string()),
+                benchmark_phase: Some("update".to_string()),
+                benchmark_operation: Some("update_commit".to_string()),
+                ..ProfileEvent::default()
+            },
+        )
+        .expect("write completed span");
+
+        let failure = RunnerEvent {
+            profile_schema_version: 10,
+            ts_unix_ns: 200,
+            event_kind: "worker_failure".to_string(),
+            failed_worker_id: "00001".to_string(),
+            failed_physical_worker_id: "worker-00001".to_string(),
+            failure_class: "cpu_starvation_timeout".to_string(),
+            failure_detail: "deadline elapsed".to_string(),
+            failure_evidence_source: Some("runner_observed_request_failure".to_string()),
+            failure_evidence_detail: Some("request timed out".to_string()),
+            failure_action: "stop_run".to_string(),
+            reassigned_to_worker_id: None,
+            benchmark_plateau_index: 3,
+            benchmark_target_size: 16,
+            benchmark_active_size: 16,
+            benchmark_phase: "update".to_string(),
+            benchmark_operation: "update_commit".to_string(),
+            benchmark_operation_seq: Some(2),
+            benchmark_payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
+            configured_payload_label: None,
+        };
+        std::fs::write(
+            run_dir.join("runner-events.jsonl"),
+            serde_json::to_string(&failure).expect("failure json") + "\n",
+        )
+        .expect("write runner failure");
+
+        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+        let mut reader = csv::Reader::from_path(run_dir.join("events.csv")).expect("open csv");
+        let headers = reader.headers().expect("headers").clone();
+        let op_index = headers.iter().position(|header| header == "op").unwrap();
+        let rows = reader
+            .records()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("rows");
+        assert_eq!(
+            rows.last().unwrap().get(op_index),
+            Some("benchmark.worker_failure")
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn aggregate_csv_atomic_write_renames_temp_to_final() {
+        let unique = format!(
+            "openmls-atomic-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let event = serde_json::json!({
+            "profile_schema_version": 3,
+            "ts_unix_ns": 1u128,
+            "op": "test.atomic",
+            "implementation": "test",
+            "cpu_process_ns": 0u128,
+            "wall_ns": 0u128,
+            "pid": 1,
+            "thread_id": "t1",
+        });
+        std::fs::write(
+            run_dir.join("client-00001.jsonl"),
+            serde_json::to_string(&event).expect("event json") + "\n",
+        )
+        .expect("write jsonl");
+
+        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+
+        assert!(
+            run_dir.join("events.csv").exists(),
+            "events.csv must exist after rename"
+        );
+        assert!(
+            !run_dir.join("events.csv.tmp").exists(),
+            "tmp file must be gone after rename"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn aggregate_csv_handles_missing_client_file() {
+        let unique = format!(
+            "openmls-missing-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let result = aggregate_csv(&run_dir, &["00001".to_string()], &None);
+        assert!(result.is_ok(), "Should not crash on missing client file");
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn aggregate_csv_handles_malformed_middle_line() {
+        let unique = format!(
+            "openmls-malformed-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let good_line = serde_json::json!({
+            "profile_schema_version": 3,
+            "ts_unix_ns": 1u128,
+            "op": "test.good",
+            "implementation": "test",
+            "cpu_process_ns": 0u128,
+            "wall_ns": 0u128,
+            "pid": 1,
+            "thread_id": "t1",
+        });
+        let content = format!(
+            "{}\n{{invalid json}}\n{}\n",
+            serde_json::to_string(&good_line).unwrap(),
+            serde_json::to_string(&good_line).unwrap(),
+        );
+        std::fs::write(run_dir.join("client-00001.jsonl"), content).expect("write jsonl");
+
+        let result = aggregate_csv(&run_dir, &["00001".to_string()], &None);
+        assert!(
+            result.is_err(),
+            "Should fail on malformed line in strict mode"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn aggregate_csv_handles_truncated_final_line() {
+        let unique = format!(
+            "openmls-truncated-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let good_line = serde_json::json!({
+            "profile_schema_version": 3,
+            "ts_unix_ns": 1u128,
+            "op": "test.good",
+            "implementation": "test",
+            "cpu_process_ns": 0u128,
+            "wall_ns": 0u128,
+            "pid": 1,
+            "thread_id": "t1",
+        });
+        let content = format!(
+            "{}\n{}",
+            serde_json::to_string(&good_line).unwrap(),
+            r#"{"profile_schema_version": 3, "implementation": "test", "ts_unix_ns": 2, "op": "trunc"#,
+        );
+        std::fs::write(run_dir.join("client-00001.jsonl"), content).expect("write jsonl");
+
+        let result = aggregate_csv(&run_dir, &["00001".to_string()], &None);
+        assert!(
+            result.is_err(),
+            "Should fail on truncated final line in strict mode"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn aggregate_csv_no_usable_records_handled() {
+        let unique = format!(
+            "openmls-norecords-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time")
+                .as_nanos()
+        );
+        let run_dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        std::fs::write(run_dir.join("client-00001.jsonl"), "").expect("write empty jsonl");
+
+        let result = aggregate_csv(&run_dir, &["00001".to_string()], &None);
+        assert!(result.is_ok(), "Empty client file should not crash");
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
 }
 
 /// Validate a run ID string for safe filesystem usage.
@@ -6711,8 +7427,9 @@ mod random_input_tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::{
-        build_plateau_sequence, build_plateau_sequence_for_step_size, PayloadSizeSource,
-        PayloadSizes, StepSize,
+        build_plateau_sequence, build_plateau_sequence_for_order,
+        build_plateau_sequence_for_step_size, PayloadSizeSource, PayloadSizes, PlateauOrder,
+        StepSize,
     };
 
     #[test]
@@ -6766,6 +7483,31 @@ mod random_input_tests {
             .all(|sample| (32..=4096).contains(sample)));
         assert!(payload_samples.iter().collect::<HashSet<_>>().len() > 1);
     }
+
+    #[test]
+    fn randomized_plateaus_are_seeded_and_not_a_monotonic_staircase() {
+        let sequence_for = |seed| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            build_plateau_sequence_for_order(
+                2,
+                32,
+                &StepSize::Fixed(5),
+                2,
+                PlateauOrder::Randomized,
+                &mut rng,
+            )
+        };
+
+        let first = sequence_for(17);
+        assert_eq!(first, sequence_for(17));
+        assert_ne!(first, sequence_for(18));
+        assert!(first.contains(&2));
+        assert!(first.contains(&32));
+        assert!(first.windows(3).any(|window| {
+            !((window[0] < window[1] && window[1] < window[2])
+                || (window[0] > window[1] && window[1] > window[2]))
+        }));
+    }
 }
 
 #[cfg(test)]
@@ -6783,15 +7525,39 @@ mod tests {
 
     use super::{
         batch_physical_base_url, build_batch_commands, fanout_workers,
-        partition_batch_failures_by_reconciled_state, retry_batch_commands_for_failures,
-        sampled_member_index, BatchFanoutCommand, FanoutController, FanoutFailure, WorkerSpec,
-        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD, FANOUT_LATENCY_SPIKE_P95_MS,
+        partition_batch_failures_by_reconciled_state, removable_member_indices,
+        retry_batch_commands_for_failures, sampled_member_index, BatchFanoutCommand,
+        FanoutController, FanoutFailure, WorkerSpec, DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
+        FANOUT_LATENCY_SPIKE_P95_MS,
     };
 
     fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
         (0..sample_count)
             .map(|seq_no| sampled_member_index(member_count, sample_count, seq_no))
             .collect()
+    }
+
+    #[test]
+    fn random_removal_preserves_profiled_and_external_clients() {
+        let mut profiled = WorkerSpec::legacy("00001".into(), "http://worker-1:8080".into());
+        profiled.profile_enabled = true;
+
+        let mut external = WorkerSpec::legacy("00002".into(), "http://worker-2:8080".into());
+        external.profile_enabled = false;
+        external.device_kind = "external-device".into();
+
+        let mut actor = WorkerSpec::legacy("00003".into(), "http://worker-3:8080".into());
+        actor.profile_enabled = false;
+
+        let mut ordinary = WorkerSpec::legacy("00004".into(), "http://worker-4:8080".into());
+        ordinary.profile_enabled = false;
+
+        let active = vec![profiled, external, actor, ordinary];
+        assert_eq!(removable_member_indices(&active, 2, true, true), vec![3]);
+        assert_eq!(
+            removable_member_indices(&active, 2, false, true),
+            vec![1, 3]
+        );
     }
 
     #[test]
@@ -7146,6 +7912,14 @@ mod failure_experiment_tests {
     }
 
     #[test]
+    fn classify_worker_error_detects_app_heap_budget_exceeded() {
+        let err = anyhow!(
+            "Worker 00001 error: APP_HEAP_BUDGET_EXCEEDED failure_class=app_heap_budget_exceeded operation_family=welcome_receive member_count=32 epoch=31"
+        );
+        assert_eq!(classify_worker_error(&err), "app_heap_budget_exceeded");
+    }
+
+    #[test]
     fn classify_worker_error_detects_connect_failure() {
         let err = anyhow!("client error: connect failure");
         assert_eq!(classify_worker_error(&err), "worker_unreachable");
@@ -7162,7 +7936,8 @@ mod failure_experiment_tests {
         let run_dir = temp_dir();
         let events = RunnerEventLog::new(&run_dir);
 
-        let worker = WorkerSpec::legacy("test-001".to_string(), "http://127.0.0.1:9999".to_string());
+        let worker =
+            WorkerSpec::legacy("test-001".to_string(), "http://127.0.0.1:9999".to_string());
         let cursor = BenchmarkCursor::new(0, 4, 4, "transition", "add_members");
         let err = anyhow!("simulated container exit");
 
@@ -7190,7 +7965,10 @@ mod failure_experiment_tests {
         assert_eq!(event.failed_worker_id, "test-001");
         assert_eq!(event.benchmark_phase, "transition");
         assert_eq!(event.benchmark_operation, "add_members");
-        assert_eq!(event.failure_evidence_source, Some("runner_inference".to_string()));
+        assert_eq!(
+            event.failure_evidence_source,
+            Some("runner_inference".to_string())
+        );
 
         let profile_path = run_dir.join("client-test-001.jsonl");
         assert!(profile_path.exists());
@@ -7283,8 +8061,19 @@ mod failure_experiment_tests {
                     resource_limit_memory_bytes: None,
                     resource_limit_memory_swap: Some("64m".to_string()),
                     resource_limit_memory_swap_bytes: None,
+                    memory_model: String::new(),
+                    docker_memory_limit: String::new(),
+                    app_heap_budget: String::new(),
+                    app_heap_budget_bytes: None,
                     resource_limit_pids: None,
-                    resource_profile: "failure-experiment-resource-envelope_cpus-0.125_memory-64m".to_string(),
+                    resource_profile: "failure-experiment-resource-envelope_cpus-0.125_memory-64m"
+                        .to_string(),
+                    resource_profile_id: "cpu_1c_012".to_string(),
+                    resource_experiment_type: "cpu_matrix_singleton".to_string(),
+                    cpu_capacity_fraction: Some(0.125),
+                    assigned_core_count: Some(1),
+                    cpuset: Some("0".to_string()),
+                    profiled_singleton: true,
                     execution_backend: "docker_container".to_string(),
                     device_kind: "scratch_container".to_string(),
                     transport: "".to_string(),
@@ -7303,8 +8092,18 @@ mod failure_experiment_tests {
                     resource_limit_memory_bytes: None,
                     resource_limit_memory_swap: None,
                     resource_limit_memory_swap_bytes: None,
+                    memory_model: String::new(),
+                    docker_memory_limit: String::new(),
+                    app_heap_budget: String::new(),
+                    app_heap_budget_bytes: None,
                     resource_limit_pids: None,
                     resource_profile: "".to_string(),
+                    resource_profile_id: "".to_string(),
+                    resource_experiment_type: "".to_string(),
+                    cpu_capacity_fraction: None,
+                    assigned_core_count: None,
+                    cpuset: None,
+                    profiled_singleton: false,
                     execution_backend: "docker_container".to_string(),
                     device_kind: "scratch_container".to_string(),
                     transport: "".to_string(),
@@ -7323,8 +8122,19 @@ mod failure_experiment_tests {
                     resource_limit_memory_bytes: None,
                     resource_limit_memory_swap: Some("1g".to_string()),
                     resource_limit_memory_swap_bytes: None,
+                    memory_model: String::new(),
+                    docker_memory_limit: String::new(),
+                    app_heap_budget: String::new(),
+                    app_heap_budget_bytes: None,
                     resource_limit_pids: None,
-                    resource_profile: "failure-experiment-resource-envelope_cpus-2.0_memory-1g".to_string(),
+                    resource_profile: "failure-experiment-resource-envelope_cpus-2.0_memory-1g"
+                        .to_string(),
+                    resource_profile_id: "cpu_2c_100".to_string(),
+                    resource_experiment_type: "cpu_matrix_singleton".to_string(),
+                    cpu_capacity_fraction: Some(1.0),
+                    assigned_core_count: Some(2),
+                    cpuset: Some("0-1".to_string()),
+                    profiled_singleton: true,
                     execution_backend: "docker_container".to_string(),
                     device_kind: "scratch_container".to_string(),
                     transport: "".to_string(),
@@ -7343,7 +8153,12 @@ mod failure_experiment_tests {
                 mode: "failure_experiment".to_string(),
                 seed: 1,
                 cpu_caps: vec![0.125, 0.25, 0.5, 1.0, 2.0],
-                ram_caps: vec!["64m","96m","128m","192m","256m","384m","512m","768m","1g"].into_iter().map(|s| s.to_string()).collect(),
+                ram_caps: vec![
+                    "64m", "96m", "128m", "192m", "256m", "384m", "512m", "768m", "1g",
+                ]
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect(),
                 grid_cells: 45,
                 swap_equals_ram: true,
                 interpretation: String::new(),
@@ -7355,7 +8170,8 @@ mod failure_experiment_tests {
         fs::write(&layout_path, &layout_json).unwrap();
 
         let events = RunnerEventLog::new(&run_dir);
-        let worker = WorkerSpec::legacy("00001".to_string(), "http://worker-00001:8080".to_string());
+        let worker =
+            WorkerSpec::legacy("00001".to_string(), "http://worker-00001:8080".to_string());
         let cursor = BenchmarkCursor::new(1, 8, 8, "update", "self_update");
         let err = anyhow!("container OOM killed");
 

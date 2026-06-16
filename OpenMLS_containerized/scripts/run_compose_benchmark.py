@@ -43,6 +43,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-size", type=int, default=2)
     p.add_argument("--max-size", type=int, default=None)
     p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
+    p.add_argument(
+        "--plateau-order",
+        choices=("staircase", "randomized"),
+        default="staircase",
+        help="Order target group-size plateaus deterministically or by the recorded scenario seed",
+    )
     p.add_argument("--roundtrips", type=int, default=1)
 
     p.add_argument("--update-rounds", type=int, default=2)
@@ -424,7 +430,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Resource experiment flags ───────────────────────────────────
     p.add_argument(
         "--resource-experiment",
-        choices=["none", "ram-sweep-singleton", "cpu-matrix-singleton"],
+        choices=[
+            "none",
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        ],
         default="none",
         help="Resource experiment mode for simulated IoT container profiling",
     )
@@ -454,6 +467,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-matrix-capacity-fractions",
         default="0.25,0.50,0.75,1.00",
         help="Comma-separated list of capacity fractions for CPU matrix",
+    )
+    p.add_argument(
+        "--embedded-heap-budgets",
+        default="32k,64k,128k,256k,512k,1m,2m",
+        help="Comma-separated synthetic application heap budgets for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-cpu-fractions",
+        default="1.00,0.50,0.25,0.10,0.05",
+        help="Comma-separated Docker CPU fractions for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-cpu-cores",
+        default="1",
+        help="Comma-separated Docker CPU core counts for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-docker-memory",
+        default="256m",
+        help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     p.add_argument(
         "--cpu-affinity-mode",
@@ -886,6 +919,44 @@ def validate_artifacts(run_dir: Path, layout_mode: str) -> None:
         raise RuntimeError(f"All per-worker JSONL files are empty in {run_dir}")
 
 
+def write_integrated_aggregation_manifest(run_dir: Path, run_id: str) -> None:
+    manifest_path = run_dir / "aggregation_manifest.json"
+    if manifest_path.exists():
+        return
+
+    events_path = run_dir / "events.csv"
+    with events_path.open("r", newline="", encoding="utf-8") as handle:
+        events_written = sum(1 for _ in csv.reader(handle)) - 1
+    events_written = max(0, events_written)
+
+    jsonl_files = sorted(run_dir.glob("client-*.jsonl"))
+    timestamp = dt.datetime.now(dt.timezone.utc).isoformat()
+    manifest = {
+        "run_id": run_id,
+        "started_at": timestamp,
+        "finished_at": timestamp,
+        "aggregation_mode": "runner_integrated",
+        "aggregation_status": "complete_success",
+        "events_written": events_written,
+        "input_files_expected": len(jsonl_files),
+        "input_files_found": len(jsonl_files),
+        "input_files_missing": [],
+        "malformed_records": [],
+        "truncated_records": [],
+        "runner_events_included": any(
+            (run_dir / filename).exists()
+            for filename in ("runner-events.jsonl", "runner_events.jsonl")
+        ),
+        "output_path": str(events_path),
+        "error_message": None,
+        "temporary_file_retained": None,
+    }
+    manifest_path.write_text(
+        json.dumps(manifest, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def run_strict_output_validation(root: Path, run_dir: Path) -> None:
     validator = root / "scripts" / "validate_benchmark_outputs.py"
     result = subprocess.run(
@@ -1125,7 +1196,7 @@ def compose_container_id(
         env: dict[str, str] | None,
 ) -> str | None:
     result = subprocess.run(
-        ["docker", "compose", "-f", str(compose_file), "ps", "-q", service],
+        ["docker", "compose", "-f", str(compose_file), "ps", "-q", "--all", service],
         cwd=str(root),
         env=env,
         stdout=subprocess.PIPE,
@@ -1192,6 +1263,164 @@ def warn_if_neighbor_cache_tight(layout_path: Path, service_count: int = 3) -> N
             "and nf_conntrack tuning.",
             flush=True,
         )
+
+
+def capture_failure_evidence(
+    *,
+    root: Path,
+    compose_file: Path,
+    run_dir: Path,
+    compose_env: dict[str, str] | None,
+    project_name: str,
+    profiled_container_names: list[str] | None = None,
+) -> dict | None:
+    """Capture Docker inspect and cgroup state for profiled containers before cleanup.
+
+    Must be called BEFORE docker compose down.
+    Writes failure_evidence.json and returns the evidence dict.
+    """
+    import csv as csv_mod
+    evidence_entries: list[dict] = []
+    container_names = list(profiled_container_names or [])
+
+    if not container_names:
+        compose_ps = run_capture_to_str(
+            root,
+            ["docker", "compose", "-f", str(compose_file), "ps", "-q"],
+            env=compose_env,
+        )
+        if compose_ps:
+            container_names = [line.strip() for line in compose_ps.splitlines() if line.strip()]
+
+    for name in container_names:
+        try:
+            entry = _capture_single_container(root, compose_file, name, compose_env)
+            if entry:
+                evidence_entries.append(entry)
+        except Exception as exc:
+            evidence_entries.append({
+                "container_name": name,
+                "capture_error": f"{type(exc).__name__}: {exc}",
+            })
+
+    if not evidence_entries:
+        return None
+
+    payload = {
+        "captured_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "container_count": len(evidence_entries),
+        "containers": evidence_entries,
+    }
+    (run_dir / "failure_evidence.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+    print(f"[evidence] captured docker/cgroup state for {len(evidence_entries)} container(s)", flush=True)
+    return payload
+
+
+def _capture_single_container(
+    root: Path,
+    compose_file: Path,
+    container_name: str,
+    compose_env: dict[str, str] | None,
+) -> dict | None:
+    """Capture docker inspect and cgroup state for a single container."""
+    container_id = compose_container_id(root, compose_file, container_name, compose_env)
+    if not container_id:
+        return None
+
+    entry: dict = {
+        "container_name": container_name,
+        "container_id": container_id,
+    }
+
+    pid = 0
+    try:
+        inspect_raw = subprocess.run(
+            ["docker", "inspect", container_id],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+            env=compose_env,
+        )
+        if inspect_raw.returncode == 0 and inspect_raw.stdout.strip():
+            inspect_data = json.loads(inspect_raw.stdout)
+            if inspect_data and isinstance(inspect_data, list):
+                insp = inspect_data[0]
+                state = insp.get("State", {})
+                hc = insp.get("HostConfig", {})
+                entry["docker_state"] = {
+                    "status": state.get("Status", ""),
+                    "running": state.get("Running"),
+                    "exit_code": state.get("ExitCode"),
+                    "oom_killed": state.get("OOMKilled"),
+                    "started_at": state.get("StartedAt", ""),
+                    "finished_at": state.get("FinishedAt", ""),
+                    "error": state.get("Error", ""),
+                }
+                entry["docker_config"] = {
+                    "memory": hc.get("Memory", 0),
+                    "memory_swap": hc.get("MemorySwap", 0),
+                    "nano_cpus": hc.get("NanoCpus", 0),
+                    "cpu_quota": hc.get("CpuQuota", 0),
+                    "cpu_period": hc.get("CpuPeriod", 0),
+                    "cpuset_cpus": hc.get("CpusetCpus", ""),
+                }
+                pid = state.get("Pid", 0)
+    except Exception:
+        pid = 0
+
+    if pid and pid > 0:
+        try:
+            cgroup_paths = cgroup_paths_for_pid(pid)
+            entry["cgroup"] = {}
+            for controller, cgroup_file, key in [
+                ("memory", "memory.current", "memory_current"),
+                ("memory", "memory.max", "memory_max"),
+                ("memory", "memory.events", "memory_events"),
+                ("memory", "memory.peak", "memory_peak"),
+                ("cpu", "cpu.stat", "cpu_stat"),
+                ("cpu", "cpu.max", "cpu_max"),
+                ("cpu", "cpuset.cpus.effective", "cpuset_cpus_effective"),
+                ("pids", "pids.current", "pids_current"),
+                ("pids", "pids.events", "pids_events"),
+            ]:
+                try:
+                    base = cgroup_paths.get(controller) or cgroup_paths.get("unified")
+                    filepath = base / cgroup_file if base else None
+                    if filepath and filepath.exists():
+                        raw = filepath.read_text().strip()
+                        entry["cgroup"][key] = raw
+                except Exception:
+                    pass
+        except Exception as exc:
+            entry["cgroup_capture_error"] = str(exc)
+
+    try:
+        log_result = subprocess.run(
+            ["docker", "logs", "--tail", "50", container_id],
+            cwd=str(root), capture_output=True, text=True, timeout=10,
+            env=compose_env,
+        )
+        if log_result.returncode == 0:
+            entry["log_tail"] = log_result.stdout[-4000:] if len(log_result.stdout) > 4000 else log_result.stdout
+    except Exception:
+        pass
+
+    return entry
+
+
+def run_capture_to_str(root: Path, cmd: list[str], *, env: dict[str, str] | None = None) -> str | None:
+    """Run a command and return stdout as string, or None on failure."""
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(root), capture_output=True, text=True, timeout=15,
+            env=env,
+        )
+        if result.returncode == 0:
+            return result.stdout
+    except Exception:
+        pass
+    return None
 
 
 def collect_failure_diagnostics(
@@ -1435,6 +1664,59 @@ def write_run_outcome(
     )
 
 
+def write_artifact_validation(
+    run_dir: Path,
+    run_success: bool,
+    primary_outcome: str = "",
+    failure_class: str = "",
+    aggregation_status: str = "",
+) -> None:
+    """Write artifact_validation.json with sidecar presence and consistency checks.
+
+    Args:
+        run_dir: The run output directory.
+        run_success: Whether the run succeeded (affects strictness of checks).
+        primary_outcome: The primary run outcome (e.g., "completed", "failed_workload").
+        failure_class: Failure classification if run failed.
+        aggregation_status: Aggregation status (e.g., "complete_success", "partial_success").
+    """
+    try:
+        from resource_experiment_sidecars import validate_sidecars_exist, get_expected_files
+    except ImportError:
+        return
+
+    sidecar_result = validate_sidecars_exist(str(run_dir), run_success=run_success)
+    manifest_exists = (run_dir / "aggregation_manifest.json").exists()
+
+    payload = {
+        "checked_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "primary_outcome": primary_outcome,
+        "failure_class": failure_class,
+        "run_success": run_success,
+        "sidecar_validation": {
+            "valid": sidecar_result["valid"],
+            "present": sidecar_result["present"],
+            "missing": sidecar_result["missing"],
+            "empty": sidecar_result["empty"],
+        },
+        "aggregation": {
+            "attempted": aggregation_status != "",
+            "status": aggregation_status,
+            "manifest_exists": manifest_exists,
+        },
+        "clean_analysis_eligible": (
+            run_success
+            and sidecar_result["valid"]
+            and not sidecar_result["missing"]
+            and aggregation_status in ("complete_success", "")
+        ),
+    }
+    (run_dir / "artifact_validation.json").write_text(
+        json.dumps(payload, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
+
+
 def docker_inspect_one(
     root: Path,
     container_id: str,
@@ -1485,9 +1767,11 @@ def has_configured_resource_limit(entry: dict) -> bool:
     )
 
 
-def expected_singleton_limit_targets(layout: dict) -> list[dict]:
+def expected_singleton_limit_targets(layout: dict, *, resource_experiment: bool = False) -> list[dict]:
     targets: list[dict] = []
     for entry in containerized_singletons_from_layout(layout):
+        if resource_experiment and not entry.get("profiled_singleton", False):
+            continue
         if has_configured_resource_limit(entry):
             targets.append(entry)
     return targets
@@ -1517,8 +1801,9 @@ def verify_resource_limits(
 ) -> list[dict]:
     envelope = singleton_resource_envelope(args)
     artifact_path = run_dir / "resource_limits_verified.json"
+    is_resource_experiment = getattr(args, "resource_experiment", "none") != "none"
 
-    if not envelope["enabled"]:
+    if not envelope["enabled"] and not is_resource_experiment:
         artifact_path.write_text(
             json.dumps(
                 {
@@ -1536,15 +1821,28 @@ def verify_resource_limits(
 
     layout = json.loads(layout_path.read_text(encoding="utf-8"))
     containerized_singletons = containerized_singletons_from_layout(layout)
-    targets = expected_singleton_limit_targets(layout)
+    targets = expected_singleton_limit_targets(
+        layout,
+        resource_experiment=is_resource_experiment,
+    )
     records = []
     failures = []
 
     if not targets:
         failures.append("resource envelope was enabled but no constrained singleton workers were found in worker_layout.json")
+    if is_resource_experiment and len(targets) != args.profiled_singleton_count:
+        failures.append(
+            f"resource experiment expected {args.profiled_singleton_count} profiled singleton(s) "
+            f"but worker_layout.json contains {len(targets)} constrained profiled singleton(s)"
+        )
+    required_singletons = (
+        [entry for entry in containerized_singletons if entry.get("profiled_singleton", False)]
+        if is_resource_experiment
+        else containerized_singletons
+    )
     missing_limit_metadata = [
         entry.get("physical_worker_id", "<unknown>")
-        for entry in containerized_singletons
+        for entry in required_singletons
         if not has_configured_resource_limit(entry)
     ]
     if missing_limit_metadata:
@@ -1583,6 +1881,15 @@ def verify_resource_limits(
             messages.append("container id not found via docker compose ps")
             record = {
                 "physical_worker_id": service,
+                "worker_id": service,
+                "logical_client_id": (target.get("client_ids") or [""])[0],
+                "container_name": service,
+                "resource_profile_id": target.get("resource_profile_id", ""),
+                "experiment_kind": target.get("resource_experiment_type", ""),
+                "cpuset_cpus": target.get("cpuset_cpus", ""),
+                "memory_limit": target.get("resource_limit_memory", ""),
+                "memory_swap": target.get("resource_limit_memory_swap", ""),
+                "rayon_num_threads": target.get("rayon_num_threads", 0),
                 "expected": expected,
                 "observed": observed,
                 "checks": checks,
@@ -1598,6 +1905,15 @@ def verify_resource_limits(
             messages.append("docker inspect did not return container metadata")
             record = {
                 "physical_worker_id": service,
+                "worker_id": service,
+                "logical_client_id": (target.get("client_ids") or [""])[0],
+                "container_name": service,
+                "resource_profile_id": target.get("resource_profile_id", ""),
+                "experiment_kind": target.get("resource_experiment_type", ""),
+                "cpuset_cpus": target.get("cpuset_cpus", ""),
+                "memory_limit": target.get("resource_limit_memory", ""),
+                "memory_swap": target.get("resource_limit_memory_swap", ""),
+                "rayon_num_threads": target.get("rayon_num_threads", 0),
                 "expected": expected,
                 "observed": observed,
                 "checks": checks,
@@ -1661,6 +1977,15 @@ def verify_resource_limits(
 
         records.append({
             "physical_worker_id": service,
+            "worker_id": service,
+            "logical_client_id": (target.get("client_ids") or [""])[0],
+            "container_name": service,
+            "resource_profile_id": target.get("resource_profile_id", ""),
+            "experiment_kind": target.get("resource_experiment_type", ""),
+            "cpuset_cpus": target.get("cpuset_cpus", ""),
+            "memory_limit": target.get("resource_limit_memory", ""),
+            "memory_swap": target.get("resource_limit_memory_swap", ""),
+            "rayon_num_threads": target.get("rayon_num_threads", 0),
             "container_id": container_id,
             "expected": expected,
             "observed": observed,
@@ -1786,17 +2111,29 @@ class ResourceMonitor:
         self.thread: threading.Thread | None = None
         self.samples_path = run_dir / "resource_samples.jsonl"
         self.summary_path = run_dir / "resource_summary.csv"
+        self.raw_summary_path = run_dir / "resource_monitor_summary.csv"
         self.oom_events_path = run_dir / "oom_events.jsonl"
         self.warning_path = run_dir / "resource_monitor_warnings.txt"
         self.warnings: list[str] = []
         self.targets = [self._build_target(record) for record in targets]
         self.summary: dict[str, dict] = {
             target["physical_worker_id"]: {
+                "worker_id": target["worker_id"],
                 "physical_worker_id": target["physical_worker_id"],
+                "logical_client_id": target["logical_client_id"],
+                "container_name": target["container_name"],
                 "container_id": target["container_id"],
+                "experiment_kind": target["experiment_kind"],
+                "cpuset_cpus": target["cpuset_cpus"],
                 "resource_limit_cpus": target["resource_limit_cpus"],
                 "resource_limit_memory_bytes": target["resource_limit_memory_bytes"],
+                "memory_limit": target["memory_limit"],
+                "memory_swap": target["memory_swap"],
+                "rayon_num_threads": target["rayon_num_threads"],
+                "resource_profile_id": target.get("resource_profile_id", ""),
                 "samples": 0,
+                "timestamp_first_unix_ns": None,
+                "timestamp_last_unix_ns": None,
                 "max_memory_current": None,
                 "last_memory_current": None,
                 "memory_events_low": None,
@@ -1806,6 +2143,12 @@ class ResourceMonitor:
                 "memory_events_oom_kill": None,
                 "cpu_usage_usec_first": None,
                 "cpu_usage_usec_last": None,
+                "cpu_user_usec_first": None,
+                "cpu_user_usec_last": None,
+                "cpu_system_usec_first": None,
+                "cpu_system_usec_last": None,
+                "cpu_nr_periods_first": None,
+                "cpu_nr_periods_last": None,
                 "cpu_nr_throttled_first": None,
                 "cpu_nr_throttled_last": None,
                 "cpu_throttled_usec_first": None,
@@ -1826,11 +2169,20 @@ class ResourceMonitor:
         pid = int(state.get("Pid") or 0)
         cgroups = cgroup_paths_for_pid(pid) if pid > 0 else {}
         return {
+            "worker_id": record.get("worker_id", record.get("physical_worker_id", "")),
             "physical_worker_id": record.get("physical_worker_id", ""),
+            "logical_client_id": record.get("logical_client_id", ""),
+            "container_name": record.get("container_name", record.get("physical_worker_id", "")),
             "container_id": container_id,
+            "experiment_kind": record.get("experiment_kind", ""),
+            "cpuset_cpus": record.get("cpuset_cpus", ""),
             "resource_limit_cpus": expected.get("cpus"),
             "resource_limit_memory_bytes": expected.get("memory_bytes"),
+            "memory_limit": record.get("memory_limit", ""),
+            "memory_swap": record.get("memory_swap", ""),
+            "rayon_num_threads": record.get("rayon_num_threads", 0),
             "resource_profile": expected.get("resource_profile", ""),
+            "resource_profile_id": record.get("resource_profile_id", ""),
             "pid": pid,
             "cgroups": cgroups,
             "state": {
@@ -1921,11 +2273,17 @@ class ResourceMonitor:
             "timestamp": timestamp,
             "timestamp_unix_ns": time.time_ns(),
             "run_id": self.run_id,
+            "worker_id": target.get("worker_id"),
             "physical_worker_id": target.get("physical_worker_id"),
+            "logical_client_id": target.get("logical_client_id"),
+            "container_name": target.get("container_name"),
             "container_id": target.get("container_id"),
+            "experiment_kind": target.get("experiment_kind", ""),
+            "cpuset_cpus": target.get("cpuset_cpus", ""),
             "resource_limit_cpus": target.get("resource_limit_cpus"),
             "resource_limit_memory_bytes": target.get("resource_limit_memory_bytes"),
             "resource_profile": target.get("resource_profile", ""),
+            "resource_profile_id": target.get("resource_profile_id", ""),
             "memory.current": read_cgroup_scalar(memory_path / "memory.current") if memory_path else None,
             "memory.max": read_cgroup_scalar(memory_path / "memory.max") if memory_path else None,
             "memory.events.low": memory_events.get("low"),
@@ -1954,6 +2312,16 @@ class ResourceMonitor:
         row = self.summary[physical_id]
         row["samples"] += 1
 
+        ts_ns = sample.get("timestamp_unix_ns")
+        if ts_ns is not None:
+            if row["timestamp_first_unix_ns"] is None:
+                row["timestamp_first_unix_ns"] = ts_ns
+            row["timestamp_last_unix_ns"] = ts_ns
+
+        sample_pid = sample.get("resource_profile_id")
+        if sample_pid and not row.get("resource_profile_id"):
+            row["resource_profile_id"] = sample_pid
+
         memory_current = sample.get("memory.current")
         if isinstance(memory_current, int):
             row["last_memory_current"] = memory_current
@@ -1981,6 +2349,9 @@ class ResourceMonitor:
 
         for summary_key, sample_key in (
             ("cpu_usage_usec", "cpu.stat.usage_usec"),
+            ("cpu_user_usec", "cpu.stat.user_usec"),
+            ("cpu_system_usec", "cpu.stat.system_usec"),
+            ("cpu_nr_periods", "cpu.stat.nr_periods"),
             ("cpu_nr_throttled", "cpu.stat.nr_throttled"),
             ("cpu_throttled_usec", "cpu.stat.throttled_usec"),
         ):
@@ -2024,11 +2395,21 @@ class ResourceMonitor:
 
     def _write_summary(self) -> None:
         fieldnames = [
+            "worker_id",
             "physical_worker_id",
+            "logical_client_id",
+            "container_name",
             "container_id",
+            "resource_profile_id",
+            "experiment_kind",
+            "cpuset_cpus",
             "resource_limit_cpus",
             "resource_limit_memory_bytes",
+            "memory_limit",
+            "memory_swap",
+            "rayon_num_threads",
             "samples",
+            "elapsed_wall_ns",
             "max_memory_current",
             "last_memory_current",
             "memory_events_low",
@@ -2037,31 +2418,117 @@ class ResourceMonitor:
             "memory_events_oom",
             "memory_events_oom_kill",
             "cpu_usage_usec_delta",
+            "cpu_user_usec_delta",
+            "cpu_system_usec_delta",
+            "cpu_nr_periods_delta",
             "cpu_nr_throttled_delta",
             "cpu_throttled_usec_delta",
+            "throttled_period_fraction",
+            "cpu_usage_fraction",
+            "throttled_time_rate",
             "pids_current_max",
             "last_container_status",
             "last_container_exit_code",
             "last_container_oom_killed",
         ]
-        with self.summary_path.open("w", encoding="utf-8", newline="") as f:
+        canonical_rows = []
+        with self.raw_summary_path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for raw in self.summary.values():
                 row = dict(raw)
+                elapsed_wall_ns = delta(
+                    row.pop("timestamp_first_unix_ns"),
+                    row.pop("timestamp_last_unix_ns"),
+                )
+                row["elapsed_wall_ns"] = elapsed_wall_ns
                 row["cpu_usage_usec_delta"] = delta(
                     row.pop("cpu_usage_usec_first"),
                     row.pop("cpu_usage_usec_last"),
                 )
-                row["cpu_nr_throttled_delta"] = delta(
+                row["cpu_user_usec_delta"] = delta(
+                    row.pop("cpu_user_usec_first"),
+                    row.pop("cpu_user_usec_last"),
+                )
+                row["cpu_system_usec_delta"] = delta(
+                    row.pop("cpu_system_usec_first"),
+                    row.pop("cpu_system_usec_last"),
+                )
+                nr_periods_delta = delta(
+                    row.pop("cpu_nr_periods_first"),
+                    row.pop("cpu_nr_periods_last"),
+                )
+                row["cpu_nr_periods_delta"] = nr_periods_delta
+                nr_throttled_delta = delta(
                     row.pop("cpu_nr_throttled_first"),
                     row.pop("cpu_nr_throttled_last"),
                 )
-                row["cpu_throttled_usec_delta"] = delta(
+                row["cpu_nr_throttled_delta"] = nr_throttled_delta
+                throttled_usec_delta = delta(
                     row.pop("cpu_throttled_usec_first"),
                     row.pop("cpu_throttled_usec_last"),
                 )
+                row["cpu_throttled_usec_delta"] = throttled_usec_delta
+
+                if (nr_periods_delta is not None
+                        and isinstance(nr_periods_delta, (int, float))
+                        and nr_periods_delta > 0):
+                    row["throttled_period_fraction"] = round(
+                        float(nr_throttled_delta or 0) / float(nr_periods_delta), 6)
+                else:
+                    row["throttled_period_fraction"] = ""
+
+                elapsed_us = elapsed_wall_ns / 1000.0 if isinstance(elapsed_wall_ns, (int, float)) else 0
+                if elapsed_us > 0:
+                    delta_usage = row["cpu_usage_usec_delta"]
+                    if isinstance(delta_usage, (int, float)):
+                        row["cpu_usage_fraction"] = round(float(delta_usage) / elapsed_us, 6)
+                    else:
+                        row["cpu_usage_fraction"] = ""
+                    delta_throttled = row["cpu_throttled_usec_delta"]
+                    if isinstance(delta_throttled, (int, float)):
+                        row["throttled_time_rate"] = round(float(delta_throttled) / elapsed_us, 6)
+                    else:
+                        row["throttled_time_rate"] = ""
+                else:
+                    row["cpu_usage_fraction"] = ""
+                    row["throttled_time_rate"] = ""
+
                 writer.writerow({key: row.get(key) for key in fieldnames})
+
+                canonical_rows.append({
+                    "worker_id": row.get("worker_id", ""),
+                    "physical_worker_id": row.get("physical_worker_id", ""),
+                    "logical_client_id": row.get("logical_client_id", ""),
+                    "container_name": row.get("container_name", ""),
+                    "resource_profile_id": row.get("resource_profile_id", ""),
+                    "experiment_kind": row.get("experiment_kind", ""),
+                    "cpuset_cpus": row.get("cpuset_cpus", ""),
+                    "cpu_limit_cpus": row.get("resource_limit_cpus"),
+                    "memory_limit": row.get("memory_limit", ""),
+                    "memory_swap": row.get("memory_swap", ""),
+                    "rayon_num_threads": row.get("rayon_num_threads", 0),
+                    "sample_count": row.get("samples", 0),
+                    "max_memory_current": row.get("max_memory_current"),
+                    "last_memory_current": row.get("last_memory_current"),
+                    "memory_events_oom": row.get("memory_events_oom"),
+                    "memory_events_oom_kill": row.get("memory_events_oom_kill"),
+                    "cpu_usage_usec_delta": row.get("cpu_usage_usec_delta"),
+                    "cpu_nr_throttled_delta": row.get("cpu_nr_throttled_delta"),
+                    "cpu_throttled_usec_delta": row.get("cpu_throttled_usec_delta"),
+                    "cpu_throttled_time_fraction": row.get("throttled_period_fraction"),
+                    "max_thread_count": row.get("pids_current_max"),
+                    "max_process_count": "",
+                    "last_container_status": row.get("last_container_status", ""),
+                    "last_container_exit_code": row.get("last_container_exit_code"),
+                    "last_container_oom_killed": row.get("last_container_oom_killed"),
+                })
+
+        from resource_experiment_sidecars import SidecarWriter
+        SidecarWriter(str(self.run_dir)).write_resource_summary(
+            self.run_id,
+            canonical_rows,
+        )
 
 
 def external_worker_oom_dmesg_lines(text: str) -> list[str]:
@@ -2169,7 +2636,7 @@ def external_oom_monitor_targets(args: argparse.Namespace, root: Path) -> list[t
 def delta(first: int | None, last: int | None) -> int | None:
     if first is None or last is None:
         return None
-    return int(last) - int(first)
+    return max(0, int(last) - int(first))
 
 
 def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
@@ -2666,8 +3133,19 @@ def run_standalone_aggregation(
     run_dir: Path,
     layout_file: Optional[Path],
     workers_file: Optional[Path],
+    *,
+    allow_partial: bool = False,
+    manifest_path: Optional[Path] = None,
 ) -> int:
-    """Run the Rust aggregate_profiles binary."""
+    """Run the Rust aggregate_profiles binary.
+
+    Args:
+        run_dir: The run directory to aggregate.
+        layout_file: Optional path to worker_layout.json.
+        workers_file: Optional path to workers file.
+        allow_partial: If True, pass --allow-partial flag for failure-tolerant aggregation.
+        manifest_path: Optional path for aggregation manifest (defaults to run dir).
+    """
     root = repo_root()
     aggregate_binary = os.environ.get("OPENMLS_AGGREGATE_PROFILES_BINARY")
     if aggregate_binary:
@@ -2715,8 +3193,12 @@ def run_standalone_aggregation(
         cmd += ["--layout-file", str(layout_file)]
     if workers_file:
         cmd += ["--workers-file", str(workers_file)]
+    if allow_partial:
+        cmd += ["--allow-partial"]
+        manifest = manifest_path or (run_dir / "aggregation_manifest.json")
+        cmd += ["--manifest", str(manifest)]
 
-    print(f"[aggregate] running standalone aggregation", flush=True)
+    print(f"[aggregate] running standalone aggregation{' (partial mode)' if allow_partial else ''}", flush=True)
     try:
         result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
     except FileNotFoundError as exc:
@@ -2844,6 +3326,7 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "min_size": args.min_size,
             "max_size": args.max_size if args.max_size is not None else args.workers,
             "step_size": args.step_size,
+            "plateau_order": args.plateau_order,
             "roundtrips": args.roundtrips,
             "update_rounds": args.update_rounds,
             "max_update_samples_per_plateau": args.max_update_samples_per_plateau,
@@ -3038,6 +3521,9 @@ def main() -> int:
     resource_monitor_stopped = False
     external_oom_monitor: ExternalOomMonitor | None = None
     external_oom_monitor_stopped = False
+    resource_experiment = getattr(args, "resource_experiment", "none")
+    resource_experiment_state = None
+    preflight_passed = False
 
     compose_env = build_compose_env(args)
 
@@ -3165,19 +3651,26 @@ def main() -> int:
         if args.failure_experiment:
             generator_cmd.append("--failure-experiment")
 
-        resource_experiment = getattr(args, "resource_experiment", "none")
-
         # ── Affinity planning for resource experiments ───────────────
         if resource_experiment != "none":
             from generate_compose import worker_id, select_singleton_ids, compute_hybrid_layout
             from cpu_mask_util import cpu_list_to_docker_cpuset
-            from cpu_affinity_planner import create_affinity_plan, write_affinity_plan_json
+            from cpu_affinity_planner import (
+                create_affinity_plan,
+                validate_affinity_plan,
+                write_affinity_plan_json,
+            )
             from resource_profiles import (
                 generate_ram_sweep_profiles,
                 generate_cpu_matrix_profiles,
+                generate_embedded_budget_profiles,
+                generate_parallel_ram_sweep_profiles,
+                generate_parallel_cpu_sweep_profiles,
                 select_profile,
                 get_selected_profile,
                 get_selected_profile_index,
+                get_group_creator_profile,
+                get_group_creator_client_index,
             )
             from resource_experiment_sidecars import SidecarWriter
 
@@ -3202,7 +3695,7 @@ def main() -> int:
                     assigned_cpu_count=args.ram_sweep_cpu_count,
                     run_id=run_id,
                 )
-            else:
+            elif resource_experiment == "cpu-matrix-singleton":
                 core_vals = [int(v.strip()) for v in args.cpu_matrix_core_counts.split(",") if v.strip()]
                 frac_vals = [float(v.strip()) for v in args.cpu_matrix_capacity_fractions.split(",") if v.strip()]
                 profiles = generate_cpu_matrix_profiles(
@@ -3210,19 +3703,55 @@ def main() -> int:
                     capacity_fractions=frac_vals,
                     run_id=run_id,
                 )
+            elif resource_experiment == "ram-app-heap-sweep":
+                profiles = generate_parallel_ram_sweep_profiles(
+                    docker_memory_limit=getattr(args, "embedded_docker_memory", "4g"),
+                    assigned_cpu_count=1,
+                    run_id=run_id,
+                )
+            elif resource_experiment == "cpu-quota-sweep":
+                profiles = generate_parallel_cpu_sweep_profiles(
+                    assigned_cpu_count=1,
+                    run_id=run_id,
+                )
+            else:
+                heap_vals = [v.strip() for v in args.embedded_heap_budgets.split(",") if v.strip()]
+                core_vals = [int(v.strip()) for v in args.embedded_cpu_cores.split(",") if v.strip()]
+                frac_vals = [float(v.strip()) for v in args.embedded_cpu_fractions.split(",") if v.strip()]
+                profiles = generate_embedded_budget_profiles(
+                    heap_budgets=heap_vals,
+                    core_counts=core_vals,
+                    capacity_fractions=frac_vals,
+                    docker_memory_limit=args.embedded_docker_memory,
+                    run_id=run_id,
+                )
 
             # ── Select single profile for threshold mode ──
             profile_index = getattr(args, "resource_profile_index", None)
             profile_id = getattr(args, "resource_profile_id", None)
 
-            selected_profile = select_profile(
-                profiles,
-                profile_index=profile_index,
-                profile_id=profile_id,
-                profiled_singleton_count=args.profiled_singleton_count,
-            )
+            is_parallel_sweep = resource_experiment in ("ram-app-heap-sweep", "cpu-quota-sweep")
+
+            if is_parallel_sweep:
+                selected_profile = select_profile(
+                    profiles,
+                    profile_index=profile_index,
+                    profile_id=profile_id,
+                    profiled_singleton_count=args.profiled_singleton_count,
+                )
+            else:
+                selected_profile = select_profile(
+                    profiles,
+                    profile_index=profile_index,
+                    profile_id=profile_id,
+                    profiled_singleton_count=args.profiled_singleton_count,
+                )
             actual_profile_index = get_selected_profile_index(profiles)
-            selected_profile_id_str = selected_profile.resource_profile_id
+            selected_profile_id_str = (
+                selected_profile.resource_profile_id
+                if args.profiled_singleton_count == 1
+                else ""
+            )
 
             failure_policy = getattr(args, "resource_failure_policy", "stop-on-profiled-failure")
 
@@ -3233,26 +3762,55 @@ def main() -> int:
 
             profiled_specs = []
             profiled_cpu_counts = {}
-            profiled_rayon_counts = {}
-            is_ram_sweep = (resource_experiment == "ram-sweep-singleton")
+            assigned_profiles = []
 
-            for i, (wid, cid) in enumerate(zip(profiled_worker_ids, profiled_singleton_ids)):
-                profile = profiles[i % len(profiles)] if profiles else None
-                if is_ram_sweep:
-                    cpu_n = 0
-                    rayon_n = profile.assigned_cpu_count if profile else args.ram_sweep_cpu_count
+            if is_parallel_sweep:
+                gc_profile = get_group_creator_profile(profiles)
+                if gc_profile is not None and len(profiles) == 8:
+                    print(f"[parallel-sweep] Group creator: {gc_profile.resource_profile_id} "
+                          f"({gc_profile.group_creator_reason})", flush=True)
+                from resource_profiles import get_group_creator_client_index
+                gc_idx = get_group_creator_client_index(profiles)
+                if gc_idx is not None and gc_idx >= 0 and gc_idx < len(profiles):
+                    reordered_indices = [gc_idx] + [i for i in range(len(profiles)) if i != gc_idx]
                 else:
+                    reordered_indices = list(range(len(profiles)))
+
+                for i, (wid, cid) in enumerate(zip(profiled_worker_ids, profiled_singleton_ids)):
+                    profile_idx = reordered_indices[i % len(reordered_indices)]
+                    profile = profiles[profile_idx] if profiles else None
+                    assigned_profiles.append(profile)
                     cpu_n = profile.assigned_cpu_count if profile else 1
                     rayon_n = cpu_n
-                profiled_specs.append({
-                    "worker_id": wid,
-                    "container_name": f"worker-{cid}",
-                    "logical_client_id": cid,
-                    "experiment_kind": ekind,
-                    "resource_profile_id": profile.resource_profile_id if profile else "",
-                    "rayon_num_threads": rayon_n,
-                })
-                profiled_cpu_counts[wid] = cpu_n
+                    profiled_specs.append({
+                        "worker_id": wid,
+                        "container_name": f"worker-{cid}",
+                        "logical_client_id": cid,
+                        "experiment_kind": ekind,
+                        "resource_profile_id": profile.resource_profile_id if profile else "",
+                        "rayon_num_threads": rayon_n,
+                        "group_creator": getattr(profile, "group_creator", False) if profile else False,
+                    })
+                    profiled_cpu_counts[wid] = cpu_n
+            else:
+                for i, (wid, cid) in enumerate(zip(profiled_worker_ids, profiled_singleton_ids)):
+                    profile = (
+                        selected_profile
+                        if args.profiled_singleton_count == 1
+                        else profiles[i % len(profiles)]
+                    ) if profiles else None
+                    assigned_profiles.append(profile)
+                    cpu_n = profile.assigned_cpu_count if profile else 1
+                    rayon_n = cpu_n
+                    profiled_specs.append({
+                        "worker_id": wid,
+                        "container_name": f"worker-{cid}",
+                        "logical_client_id": cid,
+                        "experiment_kind": ekind,
+                        "resource_profile_id": profile.resource_profile_id if profile else "",
+                        "rayon_num_threads": rayon_n,
+                    })
+                    profiled_cpu_counts[wid] = cpu_n
 
             bg_specs = [
                 {"container_name": "ds", "container_role": "infrastructure"},
@@ -3260,6 +3818,14 @@ def main() -> int:
             ]
             if args.runner_in_docker:
                 bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
+
+            profiled_id_set = set(profiled_singleton_ids)
+            for cid in singleton_ids:
+                if cid not in profiled_id_set:
+                    bg_specs.append({
+                        "container_name": f"worker-{cid}",
+                        "container_role": "unprofiled_singleton",
+                    })
 
             packed_count = layout_info["packed_container_count"]
             for p in range(packed_count):
@@ -3269,7 +3835,7 @@ def main() -> int:
                 })
 
             affinity_mode = args.cpu_affinity_mode
-            if affinity_mode == "none":
+            if affinity_mode == "none" and resource_experiment not in ("ram-app-heap-sweep", "cpu-quota-sweep"):
                 affinity_mode = "profiled-nor-background"
 
             print(f"[affinity] Computing CPU affinity plan "
@@ -3286,13 +3852,20 @@ def main() -> int:
                 profiled_cpu_counts=profiled_cpu_counts,
             )
 
+            affinity_errors = validate_affinity_plan(plan)
+            if affinity_errors:
+                raise RuntimeError(
+                    "Invalid CPU affinity plan: " + "; ".join(affinity_errors)
+                )
+
             for w in plan.warnings:
                 print(f"[affinity] WARNING: {w}", flush=True)
 
             for i, pa in enumerate(plan.profiled_assignments):
-                if i < len(profiles):
-                    profiles[i].cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
-                    profiles[i].cpuset_mask_hex = pa.assigned_mask_hex
+                profile = assigned_profiles[i] if i < len(assigned_profiles) else None
+                if profile:
+                    profile.cpuset_cpus = cpu_list_to_docker_cpuset(pa.assigned_cpus)
+                    profile.cpuset_mask_hex = pa.assigned_mask_hex
                 print(f"[affinity]   {pa.container_name}: cpus={pa.assigned_cpus} "
                       f"rayon={pa.rayon_num_threads} profile={pa.resource_profile_id}")
 
@@ -3317,6 +3890,10 @@ def main() -> int:
                 "--ram-sweep-cpu-count", str(args.ram_sweep_cpu_count),
                 "--cpu-matrix-core-counts", args.cpu_matrix_core_counts,
                 "--cpu-matrix-capacity-fractions", args.cpu_matrix_capacity_fractions,
+                "--embedded-heap-budgets", args.embedded_heap_budgets,
+                "--embedded-cpu-fractions", args.embedded_cpu_fractions,
+                "--embedded-cpu-cores", args.embedded_cpu_cores,
+                "--embedded-docker-memory", args.embedded_docker_memory,
                 "--affinity-plan-file", plan_path,
                 "--resource-profiles-file", profiles_path,
             ]
@@ -3328,6 +3905,10 @@ def main() -> int:
                 "selected_profile": selected_profile,
                 "selected_profile_index": actual_profile_index,
                 "selected_profile_id": selected_profile_id_str,
+                "memory_model": getattr(selected_profile, "memory_model", ""),
+                "docker_memory_limit": getattr(selected_profile, "docker_memory_limit", None) or getattr(selected_profile, "memory_limit", ""),
+                "app_heap_budget": getattr(selected_profile, "app_heap_budget", "") or "",
+                "app_heap_budget_bytes": getattr(selected_profile, "app_heap_budget_bytes", 0) or 0,
                 "failure_policy": failure_policy,
                 "profiled_singleton_ids": profiled_singleton_ids,
                 "profiled_worker_ids": profiled_worker_ids,
@@ -3346,6 +3927,31 @@ def main() -> int:
         copy_if_exists(workers_host_tmp, run_dir / "workers.host.txt")
         copy_if_exists(layout_tmp, run_dir / "worker_layout.json")
         warn_if_neighbor_cache_tight(layout_tmp)
+
+        if resource_experiment_state is not None:
+            from resource_experiment_runner import build_worker_resource_assignments
+
+            state = resource_experiment_state
+            packed_names = [
+                f"worker-pack-{index:03d}" for index in range(state["packed_count"])
+            ]
+            infrastructure_names = ["ds", "relay"]
+            if args.runner_in_docker:
+                infrastructure_names.append("runner")
+            assignments = build_worker_resource_assignments(
+                run_id=run_id,
+                plan=state["plan"],
+                profiles=state["profiles"],
+                selected_profile_index=state["selected_profile_index"],
+                singleton_worker_ids=state["profiled_worker_ids"],
+                singleton_client_ids=state["profiled_singleton_ids"],
+                singleton_container_names=state["profiled_container_names"],
+                packed_container_names=packed_names,
+                infrastructure_container_names=infrastructure_names,
+            )
+            SidecarWriter(str(run_dir)).write_worker_resource_assignments(
+                run_id, assignments
+            )
 
         try:
             if args.startup_batch_size > 0:
@@ -3425,14 +4031,19 @@ def main() -> int:
             )
             time.sleep(args.post_startup_settle_seconds)
 
-        resource_targets = verify_resource_limits(
-            root=root,
-            compose_file=compose_tmp,
-            run_dir=run_dir,
-            layout_path=run_dir / "worker_layout.json",
-            args=args,
-            compose_env=compose_env,
-        )
+        if args.cpu_affinity_mode == "none" and resource_experiment in ("ram-app-heap-sweep", "cpu-quota-sweep"):
+            resource_targets = []
+            print("[resources] CPU affinity disabled in parallel sweep mode; "
+                  "skipping container resource limit verification", flush=True)
+        else:
+            resource_targets = verify_resource_limits(
+                root=root,
+                compose_file=compose_tmp,
+                run_dir=run_dir,
+                layout_path=run_dir / "worker_layout.json",
+                args=args,
+                compose_env=compose_env,
+            )
         if resource_targets and not args.no_resource_monitor:
             resource_monitor = ResourceMonitor(
                 root=root,
@@ -3570,98 +4181,114 @@ def main() -> int:
         # ── Resource experiment preflight ──────────────────────────
         resource_experiment_integration_obj = None
         preflight_passed = True
-        if resource_experiment != "none" and "resource_experiment_state" in dir():
+        if resource_experiment != "none" and resource_experiment_state is not None:
             state = resource_experiment_state  # noqa: F821
-            from preflight_checks import run_preflight as re_run_preflight
-            from resource_experiment_failures import build_run_status as re_build_run_status_pf
 
-            # Docker compose names containers as <project>-<service>-<replica>
-            profiled_names = [f"{project_name}-{name}-1" for name in state["profiled_container_names"]]
-            bg_names_raw = [s["container_name"] for s in state["bg_specs"]]
-            bg_names = [f"{project_name}-{name}-1" for name in bg_names_raw]
+            skip_preflight = (args.cpu_affinity_mode == "none"
+                              and resource_experiment in ("ram-app-heap-sweep", "cpu-quota-sweep"))
 
-            profiled_containers_preflight = []
-            for idx, name in enumerate(profiled_names):
-                short_name = state["profiled_container_names"][idx]
-                cpuset = ""
-                rayon = 0
-                for pa in state["plan"].profiled_assignments:
-                    if pa.container_name == short_name:
-                        cpuset = cpu_list_to_docker_cpuset(pa.assigned_cpus)
-                        rayon = pa.rayon_num_threads
-                        break
-                profiled_containers_preflight.append({
-                    "container_name": name,
-                    "container_role": "profiled_singleton",
-                    "expected_cpuset": cpuset,
-                    "expected_rayon_threads": rayon,
-                })
+            if skip_preflight:
+                print("[preflight] Skipping CPU affinity preflight in parallel sweep mode "
+                      "with cpu-affinity-mode=none", flush=True)
+                preflight_results = []
+                all_preflight_passed = True
 
-            bg_containers_preflight = []
-            bg_cpuset_str = cpu_list_to_docker_cpuset(state["plan"].background_cpus)
-            for name in bg_names:
-                bg_containers_preflight.append({
-                    "container_name": name,
-                    "container_role": "background",
-                    "expected_cpuset": bg_cpuset_str,
-                })
+            if not skip_preflight:
+                from preflight_checks import run_preflight as re_run_preflight
+                from resource_experiment_failures import build_run_status as re_build_run_status_pf
 
-            print("[preflight] Running CPU affinity preflight checks...", flush=True)
-            preflight_results, all_preflight_passed = re_run_preflight(
-                run_id=run_id,
-                profiled_containers=profiled_containers_preflight,
-                background_containers=bg_containers_preflight,
-                affinity_plan=state["plan"],
-            )
+                # Docker compose names containers as <project>-<service>-<replica>
+                profiled_names = [f"{project_name}-{name}-1" for name in state["profiled_container_names"]]
+                bg_names_raw = [s["container_name"] for s in state["bg_specs"]]
+                bg_names_raw = [name for name in bg_names_raw if name != "runner"]
+                bg_names = [f"{project_name}-{name}-1" for name in bg_names_raw]
 
-            sw_pf = SidecarWriter(str(run_dir))
-            sw_pf.write_preflight_results(run_id, preflight_results)
+                profiled_containers_preflight = []
+                for idx, name in enumerate(profiled_names):
+                    short_name = state["profiled_container_names"][idx]
+                    cpuset = ""
+                    rayon = 0
+                    for pa in state["plan"].profiled_assignments:
+                        if pa.container_name == short_name:
+                            cpuset = cpu_list_to_docker_cpuset(pa.assigned_cpus)
+                            rayon = pa.rayon_num_threads
+                            break
+                    profiled_containers_preflight.append({
+                        "container_name": name,
+                        "container_role": "profiled_singleton",
+                        "expected_cpuset": cpuset,
+                        "expected_rayon_threads": rayon,
+                    })
 
-            pf_summary = {
-                "run_id": run_id,
-                "all_passed": all_preflight_passed,
-                "fail_count": sum(1 for r in preflight_results if r.get("status") == "FAIL"),
-                "warn_count": sum(1 for r in preflight_results if r.get("status") == "WARN"),
-                "checked_container_count": len(preflight_results),
-                "checked_thread_count": 0,
-                "profiled_mask_hex": state["plan"].profiled_mask_hex,
-                "reserved_mask_hex": state["plan"].reserved_mask_hex,
-                "background_mask_hex": state["plan"].background_mask_hex,
-            }
-            pf_summary_path = run_dir / "cpu_affinity_preflight_summary.json"
-            with open(pf_summary_path, "w") as f:
-                json.dump(pf_summary, f, indent=2)
+                bg_containers_preflight = []
+                bg_cpuset_str = cpu_list_to_docker_cpuset(state["plan"].background_cpus)
+                for name in bg_names:
+                    bg_containers_preflight.append({
+                        "container_name": name,
+                        "container_role": "background",
+                        "expected_cpuset": bg_cpuset_str,
+                    })
 
-            if not all_preflight_passed:
-                preflight_passed = False
-                fail_rows = [r for r in preflight_results if r.get("status") == "FAIL"]
-                fail_msgs = "\n".join(
-                    f"  {r.get('check_name')}: {r.get('message')}" for r in fail_rows
-                )
-                print(f"[preflight] FAILED: {len(fail_rows)} check(s) failed:\n{fail_msgs}", flush=True)
-
-                sw_pf.write_run_status(run_id, re_build_run_status_pf(
+                print("[preflight] Running CPU affinity preflight checks...", flush=True)
+                preflight_results, all_preflight_passed = re_run_preflight(
                     run_id=run_id,
-                    run_mode=state["resource_experiment"],
-                    experiment_kind=state["experiment_kind"],
-                    run_success=False,
-                    worker_failures=[],
-                    resource_experiment=state["resource_experiment"],
-                    resource_failure_policy=state["failure_policy"],
-                    resource_profile_index=state["selected_profile_index"],
-                    resource_profile_id=state["selected_profile_id"],
-                    preflight_passed=False,
-                    output_validation_passed=False,
-                    notes=f"Affinity preflight failed: {fail_msgs}",
-                ))
-
-                raise RuntimeError(
-                    f"CPU affinity preflight failed with {len(fail_rows)} FAIL(s). "
-                    f"Workload blocked. See cpu_affinity_preflight.csv for details."
+                    profiled_containers=profiled_containers_preflight,
+                    background_containers=bg_containers_preflight,
+                    affinity_plan=state["plan"],
                 )
-            else:
-                print(f"[preflight] All {len(preflight_results)} checks PASSED "
-                      f"({pf_summary['warn_count']} warnings)", flush=True)
+
+                sw_pf = SidecarWriter(str(run_dir))
+                sw_pf.write_preflight_results(run_id, preflight_results)
+
+                pf_summary = {
+                    "run_id": run_id,
+                    "all_passed": all_preflight_passed,
+                    "fail_count": sum(1 for r in preflight_results if r.get("status") == "FAIL"),
+                    "warn_count": sum(1 for r in preflight_results if r.get("status") == "WARN"),
+                    "checked_container_count": len(preflight_results),
+                    "checked_thread_count": 0,
+                    "profiled_mask_hex": state["plan"].profiled_mask_hex,
+                    "reserved_mask_hex": state["plan"].reserved_mask_hex,
+                    "background_mask_hex": state["plan"].background_mask_hex,
+                }
+                pf_summary_path = run_dir / "cpu_affinity_preflight_summary.json"
+                with open(pf_summary_path, "w") as f:
+                    json.dump(pf_summary, f, indent=2)
+
+                if not all_preflight_passed:
+                    preflight_passed = False
+                    fail_rows = [r for r in preflight_results if r.get("status") == "FAIL"]
+                    fail_msgs = "\n".join(
+                        f"  {r.get('check_name')}: {r.get('message')}" for r in fail_rows
+                    )
+                    print(f"[preflight] FAILED: {len(fail_rows)} check(s) failed:\n{fail_msgs}", flush=True)
+
+                    sw_pf.write_run_status(run_id, re_build_run_status_pf(
+                        run_id=run_id,
+                        run_mode=state["resource_experiment"],
+                        experiment_kind=state["experiment_kind"],
+                        run_success=False,
+                        worker_failures=[],
+                        resource_experiment=state["resource_experiment"],
+                        resource_failure_policy=state["failure_policy"],
+                        resource_profile_index=state["selected_profile_index"],
+                        resource_profile_id=state["selected_profile_id"],
+                        preflight_passed=False,
+                        output_validation_passed=False,
+                        memory_model=state.get("memory_model", ""),
+                        docker_memory_limit=state.get("docker_memory_limit", ""),
+                        app_heap_budget=state.get("app_heap_budget", ""),
+                        app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
+                        notes=f"Affinity preflight failed: {fail_msgs}",
+                    ))
+
+                    raise RuntimeError(
+                        f"CPU affinity preflight failed with {len(fail_rows)} FAIL(s). "
+                        f"Workload blocked. See cpu_affinity_preflight.csv for details."
+                    )
+                else:
+                    print(f"[preflight] All {len(preflight_results)} checks PASSED "
+                          f"({pf_summary['warn_count']} warnings)", flush=True)
 
         # ── Benchmark command construction ──────────────────────────
 
@@ -3686,6 +4313,8 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                "--plateau-order",
+                args.plateau_order,
                 "--roundtrips",
                 str(args.roundtrips),
                 "--update-rounds",
@@ -3748,6 +4377,8 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                "--plateau-order",
+                args.plateau_order,
                 "--roundtrips",
                 str(args.roundtrips),
                 "--update-rounds",
@@ -3814,61 +4445,151 @@ def main() -> int:
             outcome_class, evidence = classify_failure_from_resource_summary(run_dir)
             evidence["runner_exit_code"] = exit_code
 
+            # ── Run partial aggregation on failure ──────────────────
+            try:
+                layout_file = run_dir / "worker_layout.json"
+                workers_file = run_dir / "workers.combined.txt"
+                agg_exit = run_standalone_aggregation(
+                    run_dir,
+                    layout_file if layout_file.exists() else None,
+                    workers_file if workers_file.exists() else None,
+                    allow_partial=True,
+                    manifest_path=run_dir / "aggregation_manifest.json",
+                )
+                if agg_exit != 0:
+                    print(f"[aggregate] partial aggregation exit={agg_exit}, continuing", flush=True)
+            except Exception as agg_exc:
+                print(f"[aggregate] partial aggregation exception: {agg_exc}", flush=True)
+
+            # ── Capture container evidence before cleanup ──────────
+            if resource_experiment != "none":
+                try:
+                    profiled_cnames = resource_experiment_state.get("profiled_container_names", []) if "resource_experiment_state" in dir() else []
+                    capture_failure_evidence(
+                        root=root,
+                        compose_file=compose_tmp,
+                        run_dir=run_dir,
+                        compose_env=compose_env,
+                        project_name=project_name,
+                        profiled_container_names=profiled_cnames + ["ds", "relay", "runner"],
+                    )
+                except Exception:
+                    pass
+
             # ── Write resource experiment failure sidecars ─────────
+            # Aggregate first so runner-events.jsonl is authoritative for both
+            # the operation cursor and the failure reason.
             if resource_experiment != "none":
                 try:
                     from resource_experiment_failures import (
+                        append_synthetic_runner_failure_event,
                         build_run_status as re_build_run_status,
-                        classify_worker_failure_from_resource_summary,
+                        collect_worker_failures_from_artifacts,
+                        write_synthetic_failure_events_csv,
                         worker_failure_info_to_dict,
-                        enrich_worker_failures_with_cursors,
                     )
                     from resource_experiment_sidecars import SidecarWriter as RESidecarWriter
 
                     sw_re = RESidecarWriter(str(run_dir))
                     state = resource_experiment_state  # noqa: F821
-
-                    worker_failures = []
                     summary_path = run_dir / "resource_summary.csv"
+                    resource_summaries = []
                     if summary_path.exists():
                         import csv as csv_mod
-                        with open(summary_path, newline="") as f:
-                            reader = csv_mod.DictReader(f)
-                            for row in reader:
-                                klass, info = classify_worker_failure_from_resource_summary(
-                                    row, str(run_dir / "oom_events.jsonl")
-                                )
-                                if klass != "completed_successfully":
-                                    info.worker_id = row.get("worker_id", "")
-                                    info.failure_timestamp_ns = int(time.time_ns())
-                                    worker_failures.append(info)
+                        with open(summary_path, newline="") as handle:
+                            resource_summaries = list(csv_mod.DictReader(handle))
 
-                    # ── Enrich with benchmark cursor from events.csv ─
                     events_path = run_dir / "events.csv"
-                    if events_path.exists() and worker_failures:
-                        enrich_worker_failures_with_cursors(worker_failures, str(events_path))
-
-                    failure_dicts = [worker_failure_info_to_dict(wf) for wf in worker_failures]
-                    if failure_dicts:
-                        sw_re.write_worker_failures(run_id, failure_dicts)
-
-                    run_status = re_build_run_status(
-                        run_id=run_id,
-                        run_mode=state["resource_experiment"],
-                        experiment_kind=state["experiment_kind"],
-                        run_success=False,
-                        worker_failures=worker_failures,
-                        resource_experiment=state["resource_experiment"],
-                        resource_failure_policy=state["failure_policy"],
-                        resource_profile_index=state["selected_profile_index"],
-                        resource_profile_id=state["selected_profile_id"],
-                        preflight_passed=preflight_passed,
-                        output_validation_passed=False,
-                        notes=f"Runner exit code {exit_code}",
+                    worker_failures = collect_worker_failures_from_artifacts(
+                        str(events_path),
+                        resource_summaries,
+                        str(run_dir / "oom_events.jsonl"),
+                        str(terminal_output_path),
                     )
-                    sw_re.write_run_status(run_id, run_status)
+                    app_heap_failures = [
+                        wf for wf in worker_failures
+                        if wf.failure_class in (
+                            "app_heap_budget_exceeded",
+                            "app_heap_budget_allocator_abort",
+                            "embedded_budget_timeout",
+                        )
+                    ]
+                    if app_heap_failures:
+                        outcome_class = app_heap_failures[0].failure_class
+                        evidence["app_heap_budget_failure"] = worker_failure_info_to_dict(
+                            app_heap_failures[0]
+                        )
+
+                    synthesized = False
+                    for worker_failure in worker_failures:
+                        if worker_failure.failure_timestamp_ns == 0:
+                            worker_failure.failure_timestamp_ns = int(time.time_ns())
+                        worker_failure.diagnostic_log_path = str(run_dir / "compose_services.log")
+                        if worker_failure.attribution_source in (
+                            "resource_monitor",
+                            "app_heap_budget_failure_payload",
+                        ):
+                            synthesized = append_synthetic_runner_failure_event(
+                                str(run_dir), worker_failure, str(events_path)
+                            ) or synthesized
+
+                    if synthesized:
+                        agg_exit = run_standalone_aggregation(
+                            run_dir,
+                            layout_file if layout_file.exists() else None,
+                            workers_file if workers_file.exists() else None,
+                            allow_partial=True,
+                            manifest_path=run_dir / "aggregation_manifest.json",
+                        )
+                        if agg_exit == 0:
+                            worker_failures = collect_worker_failures_from_artifacts(
+                                str(events_path),
+                                resource_summaries,
+                                str(run_dir / "oom_events.jsonl"),
+                                str(terminal_output_path),
+                            )
+                            for worker_failure in worker_failures:
+                                worker_failure.diagnostic_log_path = str(
+                                    run_dir / "compose_services.log"
+                                )
+
+                    write_synthetic_failure_events_csv(str(events_path), worker_failures)
+
+                    sw_re.write_worker_failures(
+                        run_id,
+                        [worker_failure_info_to_dict(wf) for wf in worker_failures],
+                    )
+                    sw_re.write_run_status(
+                        run_id,
+                        re_build_run_status(
+                            run_id=run_id,
+                            run_mode=state["resource_experiment"],
+                            experiment_kind=state["experiment_kind"],
+                            run_success=False,
+                            worker_failures=worker_failures,
+                            resource_experiment=state["resource_experiment"],
+                            resource_failure_policy=state["failure_policy"],
+                            resource_profile_index=state["selected_profile_index"],
+                            resource_profile_id=state["selected_profile_id"],
+                            preflight_passed=preflight_passed,
+                            output_validation_passed=False,
+                            memory_model=state.get("memory_model", ""),
+                            docker_memory_limit=state.get("docker_memory_limit", ""),
+                            app_heap_budget=state.get("app_heap_budget", ""),
+                            app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
+                            notes=f"Runner exit code {exit_code}",
+                        ),
+                    )
                 except Exception as re_exc:
                     print(f"[resource] Failed to write failure sidecars: {re_exc}", flush=True)
+
+            write_artifact_validation(
+                run_dir,
+                run_success=False,
+                primary_outcome="failed_workload",
+                failure_class=outcome_class,
+                aggregation_status="partial_success",
+            )
 
             write_run_outcome(run_dir, outcome_class, evidence)
             collect_failure_diagnostics(
@@ -3900,6 +4621,7 @@ def main() -> int:
 
         if not args.preflight_only:
             validate_artifacts(run_dir, args.worker_layout_mode)
+            write_integrated_aggregation_manifest(run_dir, run_id)
 
         # Stop external device workers
         if external_device_stop_required:
@@ -3917,10 +4639,8 @@ def main() -> int:
                 from resource_experiment_runner import build_worker_resource_assignments
                 from resource_experiment_failures import (
                     build_run_status as re_build_run_status,
-                    classify_worker_failure_from_resource_summary,
-                    WorkerFailureInfo,
+                    collect_worker_failures_from_artifacts,
                     worker_failure_info_to_dict,
-                    enrich_worker_failures_with_cursors,
                 )
                 from resource_experiment_sidecars import SidecarWriter as RESidecarWriter
 
@@ -3945,30 +4665,28 @@ def main() -> int:
                 )
                 sw_re.write_worker_resource_assignments(run_id, assignments)
 
-                worker_failures = []
                 summary_path = run_dir / "resource_summary.csv"
+                resource_summaries = []
                 if summary_path.exists():
                     import csv as csv_mod
-                    with open(summary_path, newline="") as f:
-                        reader = csv_mod.DictReader(f)
-                        for row in reader:
-                            klass, info = classify_worker_failure_from_resource_summary(
-                                row, str(run_dir / "oom_events.jsonl")
-                            )
-                            if klass != "completed_successfully":
-                                info.worker_id = row.get("worker_id", "")
-                                info.failure_timestamp_ns = int(time.time_ns())
-                                info.diagnostic_log_path = str(run_dir / "compose_logs.txt")
-                                worker_failures.append(info)
+                    with open(summary_path, newline="") as handle:
+                        resource_summaries = list(csv_mod.DictReader(handle))
 
-                # ── Enrich with benchmark cursor from events.csv ─
                 events_path = run_dir / "events.csv"
-                if events_path.exists() and worker_failures:
-                    enrich_worker_failures_with_cursors(worker_failures, str(events_path))
+                worker_failures = collect_worker_failures_from_artifacts(
+                    str(events_path),
+                    resource_summaries,
+                    str(run_dir / "oom_events.jsonl"),
+                    str(terminal_output_path),
+                )
+                for worker_failure in worker_failures:
+                    worker_failure.diagnostic_log_path = str(run_dir / "compose_services.log")
 
                 failure_dicts = [worker_failure_info_to_dict(wf) for wf in worker_failures]
                 if failure_dicts:
                     sw_re.write_worker_failures(run_id, failure_dicts)
+                else:
+                    sw_re.write_worker_failures(run_id, [])
 
                 run_status = re_build_run_status(
                     run_id=run_id,
@@ -3982,6 +4700,10 @@ def main() -> int:
                     resource_profile_id=state["selected_profile_id"],
                     preflight_passed=preflight_passed,
                     output_validation_passed=True,
+                    memory_model=state.get("memory_model", ""),
+                    docker_memory_limit=state.get("docker_memory_limit", ""),
+                    app_heap_budget=state.get("app_heap_budget", ""),
+                    app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
                     notes="",
                 )
                 sw_re.write_run_status(run_id, run_status)
@@ -3994,20 +4716,20 @@ def main() -> int:
             try:
                 run_strict_output_validation(root, run_dir)
             except Exception as val_exc:
-                print(f"[validate] Publication validation had issues (non-fatal): {val_exc}", flush=True)
-                if output_validation_passed:
-                    output_validation_passed = False
-                    if resource_experiment != "none":
-                        try:
-                            from resource_experiment_failures import build_run_status as re_build_run_status_pv
-                            from resource_experiment_sidecars import SidecarWriter as RESidecarWriter_pv
-                            sw_re2 = RESidecarWriter_pv(str(run_dir))
-                            state2 = resource_experiment_state  # noqa: F821
-                            rs = re_build_run_status_pv(
+                print(f"[validate] Publication validation FAILED: {val_exc}", flush=True)
+                output_validation_passed = False
+                if resource_experiment != "none":
+                    try:
+                        from resource_experiment_failures import build_run_status as re_build_run_status_pv
+                        from resource_experiment_sidecars import SidecarWriter as RESidecarWriter_pv
+                        state2 = resource_experiment_state  # noqa: F821
+                        RESidecarWriter_pv(str(run_dir)).write_run_status(
+                            run_id,
+                            re_build_run_status_pv(
                                 run_id=run_id,
                                 run_mode=state2["resource_experiment"],
                                 experiment_kind=state2["experiment_kind"],
-                                run_success=True,
+                                run_success=False,
                                 worker_failures=[],
                                 resource_experiment=state2["resource_experiment"],
                                 resource_failure_policy=state2["failure_policy"],
@@ -4015,11 +4737,21 @@ def main() -> int:
                                 resource_profile_id=state2["selected_profile_id"],
                                 preflight_passed=preflight_passed,
                                 output_validation_passed=False,
+                                memory_model=state2.get("memory_model", ""),
+                                docker_memory_limit=state2.get("docker_memory_limit", ""),
+                                app_heap_budget=state2.get("app_heap_budget", ""),
+                                app_heap_budget_bytes=state2.get("app_heap_budget_bytes", 0),
                                 notes=f"Publication validation: {val_exc}",
-                            )
-                            sw_re2.write_run_status(run_id, rs)
-                        except Exception:
-                            pass
+                            ),
+                        )
+                    except Exception:
+                        pass
+                write_run_outcome(
+                    run_dir,
+                    "output_validation_failure",
+                    {"publication_validator_error": str(val_exc)},
+                )
+                raise RuntimeError("Publication output validation failed") from val_exc
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 
@@ -4045,9 +4777,48 @@ def main() -> int:
                     capture_output=True, text=True, timeout=30,
                 )
                 if result.returncode != 0:
-                    print(f"[resource] Output validation WARNING: {result.stdout.strip()}", flush=True)
+                    validation_detail = (result.stdout + "\n" + result.stderr).strip()
+                    print(f"[resource] Output validation FAILED: {validation_detail}", flush=True)
+                    from resource_experiment_failures import build_run_status as re_build_run_status_ov
+                    from resource_experiment_sidecars import SidecarWriter as RESidecarWriter_ov
+                    state_ov = resource_experiment_state  # noqa: F821
+                    RESidecarWriter_ov(str(run_dir)).write_run_status(
+                        run_id,
+                        re_build_run_status_ov(
+                            run_id=run_id,
+                            run_mode=state_ov["resource_experiment"],
+                            experiment_kind=state_ov["experiment_kind"],
+                            run_success=False,
+                            worker_failures=[],
+                            resource_experiment=state_ov["resource_experiment"],
+                            resource_failure_policy=state_ov["failure_policy"],
+                            resource_profile_index=state_ov["selected_profile_index"],
+                            resource_profile_id=state_ov["selected_profile_id"],
+                            preflight_passed=preflight_passed,
+                            output_validation_passed=False,
+                            memory_model=state_ov.get("memory_model", ""),
+                            docker_memory_limit=state_ov.get("docker_memory_limit", ""),
+                            app_heap_budget=state_ov.get("app_heap_budget", ""),
+                            app_heap_budget_bytes=state_ov.get("app_heap_budget_bytes", 0),
+                            notes="Resource output validation failed",
+                        ),
+                    )
+                    write_run_outcome(
+                        run_dir,
+                        "output_validation_failure",
+                        {"validator_output": validation_detail},
+                    )
+                    raise RuntimeError("Resource experiment output validation failed")
                 else:
                     print(f"[resource] Output validation PASSED", flush=True)
+
+            # ── Write artifact validation on success ─────────────────
+            write_artifact_validation(
+                run_dir,
+                run_success=True,
+                primary_outcome="completed",
+                aggregation_status="complete_success" if not use_no_aggregate else "",
+            )
 
         print("")
         print(f"Run complete: {run_id}")
@@ -4056,67 +4827,173 @@ def main() -> int:
 
     except Exception as e:
         failure_seen = True
-        if not (run_dir / "benchmark_outcome.json").exists():
-            if isinstance(e, ResourceLimitVerificationError):
-                write_run_outcome(run_dir, "invalid_resource_envelope", {"error": str(e)})
-            else:
-                write_run_outcome(run_dir, "infrastructure_failure", {"error": str(e)})
+        if resource_monitor and not resource_monitor_stopped:
+            try:
+                resource_monitor.stop()
+                resource_monitor_stopped = True
+            except Exception as monitor_exc:
+                print(f"[resources] monitor stop failed during error handling: {monitor_exc}", flush=True)
+        if external_oom_monitor and not external_oom_monitor_stopped:
+            try:
+                external_oom_monitor.stop()
+                external_oom_monitor_stopped = True
+            except Exception as monitor_exc:
+                print(f"[resources] OOM monitor stop failed during error handling: {monitor_exc}", flush=True)
 
-            # ── Write resource experiment sidecars even on fatal error ─
+        fatal_outcome_class = "infrastructure_failure"
+        fatal_outcome_evidence = {"error": str(e)}
+        if isinstance(e, ResourceLimitVerificationError):
+            fatal_outcome_class = "invalid_resource_envelope"
+        elif (run_dir / "resource_summary.csv").exists():
+            classified_outcome, classified_evidence = classify_failure_from_resource_summary(run_dir)
+            if classified_outcome != "infrastructure_failure":
+                fatal_outcome_class = classified_outcome
+            fatal_outcome_evidence.update(classified_evidence)
+
+        existing_outcome_path = run_dir / "benchmark_outcome.json"
+        if existing_outcome_path.exists():
+            try:
+                existing_outcome = json.loads(existing_outcome_path.read_text(encoding="utf-8"))
+                fatal_outcome_class = existing_outcome.get("outcome_class", fatal_outcome_class)
+            except (OSError, json.JSONDecodeError):
+                pass
+
+        if not existing_outcome_path.exists():
+            write_run_outcome(run_dir, fatal_outcome_class, fatal_outcome_evidence)
+
+        try:
+            layout_file_fatal = run_dir / "worker_layout.json"
+            workers_file_fatal = run_dir / "workers.combined.txt"
+            run_standalone_aggregation(
+                run_dir,
+                layout_file_fatal if layout_file_fatal.exists() else None,
+                workers_file_fatal if workers_file_fatal.exists() else None,
+                allow_partial=True,
+                manifest_path=run_dir / "aggregation_manifest.json",
+            )
+        except Exception as agg_exc:
+            print(f"[aggregate] fatal-path partial aggregation failed: {agg_exc}", flush=True)
+
+        # ── Write resource experiment sidecars even on fatal error ─
+        if resource_experiment != "none" and resource_experiment_state is not None:
+            try:
+                from resource_experiment_failures import (
+                    append_synthetic_runner_failure_event,
+                    build_run_status as re_build_run_status_fatal,
+                    collect_worker_failures_from_artifacts,
+                    write_synthetic_failure_events_csv,
+                    worker_failure_info_to_dict,
+                )
+                from resource_experiment_sidecars import SidecarWriter as RESidecarWriter_fatal
+                sw_re_fatal = RESidecarWriter_fatal(str(run_dir))
+                state_fatal = resource_experiment_state  # noqa: F821
+
+                summary_path = run_dir / "resource_summary.csv"
+                resource_summaries_fatal = []
+                if summary_path.exists():
+                    import csv as csv_mod
+                    with open(summary_path, newline="") as handle:
+                        resource_summaries_fatal = list(csv_mod.DictReader(handle))
+                events_path = run_dir / "events.csv"
+                worker_failures_fatal = collect_worker_failures_from_artifacts(
+                    str(events_path),
+                    resource_summaries_fatal,
+                    str(run_dir / "oom_events.jsonl"),
+                    str(terminal_output_path),
+                )
+                for worker_failure in worker_failures_fatal:
+                    if worker_failure.failure_timestamp_ns == 0:
+                        worker_failure.failure_timestamp_ns = int(time.time_ns())
+                    worker_failure.diagnostic_log_path = str(run_dir / "compose_services.log")
+                synthesized_fatal = any(
+                    append_synthetic_runner_failure_event(
+                        str(run_dir), worker_failure, str(events_path)
+                    )
+                    for worker_failure in worker_failures_fatal
+                    if worker_failure.attribution_source in (
+                        "resource_monitor",
+                        "app_heap_budget_failure_payload",
+                    )
+                )
+                if synthesized_fatal:
+                    run_standalone_aggregation(
+                        run_dir,
+                        layout_file_fatal if layout_file_fatal.exists() else None,
+                        workers_file_fatal if workers_file_fatal.exists() else None,
+                        allow_partial=True,
+                        manifest_path=run_dir / "aggregation_manifest.json",
+                    )
+                    worker_failures_fatal = collect_worker_failures_from_artifacts(
+                        str(events_path),
+                        resource_summaries_fatal,
+                        str(run_dir / "oom_events.jsonl"),
+                        str(terminal_output_path),
+                    )
+                    for worker_failure in worker_failures_fatal:
+                        worker_failure.diagnostic_log_path = str(
+                            run_dir / "compose_services.log"
+                        )
+                write_synthetic_failure_events_csv(str(events_path), worker_failures_fatal)
+
+                sw_re_fatal.write_worker_failures(
+                    run_id,
+                    [worker_failure_info_to_dict(wf) for wf in worker_failures_fatal],
+                )
+
+                rs_fatal = re_build_run_status_fatal(
+                    run_id=run_id,
+                    run_mode=state_fatal["resource_experiment"],
+                    experiment_kind=state_fatal["experiment_kind"],
+                    run_success=False,
+                    worker_failures=worker_failures_fatal,
+                    resource_experiment=state_fatal["resource_experiment"],
+                    resource_failure_policy=state_fatal["failure_policy"],
+                    resource_profile_index=state_fatal["selected_profile_index"],
+                    resource_profile_id=state_fatal["selected_profile_id"],
+                    preflight_passed=preflight_passed,
+                    output_validation_passed=False,
+                    memory_model=state_fatal.get("memory_model", ""),
+                    docker_memory_limit=state_fatal.get("docker_memory_limit", ""),
+                    app_heap_budget=state_fatal.get("app_heap_budget", ""),
+                    app_heap_budget_bytes=state_fatal.get("app_heap_budget_bytes", 0),
+                    notes=f"Fatal error: {type(e).__name__}: {e}",
+                )
+                sw_re_fatal.write_run_status(run_id, rs_fatal)
+            except Exception as re_exc_fatal:
+                print(f"[resource] Failed to write fatal-error sidecars: {re_exc_fatal}", flush=True)
+
+        # ── Capture container evidence on fatal error ────────────
+        try:
+            profiled_cnames_fatal = []
             if resource_experiment != "none":
                 try:
-                    from resource_experiment_failures import (
-                        build_run_status as re_build_run_status_fatal,
-                        enrich_worker_failures_with_cursors,
-                    )
-                    from resource_experiment_sidecars import SidecarWriter as RESidecarWriter_fatal
-                    sw_re_fatal = RESidecarWriter_fatal(str(run_dir))
-                    state_fatal = resource_experiment_state  # noqa: F821
+                    profiled_cnames_fatal = resource_experiment_state.get("profiled_container_names", [])
+                except Exception:
+                    pass
+            capture_failure_evidence(
+                root=root,
+                compose_file=compose_tmp,
+                run_dir=run_dir,
+                compose_env=compose_env,
+                project_name=project_name,
+                profiled_container_names=profiled_cnames_fatal + ["ds", "relay", "runner"],
+            )
+        except Exception:
+            pass
 
-                    worker_failures_fatal = []
-                    summary_path = run_dir / "resource_summary.csv"
-                    if summary_path.exists():
-                        import csv as csv_mod
-                        with open(summary_path, newline="") as f:
-                            reader = csv_mod.DictReader(f)
-                            for row in reader:
-                                from resource_experiment_failures import (
-                                    classify_worker_failure_from_resource_summary,
-                                )
-                                klass, info = classify_worker_failure_from_resource_summary(
-                                    row, str(run_dir / "oom_events.jsonl")
-                                )
-                                if klass != "completed_successfully":
-                                    info.worker_id = row.get("worker_id", "")
-                                    info.failure_timestamp_ns = int(time.time_ns())
-                                    worker_failures_fatal.append(info)
+        # ── Write artifact validation on fatal error ────────────
+        if resource_experiment != "none":
+            try:
+                write_artifact_validation(
+                    run_dir,
+                    run_success=False,
+                    primary_outcome=fatal_outcome_class,
+                    failure_class=fatal_outcome_class,
+                    aggregation_status="",
+                )
+            except Exception:
+                pass
 
-                    events_path = run_dir / "events.csv"
-                    if events_path.exists() and worker_failures_fatal:
-                        enrich_worker_failures_with_cursors(worker_failures_fatal, str(events_path))
-
-                    if worker_failures_fatal:
-                        from resource_experiment_failures import worker_failure_info_to_dict
-                        failure_dicts_fatal = [worker_failure_info_to_dict(wf) for wf in worker_failures_fatal]
-                        sw_re_fatal.write_worker_failures(run_id, failure_dicts_fatal)
-
-                    rs_fatal = re_build_run_status_fatal(
-                        run_id=run_id,
-                        run_mode=state_fatal["resource_experiment"],
-                        experiment_kind=state_fatal["experiment_kind"],
-                        run_success=False,
-                        worker_failures=worker_failures_fatal,
-                        resource_experiment=state_fatal["resource_experiment"],
-                        resource_failure_policy=state_fatal["failure_policy"],
-                        resource_profile_index=state_fatal["selected_profile_index"],
-                        resource_profile_id=state_fatal["selected_profile_id"],
-                        preflight_passed=preflight_passed,
-                        output_validation_passed=False,
-                        notes=f"Fatal error: {type(e).__name__}: {e}",
-                    )
-                    sw_re_fatal.write_run_status(run_id, rs_fatal)
-                except Exception as re_exc_fatal:
-                    print(f"[resource] Failed to write fatal-error sidecars: {re_exc_fatal}", flush=True)
         print(
             f"[error] benchmark orchestration failed before cleanup: "
             f"{type(e).__name__}: {e}",

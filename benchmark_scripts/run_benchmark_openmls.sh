@@ -24,9 +24,9 @@ DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 cleanup_docker() {
   echo "===== Cleaning up all dangling containers / networks ====="
   # Remove any leftover OpenMLS containers
-  docker compose -f "$SCRIPT_DIR/OpenMLS_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
+  docker compose -f "$SCRIPT_DIR/../OpenMLS_containerized/docker-compose.yml" down --timeout 2 2>/dev/null || true
   # Nuke any leftover generated compose files
-  for f in "$SCRIPT_DIR/OpenMLS_containerized"/docker-compose_benchmark_*.yml; do
+  for f in "$SCRIPT_DIR/../OpenMLS_containerized"/docker-compose_benchmark_*.yml; do
     [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
   done
   # Force-remove any stray containers from mls-* images
@@ -59,7 +59,7 @@ run_openmls() {
   echo "  singleton_resource_envelope=cpus=0.25,memory=128m,memory_swap=128m"
   echo ""
 
-  cd "$SCRIPT_DIR/OpenMLS_containerized"
+  cd "$SCRIPT_DIR/../OpenMLS_containerized"
 
   OPENMLS_SERVICE_METRICS_WARN_IN_FLIGHT=512 \
   .venv/bin/python scripts/run_compose_benchmark.py \

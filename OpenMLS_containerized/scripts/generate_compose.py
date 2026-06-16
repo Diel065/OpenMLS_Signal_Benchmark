@@ -158,7 +158,14 @@ def build_parser() -> argparse.ArgumentParser:
     # ── Resource experiment flags ──────────────────────────────────────
     p.add_argument(
         "--resource-experiment",
-        choices=["none", "ram-sweep-singleton", "cpu-matrix-singleton"],
+        choices=[
+            "none",
+            "ram-sweep-singleton",
+            "cpu-matrix-singleton",
+            "embedded-budget-singleton",
+            "ram-app-heap-sweep",
+            "cpu-quota-sweep",
+        ],
         default="none",
         help="Resource experiment mode for simulated IoT container profiling",
     )
@@ -198,6 +205,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--cpu-matrix-capacity-fractions",
         default="0.25,0.50,0.75,1.00",
         help="Comma-separated list of capacity fractions for CPU matrix",
+    )
+    p.add_argument(
+        "--embedded-heap-budgets",
+        default="32k,64k,128k,256k,512k,1m,2m",
+        help="Comma-separated synthetic application heap budgets for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-cpu-fractions",
+        default="1.00,0.50,0.25,0.10,0.05",
+        help="Comma-separated Docker CPU fractions for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-cpu-cores",
+        default="1",
+        help="Comma-separated Docker CPU core counts for embedded-budget mode",
+    )
+    p.add_argument(
+        "--embedded-docker-memory",
+        default="256m",
+        help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     p.add_argument(
         "--resource-experiment-output-dir",
@@ -407,6 +434,10 @@ def singleton_resource_limits(args: argparse.Namespace) -> dict:
         "resource_limit_memory_swap_bytes": getattr(args, "singleton_memory_swap_bytes", None),
         "resource_limit_pids": getattr(args, "singleton_pids_limit", None),
         "resource_profile": profile,
+        "memory_model": "docker-cgroup" if profile else "",
+        "docker_memory_limit": getattr(args, "singleton_memory", None) or "",
+        "app_heap_budget": "",
+        "app_heap_budget_bytes": None,
     }
 
 
@@ -419,6 +450,10 @@ def empty_resource_limits() -> dict:
         "resource_limit_memory_swap_bytes": None,
         "resource_limit_pids": None,
         "resource_profile": "",
+        "memory_model": "",
+        "docker_memory_limit": "",
+        "app_heap_budget": "",
+        "app_heap_budget_bytes": None,
     }
 
 
@@ -461,6 +496,10 @@ def failure_experiment_resource_limits(
         "resource_limit_memory_swap_bytes": None,
         "resource_limit_pids": None,
         "resource_profile": profile,
+        "memory_model": "docker-cgroup",
+        "docker_memory_limit": memory,
+        "app_heap_budget": "",
+        "app_heap_budget_bytes": None,
         "failure_experiment": True,
     }
 
@@ -640,7 +679,7 @@ def build_hybrid_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
-            resource_limits=worker_limits,
+            resource_limits=dict(worker_limits),
         ))
         singleton_counter += 1
 
@@ -699,7 +738,7 @@ def build_legacy_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
-            resource_limits=configured_singleton_limits,
+            resource_limits=dict(configured_singleton_limits),
         ))
 
     return clients, physical_workers
@@ -1074,6 +1113,19 @@ def generate_compose_text(
                     affinity_plan, resource_profiles, singleton_idx, args,
                 ) or {}
                 singleton_idx += 1
+                if affinity_result:
+                    for key in ("resource_limit_cpus", "resource_limit_memory",
+                                "resource_limit_memory_bytes",
+                                "resource_limit_memory_swap", "resource_profile_id",
+                                "resource_limit_memory_swap_bytes",
+                                "resource_experiment_type", "cpu_capacity_fraction",
+                                "assigned_core_count", "profiled_singleton",
+                                "cpuset_cpus", "rayon_num_threads",
+                                "memory_model", "docker_memory_limit",
+                                "app_heap_budget", "app_heap_budget_bytes",
+                                "resource_profile_index"):
+                        if key in affinity_result:
+                            pw.resource_limits[key] = affinity_result[key]
             else:
                 limits = pw.resource_limits
                 if limits.get("resource_limit_cpus") is not None:
@@ -1118,6 +1170,20 @@ def generate_compose_text(
         if affinity_result.get("rayon_num_threads"):
             lines.append(f'      RAYON_NUM_THREADS: "{affinity_result["rayon_num_threads"]}"')
 
+        if affinity_result.get("memory_model"):
+            lines.append(f'      OPENMLS_MEMORY_MODEL: "{affinity_result["memory_model"]}"')
+        if affinity_result.get("docker_memory_limit"):
+            lines.append(f'      OPENMLS_DOCKER_MEMORY_LIMIT: "{affinity_result["docker_memory_limit"]}"')
+        if affinity_result.get("app_heap_budget"):
+            lines.append(f'      OPENMLS_APP_HEAP_BUDGET: "{affinity_result["app_heap_budget"]}"')
+        if affinity_result.get("app_heap_budget_bytes"):
+            lines.append(f'      OPENMLS_APP_HEAP_BUDGET_BYTES: "{affinity_result["app_heap_budget_bytes"]}"')
+        if affinity_result.get("resource_profile_id"):
+            lines.append(f'      OPENMLS_RESOURCE_PROFILE_ID: "{affinity_result["resource_profile_id"]}"')
+        resource_profile_index = affinity_result.get("resource_profile_index")
+        if resource_profile_index is not None and resource_profile_index != "":
+            lines.append(f'      OPENMLS_RESOURCE_PROFILE_INDEX: "{affinity_result["resource_profile_index"]}"')
+
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
             profile_csv = ",".join(pw.profile_enabled_client_ids)
             lines.append(f'      OPENMLS_PROFILE_ENABLED: "true"')
@@ -1156,6 +1222,19 @@ def generate_compose_text(
         lines.append("")
         lines.append("  runner:")
         lines.append("    image: mls-runner")
+        if affinity_plan:
+            runner_assignment = next(
+                (
+                    assignment
+                    for assignment in affinity_plan.get("background_assignments", [])
+                    if assignment.get("container_name") == "runner"
+                ),
+                None,
+            )
+            runner_cpus = (runner_assignment or {}).get("assigned_cpus", [])
+            if runner_cpus:
+                runner_cpuset = ",".join(str(cpu) for cpu in sorted(runner_cpus))
+                lines.append(f'    cpuset: "{runner_cpuset}"')
         lines.append("    profiles:")
         lines.append("      - runner")
         lines.append("    depends_on:")
@@ -1245,6 +1324,48 @@ def load_resource_profiles(args: argparse.Namespace) -> list | None:
         return None
 
 
+def restrict_profile_enabled_clients_to_affinity_selection(
+    clients: list[ClientLayoutEntry],
+    physical_workers: list[PhysicalWorkerEntry],
+    affinity_plan: dict | None,
+) -> None:
+    """For resource experiments, only the selected singleton(s) should emit profiles."""
+    selected_client_ids: set[str] = set()
+    selected_container_names: set[str] = set()
+    for assignment in (affinity_plan or {}).get("profiled_assignments", []):
+        logical_client_id = str(assignment.get("logical_client_id") or "").strip()
+        container_name = str(assignment.get("container_name") or "").strip()
+        if logical_client_id:
+            selected_client_ids.add(logical_client_id)
+        if container_name:
+            selected_container_names.add(container_name)
+
+    if not selected_client_ids and not selected_container_names:
+        return
+
+    for client in clients:
+        client.profile_enabled = (
+            client.container_mode == "singleton"
+            and (
+                client.client_id in selected_client_ids
+                or client.physical_worker_id in selected_container_names
+            )
+        )
+
+    for worker in physical_workers:
+        worker.profile_enabled_client_ids = [
+            client_id
+            for client_id in worker.client_ids
+            if (
+                worker.container_mode == "singleton"
+                and (
+                    client_id in selected_client_ids
+                    or worker.physical_worker_id in selected_container_names
+                )
+            )
+        ]
+
+
 def apply_affinity_to_compose(
     lines: list[str],
     physical_worker_id: str,
@@ -1270,22 +1391,51 @@ def apply_affinity_to_compose(
                     cpuset_str = ",".join(str(c) for c in sorted(cpus))
                     lines.append(f'    cpuset: "{cpuset_str}"')
                     result["cpuset"] = cpuset_str
+                    result["cpuset_cpus"] = cpuset_str
                 rayon = pa.get("rayon_num_threads", 0)
                 if rayon > 0:
                     result["rayon_num_threads"] = rayon
                 found_in_plan = True
                 break
 
-        if resource_profiles and profile_idx < len(resource_profiles):
-            rp = resource_profiles[profile_idx]
-            if rp.get("cpu_limit_cpus") is not None:
-                lines.append(f'    cpus: "{rp["cpu_limit_cpus"]}"')
-            if rp.get("memory_limit"):
-                lines.append(f'    mem_limit: "{rp["memory_limit"]}"')
-            if rp.get("memory_swap"):
-                lines.append(f'    memswap_limit: "{rp["memory_swap"]}"')
-            if not found_in_plan and rp.get("rayon_num_threads", 0) > 0:
-                result["rayon_num_threads"] = rp["rayon_num_threads"]
+        if resource_profiles and found_in_plan:
+            profile_id = pa.get("resource_profile_id", "")
+            rp = next((p for p in resource_profiles if p.get("resource_profile_id") == profile_id), None)
+            if rp is None and profile_idx < len(resource_profiles):
+                rp = resource_profiles[profile_idx]
+            if rp:
+                if rp.get("cpu_limit_cpus") is not None:
+                    lines.append(f'    cpus: "{rp["cpu_limit_cpus"]}"')
+                    result["resource_limit_cpus"] = rp["cpu_limit_cpus"]
+                if rp.get("memory_limit"):
+                    lines.append(f'    mem_limit: "{rp["memory_limit"]}"')
+                    result["resource_limit_memory"] = rp["memory_limit"]
+                    result["resource_limit_memory_bytes"] = parse_memory_bytes(rp["memory_limit"])
+                if rp.get("memory_swap"):
+                    lines.append(f'    memswap_limit: "{rp["memory_swap"]}"')
+                    result["resource_limit_memory_swap"] = rp["memory_swap"]
+                    result["resource_limit_memory_swap_bytes"] = parse_memory_bytes(rp["memory_swap"])
+                result["resource_profile_id"] = rp.get("resource_profile_id", profile_id)
+                result["resource_experiment_type"] = rp.get("experiment_kind", "")
+                result["cpu_capacity_fraction"] = rp.get("capacity_fraction")
+                result["assigned_core_count"] = rp.get("assigned_cpu_count")
+                result["memory_model"] = rp.get("memory_model", "")
+                result["docker_memory_limit"] = rp.get("docker_memory_limit") or rp.get("memory_limit", "")
+                result["app_heap_budget"] = rp.get("app_heap_budget", "")
+                result["app_heap_budget_bytes"] = rp.get("app_heap_budget_bytes", "")
+                result["resource_profile_index"] = rp.get("resource_profile_index", "")
+                result["profiled_singleton"] = True
+        elif not found_in_plan:
+            for ba in affinity_plan.get("background_assignments", []):
+                if ba.get("container_name") != physical_worker_id:
+                    continue
+                cpus = ba.get("assigned_cpus", [])
+                if cpus:
+                    cpuset_str = ",".join(str(c) for c in sorted(cpus))
+                    lines.append(f'    cpuset: "{cpuset_str}"')
+                    result["cpuset"] = cpuset_str
+                    result["cpuset_cpus"] = cpuset_str
+                break
 
     return result
 
@@ -1346,8 +1496,12 @@ def main() -> None:
             "physical_worker_count": args.workers,
         }
 
-    layout_json = generate_worker_layout_json(args, clients, physical_workers)
-    write_text(layout_out, json.dumps(layout_json, indent=2) + "\n")
+    if resource_experiment != "none" and affinity_plan:
+        restrict_profile_enabled_clients_to_affinity_selection(
+            clients,
+            physical_workers,
+            affinity_plan,
+        )
 
     compose_text = generate_compose_text(
         args, physical_workers,
@@ -1356,6 +1510,9 @@ def main() -> None:
         resource_experiment=resource_experiment,
     )
     write_text(compose_out, compose_text)
+
+    layout_json = generate_worker_layout_json(args, clients, physical_workers)
+    write_text(layout_out, json.dumps(layout_json, indent=2) + "\n")
     write_text(workers_out, generate_workers_internal(args, clients))
     write_text(workers_host_out, generate_workers_host(args, physical_workers))
 

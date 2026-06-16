@@ -37,8 +37,12 @@ RESOURCE_PROFILES_HEADER = [
     "run_id", "resource_profile_id", "experiment_kind",
     "resource_profile_index", "profile_label", "selected_for_this_run",
     "cpu_limit_cpus", "capacity_fraction", "assigned_cpu_count",
-    "memory_limit", "memory_swap", "rayon_num_threads",
+    "memory_limit", "memory_swap", "memory_model", "docker_memory_limit",
+    "app_heap_budget", "app_heap_budget_bytes", "rayon_num_threads",
     "cpuset_cpus", "cpuset_mask_hex", "cpuset_role", "profile_notes",
+    "sweep_kind", "app_heap_interpretation", "cpu_interpretation",
+    "cpu_period_us", "cpu_quota_us", "group_creator", "group_creator_reason",
+    "strict_cpuset_satisfied",
 ]
 
 WORKER_RESOURCE_ASSIGNMENTS_HEADER = [
@@ -47,8 +51,12 @@ WORKER_RESOURCE_ASSIGNMENTS_HEADER = [
     "resource_profile_index", "resource_profile_id", "experiment_kind",
     "selected_for_this_run", "cpu_affinity_role", "cpuset_cpus",
     "cpuset_mask_hex", "cpu_limit_cpus", "capacity_fraction",
-    "assigned_cpu_count", "memory_limit", "memory_swap", "rayon_num_threads",
+    "assigned_cpu_count", "memory_limit", "memory_swap", "memory_model",
+    "docker_memory_limit", "app_heap_budget", "app_heap_budget_bytes",
+    "rayon_num_threads",
     "background_cpuset_cpus", "background_mask_hex", "profile_label",
+    "sweep_kind", "app_heap_interpretation", "cpu_interpretation",
+    "group_creator", "group_creator_reason", "strict_cpuset_satisfied",
 ]
 
 PREFLIGHT_HEADER = [
@@ -73,21 +81,34 @@ RESOURCE_SUMMARY_HEADER = [
 WORKER_FAILURES_HEADER = [
     "run_id", "worker_id", "physical_worker_id", "logical_client_id",
     "container_name", "container_id", "resource_profile_id",
-    "experiment_kind", "failure_class", "failure_timestamp_ns",
+    "experiment_kind", "failure_class", "failure_detail",
+    "failure_evidence_source", "failure_evidence_detail", "failure_action",
+    "attribution_confidence", "attribution_source", "failure_timestamp_ns",
     "last_successful_phase", "last_successful_operation_family",
     "last_successful_benchmark_operation", "last_successful_member_count",
     "last_successful_epoch", "current_phase", "current_operation_family",
-    "current_benchmark_operation", "current_member_count", "current_epoch",
+    "current_benchmark_operation", "last_observed_span_name",
+    "last_observed_span_id", "current_member_count", "current_epoch",
+    "memory_model", "app_heap_budget", "app_heap_budget_bytes",
+    "heap_current_live_bytes", "heap_peak_live_bytes",
+    "heap_operation_peak_live_bytes", "heap_total_allocated_bytes",
+    "heap_allocation_count", "heap_deallocation_count",
+    "heap_failed_allocation_size_bytes",
     "container_exit_code", "container_oom_killed", "memory_events_oom",
     "memory_events_oom_kill", "max_memory_current",
     "cpu_nr_throttled_delta", "cpu_throttled_usec_delta",
-    "cpu_throttled_time_fraction", "diagnostic_log_path",
+    "cpu_throttled_time_fraction", "last_container_status",
+    "diagnostic_log_path",
+    "deadline_ns", "wall_ns", "sweep_kind", "cpu_period_us", "cpu_quota_us",
 ]
 
 RUN_STATUS_HEADER = [
     "run_id", "run_mode", "resource_experiment", "resource_failure_policy",
     "resource_profile_index", "resource_profile_id", "experiment_kind",
-    "run_status", "completed", "valid_for_threshold_analysis",
+    "memory_model", "docker_memory_limit", "app_heap_budget",
+    "app_heap_budget_bytes", "run_status", "completed",
+    "valid_for_threshold_analysis", "valid_for_embedded_heap_threshold_analysis",
+    "valid_for_docker_resource_analysis",
     "valid_for_clean_performance_plots", "valid_for_churn_recovery_analysis",
     "first_failure_timestamp_ns", "first_failed_worker_id",
     "first_failed_client_id", "first_failure_class",
@@ -95,14 +116,53 @@ RUN_STATUS_HEADER = [
     "first_failure_member_count", "first_failure_epoch",
     "last_successful_operation_family", "last_successful_benchmark_operation",
     "last_successful_member_count", "last_successful_epoch",
-    "preflight_passed", "resource_output_validation_passed", "notes",
+    "preflight_passed", "resource_output_validation_passed",
+    "sweep_kind", "strict_cpuset_satisfied", "notes",
 ]
 
-FORBIDDEN_COLUMN_SUBSTRINGS = ["_bytes", "pids_limit"]
+FORBIDDEN_COLUMN_SUBSTRINGS = ["pids_limit"]
 
 
 class ValidationError(Exception):
     pass
+
+
+def _safe_int(value) -> int:
+    try:
+        if value is None or value == "":
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def parse_memory_to_bytes(value: str) -> int:
+    raw = (value or "").strip().lower()
+    if not raw:
+        return 0
+    digits = ""
+    unit = ""
+    for ch in raw:
+        if ch.isdigit() and not unit:
+            digits += ch
+        else:
+            unit += ch
+    if not digits:
+        return 0
+    multiplier = {
+        "": 1,
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "kib": 1024,
+        "m": 1024 * 1024,
+        "mb": 1024 * 1024,
+        "mib": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+        "gib": 1024 * 1024 * 1024,
+    }.get(unit, 0)
+    return int(digits) * multiplier
 
 
 class Validator:
@@ -128,6 +188,8 @@ class Validator:
             self._check_run_status()
             self._check_selected_profile()
             self._check_cpuset_overlaps()
+            self._check_embedded_budget_run()
+            self._check_parallel_sweep_run()
             return len(self.errors) == 0
         except ValidationError:
             return False
@@ -207,6 +269,27 @@ class Validator:
                     background_mask = int(data.get("background_mask_hex", "0x0"), 16)
                     if (profiled_mask & background_mask) != 0:
                         self.error(f"{fname}: profiled_mask overlaps with background_mask")
+                    for assignment in data.get("profiled_assignments", []):
+                        assigned_cpus = assignment.get("assigned_cpus", [])
+                        assigned_count = int(assignment.get("assigned_cpu_count", 0) or 0)
+                        if not assigned_cpus or assigned_count < 1:
+                            self.error(
+                                f"{fname}: profiled worker "
+                                f"{assignment.get('worker_id', '<unknown>')} has no assigned CPU"
+                            )
+                        if assigned_count != len(assigned_cpus):
+                            self.error(
+                                f"{fname}: assigned_cpu_count={assigned_count} does not match "
+                                f"assigned_cpus={assigned_cpus}"
+                            )
+                        rayon = int(assignment.get("rayon_num_threads", 0) or 0)
+                        if rayon != assigned_count:
+                            self.error(
+                                f"{fname}: RAYON_NUM_THREADS={rayon} does not match "
+                                f"assigned_cpu_count={assigned_count}"
+                            )
+                    if data.get("background_assignments") and background_mask == 0:
+                        self.error(f"{fname}: background mask is empty")
 
             except json.JSONDecodeError as e:
                 self.error(f"{fname}: invalid JSON: {e}")
@@ -356,6 +439,240 @@ class Validator:
                             )
         except Exception as e:
             self.error(f"cpu_affinity_plan.json: {e}")
+
+    def _check_embedded_budget_run(self):
+        status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
+        if not status_rows:
+            return
+        status = status_rows[0]
+        is_embedded = (
+            status.get("resource_experiment") == "embedded-budget-singleton"
+            or status.get("experiment_kind") == "embedded_budget_singleton"
+        )
+        if not is_embedded:
+            return
+
+        required_sidecars = [
+            "worker_resource_assignments.csv",
+            "worker_failures.csv",
+            "run_status.csv",
+            "benchmark_outcome.json",
+            "events.csv",
+        ]
+        for fname in required_sidecars:
+            path = os.path.join(self.run_dir, fname)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                self.error(f"embedded-budget run missing required sidecar: {fname}")
+
+        if status.get("memory_model") != "app-heap-budget":
+            self.error("run_status.csv: embedded-budget run must use memory_model=app-heap-budget")
+        if status.get("valid_for_embedded_heap_threshold_analysis", "").lower() != "true":
+            self.error("run_status.csv: embedded-budget run must be valid for embedded heap threshold analysis")
+        if status.get("valid_for_docker_resource_analysis", "").lower() != "false":
+            self.error("run_status.csv: embedded-budget run must not be valid for Docker resource analysis")
+        if not status.get("app_heap_budget") or _safe_int(status.get("app_heap_budget_bytes")) <= 0:
+            self.error("run_status.csv: embedded-budget run must include app_heap_budget and bytes")
+
+        profiles = self._read_rows(os.path.join(self.run_dir, "resource_profiles.csv"))
+        selected_profiles = [
+            row for row in profiles
+            if (row.get("selected_for_this_run") or "").lower() in ("true", "1")
+        ]
+        if len(selected_profiles) != 1:
+            self.error(f"embedded-budget run must select exactly one resource profile, found {len(selected_profiles)}")
+            selected = selected_profiles[0] if selected_profiles else {}
+        else:
+            selected = selected_profiles[0]
+
+        if selected:
+            if selected.get("memory_model") != "app-heap-budget":
+                self.error("resource_profiles.csv: selected embedded profile must use memory_model=app-heap-budget")
+            if selected.get("experiment_kind") != "embedded_budget_singleton":
+                self.error("resource_profiles.csv: selected profile must be embedded_budget_singleton")
+            if selected.get("resource_profile_index") != status.get("resource_profile_index"):
+                self.error("selected resource_profile_index does not match run_status.csv")
+            if selected.get("resource_profile_id") != status.get("resource_profile_id"):
+                self.error("selected resource_profile_id does not match run_status.csv")
+
+            docker_memory = selected.get("docker_memory_limit") or selected.get("memory_limit")
+            docker_bytes = parse_memory_to_bytes(docker_memory)
+            app_bytes = _safe_int(selected.get("app_heap_budget_bytes"))
+            if docker_bytes < 6 * 1024 * 1024:
+                self.error("selected embedded profile Docker memory is below safe Linux/container minimum")
+            if app_bytes <= 0:
+                self.error("selected embedded profile missing app_heap_budget_bytes")
+            if docker_bytes and app_bytes and docker_bytes <= app_bytes:
+                self.error("selected embedded profile Docker memory must be above app heap budget")
+            if (selected.get("memory_limit") or "") == (selected.get("app_heap_budget") or ""):
+                self.error("selected embedded profile accidentally uses app heap budget as Docker memory limit")
+            if not selected.get("cpu_limit_cpus"):
+                self.error("selected embedded profile missing Docker CPU quota")
+            if not selected.get("cpuset_cpus"):
+                self.error("selected embedded profile missing cpuset_cpus")
+
+        assignments = self._read_rows(os.path.join(self.run_dir, "worker_resource_assignments.csv"))
+        selected_assignments = [
+            row for row in assignments
+            if (row.get("selected_for_this_run") or "").lower() in ("true", "1")
+        ]
+        profiled_singletons = [
+            row for row in assignments
+            if row.get("container_mode") == "singleton"
+            and (row.get("profile_enabled") or "").lower() in ("true", "1")
+        ]
+        if len(selected_assignments) != 1:
+            self.error(f"embedded-budget run must assign exactly one selected profiled singleton, found {len(selected_assignments)}")
+        if len(profiled_singletons) != 1:
+            self.error(f"embedded-budget run must have exactly one profiled singleton, found {len(profiled_singletons)}")
+        if selected_assignments:
+            assignment = selected_assignments[0]
+            if assignment.get("memory_model") != "app-heap-budget":
+                self.error("worker_resource_assignments.csv: selected assignment missing memory_model=app-heap-budget")
+            if not assignment.get("app_heap_budget"):
+                self.error("worker_resource_assignments.csv: selected assignment missing app_heap_budget")
+            if not assignment.get("cpu_limit_cpus"):
+                self.error("worker_resource_assignments.csv: selected assignment missing Docker CPU quota")
+            if not assignment.get("cpuset_cpus"):
+                self.error("worker_resource_assignments.csv: selected assignment missing cpuset")
+            if selected and assignment.get("resource_profile_index") != selected.get("resource_profile_index"):
+                self.error("worker assignment resource_profile_index does not match selected profile")
+            if selected and assignment.get("cpu_limit_cpus") != selected.get("cpu_limit_cpus"):
+                self.error("worker assignment CPU quota does not match selected profile")
+
+        failures = self._read_rows(os.path.join(self.run_dir, "worker_failures.csv"))
+        heap_failures = [row for row in failures if row.get("failure_class") == "app_heap_budget_exceeded"]
+        hard_oom_heap = [
+            row for row in failures
+            if row.get("failure_class") == "hard_ram_oom_kill"
+            and "APP_HEAP_BUDGET_EXCEEDED" in (row.get("failure_detail") or "")
+        ]
+        if hard_oom_heap:
+            self.error("worker_failures.csv misclassified app heap budget failure as hard_ram_oom_kill")
+
+        first_class = status.get("first_failure_class", "")
+        if first_class == "app_heap_budget_exceeded":
+            if not heap_failures:
+                self.error("run_status.csv reports app_heap_budget_exceeded but worker_failures.csv has no matching row")
+            if not status.get("first_failure_operation_family") or not status.get("first_failure_benchmark_operation"):
+                self.error("run_status.csv heap-budget failure lacks operation attribution")
+            for row in heap_failures:
+                if not row.get("current_operation_family") or not row.get("current_benchmark_operation"):
+                    self.error("worker_failures.csv heap-budget failure lacks operation attribution")
+                if _safe_int(row.get("heap_operation_peak_live_bytes")) <= 0:
+                    self.error("worker_failures.csv heap-budget failure lacks operation peak heap state")
+                if not row.get("app_heap_budget") or _safe_int(row.get("app_heap_budget_bytes")) <= 0:
+                    self.error("worker_failures.csv heap-budget failure lacks app heap budget")
+
+    def _check_parallel_sweep_run(self):
+        status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
+        if not status_rows:
+            return
+        status = status_rows[0]
+
+        sweep_kind = status.get("sweep_kind", "").strip()
+        if not sweep_kind:
+            return
+
+        is_ram = sweep_kind == "ram_app_heap_sweep"
+        is_cpu = sweep_kind == "cpu_quota_sweep"
+        if not is_ram and not is_cpu:
+            return
+
+        assignments = self._read_rows(os.path.join(self.run_dir, "worker_resource_assignments.csv"))
+        profiled_singletons = [
+            row for row in assignments
+            if row.get("container_mode") == "singleton"
+            and (row.get("profile_enabled") or "").lower() in ("true", "1")
+        ]
+
+        if len(profiled_singletons) != 8:
+            self.error(f"Parallel {sweep_kind} must have exactly 8 profiled singleton workers, found {len(profiled_singletons)}")
+
+        packed_profiled = [
+            row for row in assignments
+            if row.get("container_mode") == "packed"
+            and (row.get("profile_enabled") or "").lower() in ("true", "1")
+        ]
+        if packed_profiled:
+            self.error(f"Packed containers must not be profiled: {[r.get('container_name') for r in packed_profiled]}")
+
+        group_creator_singletons = [
+            row for row in profiled_singletons
+            if (row.get("group_creator") or "").lower() in ("true", "1")
+        ]
+        if len(group_creator_singletons) != 1:
+            self.error(f"Parallel {sweep_kind} must have exactly 1 group creator singleton, found {len(group_creator_singletons)}")
+
+        profiles = self._read_rows(os.path.join(self.run_dir, "resource_profiles.csv"))
+
+        if is_ram:
+            expected_heap_budgets = ["32k", "64k", "128k", "512k", "8m", "32m", "256m", "1g"]
+            profiled_budgets = sorted(
+                [r.get("app_heap_budget", "").strip().lower() for r in profiled_singletons if r.get("app_heap_budget")]
+            )
+            expected_sorted = sorted([b.lower() for b in expected_heap_budgets])
+            if profiled_budgets != expected_sorted:
+                self.error(f"RAM sweep profiled workers have wrong heap budgets: {profiled_budgets} vs expected {expected_sorted}")
+
+            for r in profiled_singletons:
+                if r.get("memory_model") != "app-heap-budget":
+                    self.error(f"RAM sweep worker {r.get('container_name')} must use memory_model=app-heap-budget")
+
+        if is_cpu:
+            expected_fractions = [1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
+            profiled_fractions = sorted(
+                [_safe_float(r.get("capacity_fraction")) for r in profiled_singletons if r.get("capacity_fraction")],
+                reverse=True,
+            )
+            for r in profiled_singletons:
+                ahb = r.get("app_heap_budget", "").strip().lower()
+                ahb_bytes = _safe_int(r.get("app_heap_budget_bytes"))
+                if "64" not in ahb and ahb_bytes < 64 * 1024 * 1024 * 1024:
+                    self.error(f"CPU sweep worker {r.get('container_name')} must use 64 GiB app heap budget")
+
+        online_cpus = self._get_online_cpu_count()
+        profiled_cpu_assignments = []
+        plan_path = os.path.join(self.run_dir, "cpu_affinity_plan.json")
+        if os.path.exists(plan_path):
+            try:
+                with open(plan_path) as f:
+                    plan = json.load(f)
+                for pa in plan.get("profiled_assignments", []):
+                    profiled_cpu_assignments.append(set(pa.get("assigned_cpus", [])))
+            except Exception:
+                pass
+
+        if profiled_cpu_assignments:
+            all_profiled_cpus = set()
+            for cset in profiled_cpu_assignments:
+                all_profiled_cpus |= cset
+            if len(all_profiled_cpus) < 8:
+                unique_cores = len(all_profiled_cpus)
+                msg = (
+                    f"Parallel {sweep_kind}: only {unique_cores} distinct profiled CPU cores available "
+                    f"(need 8). strict CPU isolation not verifiable on this host."
+                )
+                if online_cpus > 0 and online_cpus < 8:
+                    msg += f" Host has only {online_cpus} online CPUs."
+                self.warn(msg)
+            elif len(all_profiled_cpus) >= 8:
+                pass
+
+    def _get_online_cpu_count(self) -> int:
+        try:
+            from cpu_topology import get_online_cpu_list
+            return len(get_online_cpu_list())
+        except Exception:
+            return 0
+
+    def _read_rows(self, csv_path: str) -> List[Dict[str, str]]:
+        if not os.path.exists(csv_path):
+            return []
+        try:
+            with open(csv_path, newline="") as f:
+                return list(csv.DictReader(f))
+        except Exception:
+            return []
 
     def _read_column(self, csv_path: str, column_name: str) -> Set[str]:
         return {v for v in self._read_column_values(csv_path, column_name) if v}
