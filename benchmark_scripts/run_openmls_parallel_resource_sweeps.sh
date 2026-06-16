@@ -81,6 +81,11 @@ cleanup_docker() {
         [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
     done
     docker container ls -aq --filter "name=mls-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+    # Fix root-owned output from prior sudo runs
+    local outdir="$OPENMLS_DIR/benchmark_output"
+    if [ -d "$outdir" ] && [ "$(stat -c '%U' "$outdir")" = "root" ]; then
+        sudo chown -R "$(whoami):$(whoami)" "$outdir" 2>/dev/null || true
+    fi
 }
 
 run_parallel_sweep() {
@@ -143,13 +148,14 @@ run_parallel_sweep() {
         --force-cleanup-mls-ports
         --no-aggregate
         --resource-output-validation
+        --build-images
     )
 
     echo "[run] cd $OPENMLS_DIR && ${cmd[*]}"
     cd "$OPENMLS_DIR"
 
     local exit_code=0
-    "${cmd[@]}" 2>&1 | tee "$run_dir.log" || exit_code=$?
+    "${cmd[@]}" 2>&1 | tee "/tmp/${run_id}.log" || exit_code=$?
 
     cd "$SCRIPT_DIR"
 
