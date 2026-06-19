@@ -10,9 +10,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from resource_profiles import (
     ResourceProfile,
+    DOCKER_HARD_QUOTA_CPU_FLOOR,
+    CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US,
+    CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR,
     generate_ram_sweep_profiles,
     generate_cpu_matrix_profiles,
     generate_parallel_cpu_sweep_profiles,
+    generate_parallel_ram_sweep_profiles,
     validate_memory_string,
     parse_memory_to_bytes,
     profile_to_compose_dict,
@@ -156,29 +160,104 @@ class TestCpuMatrixProfiles:
 
 
 class TestParallelCpuSweepProfiles:
-    def test_default_cpu_sweep_uses_docker_valid_period(self):
+    DEFAULT_NEW_FRACTIONS = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
+
+    def test_default_cpu_sweep_fractions_are_new_values(self):
         profiles = generate_parallel_cpu_sweep_profiles()
-
         assert len(profiles) == 8
-        assert [p.capacity_fraction for p in profiles] == [
-            1.00, 0.50, 0.10, 0.05, 0.02, 0.01, 0.005, 0.002
-        ]
-        assert {p.cpu_period_us for p in profiles} == {1_000_000}
-        assert min(p.cpu_quota_us for p in profiles) == 2_000
+        assert [p.capacity_fraction for p in profiles] == self.DEFAULT_NEW_FRACTIONS
 
-    def test_rejects_fraction_set_requiring_invalid_cpu_period(self):
-        with pytest.raises(ValueError, match="above Docker's supported maximum"):
+    def test_default_cpu_sweep_period_is_one_million(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+        assert {p.cpu_period_us for p in profiles} == {1_000_000}
+        assert min(p.cpu_quota_us for p in profiles) == 10_000
+
+    def test_all_cpu_quotas_above_cgroup_floor(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+        for p in profiles:
+            assert p.cpu_quota_us >= CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US, (
+                f"Profile {p.profile_label} quota={p.cpu_quota_us} us "
+                f"below floor {CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US} us"
+            )
+
+    def test_all_applied_cpu_fractions_distinct(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+        effective = set()
+        for p in profiles:
+            if p.cpu_period_us > 0 and p.cpu_quota_us is not None:
+                effective.add(round(p.cpu_quota_us / p.cpu_period_us, 8))
+        assert len(effective) == 8, f"Found {len(effective)} distinct effective CPU fractions, expected 8"
+
+    def test_cpu_sweep_app_heap_budget_is_64g_non_limiting(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+        for p in profiles:
+            assert p.app_heap_budget == "64g"
+            assert "non-limiting" in p.app_heap_interpretation.lower()
+
+    def test_group_creator_is_highest_fraction(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+        gc = [p for p in profiles if p.group_creator]
+        assert len(gc) == 1
+        assert gc[0].capacity_fraction == 1.00
+        assert "highest-valued profiled worker" in gc[0].group_creator_reason
+
+    def test_rejects_sub_floor_cpu_fraction(self):
+        with pytest.raises(ValueError, match="below the supported validated floor"):
+            generate_parallel_cpu_sweep_profiles(
+                cpu_fractions=[1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.005]
+            )
+
+    def test_rejects_duplicate_cpu_fractions(self):
+        with pytest.raises(ValueError, match="must be distinct"):
+            generate_parallel_cpu_sweep_profiles(
+                cpu_fractions=[1.00, 0.75, 0.50, 0.50, 0.10, 0.05, 0.02, 0.01]
+            )
+
+    def test_rejects_sub_floor_fractions_before_period_scaling(self):
+        with pytest.raises(ValueError, match="below the supported validated floor"):
             generate_parallel_cpu_sweep_profiles(
                 cpu_fractions=[1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
             )
 
     def test_parallel_cpu_profile_to_compose_emits_period_and_quota(self):
-        profile = generate_parallel_cpu_sweep_profiles()[7]
+        profiles = generate_parallel_cpu_sweep_profiles()
+        profile = profiles[-1]  # 0.01 fraction
         compose = profile_to_compose_dict(profile)
-
         assert compose["cpu_period"] == "1000000"
-        assert compose["cpu_quota"] == "2000"
+        assert compose["cpu_quota"] == "10000"
         assert "cpus" not in compose
+
+    def test_cgroup_floor_constant_is_correct(self):
+        assert CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US == 10000
+        assert CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR == 1.0
+
+    def test_hard_quota_cpu_floor_constant(self):
+        assert DOCKER_HARD_QUOTA_CPU_FLOOR == 0.01
+
+
+class TestParallelRamSweepProfiles:
+    def test_ram_sweep_has_8_default_profiles(self):
+        profiles = generate_parallel_ram_sweep_profiles()
+        assert len(profiles) == 8
+
+    def test_ram_sweep_group_creator_is_largest_heap(self):
+        profiles = generate_parallel_ram_sweep_profiles()
+        gc = [p for p in profiles if p.group_creator]
+        assert len(gc) == 1
+        assert gc[0].app_heap_budget == "1g"
+        assert "highest-valued profiled worker" in gc[0].group_creator_reason
+
+    def test_ram_sweep_default_heap_budgets(self):
+        profiles = generate_parallel_ram_sweep_profiles()
+        budgets = [p.app_heap_budget for p in profiles]
+        assert budgets == ["32k", "64k", "128k", "512k", "8m", "32m", "256m", "1g"]
+
+    def test_ram_sweep_unaffected_by_cpu_fix(self):
+        profiles = generate_parallel_ram_sweep_profiles()
+        for p in profiles:
+            assert p.cpu_limit_cpus == 1.0
+            assert p.capacity_fraction == 1.0
+            assert "non-limiting" in p.cpu_interpretation.lower()
 
 
 class TestMemoryValidation:

@@ -490,10 +490,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--cpu-sweep-fractions",
-        default="1.00,0.50,0.10,0.05,0.02,0.01,0.005,0.002",
+        default="1.00,0.75,0.50,0.25,0.10,0.05,0.02,0.01",
         help=(
             "Comma-separated 8 Docker CPU fractions for cpu-quota-sweep. "
-            "Defaults stay within Docker CFS cpu_period/cpu_quota limits."
+            "Defaults stay within Docker CFS cpu_period/cpu_quota limits. "
+            "All fractions must be >= 0.01 (Docker hard-quota floor)."
         ),
     )
     p.add_argument(

@@ -405,7 +405,7 @@ def validate_affinity_plan(plan: AffinityPlan) -> List[str]:
         )
 
     if not plan.background_cpus and plan.background_assignments:
-        errors.append(
+        plan.warnings.append(
             "Background mask is empty but background containers are assigned"
         )
 

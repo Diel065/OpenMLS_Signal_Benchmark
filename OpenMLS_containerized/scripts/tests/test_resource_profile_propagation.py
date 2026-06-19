@@ -468,9 +468,9 @@ class TestComposeGenerationPropagation:
         )
 
         joined = "\n".join(lines)
-        assert 'cpu_quota: "2000"' in joined
+        assert 'cpu_quota: "10000"' in joined
         assert 'cpu_period: "1000000"' in joined
-        assert result.get("resource_profile_id") == "cpu_quota_0p002"
+        assert result.get("resource_profile_id") == "cpu_quota_0p01"
 
     def test_compose_profile_matches_affinity_plan(self):
         profiles = generate_ram_sweep_profiles(

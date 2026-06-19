@@ -252,6 +252,7 @@ def test_embedded_validator_accepts_auditable_minimal_run(tmp_path):
                 "rayon_num_threads", "background_cpuset_cpus", "background_mask_hex",
                 "profile_label",
                 "sweep_kind", "app_heap_interpretation", "cpu_interpretation",
+                "cpu_period_us", "cpu_quota_us",
                 "group_creator", "group_creator_reason", "strict_cpuset_satisfied",
             ],
             [{

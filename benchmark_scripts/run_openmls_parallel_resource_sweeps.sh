@@ -8,7 +8,7 @@
 #
 # Two sweep types:
 #   SWEEP=ram:  8 app-heap budgets (32k..1g), Docker memory held high
-#   SWEEP=cpu:  8 Docker CPU fractions (default: 1.00..0.002), app-heap held high
+#   SWEEP=cpu:  8 Docker CPU fractions (default: 1.00..0.01), app-heap held high
 #   SWEEP=both: run both sweep types
 #
 # Usage:
@@ -54,27 +54,28 @@ WORKER_HTTP_POOL=64
 WORKER_OUTBOUND_PERMITS=32
 FANOUT_PARALLELISM=128
 FANOUT_MIN=16
-CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.50,0.10,0.05,0.02,0.01,0.005,0.002}"
+CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.02,0.01}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
 log()   { printf '\n===== %s =====\n' "$*"; }
 warn()  { printf 'WARN: %s\n' "$*" >&2; }
 
+ONLINE_CPUS=0
+
 check_cpu_cores() {
-    local online
-    online="$(nproc 2>/dev/null || echo 0)"
-    echo "[cpu] Online CPU cores on this host: $online"
-    if [ "$online" -lt 8 ]; then
+    ONLINE_CPUS="$(nproc 2>/dev/null || echo 0)"
+    echo "[cpu] Online CPU cores on this host: $ONLINE_CPUS"
+    if [ "$ONLINE_CPUS" -lt 8 ]; then
         if [ "$STRICT_CPUSET" = "1" ]; then
-            echo "ERROR: Strict cpuset mode requires >= 8 online cores, have $online"
+            echo "ERROR: Strict cpuset mode requires >= 8 online cores, have $ONLINE_CPUS"
             exit 1
         fi
-        warn "Host has fewer than 8 online CPU cores ($online). Strict isolation not achievable."
-    elif [ "$online" -lt 12 ]; then
-        warn "Host has only $online cores. 8 profiled + background need > 8 ideally."
+        warn "Host has fewer than 8 online CPU cores ($ONLINE_CPUS). Strict isolation not achievable."
+    elif [ "$ONLINE_CPUS" -lt 12 ]; then
+        warn "Host has only $ONLINE_CPUS cores. 8 profiled + background need > 8 ideally."
     else
-        echo "[cpu] $online cores available — sufficient for 8 profiled + background."
+        echo "[cpu] $ONLINE_CPUS cores available — sufficient for 8 profiled + background."
     fi
 }
 
@@ -104,7 +105,12 @@ run_parallel_sweep() {
     echo "  Strict cpuset: $STRICT_CPUSET"
 
     local affinity_mode="none"
-    [ "$STRICT_CPUSET" = "1" ] && affinity_mode="profiled-nor-background"
+    if [ "$ONLINE_CPUS" -ge 8 ]; then
+        affinity_mode="profiled-nor-background"
+        echo "  CPU affinity: $affinity_mode ($ONLINE_CPUS cores available)"
+    else
+        echo "  CPU affinity: $affinity_mode (only $ONLINE_CPUS cores; strict isolation unavailable)"
+    fi
 
     local scenario_seed singleton_selection_seed
     scenario_seed="$(shuf -i 1-2155583647 -n 1)"

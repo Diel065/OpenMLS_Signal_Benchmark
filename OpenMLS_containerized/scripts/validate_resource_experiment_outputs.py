@@ -56,6 +56,7 @@ WORKER_RESOURCE_ASSIGNMENTS_HEADER = [
     "rayon_num_threads",
     "background_cpuset_cpus", "background_mask_hex", "profile_label",
     "sweep_kind", "app_heap_interpretation", "cpu_interpretation",
+    "cpu_period_us", "cpu_quota_us",
     "group_creator", "group_creator_reason", "strict_cpuset_satisfied",
 ]
 
@@ -298,7 +299,7 @@ class Validator:
                                 f"assigned_cpu_count={assigned_count}"
                             )
                     if data.get("background_assignments") and background_mask == 0:
-                        self.error(f"{fname}: background mask is empty")
+                        self.warn(f"{fname}: background mask is empty (background containers share CPUs with profiled workers)")
 
             except json.JSONDecodeError as e:
                 self.error(f"{fname}: invalid JSON: {e}")
@@ -634,6 +635,19 @@ class Validator:
             if profiled_budgets != expected_sorted:
                 self.error(f"RAM sweep profiled workers have wrong heap budgets: {profiled_budgets} vs expected {expected_sorted}")
 
+            group_creators = [
+                r for r in profiled_singletons
+                if (r.get("group_creator") or "").lower() in ("true", "1")
+            ]
+            if group_creators:
+                gc = group_creators[0]
+                gc_budget = (gc.get("app_heap_budget") or "").strip().lower()
+                if gc_budget != "1g":
+                    self.error(
+                        f"RAM sweep group creator has heap budget '{gc_budget}', "
+                        f"but must be the 1 GiB app-heap worker"
+                    )
+
             for r in profiled_singletons:
                 if r.get("memory_model") != "app-heap-budget":
                     self.error(f"RAM sweep worker {r.get('container_name')} must use memory_model=app-heap-budget")
@@ -657,6 +671,42 @@ class Validator:
                     f"CPU sweep profiled workers have wrong CPU fractions: "
                     f"{profiled_fractions} vs selected profiles {selected_profile_fractions}"
                 )
+
+            for fraction in profiled_fractions:
+                if fraction < 0.01:
+                    self.error(
+                        f"CPU sweep contains requested fraction {fraction} which is below "
+                        f"the Docker hard-quota floor 0.01. This profile is not valid on this "
+                        f"benchmark configuration."
+                    )
+
+            distinct_effective = set()
+            for r in profiled_singletons:
+                cpu_quota_us = _safe_int(r.get("cpu_quota_us"))
+                cpu_period_us = _safe_int(r.get("cpu_period_us"))
+                if cpu_period_us > 0:
+                    effective = cpu_quota_us / cpu_period_us
+                    distinct_effective.add(round(effective, 8))
+            if len(distinct_effective) < len(profiled_singletons):
+                self.error(
+                    f"CPU sweep has collapsed CPU profiles: only {len(distinct_effective)} "
+                    f"distinct effective CPU fractions among {len(profiled_singletons)} profiled "
+                    f"workers. Check cgroup cpu.max floor enforcement."
+                )
+
+            group_creators = [
+                r for r in profiled_singletons
+                if (r.get("group_creator") or "").lower() in ("true", "1")
+            ]
+            if group_creators:
+                gc = group_creators[0]
+                gc_fraction = _safe_float(gc.get("capacity_fraction"))
+                if gc_fraction < 0.99:
+                    self.error(
+                        f"CPU sweep group creator has CPU fraction {gc_fraction}, "
+                        f"but must be the 1.00 CPU worker"
+                    )
+
             for r in profiled_singletons:
                 ahb = r.get("app_heap_budget", "").strip().lower()
                 ahb_bytes = _safe_int(r.get("app_heap_budget_bytes"))

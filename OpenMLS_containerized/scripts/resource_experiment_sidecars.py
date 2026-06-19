@@ -77,6 +77,8 @@ WORKER_RESOURCE_ASSIGNMENTS_HEADER = [
     "sweep_kind",
     "app_heap_interpretation",
     "cpu_interpretation",
+    "cpu_period_us",
+    "cpu_quota_us",
     "group_creator",
     "group_creator_reason",
     "strict_cpuset_satisfied",

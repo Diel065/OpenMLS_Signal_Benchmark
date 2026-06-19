@@ -19,8 +19,9 @@ import uuid
 
 DOCKER_MIN_MEMORY_BYTES = 6 * 1024 * 1024
 DOCKER_MIN_CPU_QUOTA = 0.01
-CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US = 1000
-CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR = 2.0
+DOCKER_HARD_QUOTA_CPU_FLOOR = 0.01
+CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US = 10000
+CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR = 1.0
 DOCKER_CFS_MAX_PERIOD_US = 1_000_000
 
 
@@ -428,9 +429,24 @@ def generate_parallel_cpu_sweep_profiles(
         List of 8 ResourceProfile objects, ordered by decreasing fraction.
     """
     if cpu_fractions is None:
-        cpu_fractions = [1.00, 0.50, 0.10, 0.05, 0.02, 0.01, 0.005, 0.002]
+        cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
     if len(cpu_fractions) != 8:
         raise ValueError(f"Parallel CPU sweep requires exactly 8 fractions, got {len(cpu_fractions)}")
+
+    for fraction in cpu_fractions:
+        if fraction < DOCKER_HARD_QUOTA_CPU_FLOOR:
+            raise ValueError(
+                f"Requested Docker hard-quota CPU fraction {fraction} is below "
+                f"the supported validated floor {DOCKER_HARD_QUOTA_CPU_FLOOR} "
+                f"on this benchmark configuration. Use >={DOCKER_HARD_QUOTA_CPU_FLOOR}, "
+                "or implement a separate synthetic sub-floor slowdown model."
+            )
+
+    if len(set(cpu_fractions)) != len(cpu_fractions):
+        raise ValueError(
+            "All CPU fractions in the hard-quota sweep must be distinct. "
+            f"Got duplicates in: {cpu_fractions}"
+        )
 
     if not validate_memory_string(app_heap_budget):
         raise ValueError(f"Invalid app heap budget '{app_heap_budget}'")
