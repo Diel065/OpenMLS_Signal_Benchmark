@@ -196,6 +196,8 @@ def build_run_status(
     docker_memory_limit: str = "",
     app_heap_budget: str = "",
     app_heap_budget_bytes: int = 0,
+    sweep_kind: str = "",
+    strict_cpuset_satisfied: bool = False,
 ) -> Dict[str, Any]:
     """Build a run_status.csv row dict matching the full corrected schema."""
     first_failure = None
@@ -267,6 +269,8 @@ def build_run_status(
         "last_successful_epoch": first_failure.last_successful_epoch if first_failure else 0,
         "preflight_passed": preflight_passed,
         "resource_output_validation_passed": output_validation_passed,
+        "sweep_kind": sweep_kind,
+        "strict_cpuset_satisfied": strict_cpuset_satisfied,
         "notes": notes,
     }
 
@@ -686,6 +690,127 @@ def worker_failures_from_events_csv(events_csv_path: str) -> List[WorkerFailureI
     return sorted(failures, key=lambda failure: failure.failure_timestamp_ns)
 
 
+def worker_failures_from_runner_events_jsonl(runner_events_path: str) -> List[WorkerFailureInfo]:
+    """Create failure records from the runner failure journal.
+
+    This is the authoritative source when --no-aggregate is used: the Rust
+    runner still writes runner-events.jsonl, but events.csv is deliberately not
+    produced until an external aggregation pass runs.
+    """
+    if not runner_events_path or not os.path.exists(runner_events_path):
+        return []
+
+    failures_by_client: Dict[str, WorkerFailureInfo] = {}
+    try:
+        with open(runner_events_path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                event_kind = str(
+                    event.get("event_kind") or event.get("runner_event_kind") or ""
+                )
+                if event_kind != "worker_failure":
+                    continue
+
+                failed_id = str(event.get("failed_worker_id") or "").strip()
+                if not failed_id:
+                    continue
+
+                physical_id = str(event.get("failed_physical_worker_id") or "").strip()
+                if not physical_id:
+                    physical_id = failed_id if failed_id.startswith("worker-") else f"worker-{failed_id}"
+
+                failure_detail = str(event.get("failure_detail") or "")
+                app_heap = parse_app_heap_budget_failure(failure_detail)
+                benchmark_phase = str(event.get("benchmark_phase") or "").strip()
+                benchmark_operation = str(event.get("benchmark_operation") or "").strip()
+                operation_family = _benchmark_operation_family(
+                    benchmark_operation, benchmark_phase
+                )
+                if app_heap:
+                    benchmark_phase = app_heap.get("span_or_phase", benchmark_phase)
+                    if benchmark_phase == "-":
+                        benchmark_phase = str(event.get("benchmark_phase") or "").strip()
+                    benchmark_operation = app_heap.get(
+                        "benchmark_operation", benchmark_operation
+                    )
+                    operation_family = app_heap.get(
+                        "operation_family", operation_family
+                    )
+
+                failure = WorkerFailureInfo(
+                    worker_id=failed_id,
+                    physical_worker_id=physical_id,
+                    logical_client_id=failed_id,
+                    container_name=physical_id,
+                    resource_profile_id=app_heap.get("resource_profile_id", ""),
+                    experiment_kind=(
+                        "embedded_budget_singleton"
+                        if app_heap.get("memory_model") == "app-heap-budget"
+                        else ""
+                    ),
+                    failure_class=_normalize_failure_class(
+                        str(event.get("failure_class") or app_heap.get("failure_class") or "")
+                    ) or "unknown_failure",
+                    failure_detail=failure_detail,
+                    failure_evidence_source=str(event.get("failure_evidence_source") or ""),
+                    failure_evidence_detail=str(event.get("failure_evidence_detail") or ""),
+                    failure_action=str(event.get("failure_action") or ""),
+                    attribution_confidence=(
+                        "exact_runner_operation"
+                        if benchmark_operation or app_heap
+                        else "runner_failure_event"
+                    ),
+                    attribution_source=(
+                        "app_heap_budget_failure_payload"
+                        if app_heap
+                        else "runner_failure_event"
+                    ),
+                    failure_timestamp_ns=_safe_int(event.get("ts_unix_ns")),
+                    current_phase=benchmark_phase,
+                    current_operation_family=operation_family,
+                    current_benchmark_operation=benchmark_operation,
+                    current_member_count=(
+                        _safe_int(app_heap.get("member_count"))
+                        or _safe_int(event.get("benchmark_active_size"))
+                    ),
+                    current_epoch=_safe_int(app_heap.get("epoch")),
+                    memory_model=app_heap.get("memory_model", ""),
+                    app_heap_budget=app_heap.get("app_heap_budget", ""),
+                    app_heap_budget_bytes=_safe_int(app_heap.get("app_heap_budget_bytes")),
+                    heap_current_live_bytes=_safe_int(app_heap.get("current_live_heap_bytes")),
+                    heap_peak_live_bytes=_safe_int(app_heap.get("peak_live_heap_bytes")),
+                    heap_operation_peak_live_bytes=_safe_int(
+                        app_heap.get("operation_peak_live_heap_bytes")
+                    ),
+                    heap_total_allocated_bytes=_safe_int(app_heap.get("total_allocated_bytes")),
+                    heap_allocation_count=_safe_int(app_heap.get("allocation_count")),
+                    heap_deallocation_count=_safe_int(app_heap.get("deallocation_count")),
+                    heap_failed_allocation_size_bytes=_safe_int(
+                        app_heap.get("failed_allocation_size_bytes")
+                    ),
+                )
+
+                existing = failures_by_client.get(failed_id)
+                if existing is None or (
+                    existing.failure_timestamp_ns == 0
+                    or 0 < failure.failure_timestamp_ns < existing.failure_timestamp_ns
+                ):
+                    failures_by_client[failed_id] = failure
+    except OSError:
+        return []
+
+    return sorted(
+        failures_by_client.values(), key=lambda failure: failure.failure_timestamp_ns
+    )
+
+
 def append_synthetic_runner_failure_event(
     run_dir: str,
     failure: WorkerFailureInfo,
@@ -972,6 +1097,12 @@ def collect_worker_failures_from_artifacts(
     """
     failures = worker_failures_from_events_csv(events_csv_path)
     existing_clients = {failure.logical_client_id for failure in failures}
+    run_dir = os.path.dirname(os.path.abspath(events_csv_path)) if events_csv_path else ""
+    runner_events_path = os.path.join(run_dir, "runner-events.jsonl")
+    for failure in worker_failures_from_runner_events_jsonl(runner_events_path):
+        if failure.logical_client_id not in existing_clients:
+            failures.append(failure)
+            existing_clients.add(failure.logical_client_id)
     for failure in worker_failures_from_terminal_output(terminal_output_path):
         if failure.logical_client_id not in existing_clients:
             failures.append(failure)

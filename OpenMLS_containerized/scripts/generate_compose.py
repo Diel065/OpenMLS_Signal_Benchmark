@@ -1419,9 +1419,12 @@ def apply_affinity_to_compose(
                 found_in_plan = True
                 break
 
-        if resource_profiles and found_in_plan:
-            profile_id = pa.get("resource_profile_id", "")
-            rp = next((p for p in resource_profiles if p.get("resource_profile_id") == profile_id), None)
+        if resource_profiles:
+            profile_id = pa.get("resource_profile_id", "") if found_in_plan else ""
+            rp = next(
+                (p for p in resource_profiles if p.get("resource_profile_id") == profile_id),
+                None,
+            ) if profile_id else None
             if rp is None and profile_idx < len(resource_profiles):
                 rp = resource_profiles[profile_idx]
             if rp:
@@ -1452,7 +1455,7 @@ def apply_affinity_to_compose(
                 result["app_heap_budget_bytes"] = rp.get("app_heap_budget_bytes", "")
                 result["resource_profile_index"] = rp.get("resource_profile_index", "")
                 result["profiled_singleton"] = True
-        elif not found_in_plan:
+        if not found_in_plan:
             for ba in affinity_plan.get("background_assignments", []):
                 if ba.get("container_name") != physical_worker_id:
                     continue

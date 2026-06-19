@@ -8,7 +8,7 @@
 #
 # Two sweep types:
 #   SWEEP=ram:  8 app-heap budgets (32k..1g), Docker memory held high
-#   SWEEP=cpu:  8 Docker CPU fractions (1.00..0.0005), app-heap held high
+#   SWEEP=cpu:  8 Docker CPU fractions (default: 1.00..0.002), app-heap held high
 #   SWEEP=both: run both sweep types
 #
 # Usage:
@@ -19,6 +19,8 @@
 # Environment variables:
 #   STRICT_CPUSET=0   (default) allow fallback on too-few-cores hosts
 #   STRICT_CPUSET=1   fail if 8 distinct profiled cores unavailable
+#   CPU_SWEEP_FRACTIONS=1.0,0.5,... override the default Docker-valid CPU sweep
+#   PLATEAU_ORDER=ascending|staircase|randomized (default: ascending)
 #
 
 set -euo pipefail
@@ -43,6 +45,7 @@ STEP_SIZE=16
 ROUNDTRIPS=1
 UPDATE_ROUNDS=4
 APP_ROUNDS=4
+PLATEAU_ORDER="${PLATEAU_ORDER:-ascending}"
 
 CPU_AFFINITY_SAMPLE=20
 HEALTH_TIMEOUT=240
@@ -51,6 +54,7 @@ WORKER_HTTP_POOL=64
 WORKER_OUTBOUND_PERMITS=32
 FANOUT_PARALLELISM=128
 FANOUT_MIN=16
+CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.50,0.10,0.05,0.02,0.01,0.005,0.002}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -124,9 +128,11 @@ run_parallel_sweep() {
         --bridge-count          "$BRIDGE_COUNT"
         --resource-experiment   "$sweep_type"
         --profiled-singleton-count "$PROFILED_SINGLETON_COUNT"
+        --resource-failure-policy remove-and-continue
         --cpu-affinity-mode     "$affinity_mode"
         --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE"
         --embedded-docker-memory 4g
+        --cpu-sweep-fractions   "$CPU_SWEEP_FRACTIONS"
         --health-timeout-seconds "$HEALTH_TIMEOUT"
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT"
         --health-poll-seconds    0.5
@@ -134,6 +140,7 @@ run_parallel_sweep() {
         --min-size              2
         --max-size              "$MAX_GROUP_SIZE"
         --step-size             "$STEP_SIZE"
+        --plateau-order         "$PLATEAU_ORDER"
         --roundtrips            "$ROUNDTRIPS"
         --update-rounds         "$UPDATE_ROUNDS"
         --app-rounds            "$APP_ROUNDS"

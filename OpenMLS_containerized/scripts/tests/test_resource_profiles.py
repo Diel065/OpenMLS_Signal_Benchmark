@@ -12,6 +12,7 @@ from resource_profiles import (
     ResourceProfile,
     generate_ram_sweep_profiles,
     generate_cpu_matrix_profiles,
+    generate_parallel_cpu_sweep_profiles,
     validate_memory_string,
     parse_memory_to_bytes,
     profile_to_compose_dict,
@@ -152,6 +153,32 @@ class TestCpuMatrixProfiles:
     def test_rejects_cpu_quota_below_effective_floor(self):
         with pytest.raises(ValueError, match="minimum distinct Docker CFS quota"):
             generate_cpu_matrix_profiles([1], [0.001])
+
+
+class TestParallelCpuSweepProfiles:
+    def test_default_cpu_sweep_uses_docker_valid_period(self):
+        profiles = generate_parallel_cpu_sweep_profiles()
+
+        assert len(profiles) == 8
+        assert [p.capacity_fraction for p in profiles] == [
+            1.00, 0.50, 0.10, 0.05, 0.02, 0.01, 0.005, 0.002
+        ]
+        assert {p.cpu_period_us for p in profiles} == {1_000_000}
+        assert min(p.cpu_quota_us for p in profiles) == 2_000
+
+    def test_rejects_fraction_set_requiring_invalid_cpu_period(self):
+        with pytest.raises(ValueError, match="above Docker's supported maximum"):
+            generate_parallel_cpu_sweep_profiles(
+                cpu_fractions=[1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
+            )
+
+    def test_parallel_cpu_profile_to_compose_emits_period_and_quota(self):
+        profile = generate_parallel_cpu_sweep_profiles()[7]
+        compose = profile_to_compose_dict(profile)
+
+        assert compose["cpu_period"] == "1000000"
+        assert compose["cpu_quota"] == "2000"
+        assert "cpus" not in compose
 
 
 class TestMemoryValidation:

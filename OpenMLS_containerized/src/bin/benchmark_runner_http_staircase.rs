@@ -6,7 +6,7 @@ use clap::ArgAction;
 
 use mls_playground::staircase_runner::{
     parse_worker_layout, parse_worker_specs, run_staircase_benchmark, workers_from_layout,
-    PayloadSizes, PlateauOrder, StaircaseConfig, StepSize,
+    PayloadSizes, PlateauOrder, ProfiledFailurePolicy, StaircaseConfig, StepSize,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -128,6 +128,9 @@ struct Args {
 
     #[arg(long, action = ArgAction::SetTrue)]
     failure_experiment: bool,
+
+    #[arg(long, default_value = "stop-on-profiled-failure")]
+    profiled_failure_policy: ProfiledFailurePolicy,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -236,6 +239,7 @@ fn main() -> Result<()> {
         external_coverage_lane: args.external_coverage_lane,
         no_aggregate: args.no_aggregate,
         failure_experiment: args.failure_experiment,
+        profiled_failure_policy: args.profiled_failure_policy,
         worker_layout,
     })
 }

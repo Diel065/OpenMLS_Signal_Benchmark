@@ -18,6 +18,7 @@ from resource_experiment_failures import (
     collect_worker_failures_from_artifacts,
     append_synthetic_runner_failure_event,
     worker_failures_from_events_csv,
+    worker_failures_from_runner_events_jsonl,
     FAILURE_CLASSES,
 )
 
@@ -258,6 +259,53 @@ def test_runner_event_is_authoritative_for_operation_and_reason(tmp_path):
     assert failure.failure_evidence_source == "runner_observed_request_failure"
     assert failure.attribution_confidence == "exact_runner_operation"
     assert failure.last_observed_span_name == "self_update.path_hpke_encrypt"
+
+
+def test_runner_events_jsonl_drives_no_aggregate_failure_sidecars(tmp_path):
+    runner_events = tmp_path / "runner-events.jsonl"
+    detail = (
+        "Worker 00002 error: APP_HEAP_BUDGET_EXCEEDED "
+        "failure_class=app_heap_budget_exceeded memory_model=app-heap-budget "
+        "operation_family=key_package_create benchmark_operation=key_package_create "
+        "span_or_phase=- worker_id=00002 resource_profile_id=ram_app_heap_32k "
+        "app_heap_budget=32k app_heap_budget_bytes=32768 "
+        "current_live_heap_bytes=90446 peak_live_heap_bytes=93507 "
+        "operation_peak_live_heap_bytes=90446 total_allocated_bytes=177653 "
+        "allocation_count=401 deallocation_count=254"
+    )
+    runner_events.write_text(
+        json.dumps({
+            "ts_unix_ns": 123,
+            "event_kind": "worker_failure",
+            "failed_worker_id": "00002",
+            "failed_physical_worker_id": "worker-00002",
+            "failure_class": "app_heap_budget_exceeded",
+            "failure_detail": detail,
+            "failure_evidence_source": "runner_observed_request_failure",
+            "failure_evidence_detail": detail,
+            "failure_action": "drop_idle_joiner",
+            "benchmark_phase": "membership_add",
+            "benchmark_operation": "generate_key_package",
+            "benchmark_active_size": 1,
+        }) + "\n",
+        encoding="utf-8",
+    )
+
+    direct = worker_failures_from_runner_events_jsonl(str(runner_events))
+    collected = collect_worker_failures_from_artifacts(str(tmp_path / "events.csv"), [])
+
+    assert len(direct) == 1
+    assert len(collected) == 1
+    failure = collected[0]
+    assert failure.logical_client_id == "00002"
+    assert failure.physical_worker_id == "worker-00002"
+    assert failure.failure_class == "app_heap_budget_exceeded"
+    assert failure.failure_action == "drop_idle_joiner"
+    assert failure.current_phase == "membership_add"
+    assert failure.current_benchmark_operation == "key_package_create"
+    assert failure.current_operation_family == "key_package_create"
+    assert failure.app_heap_budget == "32k"
+    assert failure.heap_operation_peak_live_bytes == 90446
 
 
 def test_pressure_without_failure_event_is_not_a_worker_failure(tmp_path):

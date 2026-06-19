@@ -14,7 +14,10 @@ from resource_profiles import (
     ResourceProfile,
     generate_ram_sweep_profiles,
     generate_cpu_matrix_profiles,
+    generate_parallel_ram_sweep_profiles,
+    generate_parallel_cpu_sweep_profiles,
     select_profile,
+    select_all_profiles,
     get_selected_profile,
     select_profile_by_index,
     select_profile_by_id,
@@ -258,6 +261,72 @@ class TestWorkerAssignmentPropagation:
             f"Expected profile ID {sp.resource_profile_id}, got {row['resource_profile_id']}"
         assert row["selected_for_this_run"] is True
 
+    def test_parallel_assignment_includes_sweep_and_group_creator_metadata(self):
+        profiles = select_all_profiles(generate_parallel_ram_sweep_profiles())
+        group_creator = next(p for p in profiles if p.group_creator)
+        ordinary = next(p for p in profiles if not p.group_creator)
+
+        plan = self._make_minimal_plan("test-run", [
+            {
+                "worker_id": "worker-00001",
+                "container_name": "worker-00001",
+                "logical_client_id": "00001",
+                "experiment_kind": "ram_app_heap_sweep",
+                "resource_profile_id": group_creator.resource_profile_id,
+                "rayon_num_threads": 1,
+            },
+            {
+                "worker_id": "worker-00002",
+                "container_name": "worker-00002",
+                "logical_client_id": "00002",
+                "experiment_kind": "ram_app_heap_sweep",
+                "resource_profile_id": ordinary.resource_profile_id,
+                "rayon_num_threads": 1,
+            },
+        ])
+
+        assignments = build_worker_resource_assignments(
+            run_id="test-run",
+            plan=plan,
+            profiles=profiles,
+            selected_profile_index=0,
+            singleton_worker_ids=["worker-00001", "worker-00002"],
+            singleton_client_ids=["00001", "00002"],
+            singleton_container_names=["worker-00001", "worker-00002"],
+            packed_container_names=[],
+            infrastructure_container_names=["ds", "relay"],
+        )
+
+        profiled_rows = [row for row in assignments if row["profile_enabled"]]
+        creator_rows = [row for row in profiled_rows if row["group_creator"]]
+        assert len(creator_rows) == 1
+        assert creator_rows[0]["resource_profile_id"] == group_creator.resource_profile_id
+        assert all(row["sweep_kind"] == "ram_app_heap_sweep" for row in profiled_rows)
+        assert all(row["app_heap_interpretation"] for row in profiled_rows)
+
+    def test_parallel_assignment_uses_indexed_profiles_without_affinity_assignments(self):
+        profiles = select_all_profiles(generate_parallel_ram_sweep_profiles())
+        plan = self._make_minimal_plan("test-run", [])
+
+        assignments = build_worker_resource_assignments(
+            run_id="test-run",
+            plan=plan,
+            profiles=profiles,
+            selected_profile_index=0,
+            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(8)],
+            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            packed_container_names=[],
+            infrastructure_container_names=["ds", "relay"],
+        )
+
+        profiled_rows = [row for row in assignments if row["profile_enabled"]]
+        profile_ids = [row["resource_profile_id"] for row in profiled_rows]
+
+        assert profile_ids == [profile.resource_profile_id for profile in profiles]
+        assert sum(1 for row in profiled_rows if row["group_creator"]) == 1
+        assert all(row["selected_for_this_run"] for row in profiled_rows)
+
 
 class TestComposeGenerationPropagation:
     """Tests that nonzero selected profiles reach generated Compose config."""
@@ -376,6 +445,32 @@ class TestComposeGenerationPropagation:
         expected_cpus = str(sp.cpu_limit_cpus)
         assert f'cpus: "{expected_cpus}"' in joined, \
             f"Expected cpus: {expected_cpus} in lines: {lines}"
+
+    def test_parallel_cpu_compose_limits_without_affinity_assignments(self):
+        from generate_compose import apply_affinity_to_compose
+
+        profiles = select_all_profiles(generate_parallel_cpu_sweep_profiles())
+        profile_dicts = [p.to_dict() for p in profiles]
+        plan = {
+            "profiled_assignments": [],
+            "background_assignments": [],
+        }
+
+        lines = []
+        result = apply_affinity_to_compose(
+            lines,
+            "worker-00015",
+            "singleton",
+            plan,
+            profile_dicts,
+            7,
+            self._mock_args(),
+        )
+
+        joined = "\n".join(lines)
+        assert 'cpu_quota: "2000"' in joined
+        assert 'cpu_period: "1000000"' in joined
+        assert result.get("resource_profile_id") == "cpu_quota_0p002"
 
     def test_compose_profile_matches_affinity_plan(self):
         profiles = generate_ram_sweep_profiles(

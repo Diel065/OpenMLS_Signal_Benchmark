@@ -173,6 +173,31 @@ def generate_resource_profiles(config: ResourceExperimentConfig) -> List[Resourc
     return []
 
 
+def _profile_for_profiled_index(
+    profiles: List[ResourceProfile],
+    index: int,
+) -> Optional[ResourceProfile]:
+    """Return the resource profile for a profiled singleton index.
+
+    Singleton experiments select exactly one profile and apply it to the one
+    profiled worker. Parallel sweeps select multiple profiles; in that case the
+    sidecars and affinity plan must preserve the one-profile-per-singleton
+    ordering used by compose generation.
+    """
+    if not profiles:
+        return None
+
+    selected_profiles = [p for p in profiles if p.selected_for_this_run]
+    if len(selected_profiles) > 1:
+        return selected_profiles[index % len(selected_profiles)]
+
+    selected = get_selected_profile(profiles)
+    if selected is not None:
+        return selected
+
+    return profiles[index % len(profiles)]
+
+
 def build_affinity_plan(
     run_id: str,
     config: ResourceExperimentConfig,
@@ -194,9 +219,7 @@ def build_affinity_plan(
     profiled_cpu_counts = {}
 
     for i, (worker_id, client_id) in enumerate(zip(singleton_worker_ids, singleton_client_ids)):
-        profile = get_selected_profile(profiles) if profiles else None
-        if profile is None and profiles:
-            profile = profiles[i % len(profiles)]
+        profile = _profile_for_profiled_index(profiles, i)
         cpu_count = profile.assigned_cpu_count if profile else 1
 
         profiled_worker_specs.append({
@@ -329,14 +352,10 @@ def build_worker_resource_assignments(
         if pa is not None and pa.resource_profile_id:
             profile = profile_by_id.get(pa.resource_profile_id)
         if profile is None:
-            profile = get_selected_profile(profiles) if profiles else None
-        if profile is None and profiles:
-            profile = profiles[i % len(profiles)]
+            profile = _profile_for_profiled_index(profiles, i)
 
-        is_selected = False
+        is_selected = bool(profile and profile.selected_for_this_run)
         p_index = profile.resource_profile_index if profile else -1
-        if selected_profile_index is not None and p_index == selected_profile_index:
-            is_selected = True
 
         assignments.append({
             "run_id": run_id,
@@ -367,6 +386,12 @@ def build_worker_resource_assignments(
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,
             "profile_label": profile.profile_label if profile else "",
+            "sweep_kind": profile.sweep_kind if profile else "",
+            "app_heap_interpretation": profile.app_heap_interpretation if profile else "",
+            "cpu_interpretation": profile.cpu_interpretation if profile else "",
+            "group_creator": profile.group_creator if profile else False,
+            "group_creator_reason": profile.group_creator_reason if profile else "",
+            "strict_cpuset_satisfied": profile.strict_cpuset_satisfied if profile else False,
         })
 
     for container_name in packed_container_names:
@@ -399,6 +424,12 @@ def build_worker_resource_assignments(
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,
             "profile_label": "",
+            "sweep_kind": "",
+            "app_heap_interpretation": "",
+            "cpu_interpretation": "",
+            "group_creator": False,
+            "group_creator_reason": "",
+            "strict_cpuset_satisfied": False,
         })
 
     for container_name in infrastructure_container_names:
@@ -431,6 +462,12 @@ def build_worker_resource_assignments(
             "background_cpuset_cpus": background_cpuset,
             "background_mask_hex": bg_mask_hex,
             "profile_label": "",
+            "sweep_kind": "",
+            "app_heap_interpretation": "",
+            "cpu_interpretation": "",
+            "group_creator": False,
+            "group_creator_reason": "",
+            "strict_cpuset_satisfied": False,
         })
 
     return assignments

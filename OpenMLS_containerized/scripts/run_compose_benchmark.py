@@ -45,9 +45,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
     p.add_argument(
         "--plateau-order",
-        choices=("staircase", "randomized"),
+        choices=("staircase", "ascending", "randomized"),
         default="staircase",
-        help="Order target group-size plateaus deterministically or by the recorded scenario seed",
+        help="Order target group-size plateaus as up/down staircase, ascending-only, or randomized",
     )
     p.add_argument("--roundtrips", type=int, default=1)
 
@@ -489,6 +489,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     p.add_argument(
+        "--cpu-sweep-fractions",
+        default="1.00,0.50,0.10,0.05,0.02,0.01,0.005,0.002",
+        help=(
+            "Comma-separated 8 Docker CPU fractions for cpu-quota-sweep. "
+            "Defaults stay within Docker CFS cpu_period/cpu_quota limits."
+        ),
+    )
+    p.add_argument(
         "--cpu-affinity-mode",
         choices=["none", "profiled-nor-background"],
         default="none",
@@ -897,7 +905,7 @@ def build_host_runner_layout(layout_data: dict, worker_lines: list[str]) -> dict
     return host_layout
 
 
-def validate_artifacts(run_dir: Path, layout_mode: str) -> None:
+def validate_artifacts(run_dir: Path, layout_mode: str, require_aggregate: bool = True) -> None:
     csv_path = run_dir / "events.csv"
     layout_path = run_dir / "worker_layout.json"
 
@@ -905,10 +913,11 @@ def validate_artifacts(run_dir: Path, layout_mode: str) -> None:
         if not layout_path.exists():
             raise RuntimeError(f"Missing worker_layout.json in hybrid mode: {layout_path}")
 
-    if not csv_path.exists():
-        raise RuntimeError(f"Missing aggregated CSV: {csv_path}")
-    if csv_path.stat().st_size == 0:
-        raise RuntimeError(f"Aggregated CSV is empty: {csv_path}")
+    if require_aggregate:
+        if not csv_path.exists():
+            raise RuntimeError(f"Missing aggregated CSV: {csv_path}")
+        if csv_path.stat().st_size == 0:
+            raise RuntimeError(f"Aggregated CSV is empty: {csv_path}")
 
     jsonl_files = sorted(run_dir.glob("client-*.jsonl"))
     if not jsonl_files:
@@ -1686,6 +1695,30 @@ def write_artifact_validation(
         return
 
     sidecar_result = validate_sidecars_exist(str(run_dir), run_success=run_success)
+    if run_success and aggregation_status == "":
+        missing = [
+            name
+            for name in sidecar_result["missing"]
+            if name not in ("events.csv", "aggregation_manifest.json")
+        ]
+        sidecar_result = {
+            **sidecar_result,
+            "valid": (
+                sidecar_result["valid"]
+                or not any(
+                    name
+                    in {
+                        "resource_profiles.csv",
+                        "worker_resource_assignments.csv",
+                        "cpu_affinity_plan.json",
+                        "scenario_plan.json",
+                        "run_status.csv",
+                    }
+                    for name in missing
+                )
+            ),
+            "missing": missing,
+        }
     manifest_exists = (run_dir / "aggregation_manifest.json").exists()
 
     payload = {
@@ -3700,6 +3733,7 @@ def main() -> int:
                 generate_parallel_ram_sweep_profiles,
                 generate_parallel_cpu_sweep_profiles,
                 select_profile,
+                select_all_profiles,
                 get_selected_profile,
                 get_selected_profile_index,
                 get_group_creator_profile,
@@ -3743,7 +3777,13 @@ def main() -> int:
                     run_id=run_id,
                 )
             elif resource_experiment == "cpu-quota-sweep":
+                cpu_sweep_fractions = [
+                    float(v.strip())
+                    for v in args.cpu_sweep_fractions.split(",")
+                    if v.strip()
+                ]
                 profiles = generate_parallel_cpu_sweep_profiles(
+                    cpu_fractions=cpu_sweep_fractions,
                     assigned_cpu_count=1,
                     run_id=run_id,
                 )
@@ -3766,6 +3806,7 @@ def main() -> int:
             is_parallel_sweep = resource_experiment in ("ram-app-heap-sweep", "cpu-quota-sweep")
 
             if is_parallel_sweep:
+                profiles = select_all_profiles(profiles)
                 selected_profile = select_profile(
                     profiles,
                     profile_index=profile_index,
@@ -3909,12 +3950,17 @@ def main() -> int:
 
             plan_path = write_affinity_plan_json(plan, str(run_dir))
             profiles_path = str(run_dir / "resource_profiles.json")
-            profiles_data = [p.to_dict() for p in profiles]
+            profiles_for_assignment = (
+                [profile for profile in assigned_profiles if profile is not None]
+                if is_parallel_sweep and assigned_profiles
+                else profiles
+            )
+            profiles_data = [p.to_dict() for p in profiles_for_assignment]
             with open(profiles_path, "w") as f:
                 json.dump(profiles_data, f, indent=2)
 
             sw = SidecarWriter(str(run_dir))
-            sw.write_resource_profiles(run_id, [p.to_dict() for p in profiles])
+            sw.write_resource_profiles(run_id, [p.to_dict() for p in profiles_for_assignment])
 
             generator_cmd += [
                 "--resource-experiment", resource_experiment,
@@ -3934,7 +3980,7 @@ def main() -> int:
             # Store for later lifecycle phases
             resource_experiment_state = {
                 "plan": plan,
-                "profiles": profiles,
+                "profiles": profiles_for_assignment,
                 "selected_profile": selected_profile,
                 "selected_profile_index": actual_profile_index,
                 "selected_profile_id": selected_profile_id_str,
@@ -3942,6 +3988,8 @@ def main() -> int:
                 "docker_memory_limit": getattr(selected_profile, "docker_memory_limit", None) or getattr(selected_profile, "memory_limit", ""),
                 "app_heap_budget": getattr(selected_profile, "app_heap_budget", "") or "",
                 "app_heap_budget_bytes": getattr(selected_profile, "app_heap_budget_bytes", 0) or 0,
+                "sweep_kind": getattr(selected_profile, "sweep_kind", ""),
+                "strict_cpuset_satisfied": getattr(selected_profile, "strict_cpuset_satisfied", False),
                 "failure_policy": failure_policy,
                 "profiled_singleton_ids": profiled_singleton_ids,
                 "profiled_worker_ids": profiled_worker_ids,
@@ -4312,6 +4360,8 @@ def main() -> int:
                         docker_memory_limit=state.get("docker_memory_limit", ""),
                         app_heap_budget=state.get("app_heap_budget", ""),
                         app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
+                        sweep_kind=state.get("sweep_kind", ""),
+                        strict_cpuset_satisfied=state.get("strict_cpuset_satisfied", False),
                         notes=f"Affinity preflight failed: {fail_msgs}",
                     ))
 
@@ -4382,6 +4432,8 @@ def main() -> int:
                 *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 *(["--failure-experiment"] if args.failure_experiment else []),
+                "--profiled-failure-policy",
+                args.resource_failure_policy,
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4446,6 +4498,8 @@ def main() -> int:
                 *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 *(["--failure-experiment"] if args.failure_experiment else []),
+                "--profiled-failure-policy",
+                args.resource_failure_policy,
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4610,6 +4664,8 @@ def main() -> int:
                             docker_memory_limit=state.get("docker_memory_limit", ""),
                             app_heap_budget=state.get("app_heap_budget", ""),
                             app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
+                            sweep_kind=state.get("sweep_kind", ""),
+                            strict_cpuset_satisfied=state.get("strict_cpuset_satisfied", False),
                             notes=f"Runner exit code {exit_code}",
                         ),
                     )
@@ -4653,8 +4709,18 @@ def main() -> int:
                     print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
 
         if not args.preflight_only:
-            validate_artifacts(run_dir, args.worker_layout_mode)
-            write_integrated_aggregation_manifest(run_dir, run_id)
+            validate_artifacts(
+                run_dir,
+                args.worker_layout_mode,
+                require_aggregate=not use_no_aggregate,
+            )
+            if use_no_aggregate:
+                print(
+                    "[aggregate] --no-aggregate used; skipping integrated aggregation manifest",
+                    flush=True,
+                )
+            else:
+                write_integrated_aggregation_manifest(run_dir, run_id)
 
         # Stop external device workers
         if external_device_stop_required:
@@ -4737,6 +4803,8 @@ def main() -> int:
                     docker_memory_limit=state.get("docker_memory_limit", ""),
                     app_heap_budget=state.get("app_heap_budget", ""),
                     app_heap_budget_bytes=state.get("app_heap_budget_bytes", 0),
+                    sweep_kind=state.get("sweep_kind", ""),
+                    strict_cpuset_satisfied=state.get("strict_cpuset_satisfied", False),
                     notes="",
                 )
                 sw_re.write_run_status(run_id, run_status)
@@ -4745,7 +4813,7 @@ def main() -> int:
                 output_validation_passed = False
 
         # ── Strict output validation (publication checks) ──────────
-        if not args.preflight_only:
+        if not args.preflight_only and not use_no_aggregate:
             try:
                 run_strict_output_validation(root, run_dir)
             except Exception as val_exc:
@@ -4774,6 +4842,8 @@ def main() -> int:
                                 docker_memory_limit=state2.get("docker_memory_limit", ""),
                                 app_heap_budget=state2.get("app_heap_budget", ""),
                                 app_heap_budget_bytes=state2.get("app_heap_budget_bytes", 0),
+                                sweep_kind=state2.get("sweep_kind", ""),
+                                strict_cpuset_satisfied=state2.get("strict_cpuset_satisfied", False),
                                 notes=f"Publication validation: {val_exc}",
                             ),
                         )
@@ -4785,6 +4855,11 @@ def main() -> int:
                     {"publication_validator_error": str(val_exc)},
                 )
                 raise RuntimeError("Publication output validation failed") from val_exc
+        elif not args.preflight_only:
+            print(
+                "[validate] skipping publication CSV validation because --no-aggregate was used",
+                flush=True,
+            )
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 
@@ -4833,6 +4908,8 @@ def main() -> int:
                             docker_memory_limit=state_ov.get("docker_memory_limit", ""),
                             app_heap_budget=state_ov.get("app_heap_budget", ""),
                             app_heap_budget_bytes=state_ov.get("app_heap_budget_bytes", 0),
+                            sweep_kind=state_ov.get("sweep_kind", ""),
+                            strict_cpuset_satisfied=state_ov.get("strict_cpuset_satisfied", False),
                             notes="Resource output validation failed",
                         ),
                     )
@@ -4989,6 +5066,8 @@ def main() -> int:
                     docker_memory_limit=state_fatal.get("docker_memory_limit", ""),
                     app_heap_budget=state_fatal.get("app_heap_budget", ""),
                     app_heap_budget_bytes=state_fatal.get("app_heap_budget_bytes", 0),
+                    sweep_kind=state_fatal.get("sweep_kind", ""),
+                    strict_cpuset_satisfied=state_fatal.get("strict_cpuset_satisfied", False),
                     notes=f"Fatal error: {type(e).__name__}: {e}",
                 )
                 sw_re_fatal.write_run_status(run_id, rs_fatal)

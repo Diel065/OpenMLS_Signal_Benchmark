@@ -5,7 +5,8 @@ use clap::{ArgAction, Parser};
 
 use mls_playground::local_launcher::{launch_local_stack, LocalLaunchConfig};
 use mls_playground::staircase_runner::{
-    run_staircase_benchmark, PayloadSizes, PlateauOrder, StaircaseConfig, StepSize,
+    run_staircase_benchmark, PayloadSizes, PlateauOrder, ProfiledFailurePolicy, StaircaseConfig,
+    StepSize,
 };
 
 #[derive(Parser, Debug)]
@@ -159,6 +160,7 @@ fn main() -> Result<()> {
         external_coverage_lane: false,
         no_aggregate: false,
         failure_experiment: false,
+        profiled_failure_policy: ProfiledFailurePolicy::StopOnProfiledFailure,
         worker_layout: None,
         run_id: args.run_id,
         scenario: args.scenario,

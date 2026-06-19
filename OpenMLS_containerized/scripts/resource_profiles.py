@@ -21,6 +21,7 @@ DOCKER_MIN_MEMORY_BYTES = 6 * 1024 * 1024
 DOCKER_MIN_CPU_QUOTA = 0.01
 CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US = 1000
 CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR = 2.0
+DOCKER_CFS_MAX_PERIOD_US = 1_000_000
 
 
 @dataclass
@@ -412,7 +413,9 @@ def generate_parallel_cpu_sweep_profiles(
     The highest-valued profile (1.00 CPU fraction) is marked as the
     group creator.
 
-    CPU period is 100000 us (standard Docker/CFS default).
+    CPU period starts at 100000 us (standard Docker/CFS default) and may
+    scale up to Docker's 1000000 us CFS period limit so tiny fractions still
+    have distinct quotas.
 
     Args:
         cpu_fractions: List of 8 CPU fraction values.
@@ -425,7 +428,7 @@ def generate_parallel_cpu_sweep_profiles(
         List of 8 ResourceProfile objects, ordered by decreasing fraction.
     """
     if cpu_fractions is None:
-        cpu_fractions = [1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
+        cpu_fractions = [1.00, 0.50, 0.10, 0.05, 0.02, 0.01, 0.005, 0.002]
     if len(cpu_fractions) != 8:
         raise ValueError(f"Parallel CPU sweep requires exactly 8 fractions, got {len(cpu_fractions)}")
 
@@ -447,6 +450,13 @@ def generate_parallel_cpu_sweep_profiles(
             / min_quota_us
         )
         cpu_period_us = cpu_period_us * scale
+        if cpu_period_us > DOCKER_CFS_MAX_PERIOD_US:
+            raise ValueError(
+                "CPU sweep fractions require Docker CFS cpu_period_us="
+                f"{cpu_period_us}, above Docker's supported maximum "
+                f"{DOCKER_CFS_MAX_PERIOD_US}. Increase the smallest CPU "
+                "fraction or lower CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR."
+            )
         import sys as _sys
         print(
             f"[resource_profiles] CPU period auto-scaled from 100000 us to {cpu_period_us} us "

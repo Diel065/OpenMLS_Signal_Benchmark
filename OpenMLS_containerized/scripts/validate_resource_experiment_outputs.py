@@ -136,6 +136,15 @@ def _safe_int(value) -> int:
         return 0
 
 
+def _safe_float(value) -> float:
+    try:
+        if value is None or value == "":
+            return 0.0
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def parse_memory_to_bytes(value: str) -> int:
     raw = (value or "").strip().lower()
     if not raw:
@@ -371,20 +380,31 @@ class Validator:
         if not os.path.exists(profiles_path):
             return
 
+        status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
+        sweep_kind = status_rows[0].get("sweep_kind", "").strip() if status_rows else ""
+        is_parallel_sweep = sweep_kind in ("ram_app_heap_sweep", "cpu_quota_sweep")
+        expected_selected = 8 if is_parallel_sweep else 1
+
         selected = self._read_column_values(profiles_path, "selected_for_this_run")
         true_count = sum(1 for v in selected if v.lower() in ("true", "1"))
 
         if true_count == 0:
             self.warn("No profile has selected_for_this_run=true (multiplexed mode?)")
-        elif true_count > 1:
-            self.error(f"{true_count} profiles have selected_for_this_run=true (expected exactly 1)")
+        elif true_count != expected_selected:
+            self.error(
+                f"{true_count} profiles have selected_for_this_run=true "
+                f"(expected exactly {expected_selected})"
+            )
 
         assignments_path = os.path.join(self.run_dir, "worker_resource_assignments.csv")
         if os.path.exists(assignments_path):
             assign_selected = self._read_column_values(assignments_path, "selected_for_this_run")
             assign_true = sum(1 for v in assign_selected if v.lower() in ("true", "1"))
-            if assign_true > 1:
-                self.error(f"{assign_true} workers marked selected_for_this_run=true (expected exactly 1)")
+            if assign_true != expected_selected:
+                self.error(
+                    f"{assign_true} workers marked selected_for_this_run=true "
+                    f"(expected exactly {expected_selected})"
+                )
 
     def _check_run_status(self):
         status_path = os.path.join(self.run_dir, "run_status.csv")
@@ -619,11 +639,24 @@ class Validator:
                     self.error(f"RAM sweep worker {r.get('container_name')} must use memory_model=app-heap-budget")
 
         if is_cpu:
-            expected_fractions = [1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
             profiled_fractions = sorted(
                 [_safe_float(r.get("capacity_fraction")) for r in profiled_singletons if r.get("capacity_fraction")],
                 reverse=True,
             )
+            selected_profile_fractions = sorted(
+                [
+                    _safe_float(r.get("capacity_fraction"))
+                    for r in profiles
+                    if (r.get("selected_for_this_run") or "").strip().lower() in ("true", "1", "yes")
+                    and r.get("capacity_fraction")
+                ],
+                reverse=True,
+            )
+            if selected_profile_fractions and profiled_fractions != selected_profile_fractions:
+                self.error(
+                    f"CPU sweep profiled workers have wrong CPU fractions: "
+                    f"{profiled_fractions} vs selected profiles {selected_profile_fractions}"
+                )
             for r in profiled_singletons:
                 ahb = r.get("app_heap_budget", "").strip().lower()
                 ahb_bytes = _safe_int(r.get("app_heap_budget_bytes"))

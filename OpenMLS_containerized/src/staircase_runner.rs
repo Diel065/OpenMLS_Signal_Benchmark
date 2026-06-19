@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -50,6 +50,8 @@ const EXTERNAL_BATCH_SEED_DOMAIN: u64 = 0x4558_5442_4154_4348;
 static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 static FAILURE_EXPERIMENT_MODE: AtomicBool = AtomicBool::new(false);
+static PROFILED_FAILURE_POLICY: AtomicU8 =
+    AtomicU8::new(ProfiledFailurePolicy::StopOnProfiledFailure as u8);
 static PROFILED_OPERATION_JOURNAL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
 fn profiled_operation_journal() -> &'static Mutex<Option<PathBuf>> {
@@ -91,12 +93,60 @@ pub struct StaircaseConfig {
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
     pub failure_experiment: bool,
+    pub profiled_failure_policy: ProfiledFailurePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfiledFailurePolicy {
+    StopOnProfiledFailure = 0,
+    RemoveAndContinue = 1,
+}
+
+impl Default for ProfiledFailurePolicy {
+    fn default() -> Self {
+        Self::StopOnProfiledFailure
+    }
+}
+
+impl FromStr for ProfiledFailurePolicy {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value {
+            "stop-on-profiled-failure" => Ok(Self::StopOnProfiledFailure),
+            "remove-and-continue" => Ok(Self::RemoveAndContinue),
+            other => Err(format!(
+                "invalid profiled failure policy '{}'; expected stop-on-profiled-failure or remove-and-continue",
+                other
+            )),
+        }
+    }
+}
+
+fn store_profiled_failure_policy(policy: ProfiledFailurePolicy) {
+    PROFILED_FAILURE_POLICY.store(policy as u8, Ordering::Relaxed);
+}
+
+fn profiled_failure_policy() -> ProfiledFailurePolicy {
+    match PROFILED_FAILURE_POLICY.load(Ordering::Relaxed) {
+        value if value == ProfiledFailurePolicy::RemoveAndContinue as u8 => {
+            ProfiledFailurePolicy::RemoveAndContinue
+        }
+        _ => ProfiledFailurePolicy::StopOnProfiledFailure,
+    }
+}
+
+fn should_continue_after_profiled_failure() -> bool {
+    FAILURE_EXPERIMENT_MODE.load(Ordering::Relaxed)
+        || profiled_failure_policy() == ProfiledFailurePolicy::RemoveAndContinue
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlateauOrder {
     Staircase,
+    Ascending,
     Randomized,
 }
 
@@ -106,9 +156,10 @@ impl FromStr for PlateauOrder {
     fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
         match value.trim().to_ascii_lowercase().as_str() {
             "staircase" => Ok(Self::Staircase),
+            "ascending" | "asc" => Ok(Self::Ascending),
             "randomized" | "random" => Ok(Self::Randomized),
             other => Err(format!(
-                "--plateau-order expected 'staircase' or 'randomized', got '{other}'"
+                "--plateau-order expected 'staircase', 'ascending', or 'randomized', got '{other}'"
             )),
         }
     }
@@ -118,6 +169,7 @@ impl fmt::Display for PlateauOrder {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Staircase => formatter.write_str("staircase"),
+            Self::Ascending => formatter.write_str("ascending"),
             Self::Randomized => formatter.write_str("randomized"),
         }
     }
@@ -1743,9 +1795,15 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
 
 async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     FAILURE_EXPERIMENT_MODE.store(config.failure_experiment, Ordering::Relaxed);
+    store_profiled_failure_policy(config.profiled_failure_policy);
     if config.failure_experiment {
         eprintln!(
             "[failure-experiment] enabled: profiled singleton failures will be recorded but the run will continue"
+        );
+    }
+    if should_continue_after_profiled_failure() && !config.failure_experiment {
+        eprintln!(
+            "[resource-failure-policy] remove-and-continue enabled: profiled singleton failures will be recorded and evicted when possible"
         );
     }
     let max_size = validate_config(&config, config.workers.len())?;
@@ -1807,9 +1865,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         .timeout(runner_http_request_timeout)
         .pool_max_idle_per_host(http_pool_max_idle_per_host)
         .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
-        .tcp_keepalive(Some(Duration::from_secs(
-            (pool_idle_secs / 2).max(5),
-        )))
+        .tcp_keepalive(Some(Duration::from_secs((pool_idle_secs / 2).max(5))))
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -2630,7 +2686,7 @@ async fn record_profiled_worker_failure(
     action: &str,
     reassigned_to: Option<&WorkerSpec>,
 ) -> Result<bool> {
-    let failure_experiment = FAILURE_EXPERIMENT_MODE.load(Ordering::Relaxed);
+    let continue_profiled_failure = should_continue_after_profiled_failure();
     if let Some(evidence) = runner_events.find_oom_evidence(worker).await {
         runner_events.record_oom_failure(
             cursor,
@@ -2642,7 +2698,7 @@ async fn record_profiled_worker_failure(
         )?;
         let must_stop_profiled_singleton =
             worker.profile_enabled && worker.container_mode == ContainerMode::Singleton;
-        return Ok(failure_experiment || !must_stop_profiled_singleton);
+        return Ok(continue_profiled_failure || !must_stop_profiled_singleton);
     }
     if worker.profile_enabled && worker.container_mode == ContainerMode::Singleton {
         let failure_class = classify_worker_error(error);
@@ -2657,7 +2713,7 @@ async fn record_profiled_worker_failure(
             action,
             reassigned_to,
         )?;
-        return Ok(failure_experiment);
+        return Ok(continue_profiled_failure);
     }
     Ok(false)
 }
@@ -4469,6 +4525,30 @@ fn build_plateau_sequence_for_step_size<R: Rng + ?Sized>(
     sequence
 }
 
+fn build_ascending_plateau_sequence_for_step_size<R: Rng + ?Sized>(
+    min_size: usize,
+    max_size: usize,
+    step_size: &StepSize,
+    rng: &mut R,
+) -> Vec<usize> {
+    if let StepSize::Fixed(step_size) = step_size {
+        return stepped_sizes(min_size, max_size, *step_size);
+    }
+
+    let mut sequence = Vec::new();
+    let mut current = min_size;
+    if sequence.last().copied() != Some(current) {
+        sequence.push(current);
+    }
+    while current < max_size {
+        current = current.saturating_add(step_size.sample(rng)).min(max_size);
+        if sequence.last().copied() != Some(current) {
+            sequence.push(current);
+        }
+    }
+    sequence
+}
+
 fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
     min_size: usize,
     max_size: usize,
@@ -4481,6 +4561,9 @@ fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
         return build_plateau_sequence_for_step_size(
             min_size, max_size, step_size, roundtrips, rng,
         );
+    }
+    if plateau_order == PlateauOrder::Ascending {
+        return build_ascending_plateau_sequence_for_step_size(min_size, max_size, step_size, rng);
     }
 
     let mut candidates = vec![min_size];
@@ -4896,15 +4979,32 @@ async fn add_n_members(
     )
     .await
     {
-        let _ = record_profiled_worker_failure(
+        if record_profiled_worker_failure(
             runner_events,
             &cursor,
             &actor,
             &error,
-            "stop_run",
-            None,
+            "evict_add_actor_and_retry",
+            active.iter().find(|worker| worker.id != actor.id),
         )
-        .await?;
+        .await?
+        {
+            for joiner in joiners.into_iter().rev() {
+                idle.push_front(joiner);
+            }
+            evict_oom_group_members(
+                http,
+                active,
+                &[actor],
+                fanout,
+                process_pending_fanout,
+                target_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+            )
+            .await?;
+            return Ok(());
+        }
         return Err(error);
     }
     if process_pending_fanout {
@@ -5173,15 +5273,29 @@ async fn remove_n_members(
     )
     .await
     {
-        let _ = record_profiled_worker_failure(
+        if record_profiled_worker_failure(
             runner_events,
             &cursor,
             &actor,
             &error,
-            "stop_run",
-            None,
+            "evict_remove_actor_and_retry",
+            active.iter().find(|worker| worker.id != actor.id),
         )
-        .await?;
+        .await?
+        {
+            evict_oom_group_members(
+                http,
+                active,
+                &[actor],
+                fanout,
+                process_pending_fanout,
+                plateau_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+            )
+            .await?;
+            return Ok(());
+        }
         return Err(error);
     }
 
@@ -7459,6 +7573,11 @@ mod random_input_tests {
     fn fixed_and_range_flag_values_parse() {
         assert_eq!("8".parse::<StepSize>(), Ok(StepSize::Fixed(8)));
         assert_eq!(
+            "ascending".parse::<PlateauOrder>(),
+            Ok(PlateauOrder::Ascending)
+        );
+        assert_eq!("asc".parse::<PlateauOrder>(), Ok(PlateauOrder::Ascending));
+        assert_eq!(
             "[2,16]".parse::<StepSize>(),
             Ok(StepSize::UniformRange { min: 2, max: 16 })
         );
@@ -7505,6 +7624,22 @@ mod random_input_tests {
             .iter()
             .all(|sample| (32..=4096).contains(sample)));
         assert!(payload_samples.iter().collect::<HashSet<_>>().len() > 1);
+    }
+
+    #[test]
+    fn ascending_plateaus_only_grow() {
+        let mut rng = StdRng::seed_from_u64(19);
+        let sequence = build_plateau_sequence_for_order(
+            2,
+            16,
+            &StepSize::Fixed(4),
+            3,
+            PlateauOrder::Ascending,
+            &mut rng,
+        );
+
+        assert_eq!(sequence, vec![2, 6, 10, 14, 16]);
+        assert!(sequence.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
@@ -7996,6 +8131,45 @@ mod failure_experiment_tests {
         let profile_path = run_dir.join("client-test-001.jsonl");
         assert!(profile_path.exists());
 
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn profiled_failure_policy_controls_continuation() {
+        let run_dir = temp_dir();
+        let events = RunnerEventLog::new(&run_dir);
+        let worker = WorkerSpec::legacy("00001".to_string(), "http://127.0.0.1:9999".to_string());
+        let cursor = BenchmarkCursor::new(1, 2, 1, "membership_add", "generate_key_package");
+        let err = anyhow!("APP_HEAP_BUDGET_EXCEEDED failure_class=app_heap_budget_exceeded");
+
+        FAILURE_EXPERIMENT_MODE.store(false, Ordering::Relaxed);
+        store_profiled_failure_policy(ProfiledFailurePolicy::StopOnProfiledFailure);
+        let should_continue = record_profiled_worker_failure(
+            &events,
+            &cursor,
+            &worker,
+            &err,
+            "drop_idle_joiner",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(!should_continue);
+
+        store_profiled_failure_policy(ProfiledFailurePolicy::RemoveAndContinue);
+        let should_continue = record_profiled_worker_failure(
+            &events,
+            &cursor,
+            &worker,
+            &err,
+            "drop_idle_joiner",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(should_continue);
+
+        store_profiled_failure_policy(ProfiledFailurePolicy::StopOnProfiledFailure);
         let _ = fs::remove_dir_all(&run_dir);
     }
 
