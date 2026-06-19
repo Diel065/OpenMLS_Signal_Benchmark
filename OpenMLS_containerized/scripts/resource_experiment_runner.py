@@ -317,13 +317,21 @@ def build_worker_resource_assignments(
     if selected_profile_index is not None and 0 <= selected_profile_index < len(profiles):
         selected_sp_profile_id = profiles[selected_profile_index].resource_profile_id
 
+    profile_by_id: Dict[str, ResourceProfile] = {}
+    if profiles:
+        profile_by_id = {p.resource_profile_id: p for p in profiles}
+
     for i, (worker_id, client_id, container_name) in enumerate(
         zip(singleton_worker_ids, singleton_client_ids, singleton_container_names)
     ):
-        profile = get_selected_profile(profiles) if profiles else None
+        pa = plan.profiled_assignments[i] if i < len(plan.profiled_assignments) else None
+        profile = None
+        if pa is not None and pa.resource_profile_id:
+            profile = profile_by_id.get(pa.resource_profile_id)
+        if profile is None:
+            profile = get_selected_profile(profiles) if profiles else None
         if profile is None and profiles:
             profile = profiles[i % len(profiles)]
-        pa = plan.profiled_assignments[i] if i < len(plan.profiled_assignments) else None
 
         is_selected = False
         p_index = profile.resource_profile_index if profile else -1

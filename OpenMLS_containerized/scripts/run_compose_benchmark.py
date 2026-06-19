@@ -1949,6 +1949,24 @@ def verify_resource_limits(
                     f"memory_swap expected {expected['memory_swap_bytes']} observed {host_config.get('MemorySwap')}"
                 )
 
+        cgroup_cpu_max = None
+        cgroup_cpu_max_quota = None
+        cgroup_cpu_max_period = None
+        pid = int((inspect.get("State") or {}).get("Pid") or 0)
+        if pid > 0:
+            cgroups = cgroup_paths_for_pid(pid)
+            cpu_path = cgroups.get("cpu") or cgroups.get("unified")
+            if cpu_path:
+                cpu_max_raw = (cpu_path / "cpu.max").read_text(encoding="utf-8").strip()
+                cgroup_cpu_max = cpu_max_raw
+                parts = cpu_max_raw.split()
+                if len(parts) == 2:
+                    cgroup_cpu_max_quota = parts[0]
+                    cgroup_cpu_max_period = parts[1]
+        observed["cgroup_cpu_max"] = cgroup_cpu_max
+        observed["cgroup_cpu_max_quota"] = cgroup_cpu_max_quota
+        observed["cgroup_cpu_max_period"] = cgroup_cpu_max_period
+
         if expected["cpus"] is not None:
             observed_cpus = observed["effective_cpus"]
             tolerance = max(0.001, float(expected["cpus"]) * 0.005)
@@ -1960,6 +1978,20 @@ def verify_resource_limits(
                 messages.append(
                     f"cpus expected {expected['cpus']} observed {observed_cpus}"
                 )
+            if cgroup_cpu_max_quota is not None and cgroup_cpu_max_period is not None:
+                try:
+                    cgroup_effective = float(cgroup_cpu_max_quota) / float(cgroup_cpu_max_period)
+                    checks["cgroup_cpu_max_matches_docker"] = (
+                        observed_cpus is not None
+                        and abs(cgroup_effective - float(observed_cpus)) <= max(0.001, float(observed_cpus) * 0.02)
+                    )
+                    if not checks["cgroup_cpu_max_matches_docker"]:
+                        messages.append(
+                            f"cgroup cpu.max ({cgroup_cpu_max}) effective={cgroup_effective:.6f} "
+                            f"differs from Docker effective_cpus={observed_cpus}"
+                        )
+                except (ValueError, ZeroDivisionError):
+                    pass
 
         if expected["pids_limit"] is not None:
             checks["pids_limit"] = int(host_config.get("PidsLimit") or 0) == int(expected["pids_limit"])
@@ -2297,6 +2329,7 @@ class ResourceMonitor:
             "cpu.stat.nr_periods": cpu_stat.get("nr_periods"),
             "cpu.stat.nr_throttled": cpu_stat.get("nr_throttled"),
             "cpu.stat.throttled_usec": cpu_stat.get("throttled_usec"),
+            "cpu.max": (cpu_path / "cpu.max").read_text(encoding="utf-8").strip() if cpu_path else None,
             "pids.current": read_cgroup_scalar(pids_path / "pids.current") if pids_path else None,
             "container.status": state.get("status"),
             "container.running": state.get("running"),

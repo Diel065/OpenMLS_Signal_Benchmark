@@ -1755,6 +1755,19 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     configure_profiled_operation_journal(&run_dir);
     let runner_events = RunnerEventLog::new(&run_dir);
 
+    for worker in &config.workers {
+        if worker.profile_enabled {
+            let profile_path = run_dir.join(format!("client-{}.jsonl", worker.id));
+            if !profile_path.exists() {
+                let _ = OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(false)
+                    .open(&profile_path);
+            }
+        }
+    }
+
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
     let min_fanout_parallelism =
         effective_min_fanout_parallelism(config.min_fanout_parallelism, max_fanout_parallelism);
@@ -1788,12 +1801,15 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         config.process_pending_fanout
     );
 
+    let pool_idle_secs = runner_http_pool_idle_timeout_secs();
     let http = reqwest::Client::builder()
         .connect_timeout(runner_http_connect_timeout)
         .timeout(runner_http_request_timeout)
         .pool_max_idle_per_host(http_pool_max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(30))
-        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .pool_idle_timeout(Duration::from_secs(pool_idle_secs))
+        .tcp_keepalive(Some(Duration::from_secs(
+            (pool_idle_secs / 2).max(5),
+        )))
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -2074,6 +2090,13 @@ fn effective_http_pool_max_idle_per_host(configured: usize) -> usize {
     } else {
         DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST
     }
+}
+
+fn runner_http_pool_idle_timeout_secs() -> u64 {
+    std::env::var("OPENMLS_RUNNER_HTTP_POOL_IDLE_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(30)
 }
 
 fn runner_http_connect_timeout_ms() -> u64 {

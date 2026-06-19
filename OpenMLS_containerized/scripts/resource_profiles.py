@@ -19,6 +19,8 @@ import uuid
 
 DOCKER_MIN_MEMORY_BYTES = 6 * 1024 * 1024
 DOCKER_MIN_CPU_QUOTA = 0.01
+CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US = 1000
+CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR = 2.0
 
 
 @dataclass
@@ -438,6 +440,21 @@ def generate_parallel_cpu_sweep_profiles(
 
     cpu_period_us = 100000
 
+    min_quota_us = min(int(round(cpu_period_us * fraction)) for fraction in cpu_fractions)
+    if min_quota_us < int(CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR * CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US):
+        scale = int(
+            (CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR * CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US + min_quota_us - 1)
+            / min_quota_us
+        )
+        cpu_period_us = cpu_period_us * scale
+        import sys as _sys
+        print(
+            f"[resource_profiles] CPU period auto-scaled from 100000 us to {cpu_period_us} us "
+            f"(x{scale}) to keep all quotas >= {int(CGROUP_V2_CPU_QUOTA_HEADROOM_FACTOR * CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US)} us "
+            f"(cgroup v2 cpu.max floor is {CGROUP_V2_CPU_MAX_QUOTA_FLOOR_US} us)",
+            file=_sys.stderr,
+        )
+
     profiles = []
     for idx, fraction in enumerate(cpu_fractions):
         if fraction <= 0 or fraction > 1.0:
@@ -547,13 +564,21 @@ def profile_to_compose_dict(profile: ResourceProfile) -> Dict:
 
     Returns a dict with keys that can be directly merged into a compose service definition.
     Fields that are None are omitted from the result.
+
+    When cpu_quota_us is explicitly set and cpu_period_us differs from the Docker
+    default of 100000 us, cpu_quota and cpu_period compose keys are emitted instead
+    of the cpus key.  This avoids the cgroup v2 cpu.max minimum-quota floor (1000 us)
+    that would otherwise collapse sub-0.01-CPU profiles into a single effective limit.
     """
     result: Dict = {}
 
     if profile.cpuset_cpus:
         result["cpuset"] = profile.cpuset_cpus
 
-    if profile.cpu_limit_cpus is not None:
+    if profile.cpu_quota_us is not None and profile.cpu_period_us != 100000:
+        result["cpu_quota"] = str(int(profile.cpu_quota_us))
+        result["cpu_period"] = str(int(profile.cpu_period_us))
+    elif profile.cpu_limit_cpus is not None:
         result["cpus"] = str(profile.cpu_limit_cpus)
 
     if profile.memory_limit:

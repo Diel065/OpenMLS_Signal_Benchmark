@@ -27,13 +27,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OPENMLS_DIR="$(cd "$SCRIPT_DIR/../OpenMLS_containerized" && pwd)"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
-SWEEP="${SWEEP:-ram}"
+SWEEP="${SWEEP:-both}"
 STRICT_CPUSET="${STRICT_CPUSET:-0}"
 
 WORKERS=1024
 PROFILED_SINGLETON_COUNT=8
 SINGLETON_MIN_COUNT=8
-SINGLETON_FRACTION=0
+SINGLETON_FRACTION=0.000000001
 PACKED_PER_CONTAINER=64
 PACKED_INTERNAL_PARALLELISM=16
 BRIDGE_COUNT=2
@@ -41,8 +41,8 @@ BRIDGE_COUNT=2
 MAX_GROUP_SIZE=1024
 STEP_SIZE=16
 ROUNDTRIPS=1
-UPDATE_ROUNDS=1
-APP_ROUNDS=1
+UPDATE_ROUNDS=4
+APP_ROUNDS=4
 
 CPU_AFFINITY_SAMPLE=20
 HEALTH_TIMEOUT=240
@@ -137,8 +137,8 @@ run_parallel_sweep() {
         --roundtrips            "$ROUNDTRIPS"
         --update-rounds         "$UPDATE_ROUNDS"
         --app-rounds            "$APP_ROUNDS"
-        --max-update-samples-per-plateau 1
-        --max-app-samples-per-payload    1
+        --max-update-samples-per-plateau 4
+        --max-app-samples-per-payload    4
         --payload-sizes         32,256,2048
         --http-pool-max-idle-per-host   "$WORKER_HTTP_POOL"
         --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL"

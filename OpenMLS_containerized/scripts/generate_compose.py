@@ -1126,6 +1126,27 @@ def generate_compose_text(
                                 "resource_profile_index"):
                         if key in affinity_result:
                             pw.resource_limits[key] = affinity_result[key]
+            elif resource_experiment != "none" and resource_profiles and singleton_idx < len(resource_profiles):
+                rp = resource_profiles[singleton_idx]
+                if rp.get("cpu_quota_us") is not None and rp.get("cpu_period_us") is not None and rp.get("cpu_period_us") != 100000:
+                    lines.append(f'    cpu_quota: "{int(rp["cpu_quota_us"])}"')
+                    lines.append(f'    cpu_period: "{int(rp["cpu_period_us"])}"')
+                elif rp.get("cpu_limit_cpus") is not None:
+                    lines.append(f'    cpus: "{rp["cpu_limit_cpus"]}"')
+                if rp.get("memory_limit"):
+                    lines.append(f'    mem_limit: "{rp["memory_limit"]}"')
+                    pw.resource_limits["resource_limit_memory"] = rp["memory_limit"]
+                if rp.get("memory_swap"):
+                    lines.append(f'    memswap_limit: "{rp["memory_swap"]}"')
+                    pw.resource_limits["resource_limit_memory_swap"] = rp["memory_swap"]
+                if rp.get("cpu_limit_cpus") is not None:
+                    pw.resource_limits["resource_limit_cpus"] = rp["cpu_limit_cpus"]
+                pw.resource_limits["resource_profile_id"] = rp.get("resource_profile_id", "")
+                pw.resource_limits["app_heap_budget"] = rp.get("app_heap_budget", "")
+                pw.resource_limits["app_heap_budget_bytes"] = rp.get("app_heap_budget_bytes", "")
+                pw.resource_limits["memory_model"] = rp.get("memory_model", "")
+                pw.resource_limits["docker_memory_limit"] = rp.get("docker_memory_limit") or rp.get("memory_limit", "")
+                singleton_idx += 1
             else:
                 limits = pw.resource_limits
                 if limits.get("resource_limit_cpus") is not None:
@@ -1404,7 +1425,13 @@ def apply_affinity_to_compose(
             if rp is None and profile_idx < len(resource_profiles):
                 rp = resource_profiles[profile_idx]
             if rp:
-                if rp.get("cpu_limit_cpus") is not None:
+                cpu_quota = rp.get("cpu_quota_us")
+                cpu_period = rp.get("cpu_period_us")
+                if cpu_quota is not None and cpu_period is not None and cpu_period != 100000:
+                    lines.append(f'    cpu_quota: "{int(cpu_quota)}"')
+                    lines.append(f'    cpu_period: "{int(cpu_period)}"')
+                    result["resource_limit_cpus"] = rp.get("cpu_limit_cpus")
+                elif rp.get("cpu_limit_cpus") is not None:
                     lines.append(f'    cpus: "{rp["cpu_limit_cpus"]}"')
                     result["resource_limit_cpus"] = rp["cpu_limit_cpus"]
                 if rp.get("memory_limit"):
