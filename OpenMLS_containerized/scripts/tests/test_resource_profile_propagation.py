@@ -327,6 +327,43 @@ class TestWorkerAssignmentPropagation:
         assert sum(1 for row in profiled_rows if row["group_creator"]) == 1
         assert all(row["selected_for_this_run"] for row in profiled_rows)
 
+    def test_parallel_cpu_assignment_includes_cfs_quota_metadata(self):
+        profiles = select_all_profiles(generate_parallel_cpu_sweep_profiles(
+            [1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
+        ))
+        plan = self._make_minimal_plan("test-run", [
+            {
+                "worker_id": f"worker-{idx + 1:05d}",
+                "container_name": f"worker-{idx + 1:05d}",
+                "logical_client_id": f"{idx + 1:05d}",
+                "experiment_kind": "cpu_quota_sweep",
+                "resource_profile_id": profile.resource_profile_id,
+                "rayon_num_threads": 1,
+            }
+            for idx, profile in enumerate(profiles)
+        ])
+
+        assignments = build_worker_resource_assignments(
+            run_id="test-run",
+            plan=plan,
+            profiles=profiles,
+            selected_profile_index=0,
+            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(8)],
+            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            packed_container_names=[],
+            infrastructure_container_names=["ds", "relay"],
+        )
+
+        profiled_rows = [row for row in assignments if row["profile_enabled"]]
+        effective = {
+            round(row["cpu_quota_us"] / row["cpu_period_us"], 8)
+            for row in profiled_rows
+        }
+
+        assert len(effective) == 8
+        assert {row["cpu_period_us"] for row in profiled_rows} == {1_000_000}
+
 
 class TestComposeGenerationPropagation:
     """Tests that nonzero selected profiles reach generated Compose config."""

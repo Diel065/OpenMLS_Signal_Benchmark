@@ -146,6 +146,24 @@ def _safe_float(value) -> float:
         return 0.0
 
 
+def _effective_cpu_fraction(row) -> Optional[float]:
+    cpu_quota_us = _safe_int(row.get("cpu_quota_us"))
+    cpu_period_us = _safe_int(row.get("cpu_period_us"))
+    if cpu_period_us > 0 and cpu_quota_us > 0:
+        return cpu_quota_us / cpu_period_us
+
+    capacity_fraction = _safe_float(row.get("capacity_fraction"))
+    if capacity_fraction > 0:
+        return capacity_fraction
+
+    cpu_limit = _safe_float(row.get("cpu_limit_cpus"))
+    assigned_count = _safe_float(row.get("assigned_cpu_count"))
+    if cpu_limit > 0 and assigned_count > 0:
+        return cpu_limit / assigned_count
+
+    return None
+
+
 def parse_memory_to_bytes(value: str) -> int:
     raw = (value or "").strip().lower()
     if not raw:
@@ -682,10 +700,8 @@ class Validator:
 
             distinct_effective = set()
             for r in profiled_singletons:
-                cpu_quota_us = _safe_int(r.get("cpu_quota_us"))
-                cpu_period_us = _safe_int(r.get("cpu_period_us"))
-                if cpu_period_us > 0:
-                    effective = cpu_quota_us / cpu_period_us
+                effective = _effective_cpu_fraction(r)
+                if effective is not None:
                     distinct_effective.add(round(effective, 8))
             if len(distinct_effective) < len(profiled_singletons):
                 self.error(

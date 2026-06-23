@@ -3002,6 +3002,10 @@ async fn send_cmd_expect_ok_fragment_with_context(
     }
 }
 
+fn is_queued_epoch_race_message(message: &str) -> bool {
+    message.contains("lost the epoch race") && message.contains("queued for retry")
+}
+
 async fn send_cmd_until_ok(
     http: &reqwest::Client,
     worker: &WorkerSpec,
@@ -5443,6 +5447,125 @@ fn removable_member_indices(
         .collect()
 }
 
+async fn process_pending_commits_after_epoch_race(
+    http: &reqwest::Client,
+    actor: &WorkerSpec,
+    cursor: &BenchmarkCursor,
+    attempt: usize,
+) -> Result<()> {
+    let command = Command::ProcessPending {
+        kinds: Some(vec![PendingKind::Commits]),
+        max_messages: Some(8),
+        expected_epoch: None,
+        profile: false,
+        commit_create_op: None,
+        commit_receive_sampling_policy: None,
+        commit_receive_sampling_seed: None,
+        commit_receive_sample_index: None,
+        commit_receive_sample_count: None,
+        commit_receive_population_size: None,
+    };
+    let phase = format!("oom_eviction.actor_process_pending_after_epoch_race_{attempt}");
+    let context = WorkerCommandContext::with_metadata(
+        actor,
+        &command,
+        None,
+        Some(phase.as_str()),
+        Some(cursor),
+    );
+
+    send_cmd_expect_ok_fragment_with_context(
+        http,
+        actor,
+        &command,
+        "process_pending processed;",
+        &context,
+    )
+    .await
+    .map(|_| ())
+}
+
+async fn publish_remove_members_with_epoch_race_recovery(
+    http: &reqwest::Client,
+    actor: &WorkerSpec,
+    dead_ids: &HashSet<String>,
+    cursor: &BenchmarkCursor,
+) -> Result<ExpectedGroupState> {
+    for attempt in 1..=3 {
+        let actor_before = show_group_state(http, actor).await?;
+        let removed_ids = actor_before
+            .members
+            .iter()
+            .filter(|member| dead_ids.contains(*member))
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected_members = actor_before
+            .members
+            .iter()
+            .filter(|member| !dead_ids.contains(*member))
+            .cloned()
+            .collect::<Vec<_>>();
+
+        if removed_ids.is_empty() {
+            return Ok(expected_group_state(
+                &actor_before,
+                actor_before.epoch,
+                expected_members,
+            ));
+        }
+
+        let expected_after_commit =
+            expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
+        let command = Command::RemoveMembers {
+            members: removed_ids.clone(),
+        };
+        let context = WorkerCommandContext::with_metadata(
+            actor,
+            &command,
+            None,
+            Some("oom_eviction.remove_members"),
+            Some(cursor),
+        );
+        let response = send_command_with_context(http, actor, &command, &context).await?;
+
+        match response.status.as_str() {
+            "ok" if response
+                .message
+                .contains("removed locally; group commit published") =>
+            {
+                return Ok(expected_after_commit);
+            }
+            "ok" if is_queued_epoch_race_message(&response.message) => {
+                eprintln!(
+                    "[oom-eviction] remove_members queued after epoch race; actor={} attempt={} message={}",
+                    actor.id, attempt, response.message
+                );
+                process_pending_commits_after_epoch_race(http, actor, cursor, attempt).await?;
+            }
+            "ok" => {
+                return Err(anyhow!(
+                    "Worker {} returned unexpected ok message: {}",
+                    actor.id,
+                    response.message
+                ));
+            }
+            "error" => return Err(anyhow!("Worker {} error: {}", actor.id, response.message)),
+            other => {
+                return Err(anyhow!(
+                    "Worker {} returned unknown status '{}': {}",
+                    actor.id,
+                    other,
+                    response.message
+                ));
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "remove_members for OOM eviction kept losing the epoch race after 3 attempts"
+    ))
+}
+
 async fn evict_oom_group_members(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
@@ -5478,15 +5601,6 @@ async fn evict_oom_group_members(
         return Ok(());
     }
 
-    let expected_members = actor_before
-        .members
-        .iter()
-        .filter(|member| !dead_ids.contains(*member))
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_after_commit =
-        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
-
     let cursor = BenchmarkCursor::new(
         plateau_size,
         plateau_size,
@@ -5495,15 +5609,8 @@ async fn evict_oom_group_members(
         "evict_commit",
     );
 
-    send_cmd_expect_ok_fragment(
-        http,
-        &actor,
-        &Command::RemoveMembers {
-            members: removed_ids.clone(),
-        },
-        "removed locally; group commit published",
-    )
-    .await?;
+    let expected_after_commit =
+        publish_remove_members_with_epoch_race_recovery(http, &actor, &dead_ids, &cursor).await?;
     if process_pending_fanout {
         process_pending_commit_expect(
             http,
@@ -8081,6 +8188,16 @@ mod failure_experiment_tests {
     fn classify_worker_error_detects_connect_failure() {
         let err = anyhow!("client error: connect failure");
         assert_eq!(classify_worker_error(&err), "worker_unreachable");
+    }
+
+    #[test]
+    fn queued_epoch_race_message_is_detected() {
+        assert!(is_queued_epoch_race_message(
+            "remove_members for [\"00494\"] lost the epoch race and was queued for retry: Commit epoch mismatch"
+        ));
+        assert!(!is_queued_epoch_race_message(
+            "members [\"00494\"] removed locally; group commit published"
+        ));
     }
 
     #[test]
