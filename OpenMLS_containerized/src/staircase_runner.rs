@@ -2027,8 +2027,19 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         )
         .await?;
 
-        let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
-        let state = ensure_converged(&http, &active, &active_ids, max_fanout_parallelism).await?;
+        let state = ensure_converged_with_attrition(
+            &http,
+            &mut active,
+            &mut fanout,
+            config.process_pending_fanout,
+            target_size,
+            config.max_commit_receive_samples_per_plateau,
+            config.commit_receive_sampling_seed,
+            max_fanout_parallelism,
+            plateau_idx + 1,
+            &runner_events,
+        )
+        .await?;
         eprintln!(
             "\n[plateau {}] converged at epoch {} with members {:?}",
             target_size, state.epoch, state.members
@@ -2052,12 +2063,17 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         )
         .await?;
 
-        let active_ids_after_updates: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
-        let state_after_updates = ensure_converged(
+        let state_after_updates = ensure_converged_with_attrition(
             &http,
-            &active,
-            &active_ids_after_updates,
+            &mut active,
+            &mut fanout,
+            config.process_pending_fanout,
+            target_size,
+            config.max_commit_receive_samples_per_plateau,
+            config.commit_receive_sampling_seed,
             max_fanout_parallelism,
+            plateau_idx + 1,
+            &runner_events,
         )
         .await?;
         eprintln!(
@@ -3494,6 +3510,59 @@ async fn ensure_converged(
     Ok(reference.clone())
 }
 
+async fn ensure_converged_with_attrition(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    fanout: &mut FanoutController,
+    process_pending_fanout: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    max_parallelism: usize,
+    plateau_index: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<GroupStateSnapshot> {
+    loop {
+        let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
+        let result = ensure_converged(http, active, &active_ids, max_parallelism).await;
+        match result {
+            Ok(state) => return Ok(state),
+            Err(error) => {
+                let cursor = BenchmarkCursor::new(
+                    plateau_index,
+                    plateau_size,
+                    active.len(),
+                    "convergence",
+                    "show_group_state",
+                );
+                let Some(dead_workers) = record_batch_oom_failures(
+                    runner_events,
+                    &cursor,
+                    &error,
+                    "evict_convergence_member_and_retry",
+                    active.first(),
+                )
+                .await?
+                else {
+                    return Err(error);
+                };
+                evict_oom_group_members(
+                    http,
+                    active,
+                    &dead_workers,
+                    fanout,
+                    process_pending_fanout,
+                    plateau_size,
+                    max_commit_receive_samples_per_plateau,
+                    commit_receive_sampling_seed,
+                    runner_events,
+                )
+                .await?;
+            }
+        }
+    }
+}
+
 async fn collect_worker_group_states(
     http: &reqwest::Client,
     workers: &[WorkerSpec],
@@ -3518,12 +3587,12 @@ async fn collect_worker_group_states(
     );
 
     if !collect.failures.is_empty() {
-        return Err(anyhow!(
-            "convergence ShowGroupState failed_workers={} max_parallelism={} failures=[{}]",
-            collect.failures.len(),
-            max_parallelism,
-            format_fanout_failures(&collect.failures)
-        ));
+        return Err(BatchFanoutError {
+            phase: "convergence".to_string(),
+            operation: "show_group_state".to_string(),
+            failures: collect.failures,
+        }
+        .into());
     }
 
     let mut by_id = HashMap::with_capacity(collect.successes.len());
@@ -5005,6 +5074,7 @@ async fn add_n_members(
                 target_size,
                 max_commit_receive_samples_per_plateau,
                 commit_receive_sampling_seed,
+                runner_events,
             )
             .await?;
             return Ok(());
@@ -5162,6 +5232,7 @@ async fn add_n_members(
         target_size,
         max_commit_receive_samples_per_plateau,
         commit_receive_sampling_seed,
+        runner_events,
     )
     .await?;
     progress.tick_units(
@@ -5296,6 +5367,7 @@ async fn remove_n_members(
                 plateau_size,
                 max_commit_receive_samples_per_plateau,
                 commit_receive_sampling_seed,
+                runner_events,
             )
             .await?;
             return Ok(());
@@ -5575,143 +5647,226 @@ async fn evict_oom_group_members(
     plateau_size: usize,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     if dead_workers.is_empty() {
         return Ok(());
     }
-    let dead_ids = dead_workers
+    let mut dead_ids = dead_workers
         .iter()
         .map(|worker| worker.id.clone())
         .collect::<HashSet<_>>();
-    let actor = active
-        .iter()
-        .find(|worker| !dead_ids.contains(&worker.id))
-        .cloned()
-        .ok_or_else(|| anyhow!("No live OpenMLS member remains to evict OOM workers"))?;
 
-    let actor_before = show_group_state(http, &actor).await?;
-    let removed_ids = actor_before
-        .members
-        .iter()
-        .filter(|member| dead_ids.contains(*member))
-        .cloned()
-        .collect::<Vec<_>>();
-    if removed_ids.is_empty() {
+    loop {
+        let actor = active
+            .iter()
+            .find(|worker| !dead_ids.contains(&worker.id))
+            .cloned()
+            .ok_or_else(|| anyhow!("No live OpenMLS member remains to evict OOM workers"))?;
+
+        let cursor = BenchmarkCursor::new(
+            plateau_size,
+            plateau_size,
+            active.len(),
+            "oom_eviction",
+            "evict_commit",
+        );
+
+        let actor_before = match show_group_state(http, &actor).await {
+            Ok(state) => state,
+            Err(error) => {
+                if record_profiled_worker_failure(
+                    runner_events,
+                    &cursor,
+                    &actor,
+                    &error,
+                    "evict_oom_eviction_actor_and_retry",
+                    active
+                        .iter()
+                        .find(|worker| worker.id != actor.id && !dead_ids.contains(&worker.id)),
+                )
+                .await?
+                {
+                    dead_ids.insert(actor.id);
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        let removed_ids = actor_before
+            .members
+            .iter()
+            .filter(|member| dead_ids.contains(*member))
+            .cloned()
+            .collect::<Vec<_>>();
+        if removed_ids.is_empty() {
+            active.retain(|worker| !dead_ids.contains(&worker.id));
+            return Ok(());
+        }
+
+        let expected_after_commit =
+            match publish_remove_members_with_epoch_race_recovery(http, &actor, &dead_ids, &cursor)
+                .await
+            {
+                Ok(expected) => expected,
+                Err(error) => {
+                    if record_profiled_worker_failure(
+                        runner_events,
+                        &cursor,
+                        &actor,
+                        &error,
+                        "evict_oom_eviction_actor_and_retry",
+                        active
+                            .iter()
+                            .find(|worker| worker.id != actor.id && !dead_ids.contains(&worker.id)),
+                    )
+                    .await?
+                    {
+                        dead_ids.insert(actor.id);
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+
+        let actor_commit_result = if process_pending_fanout {
+            process_pending_commit_expect(
+                http,
+                &actor,
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "oom_eviction.actor_process_pending",
+                Some(&cursor),
+            )
+            .await
+        } else {
+            receive_commit_expect(
+                http,
+                &actor,
+                "own commit accepted from DS",
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "oom_eviction.actor_receive_commit",
+                Some(&cursor),
+            )
+            .await
+        };
+        if let Err(error) = actor_commit_result {
+            if record_profiled_worker_failure(
+                runner_events,
+                &cursor,
+                &actor,
+                &error,
+                "evict_oom_eviction_actor_and_retry",
+                active
+                    .iter()
+                    .find(|worker| worker.id != actor.id && !dead_ids.contains(&worker.id)),
+            )
+            .await?
+            {
+                dead_ids.insert(actor.id);
+                continue;
+            }
+            return Err(error);
+        }
+
+        let recipients = active
+            .iter()
+            .filter(|worker| worker.id != actor.id && !dead_ids.contains(&worker.id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
+        let expected_ep = expected_epoch(&expected_state);
+        let fanout_phase = if process_pending_fanout {
+            "oom_eviction.fanout_process_pending"
+        } else {
+            "oom_eviction.fanout_receive_commit"
+        };
+        let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+            &recipients,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            plateau_size,
+            expected_after_commit.epoch,
+            0,
+        );
+        let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    let sampled = sampled_ids.contains(&worker.id);
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                } else {
+                    let sampled = sampled_ids.contains(&worker.id);
+                    Command::ReceiveCommit {
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: sampled_ids.contains(&worker.id).then_some(true),
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+            }
+            .with_benchmark_cursor(&cursor)
+        });
+        let expected_by_client = recipients
+            .iter()
+            .map(|worker| (worker.id.clone(), expected_state.clone()))
+            .collect::<HashMap<_, _>>();
+        let fanout_result = batch_fanout_workers(
+            http,
+            "oom_eviction",
+            recipients.len(),
+            "receive_commit",
+            &recipients,
+            fanout,
+            &commands_by_physical,
+            Some(&expected_by_client),
+        )
+        .await;
+        if let Err(error) = fanout_result {
+            if let Some(new_dead_workers) = record_batch_oom_failures(
+                runner_events,
+                &cursor,
+                &error,
+                "evict_oom_eviction_recipient_and_retry",
+                Some(&actor),
+            )
+            .await?
+            {
+                for worker in new_dead_workers {
+                    dead_ids.insert(worker.id);
+                }
+                continue;
+            }
+            return Err(error);
+        }
+
         active.retain(|worker| !dead_ids.contains(&worker.id));
         return Ok(());
     }
-
-    let cursor = BenchmarkCursor::new(
-        plateau_size,
-        plateau_size,
-        active.len(),
-        "oom_eviction",
-        "evict_commit",
-    );
-
-    let expected_after_commit =
-        publish_remove_members_with_epoch_race_recovery(http, &actor, &dead_ids, &cursor).await?;
-    if process_pending_fanout {
-        process_pending_commit_expect(
-            http,
-            &actor,
-            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-            "oom_eviction.actor_process_pending",
-            Some(&cursor),
-        )
-        .await?;
-    } else {
-        receive_commit_expect(
-            http,
-            &actor,
-            "own commit accepted from DS",
-            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-            "oom_eviction.actor_receive_commit",
-            Some(&cursor),
-        )
-        .await?;
-    }
-
-    let recipients = active
-        .iter()
-        .filter(|worker| worker.id != actor.id && !dead_ids.contains(&worker.id))
-        .cloned()
-        .collect::<Vec<_>>();
-    let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
-    let expected_ep = expected_epoch(&expected_state);
-    let fanout_phase = if process_pending_fanout {
-        "oom_eviction.fanout_process_pending"
-    } else {
-        "oom_eviction.fanout_receive_commit"
-    };
-    let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
-        &recipients,
-        max_commit_receive_samples_per_plateau,
-        commit_receive_sampling_seed,
-        plateau_size,
-        expected_after_commit.epoch,
-        0,
-    );
-    let commands_by_physical = build_batch_commands(&recipients, |worker| {
-        BatchFanoutCommand {
-            client_id: worker.id.clone(),
-            request_id: None,
-            command: if process_pending_fanout {
-                let sampled = sampled_ids.contains(&worker.id);
-                Command::ProcessPending {
-                    kinds: Some(vec![PendingKind::Commits]),
-                    max_messages: None,
-                    expected_epoch: expected_ep,
-                    profile: sampled,
-                    commit_create_op: Some("remove".to_string()),
-                    commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
-                    commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                    commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
-                    commit_receive_sample_count: Some(sample_count),
-                    commit_receive_population_size: Some(recipients.len()),
-                }
-            } else {
-                let sampled = sampled_ids.contains(&worker.id);
-                Command::ReceiveCommit {
-                    profile: sampled,
-                    commit_create_op: Some("remove".to_string()),
-                    commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
-                    commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                    commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
-                    commit_receive_sample_count: Some(sample_count),
-                    commit_receive_population_size: Some(recipients.len()),
-                }
-            },
-            expected_epoch: expected_ep,
-            phase: Some(fanout_phase.to_string()),
-            profile: sampled_ids.contains(&worker.id).then_some(true),
-            benchmark_plateau_index: None,
-            benchmark_target_size: None,
-            benchmark_active_size: None,
-            benchmark_phase: None,
-            benchmark_operation: None,
-            benchmark_operation_seq: None,
-            benchmark_payload_size: None,
-        }
-        .with_benchmark_cursor(&cursor)
-    });
-    let expected_by_client = recipients
-        .iter()
-        .map(|worker| (worker.id.clone(), expected_state.clone()))
-        .collect::<HashMap<_, _>>();
-    batch_fanout_workers(
-        http,
-        "oom_eviction",
-        recipients.len(),
-        "receive_commit",
-        &recipients,
-        fanout,
-        &commands_by_physical,
-        Some(&expected_by_client),
-    )
-    .await?;
-    active.retain(|worker| !dead_ids.contains(&worker.id));
-    Ok(())
 }
 
 async fn transition_to_size(
@@ -5971,6 +6126,7 @@ async fn run_update_phase(
                         plateau_size,
                         max_commit_receive_samples_per_plateau,
                         commit_receive_sampling_seed,
+                        runner_events,
                     )
                     .await?;
                     continue;
@@ -6021,6 +6177,7 @@ async fn run_update_phase(
                     plateau_size,
                     max_commit_receive_samples_per_plateau,
                     commit_receive_sampling_seed,
+                    runner_events,
                 )
                 .await?;
                 continue;
@@ -6069,6 +6226,7 @@ async fn run_update_phase(
                     plateau_size,
                     max_commit_receive_samples_per_plateau,
                     commit_receive_sampling_seed,
+                    runner_events,
                 )
                 .await?;
                 continue;
@@ -6182,6 +6340,7 @@ async fn run_update_phase(
                     plateau_size,
                     max_commit_receive_samples_per_plateau,
                     commit_receive_sampling_seed,
+                    runner_events,
                 )
                 .await?;
                 continue;
@@ -6383,6 +6542,7 @@ async fn run_application_phase(
                         plateau_size,
                         max_commit_receive_samples_per_plateau,
                         commit_receive_sampling_seed,
+                        runner_events,
                     )
                     .await?;
                     continue;
@@ -6466,6 +6626,7 @@ async fn run_application_phase(
                         plateau_size,
                         max_commit_receive_samples_per_plateau,
                         commit_receive_sampling_seed,
+                        runner_events,
                     )
                     .await?;
                     continue;
@@ -8285,6 +8446,57 @@ mod failure_experiment_tests {
         .await
         .unwrap();
         assert!(should_continue);
+
+        store_profiled_failure_policy(ProfiledFailurePolicy::StopOnProfiledFailure);
+        let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[tokio::test]
+    async fn batch_app_heap_failures_become_dead_workers_for_attrition() {
+        let run_dir = temp_dir();
+        let events = RunnerEventLog::new(&run_dir);
+        let cursor = BenchmarkCursor::new(4, 50, 50, "oom_eviction", "receive_commit");
+        let worker = WorkerSpec::legacy("00042".to_string(), "http://127.0.0.1:9999".to_string());
+        let reassigned_to =
+            WorkerSpec::legacy("00001".to_string(), "http://127.0.0.1:9998".to_string());
+        let error = anyhow!(
+            "APP_HEAP_BUDGET_EXCEEDED failure_class=app_heap_budget_exceeded memory_model=app-heap-budget operation_family=commit_receive benchmark_operation=self_update span_or_phase=oom_eviction.fanout_receive_commit member_count=50 epoch=24 worker_id=00042 resource_profile_id=ram_app_heap_512k resource_profile_index=3 app_heap_budget=512k app_heap_budget_bytes=524288 configured_heap_budget_bytes=524288 current_live_heap_bytes=533430 peak_live_heap_bytes=533430 operation_peak_live_heap_bytes=533430 total_allocated_bytes=23941687 allocation_count=158199 deallocation_count=157172 failed_allocation_size_bytes=49723"
+        );
+        let batch_error: anyhow::Error = BatchFanoutError {
+            phase: "oom_eviction".to_string(),
+            operation: "receive_commit".to_string(),
+            failures: vec![FanoutFailure {
+                worker: worker.clone(),
+                error,
+            }],
+        }
+        .into();
+
+        FAILURE_EXPERIMENT_MODE.store(false, Ordering::Relaxed);
+        store_profiled_failure_policy(ProfiledFailurePolicy::RemoveAndContinue);
+
+        let dead_workers = record_batch_oom_failures(
+            &events,
+            &cursor,
+            &batch_error,
+            "evict_oom_eviction_recipient_and_retry",
+            Some(&reassigned_to),
+        )
+        .await
+        .unwrap()
+        .expect("app-heap fanout failure should be recoverable under remove-and-continue");
+
+        assert_eq!(dead_workers.len(), 1);
+        assert_eq!(dead_workers[0].id, worker.id);
+
+        let runner_jsonl = run_dir.join("runner-events.jsonl");
+        let content = fs::read_to_string(&runner_jsonl).unwrap();
+        let event: RunnerEvent = serde_json::from_str(content.lines().next().unwrap()).unwrap();
+        assert_eq!(event.failure_class, "app_heap_budget_exceeded");
+        assert_eq!(
+            event.failure_action,
+            "evict_oom_eviction_recipient_and_retry"
+        );
 
         store_profiled_failure_policy(ProfiledFailurePolicy::StopOnProfiledFailure);
         let _ = fs::remove_dir_all(&run_dir);
