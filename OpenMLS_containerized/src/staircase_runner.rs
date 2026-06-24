@@ -3221,6 +3221,10 @@ async fn receive_commit_expect(
     {
         Ok(_) => return Ok(()),
         Err(err) => {
+            if is_resource_budget_failure(&err) {
+                return Err(err);
+            }
+
             let is_ambiguous = err
                 .downcast_ref::<WorkerCommandError>()
                 .map(WorkerCommandError::is_ambiguous_transport)
@@ -3251,6 +3255,10 @@ async fn receive_commit_expect(
             {
                 Ok(_) => Ok(()),
                 Err(retry_err) => {
+                    if is_resource_budget_failure(&retry_err) {
+                        return Err(retry_err);
+                    }
+
                     let retry_error = format!("{:#}", retry_err);
                     if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
                         .await?
@@ -3411,6 +3419,10 @@ async fn process_pending_commit_expect(
             }
         }
         Err(err) => {
+            if is_resource_budget_failure(&err) {
+                return Err(err);
+            }
+
             let original_error = format!("{:#}", err);
             if receive_commit_reconciled_by_state(http, worker, &expected, &original_error).await? {
                 return Ok(());
@@ -3441,6 +3453,10 @@ async fn process_pending_commit_expect(
                     }
                 }
                 Err(retry_err) => {
+                    if is_resource_budget_failure(&retry_err) {
+                        return Err(retry_err);
+                    }
+
                     let retry_error = format!("{:#}", retry_err);
                     if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
                         .await?
@@ -3763,6 +3779,22 @@ fn classify_worker_error(error: &anyhow::Error) -> &'static str {
         return "worker_unreachable";
     }
     "infrastructure_failure"
+}
+
+fn is_resource_budget_failure(error: &anyhow::Error) -> bool {
+    matches!(
+        classify_worker_error(error),
+        "app_heap_budget_exceeded"
+            | "app_heap_budget_allocator_abort"
+            | "embedded_budget_timeout"
+            | "cpu_starvation_timeout"
+    )
+}
+
+fn is_profiled_resource_budget_failure(worker: &WorkerSpec, error: &anyhow::Error) -> bool {
+    worker.profile_enabled
+        && worker.container_mode == ContainerMode::Singleton
+        && is_resource_budget_failure(error)
 }
 
 #[derive(Debug)]
@@ -4144,6 +4176,11 @@ async fn reconcile_batch_receive_failures(
             remaining.push(failure);
             continue;
         };
+
+        if is_profiled_resource_budget_failure(&failure.worker, &failure.error) {
+            remaining.push(failure);
+            continue;
+        }
 
         let original_error = format!("{:#}", failure.error);
         match receive_commit_reconciled_by_state(http, &failure.worker, expected, &original_error)
@@ -5209,7 +5246,7 @@ async fn add_n_members(
         .iter()
         .map(|worker| (worker.id.clone(), expected_state.clone()))
         .collect::<HashMap<_, _>>();
-    batch_fanout_workers(
+    let fanout_result = batch_fanout_workers(
         http,
         "add_member",
         target_size,
@@ -5219,10 +5256,28 @@ async fn add_n_members(
         &commands_by_physical,
         Some(&expected_by_client),
     )
-    .await?;
+    .await;
+
+    let mut failed_recipients = Vec::new();
+    if let Err(error) = fanout_result {
+        if let Some(dead_workers) = record_batch_oom_failures(
+            runner_events,
+            &cursor,
+            &error,
+            "evict_add_recipient_and_retry",
+            Some(&actor),
+        )
+        .await?
+        {
+            failed_recipients = dead_workers;
+        } else {
+            return Err(error);
+        }
+    }
 
     let joined_count = joined.len();
     active.extend(joined);
+    failed_joiners.extend(failed_recipients);
     evict_oom_group_members(
         http,
         active,
@@ -5519,12 +5574,12 @@ fn removable_member_indices(
         .collect()
 }
 
-async fn process_pending_commits_after_epoch_race(
+async fn best_effort_process_pending_commits_after_epoch_race(
     http: &reqwest::Client,
     actor: &WorkerSpec,
     cursor: &BenchmarkCursor,
     attempt: usize,
-) -> Result<()> {
+) {
     let command = Command::ProcessPending {
         kinds: Some(vec![PendingKind::Commits]),
         max_messages: Some(8),
@@ -5546,7 +5601,7 @@ async fn process_pending_commits_after_epoch_race(
         Some(cursor),
     );
 
-    send_cmd_expect_ok_fragment_with_context(
+    if let Err(error) = send_cmd_expect_ok_fragment_with_context(
         http,
         actor,
         &command,
@@ -5554,7 +5609,12 @@ async fn process_pending_commits_after_epoch_race(
         &context,
     )
     .await
-    .map(|_| ())
+    {
+        eprintln!(
+            "[oom-eviction] process_pending after epoch race failed; actor={} attempt={} error={:#}; retrying from fresh group state",
+            actor.id, attempt, error
+        );
+    }
 }
 
 async fn publish_remove_members_with_epoch_race_recovery(
@@ -5612,7 +5672,8 @@ async fn publish_remove_members_with_epoch_race_recovery(
                     "[oom-eviction] remove_members queued after epoch race; actor={} attempt={} message={}",
                     actor.id, attempt, response.message
                 );
-                process_pending_commits_after_epoch_race(http, actor, cursor, attempt).await?;
+                best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
+                    .await;
             }
             "ok" => {
                 return Err(anyhow!(
@@ -5620,6 +5681,14 @@ async fn publish_remove_members_with_epoch_race_recovery(
                     actor.id,
                     response.message
                 ));
+            }
+            "error" if response.message.contains("pending commit exists") => {
+                eprintln!(
+                    "[oom-eviction] remove_members blocked by pending commit; actor={} attempt={} message={}",
+                    actor.id, attempt, response.message
+                );
+                best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
+                    .await;
             }
             "error" => return Err(anyhow!("Worker {} error: {}", actor.id, response.message)),
             other => {
@@ -5643,7 +5712,7 @@ async fn evict_oom_group_members(
     active: &mut Vec<WorkerSpec>,
     dead_workers: &[WorkerSpec],
     fanout: &mut FanoutController,
-    process_pending_fanout: bool,
+    _process_pending_fanout: bool,
     plateau_size: usize,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
@@ -5729,26 +5798,14 @@ async fn evict_oom_group_members(
                 }
             };
 
-        let actor_commit_result = if process_pending_fanout {
-            process_pending_commit_expect(
-                http,
-                &actor,
-                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-                "oom_eviction.actor_process_pending",
-                Some(&cursor),
-            )
-            .await
-        } else {
-            receive_commit_expect(
-                http,
-                &actor,
-                "own commit accepted from DS",
-                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-                "oom_eviction.actor_receive_commit",
-                Some(&cursor),
-            )
-            .await
-        };
+        let actor_commit_result = process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "oom_eviction.actor_process_pending",
+            Some(&cursor),
+        )
+        .await;
         if let Err(error) = actor_commit_result {
             if record_profiled_worker_failure(
                 runner_events,
@@ -5775,11 +5832,7 @@ async fn evict_oom_group_members(
             .collect::<Vec<_>>();
         let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
         let expected_ep = expected_epoch(&expected_state);
-        let fanout_phase = if process_pending_fanout {
-            "oom_eviction.fanout_process_pending"
-        } else {
-            "oom_eviction.fanout_receive_commit"
-        };
+        let fanout_phase = "oom_eviction.fanout_process_pending";
         let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
             &recipients,
             max_commit_receive_samples_per_plateau,
@@ -5789,38 +5842,25 @@ async fn evict_oom_group_members(
             0,
         );
         let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            let sampled = sampled_ids.contains(&worker.id);
             BatchFanoutCommand {
                 client_id: worker.id.clone(),
                 request_id: None,
-                command: if process_pending_fanout {
-                    let sampled = sampled_ids.contains(&worker.id);
-                    Command::ProcessPending {
-                        kinds: Some(vec![PendingKind::Commits]),
-                        max_messages: None,
-                        expected_epoch: expected_ep,
-                        profile: sampled,
-                        commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
-                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
-                        commit_receive_sample_count: Some(sample_count),
-                        commit_receive_population_size: Some(recipients.len()),
-                    }
-                } else {
-                    let sampled = sampled_ids.contains(&worker.id);
-                    Command::ReceiveCommit {
-                        profile: sampled,
-                        commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
-                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
-                        commit_receive_sample_count: Some(sample_count),
-                        commit_receive_population_size: Some(recipients.len()),
-                    }
+                command: Command::ProcessPending {
+                    kinds: Some(vec![PendingKind::Commits]),
+                    max_messages: None,
+                    expected_epoch: expected_ep,
+                    profile: sampled,
+                    commit_create_op: Some("remove".to_string()),
+                    commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                    commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                    commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                    commit_receive_sample_count: Some(sample_count),
+                    commit_receive_population_size: Some(recipients.len()),
                 },
                 expected_epoch: expected_ep,
                 phase: Some(fanout_phase.to_string()),
-                profile: sampled_ids.contains(&worker.id).then_some(true),
+                profile: sampled.then_some(true),
                 benchmark_plateau_index: None,
                 benchmark_target_size: None,
                 benchmark_active_size: None,
@@ -5839,7 +5879,7 @@ async fn evict_oom_group_members(
             http,
             "oom_eviction",
             recipients.len(),
-            "receive_commit",
+            "process_pending",
             &recipients,
             fanout,
             &commands_by_physical,
