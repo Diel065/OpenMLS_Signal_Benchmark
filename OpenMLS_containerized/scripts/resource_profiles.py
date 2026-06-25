@@ -5,11 +5,11 @@ Generates structured resource profiles for:
   - ram_sweep_singleton: Sweep memory limits with abundant CPU
   - cpu_matrix_singleton: Matrix of (core_count, capacity_fraction) combinations
   - embedded_budget_singleton: App heap budget x Docker CPU combinations
-  - ram_app_heap_sweep: Parallel 8-profile sweep of application heap budgets
-  - cpu_quota_sweep: Parallel 8-profile sweep of Docker CPU fractions
+  - ram_app_heap_sweep: Parallel 10-profile sweep of application heap budgets
+  - cpu_quota_sweep: Parallel 10-profile sweep of Docker CPU fractions
 
 Supports explicit profile selection via index or ID for single-profile
-scientific threshold experiments. Supports parallel 8-profile sweeps.
+scientific threshold experiments. Supports parallel 10-profile sweeps.
 """
 
 from dataclasses import dataclass, field
@@ -307,7 +307,7 @@ def generate_parallel_ram_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 8 parallel app-heap budget profiles for RAM sweep.
+    """Generate 10 parallel app-heap budget profiles for RAM sweep.
 
     Each profile tests a single application heap budget.
     Docker memory is held high (4 GiB default) so Linux/container memory
@@ -318,18 +318,18 @@ def generate_parallel_ram_sweep_profiles(
     as the group creator.
 
     Args:
-        heap_budgets: List of 8 heap budget strings.
+        heap_budgets: List of 10 heap budget strings.
         docker_memory_limit: Safe Docker memory limit for all containers.
         assigned_cpu_count: CPU cores assigned to each profiled worker.
         run_id: Benchmark run ID for profile labeling.
 
     Returns:
-        List of 8 ResourceProfile objects, ordered by increasing budget.
+        List of 10 ResourceProfile objects, ordered by increasing budget.
     """
     if heap_budgets is None:
-        heap_budgets = ["32k", "64k", "128k", "512k", "8m", "32m", "256m", "1g"]
-    if len(heap_budgets) != 8:
-        raise ValueError(f"Parallel RAM sweep requires exactly 8 heap budgets, got {len(heap_budgets)}")
+        heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
+    if len(heap_budgets) != 10:
+        raise ValueError(f"Parallel RAM sweep requires exactly 10 heap budgets, got {len(heap_budgets)}")
 
     if not validate_memory_string(docker_memory_limit):
         raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")
@@ -404,7 +404,7 @@ def generate_parallel_cpu_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 8 parallel CPU quota profiles for CPU sweep.
+    """Generate 10 parallel CPU quota profiles for CPU sweep.
 
     Each profile tests a single Docker CPU fraction.
     App heap budget is held absurdly high (64 GiB default) so memory
@@ -419,19 +419,19 @@ def generate_parallel_cpu_sweep_profiles(
     have distinct quotas.
 
     Args:
-        cpu_fractions: List of 8 CPU fraction values.
+        cpu_fractions: List of 10 CPU fraction values.
         app_heap_budget: Absurdly high heap budget string.
         docker_memory_limit: Docker memory envelope (above heap budget).
         assigned_cpu_count: CPU cores assigned to each profiled worker.
         run_id: Benchmark run ID for profile labeling.
 
     Returns:
-        List of 8 ResourceProfile objects, ordered by decreasing fraction.
+        List of 10 ResourceProfile objects, ordered by decreasing fraction.
     """
     if cpu_fractions is None:
-        cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
-    if len(cpu_fractions) != 8:
-        raise ValueError(f"Parallel CPU sweep requires exactly 8 fractions, got {len(cpu_fractions)}")
+        cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
+    if len(cpu_fractions) != 10:
+        raise ValueError(f"Parallel CPU sweep requires exactly 10 fractions, got {len(cpu_fractions)}")
 
     for fraction in cpu_fractions:
         if fraction < DOCKER_HARD_QUOTA_CPU_FLOOR:

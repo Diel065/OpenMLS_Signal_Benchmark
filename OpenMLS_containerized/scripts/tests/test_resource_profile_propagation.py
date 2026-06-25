@@ -313,9 +313,9 @@ class TestWorkerAssignmentPropagation:
             plan=plan,
             profiles=profiles,
             selected_profile_index=0,
-            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(8)],
-            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(8)],
-            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(10)],
+            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(10)],
+            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(10)],
             packed_container_names=[],
             infrastructure_container_names=["ds", "relay"],
         )
@@ -329,7 +329,7 @@ class TestWorkerAssignmentPropagation:
 
     def test_parallel_cpu_assignment_includes_cfs_quota_metadata(self):
         profiles = select_all_profiles(generate_parallel_cpu_sweep_profiles(
-            [1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
+            [1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
         ))
         plan = self._make_minimal_plan("test-run", [
             {
@@ -348,9 +348,9 @@ class TestWorkerAssignmentPropagation:
             plan=plan,
             profiles=profiles,
             selected_profile_index=0,
-            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(8)],
-            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(8)],
-            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(8)],
+            singleton_worker_ids=[f"worker-{idx + 1:05d}" for idx in range(10)],
+            singleton_client_ids=[f"{idx + 1:05d}" for idx in range(10)],
+            singleton_container_names=[f"worker-{idx + 1:05d}" for idx in range(10)],
             packed_container_names=[],
             infrastructure_container_names=["ds", "relay"],
         )
@@ -361,7 +361,7 @@ class TestWorkerAssignmentPropagation:
             for row in profiled_rows
         }
 
-        assert len(effective) == 8
+        assert len(effective) == 10
         assert {row["cpu_period_us"] for row in profiled_rows} == {1_000_000}
 
 
@@ -500,7 +500,7 @@ class TestComposeGenerationPropagation:
             "singleton",
             plan,
             profile_dicts,
-            7,
+            9,
             self._mock_args(),
         )
 

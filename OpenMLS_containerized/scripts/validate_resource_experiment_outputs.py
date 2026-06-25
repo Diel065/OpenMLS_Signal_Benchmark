@@ -402,7 +402,7 @@ class Validator:
         status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
         sweep_kind = status_rows[0].get("sweep_kind", "").strip() if status_rows else ""
         is_parallel_sweep = sweep_kind in ("ram_app_heap_sweep", "cpu_quota_sweep")
-        expected_selected = 8 if is_parallel_sweep else 1
+        expected_selected = 10 if is_parallel_sweep else 1
 
         selected = self._read_column_values(profiles_path, "selected_for_this_run")
         true_count = sum(1 for v in selected if v.lower() in ("true", "1"))
@@ -624,8 +624,8 @@ class Validator:
             and (row.get("profile_enabled") or "").lower() in ("true", "1")
         ]
 
-        if len(profiled_singletons) != 8:
-            self.error(f"Parallel {sweep_kind} must have exactly 8 profiled singleton workers, found {len(profiled_singletons)}")
+        if len(profiled_singletons) != 10:
+            self.error(f"Parallel {sweep_kind} must have exactly 10 profiled singleton workers, found {len(profiled_singletons)}")
 
         packed_profiled = [
             row for row in assignments
@@ -645,7 +645,7 @@ class Validator:
         profiles = self._read_rows(os.path.join(self.run_dir, "resource_profiles.csv"))
 
         if is_ram:
-            expected_heap_budgets = ["32k", "64k", "128k", "512k", "8m", "32m", "256m", "1g"]
+            expected_heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
             profiled_budgets = sorted(
                 [r.get("app_heap_budget", "").strip().lower() for r in profiled_singletons if r.get("app_heap_budget")]
             )

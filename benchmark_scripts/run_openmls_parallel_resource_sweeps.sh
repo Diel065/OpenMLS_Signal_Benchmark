@@ -2,13 +2,13 @@
 #
 # OpenMLS Parallel Resource Sweep Benchmarks
 # -------------------------------------------
-# Runs 8-profile parallel resource sweeps using 8 profiled singleton
+# Runs 10-profile parallel resource sweeps using 10 profiled singleton
 # workers simultaneously. Each profiled worker tests one resource level.
 # All non-profiled workers are packed with maximum density for speed.
 #
 # Two sweep types:
-#   SWEEP=ram:  8 app-heap budgets (32k..1g), Docker memory held high
-#   SWEEP=cpu:  8 Docker CPU fractions (default: 1.00..0.01), app-heap held high
+#   SWEEP=ram:  10 app-heap budgets (32k..1g), Docker memory held high
+#   SWEEP=cpu:  10 Docker CPU fractions (default: 1.00..0.01), app-heap held high
 #   SWEEP=both: run both sweep types
 #
 # Usage:
@@ -33,8 +33,8 @@ SWEEP="${SWEEP:-both}"
 STRICT_CPUSET="${STRICT_CPUSET:-0}"
 
 WORKERS="${WORKERS:-1024}"
-PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-8}"
-SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-8}"
+PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
+SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
 SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
 PACKED_PER_CONTAINER="${PACKED_PER_CONTAINER:-64}"
 PACKED_INTERNAL_PARALLELISM="${PACKED_INTERNAL_PARALLELISM:-16}"
@@ -57,7 +57,7 @@ WORKER_HTTP_POOL="${WORKER_HTTP_POOL:-64}"
 WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
-CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.02,0.01}"
+CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -69,16 +69,16 @@ ONLINE_CPUS=0
 check_cpu_cores() {
     ONLINE_CPUS="$(nproc 2>/dev/null || echo 0)"
     echo "[cpu] Online CPU cores on this host: $ONLINE_CPUS"
-    if [ "$ONLINE_CPUS" -lt 8 ]; then
+    if [ "$ONLINE_CPUS" -lt "$PROFILED_SINGLETON_COUNT" ]; then
         if [ "$STRICT_CPUSET" = "1" ]; then
-            echo "ERROR: Strict cpuset mode requires >= 8 online cores, have $ONLINE_CPUS"
+            echo "ERROR: Strict cpuset mode requires >= $PROFILED_SINGLETON_COUNT online cores, have $ONLINE_CPUS"
             exit 1
         fi
-        warn "Host has fewer than 8 online CPU cores ($ONLINE_CPUS). Strict isolation not achievable."
-    elif [ "$ONLINE_CPUS" -lt 12 ]; then
-        warn "Host has only $ONLINE_CPUS cores. 8 profiled + background need > 8 ideally."
+        warn "Host has fewer than $PROFILED_SINGLETON_COUNT online CPU cores ($ONLINE_CPUS). Strict isolation not achievable."
+    elif [ "$ONLINE_CPUS" -lt $((PROFILED_SINGLETON_COUNT + 4)) ]; then
+        warn "Host has only $ONLINE_CPUS cores. $PROFILED_SINGLETON_COUNT profiled + background need > $PROFILED_SINGLETON_COUNT ideally."
     else
-        echo "[cpu] $ONLINE_CPUS cores available — sufficient for 8 profiled + background."
+        echo "[cpu] $ONLINE_CPUS cores available — sufficient for $PROFILED_SINGLETON_COUNT profiled + background."
     fi
 }
 
@@ -108,7 +108,7 @@ run_parallel_sweep() {
     echo "  Strict cpuset: $STRICT_CPUSET"
 
     local affinity_mode="none"
-    if [ "$ONLINE_CPUS" -ge 8 ]; then
+    if [ "$ONLINE_CPUS" -ge "$PROFILED_SINGLETON_COUNT" ]; then
         affinity_mode="profiled-nor-background"
         echo "  CPU affinity: $affinity_mode ($ONLINE_CPUS cores available)"
     else

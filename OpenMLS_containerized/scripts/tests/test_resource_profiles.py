@@ -160,11 +160,11 @@ class TestCpuMatrixProfiles:
 
 
 class TestParallelCpuSweepProfiles:
-    DEFAULT_NEW_FRACTIONS = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
+    DEFAULT_NEW_FRACTIONS = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
 
     def test_default_cpu_sweep_fractions_are_new_values(self):
         profiles = generate_parallel_cpu_sweep_profiles()
-        assert len(profiles) == 8
+        assert len(profiles) == 10
         assert [p.capacity_fraction for p in profiles] == self.DEFAULT_NEW_FRACTIONS
 
     def test_default_cpu_sweep_period_is_one_million(self):
@@ -186,7 +186,7 @@ class TestParallelCpuSweepProfiles:
         for p in profiles:
             if p.cpu_period_us > 0 and p.cpu_quota_us is not None:
                 effective.add(round(p.cpu_quota_us / p.cpu_period_us, 8))
-        assert len(effective) == 8, f"Found {len(effective)} distinct effective CPU fractions, expected 8"
+        assert len(effective) == 10, f"Found {len(effective)} distinct effective CPU fractions, expected 10"
 
     def test_cpu_sweep_app_heap_budget_is_64g_non_limiting(self):
         profiles = generate_parallel_cpu_sweep_profiles()
@@ -204,19 +204,19 @@ class TestParallelCpuSweepProfiles:
     def test_rejects_sub_floor_cpu_fraction(self):
         with pytest.raises(ValueError, match="below the supported validated floor"):
             generate_parallel_cpu_sweep_profiles(
-                cpu_fractions=[1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.005]
+                cpu_fractions=[1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.005]
             )
 
     def test_rejects_duplicate_cpu_fractions(self):
         with pytest.raises(ValueError, match="must be distinct"):
             generate_parallel_cpu_sweep_profiles(
-                cpu_fractions=[1.00, 0.75, 0.50, 0.50, 0.10, 0.05, 0.02, 0.01]
+                cpu_fractions=[1.00, 0.75, 0.50, 0.50, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
             )
 
     def test_rejects_sub_floor_fractions_before_period_scaling(self):
         with pytest.raises(ValueError, match="below the supported validated floor"):
             generate_parallel_cpu_sweep_profiles(
-                cpu_fractions=[1.00, 0.50, 0.10, 0.01, 0.005, 0.002, 0.001, 0.0005]
+                cpu_fractions=[1.00, 0.50, 0.10, 0.05, 0.03, 0.01, 0.005, 0.002, 0.001, 0.0005]
             )
 
     def test_parallel_cpu_profile_to_compose_emits_period_and_quota(self):
@@ -236,9 +236,9 @@ class TestParallelCpuSweepProfiles:
 
 
 class TestParallelRamSweepProfiles:
-    def test_ram_sweep_has_8_default_profiles(self):
+    def test_ram_sweep_has_10_default_profiles(self):
         profiles = generate_parallel_ram_sweep_profiles()
-        assert len(profiles) == 8
+        assert len(profiles) == 10
 
     def test_ram_sweep_group_creator_is_largest_heap(self):
         profiles = generate_parallel_ram_sweep_profiles()
@@ -250,7 +250,7 @@ class TestParallelRamSweepProfiles:
     def test_ram_sweep_default_heap_budgets(self):
         profiles = generate_parallel_ram_sweep_profiles()
         budgets = [p.app_heap_budget for p in profiles]
-        assert budgets == ["32k", "64k", "128k", "512k", "8m", "32m", "256m", "1g"]
+        assert budgets == ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
 
     def test_ram_sweep_unaffected_by_cpu_fix(self):
         profiles = generate_parallel_ram_sweep_profiles()

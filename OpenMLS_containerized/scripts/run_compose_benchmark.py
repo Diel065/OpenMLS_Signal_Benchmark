@@ -490,9 +490,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--cpu-sweep-fractions",
-        default="1.00,0.75,0.50,0.25,0.10,0.05,0.02,0.01",
+        default="1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01",
         help=(
-            "Comma-separated 8 Docker CPU fractions for cpu-quota-sweep. "
+            "Comma-separated 10 Docker CPU fractions for cpu-quota-sweep. "
             "Defaults stay within Docker CFS cpu_period/cpu_quota limits. "
             "All fractions must be >= 0.01 (Docker hard-quota floor)."
         ),
@@ -3841,7 +3841,7 @@ def main() -> int:
 
             if is_parallel_sweep:
                 gc_profile = get_group_creator_profile(profiles)
-                if gc_profile is not None and len(profiles) == 8:
+                if gc_profile is not None and len(profiles) == args.profiled_singleton_count:
                     print(f"[parallel-sweep] Group creator: {gc_profile.resource_profile_id} "
                           f"({gc_profile.group_creator_reason})", flush=True)
                 from resource_profiles import get_group_creator_client_index

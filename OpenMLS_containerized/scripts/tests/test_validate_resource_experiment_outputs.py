@@ -35,7 +35,7 @@ def test_validator_rejects_zero_cpu_profiled_assignment(tmp_path):
 
 
 def test_parallel_cpu_sweep_validator_accepts_new_default_fractions(tmp_path):
-    fractions = [1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.02, 0.01]
+    fractions = [1.0, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
 
     with (tmp_path / "run_status.csv").open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RUN_STATUS_HEADER)
