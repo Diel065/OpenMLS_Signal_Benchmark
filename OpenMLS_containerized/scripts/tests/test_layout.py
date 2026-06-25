@@ -197,6 +197,41 @@ def test_legacy_layout_build():
     print("PASS: legacy layout build produces correct structure")
 
 
+def test_disable_container_profiling_marks_container_workers_unprofiled():
+    args = generate_compose.build_parser().parse_args([
+        "--workers", "16",
+        "--worker-layout-mode", "hybrid",
+        "--singleton-min-count", "4",
+        "--singleton-fraction", "0.25",
+        "--packed-clients-per-container", "4",
+        "--disable-container-profiling",
+    ])
+    generate_compose.validate_args(args)
+
+    layout = compute_hybrid_layout(
+        args.workers,
+        args.singleton_min_count,
+        args.singleton_fraction,
+        args.packed_clients_per_container,
+    )
+    singleton_ids = select_singleton_ids(
+        args.workers,
+        layout["singleton_count"],
+        args.singleton_selection_seed,
+        args.singleton_selection_strategy,
+    )
+    singleton_set = set(singleton_ids)
+    all_ids = [worker_id(i) for i in range(1, args.workers + 1)]
+    packed_ids = [cid for cid in all_ids if cid not in singleton_set]
+    clients, physical_workers = build_hybrid_layout(args, singleton_ids, packed_ids, layout)
+
+    assert clients
+    assert physical_workers
+    assert all(not c.profile_enabled for c in clients)
+    assert all(not pw.profile_enabled_client_ids for pw in physical_workers)
+    print("PASS: disabled container profiling marks Docker workers unprofiled")
+
+
 def test_resource_limits_apply_to_singletons_only():
     args = generate_compose.build_parser().parse_args([
         "--workers", "64",
@@ -291,6 +326,7 @@ def main() -> int:
         test_all_clients_covered,
         test_hybrid_layout_build,
         test_legacy_layout_build,
+        test_disable_container_profiling_marks_container_workers_unprofiled,
         test_resource_limits_apply_to_singletons_only,
         test_worker_compose_enables_perf_event_access,
     ]

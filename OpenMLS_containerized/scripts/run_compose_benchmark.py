@@ -361,6 +361,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only profile singleton measured clients (default: true)",
     )
     p.add_argument(
+        "--disable-container-profiling",
+        action="store_true",
+        help="Disable profiling for Docker container workers; external devices may still be profiled.",
+    )
+    p.add_argument(
         "--external-coverage-lane",
         action="store_true",
         help=(
@@ -549,8 +554,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--resource-output-validation",
         action="store_true",
+        dest="resource_output_validation",
         default=True,
         help="Validate resource experiment outputs after run (default: enabled)",
+    )
+    p.add_argument(
+        "--no-resource-output-validation",
+        action="store_false",
+        dest="resource_output_validation",
+        help="Skip resource experiment output validation after run.",
     )
 
     # External device flags
@@ -3278,6 +3290,17 @@ def run_standalone_aggregation(
     return result.returncode
 
 
+def standalone_aggregation_inputs(run_dir: Path) -> tuple[Optional[Path], Optional[Path]]:
+    layout_file = run_dir / "worker_layout.json"
+    workers_file = run_dir / "workers.combined.txt"
+    if not workers_file.exists():
+        workers_file = run_dir / "workers.txt"
+    return (
+        layout_file if layout_file.exists() else None,
+        workers_file if workers_file.exists() else None,
+    )
+
+
 def command_stdout(cmd: list[str], cwd: Path | None = None) -> str:
     try:
         result = subprocess.run(
@@ -3404,6 +3427,7 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "singleton_resource_envelope": singleton_resource_envelope(args),
             "process_pending_fanout": args.process_pending_fanout,
             "profile_only_singletons": args.profile_only_singletons,
+            "disable_container_profiling": args.disable_container_profiling,
             "external_coverage_lane": args.external_coverage_lane,
             "randomized_payload_order": True,
             "randomized_external_actor_position": True,
@@ -3698,6 +3722,8 @@ def main() -> int:
             "--packed-worker-internal-parallelism",
             str(args.packed_worker_internal_parallelism),
         ]
+        if args.disable_container_profiling:
+            generator_cmd.append("--disable-container-profiling")
 
         if args.singleton_cpus is not None:
             generator_cmd += ["--singleton-cpus", args.singleton_cpus]
@@ -3717,6 +3743,88 @@ def main() -> int:
             generator_cmd.append("--include-netcheck")
         if args.failure_experiment:
             generator_cmd.append("--failure-experiment")
+
+        # ── Affinity planning for unconstrained container baselines ───
+        if (
+            resource_experiment == "none"
+            and args.cpu_affinity_mode != "none"
+            and args.profiled_singleton_count > 0
+            and not args.disable_container_profiling
+        ):
+            from generate_compose import select_singleton_ids, compute_hybrid_layout
+            from cpu_affinity_planner import (
+                create_affinity_plan,
+                validate_affinity_plan,
+                write_affinity_plan_json,
+            )
+
+            layout_info = compute_hybrid_layout(
+                args.workers, args.singleton_min_count,
+                args.singleton_fraction, args.packed_clients_per_container,
+            )
+            singleton_ids = select_singleton_ids(
+                args.workers, layout_info["singleton_count"],
+                args.singleton_selection_seed, args.singleton_selection_strategy,
+            )
+            count = min(len(singleton_ids), args.profiled_singleton_count)
+            profiled_singleton_ids = singleton_ids[:count]
+            profiled_worker_ids = [f"worker-{cid}" for cid in profiled_singleton_ids]
+            profiled_specs = [
+                {
+                    "worker_id": wid,
+                    "container_name": f"worker-{cid}",
+                    "logical_client_id": cid,
+                    "experiment_kind": "unconstrained_container_baseline",
+                    "resource_profile_id": "",
+                    "rayon_num_threads": 1,
+                }
+                for wid, cid in zip(profiled_worker_ids, profiled_singleton_ids)
+            ]
+            profiled_cpu_counts = {wid: 1 for wid in profiled_worker_ids}
+            bg_specs = [
+                {"container_name": "ds", "container_role": "infrastructure"},
+                {"container_name": "relay", "container_role": "infrastructure"},
+            ]
+            if args.runner_in_docker:
+                bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
+            profiled_id_set = set(profiled_singleton_ids)
+            for cid in singleton_ids:
+                if cid not in profiled_id_set:
+                    bg_specs.append({
+                        "container_name": f"worker-{cid}",
+                        "container_role": "unprofiled_singleton",
+                    })
+            for p in range(layout_info["packed_container_count"]):
+                bg_specs.append({
+                    "container_name": f"worker-pack-{p:03d}",
+                    "container_role": "packed",
+                })
+
+            print(f"[affinity] Computing baseline CPU affinity plan "
+                  f"({len(profiled_specs)} profiled workers, "
+                  f"{sum(profiled_cpu_counts.values())} total CPUs)...", flush=True)
+            plan = create_affinity_plan(
+                run_id=run_id,
+                profiled_worker_specs=profiled_specs,
+                background_specs=bg_specs,
+                cpu_affinity_mode=args.cpu_affinity_mode,
+                sample_seconds=args.cpu_affinity_sample_seconds,
+                reserve_smt_siblings=args.reserve_smt_siblings,
+                profiled_cpu_counts=profiled_cpu_counts,
+            )
+            affinity_errors = validate_affinity_plan(plan)
+            if affinity_errors:
+                raise RuntimeError(
+                    "Invalid CPU affinity plan: " + "; ".join(affinity_errors)
+                )
+            for w in plan.warnings:
+                print(f"[affinity] WARNING: {w}", flush=True)
+            for pa in plan.profiled_assignments:
+                print(f"[affinity]   {pa.container_name}: cpus={pa.assigned_cpus} "
+                      f"rayon={pa.rayon_num_threads}")
+            print(f"[affinity] Background cpuset: {len(plan.background_cpus)} CPUs", flush=True)
+            os.makedirs(str(run_dir), exist_ok=True)
+            generator_cmd += ["--affinity-plan-file", write_affinity_plan_json(plan, str(run_dir))]
 
         # ── Affinity planning for resource experiments ───────────────
         if resource_experiment != "none":
@@ -4701,13 +4809,11 @@ def main() -> int:
             print("[device] pulling external device profiles...", flush=True)
             pull_external_device_profiles(args, root, run_id, run_dir)
 
-            # Run standalone aggregation if --no-aggregate was used
-            if use_no_aggregate and not args.preflight_only:
-                layout_file = run_dir / "worker_layout.json"
-                workers_file = run_dir / "workers.combined.txt"
-                agg_exit = run_standalone_aggregation(run_dir, layout_file if layout_file.exists() else None, workers_file if workers_file.exists() else None)
-                if agg_exit != 0:
-                    print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
+        if use_no_aggregate and not args.preflight_only:
+            layout_file, workers_file = standalone_aggregation_inputs(run_dir)
+            agg_exit = run_standalone_aggregation(run_dir, layout_file, workers_file)
+            if agg_exit != 0:
+                print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
 
         if not args.preflight_only:
             validate_artifacts(

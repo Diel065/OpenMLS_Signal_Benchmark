@@ -112,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Internal parallelism for packed worker containers",
     )
     p.add_argument(
+        "--disable-container-profiling",
+        action="store_true",
+        help="Do not emit profiles from Docker container workers.",
+    )
+    p.add_argument(
         "--singleton-cpus",
         default=None,
         help=(
@@ -657,11 +662,12 @@ def build_hybrid_layout(
     for idx, cid in enumerate(singleton_ids):
         sid = f"worker-{cid}"
         base_url = f"http://{sid}:8080"
+        profile_enabled = not getattr(args, "disable_container_profiling", False)
         clients.append(ClientLayoutEntry(
             client_id=cid,
             physical_worker_id=sid,
             container_mode="singleton",
-            profile_enabled=True,
+            profile_enabled=profile_enabled,
             command_url=f"{base_url}/client/{cid}",
             health_url=f"{base_url}/client/{cid}/health",
         ))
@@ -678,7 +684,7 @@ def build_hybrid_layout(
             container_mode="singleton",
             client_ids=[cid],
             base_url=base_url,
-            profile_enabled_client_ids=[cid],
+            profile_enabled_client_ids=[cid] if profile_enabled else [],
             resource_limits=dict(worker_limits),
         ))
         singleton_counter += 1
@@ -724,11 +730,12 @@ def build_legacy_layout(
         cid = worker_id(i)
         sid = f"worker-{cid}"
         base_url = f"http://{sid}:8080"
+        profile_enabled = not getattr(args, "disable_container_profiling", False)
         clients.append(ClientLayoutEntry(
             client_id=cid,
             physical_worker_id=sid,
             container_mode="singleton",
-            profile_enabled=True,
+            profile_enabled=profile_enabled,
             command_url=f"{base_url}/client/{cid}",
             health_url=f"{base_url}/client/{cid}/health",
         ))
@@ -737,7 +744,7 @@ def build_legacy_layout(
             container_mode="singleton",
             client_ids=[cid],
             base_url=base_url,
-            profile_enabled_client_ids=[cid],
+            profile_enabled_client_ids=[cid] if profile_enabled else [],
             resource_limits=dict(configured_singleton_limits),
         ))
 
@@ -1481,7 +1488,7 @@ def main() -> None:
     layout_out = Path(args.worker_layout_out)
 
     resource_experiment = getattr(args, "resource_experiment", "none")
-    affinity_plan = load_affinity_plan(args) if resource_experiment != "none" else None
+    affinity_plan = load_affinity_plan(args) if args.affinity_plan_file else None
     resource_profiles = load_resource_profiles(args) if resource_experiment != "none" else None
 
     if resource_experiment != "none" and affinity_plan:
@@ -1526,7 +1533,7 @@ def main() -> None:
             "physical_worker_count": args.workers,
         }
 
-    if resource_experiment != "none" and affinity_plan:
+    if affinity_plan:
         restrict_profile_enabled_clients_to_affinity_selection(
             clients,
             physical_workers,
