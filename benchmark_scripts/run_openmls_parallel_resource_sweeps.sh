@@ -20,7 +20,7 @@
 #   STRICT_CPUSET=0   (default) allow fallback on too-few-cores hosts
 #   STRICT_CPUSET=1   fail if 8 distinct profiled cores unavailable
 #   CPU_SWEEP_FRACTIONS=1.0,0.5,... override the default Docker-valid CPU sweep
-#   PLATEAU_ORDER=ascending|staircase|randomized (default: ascending)
+#   PLATEAU_ORDER=staircase|ascending|randomized (default: staircase)
 #
 
 set -euo pipefail
@@ -45,7 +45,7 @@ STEP_SIZE="${STEP_SIZE:-16}"
 ROUNDTRIPS="${ROUNDTRIPS:-1}"
 UPDATE_ROUNDS="${UPDATE_ROUNDS:-4}"
 APP_ROUNDS="${APP_ROUNDS:-4}"
-PLATEAU_ORDER="${PLATEAU_ORDER:-ascending}"
+PLATEAU_ORDER="${PLATEAU_ORDER:-staircase}"
 
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
