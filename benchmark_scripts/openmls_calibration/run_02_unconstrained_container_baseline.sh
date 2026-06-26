@@ -138,6 +138,7 @@ run_baseline() {
     --max-fanout-parallelism "$FANOUT_PARALLELISM" \
     --min-fanout-parallelism "$FANOUT_MIN" \
     --force-cleanup-mls-ports \
+    --runner-in-docker \
     --no-aggregate \
     "${image_args[@]}"
   require_events_csv "$run_dir"

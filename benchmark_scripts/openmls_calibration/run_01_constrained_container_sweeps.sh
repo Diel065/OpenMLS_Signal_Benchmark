@@ -161,6 +161,7 @@ run_sweep() {
     --max-fanout-parallelism "$FANOUT_PARALLELISM" \
     --min-fanout-parallelism "$FANOUT_MIN" \
     --force-cleanup-mls-ports \
+    --runner-in-docker \
     --no-aggregate \
     "${validation_args[@]}" \
     "${image_args[@]}"
