@@ -15,6 +15,7 @@ SWEEP="${SWEEP:-both}"
 STRICT_CPUSET="${STRICT_CPUSET:-1}"
 RESOURCE_OUTPUT_VALIDATION="${RESOURCE_OUTPUT_VALIDATION:-1}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
+NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 
 WORKERS="${WORKERS:-1024}"
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
@@ -44,6 +45,12 @@ FANOUT_MIN="${FANOUT_MIN:-16}"
 CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
+
+raise_nofile_limit() {
+  ulimit -n "$NOFILE_LIMIT" 2>/dev/null || {
+    echo "WARN: could not raise nofile limit to $NOFILE_LIMIT; current limit is $(ulimit -n)" >&2
+  }
+}
 
 python_bin() {
   [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
@@ -163,6 +170,7 @@ run_sweep() {
   cleanup_docker
 }
 
+raise_nofile_limit
 cleanup_docker
 for iter in $(seq 1 "$N"); do
   case "$SWEEP" in

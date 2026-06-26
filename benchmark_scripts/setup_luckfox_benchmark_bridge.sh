@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LAPTOP_TS_IP="${LAPTOP_TS_IP:-100.71.112.120}"
-VM_IP="${VM_IP:-192.168.11.127}"
+VM_IP="${VM_IP:-100.90.220.67}"
 LUCKFOX_SERIAL="${LUCKFOX_SERIAL:-242d5fe430c7c951}"
 LUCKFOX_DEVICE_IP="${LUCKFOX_DEVICE_IP:-172.32.0.93}"
 LUCKFOX_HOST_IP="${LUCKFOX_HOST_IP:-172.32.0.98}"
@@ -35,7 +35,7 @@ stop() {
 
 proxy() {
   local bind_ip="$1" listen_port="$2" target_host="$3" target_port="$4"
-  socat "TCP-LISTEN:${listen_port},bind=${bind_ip},reuseaddr,fork" "TCP:${target_host}:${target_port}" &
+  nohup socat "TCP-LISTEN:${listen_port},bind=${bind_ip},reuseaddr,fork" "TCP:${target_host}:${target_port}" >/dev/null 2>&1 &
   local pid=$!
   sleep 0.1
   kill -0 "$pid" 2>/dev/null || { echo "proxy failed: ${bind_ip}:${listen_port}" >&2; exit 1; }
@@ -57,7 +57,7 @@ adb devices | awk -v serial="$LUCKFOX_SERIAL" 'NR > 1 && $1 == serial && $2 == "
 adb -s "$LUCKFOX_SERIAL" shell "ip link set $LUCKFOX_DEVICE_IFACE up; ip addr show dev $LUCKFOX_DEVICE_IFACE | grep -q '$LUCKFOX_DEVICE_IP/' || ip addr add $LUCKFOX_DEVICE_IP/$LUCKFOX_PREFIX dev $LUCKFOX_DEVICE_IFACE"
 HOST_IFACE="$(iface)"
 [[ -n "$HOST_IFACE" ]] || { echo "set LUCKFOX_IFACE" >&2; exit 1; }
-sudo ip link set "$HOST_IFACE" up
+ip -o link show dev "$HOST_IFACE" | grep -q 'UP' || sudo ip link set "$HOST_IFACE" up
 ip -o -4 addr show dev "$HOST_IFACE" | grep -q " $LUCKFOX_HOST_IP/" || sudo ip addr add "$LUCKFOX_HOST_IP/$LUCKFOX_PREFIX" dev "$HOST_IFACE"
 ping -c 1 -W 2 "$LUCKFOX_DEVICE_IP" >/dev/null
 

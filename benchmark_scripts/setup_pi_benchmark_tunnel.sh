@@ -2,7 +2,7 @@
 set -euo pipefail
 
 LAPTOP_TS_IP="${LAPTOP_TS_IP:-100.71.112.120}"
-VM_IP="${VM_IP:-192.168.11.127}"
+VM_IP="${VM_IP:-100.90.220.67}"
 PI_HOST="${PI_HOST:-192.168.178.33}"
 PI_USER="${PI_USER:-diel}"
 PI_SSH_PROXY_PORT="${PI_SSH_PROXY_PORT:-10022}"
@@ -32,7 +32,7 @@ stop() {
 
 proxy() {
   local bind_ip="$1" listen_port="$2" target_host="$3" target_port="$4"
-  socat "TCP-LISTEN:${listen_port},bind=${bind_ip},reuseaddr,fork" "TCP:${target_host}:${target_port}" &
+  nohup socat "TCP-LISTEN:${listen_port},bind=${bind_ip},reuseaddr,fork" "TCP:${target_host}:${target_port}" >/dev/null 2>&1 &
   local pid=$!
   sleep 0.1
   kill -0 "$pid" 2>/dev/null || { echo "proxy failed: ${bind_ip}:${listen_port}" >&2; exit 1; }

@@ -13,6 +13,7 @@ DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 N="${N:-3}"
 STRICT_CPUSET="${STRICT_CPUSET:-1}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
+NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 
 WORKERS="${WORKERS:-1024}"
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
@@ -41,6 +42,12 @@ FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
+
+raise_nofile_limit() {
+  ulimit -n "$NOFILE_LIMIT" 2>/dev/null || {
+    echo "WARN: could not raise nofile limit to $NOFILE_LIMIT; current limit is $(ulimit -n)" >&2
+  }
+}
 
 python_bin() {
   [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
@@ -138,6 +145,7 @@ run_baseline() {
   cleanup_docker
 }
 
+raise_nofile_limit
 cleanup_docker
 for iter in $(seq 1 "$N"); do
   run_baseline "$iter"
