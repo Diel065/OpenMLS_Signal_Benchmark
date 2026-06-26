@@ -1897,8 +1897,28 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     }
 
     let mut plateau_rng = StdRng::seed_from_u64(config.scenario_seed);
+    let protected_floor = protected_member_floor(
+        &config.workers,
+        config.profile_only_singletons,
+        config.external_coverage_lane,
+    );
+    let effective_min_size = config.min_size.max(protected_floor);
+    if effective_min_size > max_size {
+        return Err(anyhow!(
+            "protected calibration members require min-size {}, but max-size is {}",
+            effective_min_size,
+            max_size
+        ));
+    }
+    if effective_min_size > config.min_size {
+        eprintln!(
+            "[sampling] raising effective min-size {} -> {} to keep protected calibration members active",
+            config.min_size, effective_min_size
+        );
+    }
+
     let plateau_sequence = build_plateau_sequence_for_order(
-        config.min_size,
+        effective_min_size,
         max_size,
         &config.step_size,
         config.roundtrips,
@@ -1927,7 +1947,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         scenario_seed: config.scenario_seed,
         plateau_order: config.plateau_order,
         plateau_sequence: &plateau_sequence,
-        min_size: config.min_size,
+        min_size: effective_min_size,
         max_size,
         step_size: config.step_size.to_string(),
         roundtrips: config.roundtrips,
@@ -5317,7 +5337,8 @@ async fn remove_n_members(
     rng: &mut StdRng,
     runner_events: &RunnerEventLog,
 ) -> Result<()> {
-    let batch_size = batch_decision.effective;
+    let mut batch_decision = batch_decision;
+    let mut batch_size = batch_decision.effective;
     if active.len() <= 1 {
         return Err(anyhow!("Cannot remove the last remaining member"));
     }
@@ -5332,20 +5353,33 @@ async fn remove_n_members(
         ));
     }
 
-    let actor_idx = forced_actor_id
-        .and_then(|actor_id| active.iter().position(|worker| worker.id == actor_id))
-        .unwrap_or_else(|| rng.gen_range(0..active.len()));
-    let actor = active[actor_idx].clone();
-
-    // Pick random members to remove, but do not let the actor remove itself or
-    // invalidate a coverage/resource lane by removing its protected clients.
-    // Self-removal is possible in MLS-style flows, but it complicates this benchmark's bookkeeping.
-    let removable_indices = removable_member_indices(
+    let (actor_idx, mut removable_indices) = choose_remove_actor_and_removable_indices(
         active,
-        actor_idx,
+        forced_actor_id,
         protect_external_members,
         protect_profile_enabled_members,
-    );
+        batch_size,
+        rng,
+    )?;
+    let actor = active[actor_idx].clone();
+
+    if removable_indices.is_empty() {
+        return Err(anyhow!(
+            "Cannot remove any member from {} active members without removing protected clients; actor={}",
+            active.len(),
+            actor.id
+        ));
+    }
+    if removable_indices.len() < batch_size {
+        eprintln!(
+            "[remove] reducing batch {} -> {} to preserve protected clients; actor={}",
+            batch_size,
+            removable_indices.len(),
+            actor.id
+        );
+        batch_size = removable_indices.len();
+        batch_decision.effective = batch_size;
+    }
     if removable_indices.len() < batch_size {
         return Err(anyhow!(
             "Cannot remove {} member(s) from {} active members without removing protected clients; actor={}, removable={}",
@@ -5355,7 +5389,6 @@ async fn remove_n_members(
             removable_indices.len()
         ));
     }
-    let mut removable_indices = removable_indices;
     let mut removed = Vec::with_capacity(batch_size);
     for _ in 0..batch_size {
         let candidate_pos = rng.gen_range(0..removable_indices.len());
@@ -5574,6 +5607,88 @@ fn removable_member_indices(
         .collect()
 }
 
+fn choose_remove_actor_and_removable_indices(
+    active: &[WorkerSpec],
+    forced_actor_id: Option<&str>,
+    protect_external_members: bool,
+    protect_profile_enabled_members: bool,
+    requested_batch_size: usize,
+    rng: &mut StdRng,
+) -> Result<(usize, Vec<usize>)> {
+    if let Some(actor_id) = forced_actor_id {
+        if let Some(actor_idx) = active.iter().position(|worker| worker.id == actor_id) {
+            let removable = removable_member_indices(
+                active,
+                actor_idx,
+                protect_external_members,
+                protect_profile_enabled_members,
+            );
+            return Ok((actor_idx, removable));
+        }
+    }
+
+    let candidates = (0..active.len())
+        .map(|actor_idx| {
+            let removable = removable_member_indices(
+                active,
+                actor_idx,
+                protect_external_members,
+                protect_profile_enabled_members,
+            );
+            (actor_idx, removable)
+        })
+        .collect::<Vec<_>>();
+
+    let capable = candidates
+        .iter()
+        .filter(|(_, removable)| removable.len() >= requested_batch_size)
+        .collect::<Vec<_>>();
+    if !capable.is_empty() {
+        let selected = capable[rng.gen_range(0..capable.len())];
+        return Ok((selected.0, selected.1.clone()));
+    }
+
+    let max_removable = candidates
+        .iter()
+        .map(|(_, removable)| removable.len())
+        .max()
+        .unwrap_or(0);
+    let best = candidates
+        .iter()
+        .filter(|(_, removable)| removable.len() == max_removable)
+        .collect::<Vec<_>>();
+    if best.is_empty() {
+        return Err(anyhow!("No active removal actor candidates"));
+    }
+    let selected = best[rng.gen_range(0..best.len())];
+    Ok((selected.0, selected.1.clone()))
+}
+
+fn protected_member_floor(
+    workers: &[WorkerSpec],
+    protect_profile_enabled_members: bool,
+    protect_external_members: bool,
+) -> usize {
+    let mut protected = HashSet::new();
+    if protect_profile_enabled_members {
+        protected.extend(
+            workers
+                .iter()
+                .filter(|worker| worker.profile_enabled)
+                .map(|worker| worker.id.clone()),
+        );
+    }
+    if protect_external_members {
+        protected.extend(
+            workers
+                .iter()
+                .filter(|worker| is_external_device(worker))
+                .map(|worker| worker.id.clone()),
+        );
+    }
+    protected.len()
+}
+
 async fn best_effort_process_pending_commits_after_epoch_race(
     http: &reqwest::Client,
     actor: &WorkerSpec,
@@ -5712,7 +5827,7 @@ async fn evict_oom_group_members(
     active: &mut Vec<WorkerSpec>,
     dead_workers: &[WorkerSpec],
     fanout: &mut FanoutController,
-    _process_pending_fanout: bool,
+    process_pending_fanout: bool,
     plateau_size: usize,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
@@ -5798,14 +5913,26 @@ async fn evict_oom_group_members(
                 }
             };
 
-        let actor_commit_result = process_pending_commit_expect(
-            http,
-            &actor,
-            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-            "oom_eviction.actor_process_pending",
-            Some(&cursor),
-        )
-        .await;
+        let actor_commit_result = if process_pending_fanout {
+            process_pending_commit_expect(
+                http,
+                &actor,
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "oom_eviction.actor_process_pending",
+                Some(&cursor),
+            )
+            .await
+        } else {
+            receive_commit_expect(
+                http,
+                &actor,
+                "own commit accepted from DS",
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "oom_eviction.actor_receive_commit",
+                Some(&cursor),
+            )
+            .await
+        };
         if let Err(error) = actor_commit_result {
             if record_profiled_worker_failure(
                 runner_events,
@@ -5832,7 +5959,11 @@ async fn evict_oom_group_members(
             .collect::<Vec<_>>();
         let expected_state = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
         let expected_ep = expected_epoch(&expected_state);
-        let fanout_phase = "oom_eviction.fanout_process_pending";
+        let fanout_phase = if process_pending_fanout {
+            "oom_eviction.fanout_process_pending"
+        } else {
+            "oom_eviction.fanout_receive_commit"
+        };
         let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
             &recipients,
             max_commit_receive_samples_per_plateau,
@@ -5846,17 +5977,29 @@ async fn evict_oom_group_members(
             BatchFanoutCommand {
                 client_id: worker.id.clone(),
                 request_id: None,
-                command: Command::ProcessPending {
-                    kinds: Some(vec![PendingKind::Commits]),
-                    max_messages: None,
-                    expected_epoch: expected_ep,
-                    profile: sampled,
-                    commit_create_op: Some("remove".to_string()),
-                    commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
-                    commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                    commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
-                    commit_receive_sample_count: Some(sample_count),
-                    commit_receive_population_size: Some(recipients.len()),
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                } else {
+                    Command::ReceiveCommit {
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
                 },
                 expected_epoch: expected_ep,
                 phase: Some(fanout_phase.to_string()),
@@ -5879,7 +6022,11 @@ async fn evict_oom_group_members(
             http,
             "oom_eviction",
             recipients.len(),
-            "process_pending",
+            if process_pending_fanout {
+                "process_pending"
+            } else {
+                "receive_commit"
+            },
             &recipients,
             fanout,
             &commands_by_physical,
@@ -7986,15 +8133,16 @@ mod tests {
     use std::time::Duration;
 
     use anyhow::anyhow;
+    use rand::{rngs::StdRng, SeedableRng};
 
     use crate::worker_api::Command;
 
     use super::{
-        batch_physical_base_url, build_batch_commands, fanout_workers,
-        partition_batch_failures_by_reconciled_state, removable_member_indices,
-        retry_batch_commands_for_failures, sampled_member_index, BatchFanoutCommand,
-        FanoutController, FanoutFailure, WorkerSpec, DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
-        FANOUT_LATENCY_SPIKE_P95_MS,
+        batch_physical_base_url, build_batch_commands, choose_remove_actor_and_removable_indices,
+        fanout_workers, partition_batch_failures_by_reconciled_state, protected_member_floor,
+        removable_member_indices, retry_batch_commands_for_failures, sampled_member_index,
+        BatchFanoutCommand, FanoutController, FanoutFailure, WorkerSpec,
+        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD, FANOUT_LATENCY_SPIKE_P95_MS,
     };
 
     fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
@@ -8024,6 +8172,44 @@ mod tests {
             removable_member_indices(&active, 2, false, true),
             vec![1, 3]
         );
+    }
+
+    #[test]
+    fn protected_members_raise_minimum_plateau_floor() {
+        let mut profiled = WorkerSpec::legacy("00001".into(), "http://worker-1:8080".into());
+        profiled.profile_enabled = true;
+
+        let mut external = WorkerSpec::legacy("00002".into(), "http://worker-2:8080".into());
+        external.profile_enabled = false;
+        external.device_kind = "external-device".into();
+
+        let mut ordinary = WorkerSpec::legacy("00003".into(), "http://worker-3:8080".into());
+        ordinary.profile_enabled = false;
+        let workers = vec![profiled, external, ordinary];
+
+        assert_eq!(protected_member_floor(&workers, true, false), 1);
+        assert_eq!(protected_member_floor(&workers, false, true), 1);
+        assert_eq!(protected_member_floor(&workers, true, true), 2);
+    }
+
+    #[test]
+    fn removal_actor_prefers_actor_that_can_remove_full_batch() {
+        let mut protected = WorkerSpec::legacy("00001".into(), "http://worker-1:8080".into());
+        protected.profile_enabled = true;
+
+        let mut ordinary_a = WorkerSpec::legacy("00002".into(), "http://worker-2:8080".into());
+        ordinary_a.profile_enabled = false;
+        let mut ordinary_b = WorkerSpec::legacy("00003".into(), "http://worker-3:8080".into());
+        ordinary_b.profile_enabled = false;
+        let active = vec![protected, ordinary_a, ordinary_b];
+        let mut rng = StdRng::seed_from_u64(7);
+
+        let (actor_idx, removable) =
+            choose_remove_actor_and_removable_indices(&active, None, false, true, 2, &mut rng)
+                .unwrap();
+
+        assert_eq!(actor_idx, 0);
+        assert_eq!(removable, vec![1, 2]);
     }
 
     #[test]
