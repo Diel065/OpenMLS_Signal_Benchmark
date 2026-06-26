@@ -4769,7 +4769,7 @@ fn app_ops_for_plateau(
 }
 
 fn is_external_device(worker: &WorkerSpec) -> bool {
-    !worker.device_kind.is_empty()
+    !worker.device_kind.is_empty() && worker.device_kind != "scratch_container"
 }
 
 fn active_external_indices(active: &[WorkerSpec]) -> Vec<usize> {
@@ -8185,7 +8185,10 @@ mod tests {
 
         let mut ordinary = WorkerSpec::legacy("00003".into(), "http://worker-3:8080".into());
         ordinary.profile_enabled = false;
-        let workers = vec![profiled, external, ordinary];
+        let mut scratch = WorkerSpec::legacy("00004".into(), "http://worker-4:8080".into());
+        scratch.profile_enabled = false;
+        scratch.device_kind = "scratch_container".into();
+        let workers = vec![profiled, external, ordinary, scratch];
 
         assert_eq!(protected_member_floor(&workers, true, false), 1);
         assert_eq!(protected_member_floor(&workers, false, true), 1);
