@@ -271,7 +271,7 @@ def test_runner_events_jsonl_drives_no_aggregate_failure_sidecars(tmp_path):
         "app_heap_budget=32k app_heap_budget_bytes=32768 "
         "current_live_heap_bytes=90446 peak_live_heap_bytes=93507 "
         "operation_peak_live_heap_bytes=90446 total_allocated_bytes=177653 "
-        "allocation_count=401 deallocation_count=254"
+        "allocation_count=401 deallocation_count=254 failure_span_id=77"
     )
     runner_events.write_text(
         json.dumps({
@@ -306,6 +306,7 @@ def test_runner_events_jsonl_drives_no_aggregate_failure_sidecars(tmp_path):
     assert failure.current_operation_family == "key_package_create"
     assert failure.app_heap_budget == "32k"
     assert failure.heap_operation_peak_live_bytes == 90446
+    assert failure.last_observed_span_id == "77"
 
 
 def test_pressure_without_failure_event_is_not_a_worker_failure(tmp_path):

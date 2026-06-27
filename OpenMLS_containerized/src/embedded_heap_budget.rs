@@ -70,6 +70,10 @@ pub fn begin_operation(attribution: OperationAttribution) -> Option<OperationBud
     })
 }
 
+pub fn mark_worker_command_execution() {
+    tracker::set_active_context(tracker::HeapBudgetContext::WorkerCommand);
+}
+
 impl OperationBudgetGuard {
     pub fn failure_if_exceeded(&self) -> Option<HeapBudgetFailure> {
         let snapshot = tracker::snapshot();
@@ -102,6 +106,11 @@ impl HeapBudgetFailure {
             .resource_profile_index
             .map(|v| v.to_string())
             .unwrap_or_default();
+        let failure_span_id = self
+            .snapshot
+            .failure_span_id
+            .map(|value| value.to_string())
+            .unwrap_or_default();
         let detail = self.human_detail();
 
         format!(
@@ -127,6 +136,8 @@ impl HeapBudgetFailure {
                 "allocation_count={} ",
                 "deallocation_count={} ",
                 "failed_allocation_size_bytes={} ",
+                "failure_span_id={} ",
+                "heap_failure_context={} ",
                 "detail=\"{}\""
             ),
             self.attribution.operation_family,
@@ -147,6 +158,8 @@ impl HeapBudgetFailure {
             self.snapshot.failure_allocation_count,
             self.snapshot.failure_deallocation_count,
             failed_allocation,
+            failure_span_id,
+            self.snapshot.failure_context.as_str(),
             detail.replace('"', "'"),
         )
     }

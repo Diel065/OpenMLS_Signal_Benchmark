@@ -436,6 +436,7 @@ def worker_failures_from_terminal_output(terminal_output_path: Optional[str]) ->
             heap_allocation_count=_safe_int(app_heap.get("allocation_count")),
             heap_deallocation_count=_safe_int(app_heap.get("deallocation_count")),
             heap_failed_allocation_size_bytes=_safe_int(app_heap.get("failed_allocation_size_bytes")),
+            last_observed_span_id=app_heap.get("failure_span_id", ""),
         ))
     return failures
 
@@ -582,7 +583,10 @@ def extract_failure_cursors_from_events_csv(
                 cursor["heap_allocation_count"] = _safe_int(app_heap.get("allocation_count")) or cursor["heap_allocation_count"]
                 cursor["heap_deallocation_count"] = _safe_int(app_heap.get("deallocation_count")) or cursor["heap_deallocation_count"]
                 cursor["heap_failed_allocation_size_bytes"] = _safe_int(app_heap.get("failed_allocation_size_bytes")) or cursor["heap_failed_allocation_size_bytes"]
-                cursor["attribution_confidence"] = "exact_runner_operation"
+                cursor["span_id"] = app_heap.get("failure_span_id", cursor["span_id"])
+                cursor["attribution_confidence"] = (
+                    "exact_profile_span" if cursor["span_name"] else "exact_runner_operation"
+                )
                 cursor["attribution_source"] = "app_heap_budget_failure_payload"
             if not cursor["member_count"]:
                 cursor["member_count"] = (
@@ -795,6 +799,7 @@ def worker_failures_from_runner_events_jsonl(runner_events_path: str) -> List[Wo
                     heap_failed_allocation_size_bytes=_safe_int(
                         app_heap.get("failed_allocation_size_bytes")
                     ),
+                    last_observed_span_id=app_heap.get("failure_span_id", ""),
                 )
 
                 existing = failures_by_client.get(failed_id)

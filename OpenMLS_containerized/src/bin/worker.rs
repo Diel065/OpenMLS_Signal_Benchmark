@@ -18,8 +18,8 @@ use tokio::sync::{mpsc, oneshot, Semaphore};
 use mls_playground::client::Client;
 use mls_playground::debug::{debug_logs_enabled, worker_debug_logs_enabled};
 use mls_playground::embedded_heap_budget::{
-    begin_operation as begin_heap_budget_operation, operation_family_for_command,
-    EmbeddedHeapBudgetConfig, OperationAttribution,
+    begin_operation as begin_heap_budget_operation, mark_worker_command_execution,
+    operation_family_for_command, EmbeddedHeapBudgetConfig, OperationAttribution,
 };
 use mls_playground::worker_api::{
     handle_command, BenchmarkContextFields, Command, CommandResponse, CompletedCommandCache,
@@ -635,6 +635,9 @@ async fn client_command_actor(
         } else {
             None
         };
+        if heap_budget_guard.is_some() {
+            mark_worker_command_execution();
+        }
 
         let mut result = handle_command(
             &mut slot.client,

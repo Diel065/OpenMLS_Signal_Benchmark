@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Mutex, OnceLock,
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
@@ -19,6 +19,9 @@ use serde::Serialize;
 
 static PROFILE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
 static CPU_STAT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
+static CPU_STAT_BASELINE: OnceLock<Option<CpuStatSnapshot>> = OnceLock::new();
+static CPU_THROTTLED_PERIOD_THRESHOLD: OnceLock<f64> = OnceLock::new();
+static CPU_THROTTLED_PERIOD_THRESHOLD_REPORTED: AtomicBool = AtomicBool::new(false);
 static CPU_LIMIT_CORES: OnceLock<Option<f64>> = OnceLock::new();
 static MEMORY_LIMIT_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 static PAGE_SIZE_BYTES: OnceLock<u64> = OnceLock::new();
@@ -809,6 +812,17 @@ fn current_parent_operation() -> Option<String> {
 
 fn push_span_id(span_id: u64, op_name: String) {
     SPAN_STACK.with(|stack| stack.borrow_mut().push((span_id, op_name)));
+    allocation_counter::embedded_heap_budget::set_active_span_id(Some(span_id));
+}
+
+fn restore_heap_budget_execution_context() {
+    let active_span_id = current_parent_span_id();
+    allocation_counter::embedded_heap_budget::set_active_span_id(active_span_id);
+    allocation_counter::embedded_heap_budget::set_active_context(if active_span_id.is_some() {
+        allocation_counter::embedded_heap_budget::HeapBudgetContext::OpenMlsSpanExecution
+    } else {
+        allocation_counter::embedded_heap_budget::HeapBudgetContext::WorkerCommand
+    });
 }
 
 fn pop_span_id(span_id: u64) {
@@ -820,6 +834,7 @@ fn pop_span_id(span_id: u64) {
             stack.remove(position);
         }
     });
+    restore_heap_budget_execution_context();
 }
 
 fn cgroup_file_candidates(controller: &str, file_name: &str) -> Vec<PathBuf> {
@@ -885,24 +900,30 @@ fn parse_keyed_u128(contents: &str, key: &str) -> Option<u128> {
     })
 }
 
-fn read_cpu_throttled_ns(path: &Path) -> Option<u128> {
-    let contents = fs::read_to_string(path).ok()?;
-    if let Some(throttled_usec) = parse_keyed_u128(&contents, "throttled_usec") {
-        return throttled_usec.checked_mul(1_000);
-    }
-    parse_keyed_u128(&contents, "throttled_time")
+#[derive(Clone, Copy, Debug)]
+struct CpuStatSnapshot {
+    nr_periods: u64,
+    nr_throttled: u64,
+    throttled_usec: u128,
 }
 
-fn current_cpu_throttled_ns() -> Option<u128> {
-    // Some embedded kernels expose no cgroup CPU-throttling counter.
-    // This metric is cgroup quota throttling, so unsupported counters use zero.
+fn read_cpu_stat(path: &Path) -> Option<CpuStatSnapshot> {
+    let contents = fs::read_to_string(path).ok()?;
+    let nr_periods = parse_keyed_u128(&contents, "nr_periods")?.try_into().ok()?;
+    let nr_throttled = parse_keyed_u128(&contents, "nr_throttled")?.try_into().ok()?;
+    let throttled_usec = parse_keyed_u128(&contents, "throttled_usec").or_else(|| {
+        parse_keyed_u128(&contents, "throttled_time").map(|nanoseconds| nanoseconds / 1_000)
+    })?;
+    Some(CpuStatSnapshot {
+        nr_periods,
+        nr_throttled,
+        throttled_usec,
+    })
+}
+
+fn current_cpu_stat() -> Option<CpuStatSnapshot> {
     let counter = CPU_STAT_PATH.get_or_init(|| first_existing_cgroup_file("cpu", "cpu.stat"));
-    Some(
-        counter
-            .as_ref()
-            .and_then(|path| read_cpu_throttled_ns(path))
-            .unwrap_or(0),
-    )
+    counter.as_ref().and_then(|path| read_cpu_stat(path))
 }
 
 fn read_cpu_max_limit(path: &Path) -> Option<f64> {
@@ -942,6 +963,16 @@ fn effective_cpu_limit_cores() -> Option<f64> {
         } else {
             None
         }
+    })
+}
+
+fn cpu_throttled_period_threshold() -> f64 {
+    *CPU_THROTTLED_PERIOD_THRESHOLD.get_or_init(|| {
+        std::env::var("OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD")
+            .ok()
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|value| (0.0..=1.0).contains(value))
+            .unwrap_or(0.05)
     })
 }
 
@@ -1021,24 +1052,21 @@ fn current_rss_bytes() -> Option<u64> {
 }
 
 struct ResourceSnapshot {
-    process_cpu_start: Option<ProcessTime>,
-    throttled_ns: Option<u128>,
+    cpu_stat: Option<CpuStatSnapshot>,
     rss_bytes: Option<u64>,
 }
 
 impl ResourceSnapshot {
     fn capture_start() -> Self {
         Self {
-            process_cpu_start: Some(ProcessTime::now()),
-            throttled_ns: current_cpu_throttled_ns(),
+            cpu_stat: current_cpu_stat(),
             rss_bytes: current_rss_bytes(),
         }
     }
 
     fn capture_end() -> Self {
         Self {
-            process_cpu_start: None,
-            throttled_ns: current_cpu_throttled_ns(),
+            cpu_stat: current_cpu_stat(),
             rss_bytes: current_rss_bytes(),
         }
     }
@@ -1151,8 +1179,20 @@ pub struct ProfileEvent {
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
     pub cpu_process_ns: u128,
+    // Quota-normalized span signal. Sub-period CFS bursts can make this exceed 1.
     pub cpu_envelope_utilization: Option<f64>,
+    // Shared cgroup throttled-time delta divided by span wall time; not a bounded fraction.
     pub cpu_throttled_time_ratio: Option<f64>,
+    pub cpu_nr_periods_delta: Option<u64>,
+    pub cpu_nr_throttled_delta: Option<u64>,
+    pub cpu_throttled_usec_delta: Option<u128>,
+    pub cpu_throttled_period_fraction: Option<f64>,
+    pub cpu_nr_periods_cumulative: Option<u64>,
+    pub cpu_nr_throttled_cumulative: Option<u64>,
+    pub cpu_throttled_usec_cumulative: Option<u128>,
+    pub cpu_throttled_period_fraction_cumulative: Option<f64>,
+    pub cpu_throttled_period_threshold: Option<f64>,
+    pub cpu_throttled_period_threshold_crossing: Option<bool>,
 
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
@@ -1316,6 +1356,11 @@ impl ProfileEvent {
 }
 
 pub fn emit_event(event: &ProfileEvent) {
+    let _heap_budget_context =
+        allocation_counter::embedded_heap_budget::enter_attribution_context(
+            allocation_counter::embedded_heap_budget::HeapBudgetContext::ProfilingEmit,
+            Some(event.span_id),
+        );
     let Some(lock) = writer().as_ref() else {
         return;
     };
@@ -1583,6 +1628,7 @@ pub struct ProfileScope {
     implementation: String,
     wall_start: Instant,
     cpu_start: Option<ThreadTime>,
+    process_cpu_start: Option<ProcessTime>,
     resource_start: ResourceSnapshot,
     structural_start: StructuralCounterSnapshot,
     l1d_cache_start: Option<L1DCacheCounterScope>,
@@ -1601,6 +1647,9 @@ impl ProfileScope {
         if !profiling_enabled() {
             return None;
         }
+        allocation_counter::embedded_heap_budget::set_active_context(
+            allocation_counter::embedded_heap_budget::HeapBudgetContext::ProfilingStart,
+        );
         let span_id = next_span_id();
         let op_name: String = op.into();
         let parent_span_id = current_parent_span_id();
@@ -1631,14 +1680,17 @@ impl ProfileScope {
         let process_allocation_start = process_snapshot();
         let structural_start = StructuralCounterSnapshot::capture();
         let resource_start = ResourceSnapshot::capture_start();
-        let cpu_start = Some(ThreadTime::now());
+        CPU_STAT_BASELINE.get_or_init(|| resource_start.cpu_stat);
         let wall_start = Instant::now();
+        let cpu_start = Some(ThreadTime::now());
+        let process_cpu_start = Some(ProcessTime::now());
 
-        Some(Self {
+        let scope = Self {
             op: op_name,
             implementation: implementation.into(),
             wall_start,
             cpu_start,
+            process_cpu_start,
             resource_start,
             structural_start,
             l1d_cache_start,
@@ -1650,24 +1702,30 @@ impl ProfileScope {
             parent_span_id,
             parent_operation,
             finished: false,
-        })
+        };
+        allocation_counter::embedded_heap_budget::set_active_context(
+            allocation_counter::embedded_heap_budget::HeapBudgetContext::OpenMlsSpanExecution,
+        );
+        Some(scope)
     }
 
     pub(crate) fn finish(mut self) -> ProfileEvent {
+        allocation_counter::embedded_heap_budget::set_active_context(
+            allocation_counter::embedded_heap_budget::HeapBudgetContext::ProfilingFinish,
+        );
         let op = self.op.clone();
         let implementation = self.implementation.clone();
         // Capture primary timing endpoints before profiler teardown work.
-        let wall_ns = self.wall_start.elapsed().as_nanos();
+        let cpu_process_ns = self
+            .process_cpu_start
+            .as_ref()
+            .map(|start| start.elapsed().as_nanos());
         let cpu_thread_ns = self
             .cpu_start
             .as_ref()
             .map(|start| start.elapsed().as_nanos());
-        let cpu_process_ns = self
-            .resource_start
-            .process_cpu_start
-            .as_ref()
-            .map(|start| start.elapsed().as_nanos())
-            .unwrap_or(0);
+        let wall_ns = self.wall_start.elapsed().as_nanos();
+        let cpu_process_ns = cpu_process_ns.unwrap_or(0);
         let process_allocation = process_snapshot().delta_since(self.process_allocation_start);
         let structural_counters =
             StructuralCounterSnapshot::capture().delta_since(self.structural_start);
@@ -1714,13 +1772,55 @@ impl ProfileScope {
         } else {
             None
         };
-        let cpu_throttled_time_ratio =
-            match (self.resource_start.throttled_ns, resource_end.throttled_ns) {
-                (Some(start), Some(end)) if wall_ns > 0 && end >= start => {
-                    Some((end - start) as f64 / wall_ns as f64)
-                }
-                _ => None,
-            };
+        let cpu_stat_delta = match (self.resource_start.cpu_stat, resource_end.cpu_stat) {
+            (Some(start), Some(end)) => Some((
+                end.nr_periods.saturating_sub(start.nr_periods),
+                end.nr_throttled.saturating_sub(start.nr_throttled),
+                end.throttled_usec.saturating_sub(start.throttled_usec),
+            )),
+            _ => None,
+        };
+        let cpu_nr_periods_delta = cpu_stat_delta.map(|value| value.0);
+        let cpu_nr_throttled_delta = cpu_stat_delta.map(|value| value.1);
+        let cpu_throttled_usec_delta = cpu_stat_delta.map(|value| value.2);
+        let cpu_throttled_period_fraction = cpu_stat_delta.and_then(
+            |(periods, throttled, _)| (periods > 0).then_some(throttled as f64 / periods as f64),
+        );
+        let cpu_throttled_time_ratio = cpu_throttled_usec_delta
+            .filter(|_| wall_ns > 0)
+            .map(|microseconds| microseconds as f64 * 1_000.0 / wall_ns as f64);
+        let cpu_stat_cumulative = match (
+            CPU_STAT_BASELINE.get().copied().flatten(),
+            resource_end.cpu_stat,
+        ) {
+            (Some(baseline), Some(end)) => Some((
+                end.nr_periods.saturating_sub(baseline.nr_periods),
+                end.nr_throttled.saturating_sub(baseline.nr_throttled),
+                end.throttled_usec.saturating_sub(baseline.throttled_usec),
+            )),
+            _ => None,
+        };
+        let cpu_nr_periods_cumulative = cpu_stat_cumulative.map(|value| value.0);
+        let cpu_nr_throttled_cumulative = cpu_stat_cumulative.map(|value| value.1);
+        let cpu_throttled_usec_cumulative = cpu_stat_cumulative.map(|value| value.2);
+        let cpu_throttled_period_fraction_cumulative = cpu_stat_cumulative.and_then(
+            |(periods, throttled, _)| (periods > 0).then_some(throttled as f64 / periods as f64),
+        );
+        let cpu_throttled_period_threshold_value = resource_end
+            .cpu_stat
+            .map(|_| cpu_throttled_period_threshold());
+        let threshold_minimum_periods = if cpu_throttled_period_threshold() > 0.0 {
+            (1.0 / cpu_throttled_period_threshold()).ceil() as u64
+        } else {
+            1
+        };
+        let cpu_throttled_period_threshold_crossing =
+            cpu_throttled_period_fraction_cumulative.map(|fraction| {
+                fraction >= cpu_throttled_period_threshold()
+                    && cpu_nr_periods_cumulative.unwrap_or(0) >= threshold_minimum_periods
+                    && cpu_nr_throttled_delta.unwrap_or(0) > 0
+                    && !CPU_THROTTLED_PERIOD_THRESHOLD_REPORTED.swap(true, Ordering::AcqRel)
+            });
         let ram_rss_delta_bytes = match (self.resource_start.rss_bytes, resource_end.rss_bytes) {
             (Some(start), Some(end)) => Some(bounded_i64_delta(start, end)),
             _ => None,
@@ -1740,7 +1840,7 @@ impl ProfileScope {
         pop_span_id(self.span_id);
 
         let mut event = ProfileEvent {
-            profile_schema_version: 10,
+            profile_schema_version: 11,
             ts_unix_ns: unix_timestamp_ns(),
             measurement_class: measurement_class_for_op(&op).to_string(),
             measurement_plane: measurement_plane_for_op(&op).to_string(),
@@ -1758,6 +1858,16 @@ impl ProfileScope {
             cpu_process_ns,
             cpu_envelope_utilization,
             cpu_throttled_time_ratio,
+            cpu_nr_periods_delta,
+            cpu_nr_throttled_delta,
+            cpu_throttled_usec_delta,
+            cpu_throttled_period_fraction,
+            cpu_nr_periods_cumulative,
+            cpu_nr_throttled_cumulative,
+            cpu_throttled_usec_cumulative,
+            cpu_throttled_period_fraction_cumulative,
+            cpu_throttled_period_threshold: cpu_throttled_period_threshold_value,
+            cpu_throttled_period_threshold_crossing,
 
             alloc_bytes: Some(process_allocation.bytes_total),
             alloc_count: Some(process_allocation.count_total),
@@ -1996,4 +2106,29 @@ pub fn finish_and_emit(scope: Option<ProfileScope>, fill: impl FnOnce(&mut Profi
     let mut event = scope.finish();
     fill(&mut event);
     emit_event(&event);
+}
+
+#[cfg(test)]
+mod cpu_stat_tests {
+    use super::*;
+
+    #[test]
+    fn parses_cgroup_v2_cpu_stat() {
+        let path = std::env::temp_dir().join(format!(
+            "openmls-cpu-stat-test-{}",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            "usage_usec 100\nnr_periods 20\nnr_throttled 3\nthrottled_usec 400\n",
+        )
+        .expect("write cpu.stat fixture");
+
+        let snapshot = read_cpu_stat(&path).expect("parse cpu.stat");
+        assert_eq!(snapshot.nr_periods, 20);
+        assert_eq!(snapshot.nr_throttled, 3);
+        assert_eq!(snapshot.throttled_usec, 400);
+
+        let _ = std::fs::remove_file(path);
+    }
 }

@@ -665,7 +665,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 10,
+            profile_schema_version: 11,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -725,7 +725,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 10,
+            profile_schema_version: 11,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -839,6 +839,9 @@ fn apply_app_heap_budget_failure_fields(event: &mut ProfileEvent) {
     event.heap_failed_allocation_size_bytes =
         app_heap_field(detail, "failed_allocation_size_bytes")
             .and_then(|value| value.parse::<u64>().ok());
+    event.heap_failure_context = app_heap_field(detail, "heap_failure_context");
+    event.span_id =
+        app_heap_field(detail, "failure_span_id").and_then(|value| value.parse::<u64>().ok());
 
     if event.operation_family.is_none() {
         event.operation_family = app_heap_field(detail, "operation_family");
@@ -1163,6 +1166,8 @@ struct ProfileEvent {
     #[serde(default)]
     heap_failed_allocation_size_bytes: Option<u64>,
     #[serde(default)]
+    heap_failure_context: Option<String>,
+    #[serde(default)]
     benchmark_plateau_index: Option<usize>,
     #[serde(default)]
     benchmark_target_size: Option<usize>,
@@ -1197,6 +1202,26 @@ struct ProfileEvent {
     cpu_envelope_utilization: Option<f64>,
     #[serde(default)]
     cpu_throttled_time_ratio: Option<f64>,
+    #[serde(default)]
+    cpu_nr_periods_delta: Option<u64>,
+    #[serde(default)]
+    cpu_nr_throttled_delta: Option<u64>,
+    #[serde(default)]
+    cpu_throttled_usec_delta: Option<u128>,
+    #[serde(default)]
+    cpu_throttled_period_fraction: Option<f64>,
+    #[serde(default)]
+    cpu_nr_periods_cumulative: Option<u64>,
+    #[serde(default)]
+    cpu_nr_throttled_cumulative: Option<u64>,
+    #[serde(default)]
+    cpu_throttled_usec_cumulative: Option<u128>,
+    #[serde(default)]
+    cpu_throttled_period_fraction_cumulative: Option<f64>,
+    #[serde(default)]
+    cpu_throttled_period_threshold: Option<f64>,
+    #[serde(default)]
+    cpu_throttled_period_threshold_crossing: Option<bool>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     #[serde(default)]
@@ -6840,7 +6865,7 @@ pub fn aggregate_csv(
     run_dir: &Path,
     worker_ids: &[String],
     provided_layout: &Option<WorkerLayout>,
-) -> Result<()> {
+) -> Result<u64> {
     materialize_runner_profile_events(run_dir)?;
 
     let csv_path = run_dir.join("events.csv");
@@ -6932,6 +6957,7 @@ pub fn aggregate_csv(
         heap_allocation_count: Option<u64>,
         heap_deallocation_count: Option<u64>,
         heap_failed_allocation_size_bytes: Option<u64>,
+        heap_failure_context: Option<String>,
         benchmark_plateau_index: Option<usize>,
         benchmark_target_size: Option<usize>,
         benchmark_active_size: Option<usize>,
@@ -6950,6 +6976,16 @@ pub fn aggregate_csv(
         cpu_process_ns: u128,
         cpu_envelope_utilization: Option<f64>,
         cpu_throttled_time_ratio: Option<f64>,
+        cpu_nr_periods_delta: Option<u64>,
+        cpu_nr_throttled_delta: Option<u64>,
+        cpu_throttled_usec_delta: Option<u128>,
+        cpu_throttled_period_fraction: Option<f64>,
+        cpu_nr_periods_cumulative: Option<u64>,
+        cpu_nr_throttled_cumulative: Option<u64>,
+        cpu_throttled_usec_cumulative: Option<u128>,
+        cpu_throttled_period_fraction_cumulative: Option<f64>,
+        cpu_throttled_period_threshold: Option<f64>,
+        cpu_throttled_period_threshold_crossing: Option<bool>,
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
         alloc_measurement_scope: Option<String>,
@@ -7119,6 +7155,8 @@ pub fn aggregate_csv(
 
         let file = File::open(&path)?;
         let reader = BufReader::new(file);
+        let mut span_metadata: std::collections::HashMap<u64, (String, Option<String>)> =
+            std::collections::HashMap::new();
 
         for line in reader.lines() {
             let line = line?;
@@ -7126,8 +7164,21 @@ pub fn aggregate_csv(
                 continue;
             }
 
-            let event: ProfileEvent = serde_json::from_str(&line)
+            let mut event: ProfileEvent = serde_json::from_str(&line)
                 .with_context(|| format!("Invalid json in {}", path.display()))?;
+            if event.failure_class.as_deref() == Some("app_heap_budget_exceeded") {
+                if let Some((span_name, parent_operation)) = event
+                    .span_id
+                    .and_then(|span_id| span_metadata.get(&span_id))
+                {
+                    event.span_name = Some(span_name.clone());
+                    event.parent_operation = parent_operation.clone();
+                }
+            } else if let (Some(span_id), Some(span_name)) =
+                (event.span_id, event.span_name.clone())
+            {
+                span_metadata.insert(span_id, (span_name, event.parent_operation.clone()));
+            }
             let physical_worker_id =
                 non_empty_or(meta.map(|m| m.physical_worker_id.as_str()), worker_id);
             let phys = physical_meta.get(physical_worker_id).copied();
@@ -7184,6 +7235,7 @@ pub fn aggregate_csv(
                 heap_allocation_count: event.heap_allocation_count,
                 heap_deallocation_count: event.heap_deallocation_count,
                 heap_failed_allocation_size_bytes: event.heap_failed_allocation_size_bytes,
+                heap_failure_context: event.heap_failure_context,
                 benchmark_plateau_index: event.benchmark_plateau_index,
                 benchmark_target_size: event.benchmark_target_size,
                 benchmark_active_size: event.benchmark_active_size,
@@ -7202,6 +7254,18 @@ pub fn aggregate_csv(
                 cpu_process_ns: event.cpu_process_ns,
                 cpu_envelope_utilization: event.cpu_envelope_utilization,
                 cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
+                cpu_nr_periods_delta: event.cpu_nr_periods_delta,
+                cpu_nr_throttled_delta: event.cpu_nr_throttled_delta,
+                cpu_throttled_usec_delta: event.cpu_throttled_usec_delta,
+                cpu_throttled_period_fraction: event.cpu_throttled_period_fraction,
+                cpu_nr_periods_cumulative: event.cpu_nr_periods_cumulative,
+                cpu_nr_throttled_cumulative: event.cpu_nr_throttled_cumulative,
+                cpu_throttled_usec_cumulative: event.cpu_throttled_usec_cumulative,
+                cpu_throttled_period_fraction_cumulative: event
+                    .cpu_throttled_period_fraction_cumulative,
+                cpu_throttled_period_threshold: event.cpu_throttled_period_threshold,
+                cpu_throttled_period_threshold_crossing: event
+                    .cpu_throttled_period_threshold_crossing,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
                 alloc_measurement_scope: event.alloc_measurement_scope,
@@ -7353,6 +7417,7 @@ pub fn aggregate_csv(
             left_failure.cmp(&right_failure)
         })
     });
+    let events_written = rows.len() as u64;
     for row in rows {
         wtr.serialize(row)?;
     }
@@ -7366,7 +7431,7 @@ pub fn aggregate_csv(
             csv_path.display()
         )
     })?;
-    Ok(())
+    Ok(events_written)
 }
 
 #[cfg(test)]
@@ -7475,6 +7540,72 @@ mod aggregate_csv_resource_tests {
     use super::*;
 
     #[test]
+    fn aggregate_csv_resolves_heap_failure_suboperation() {
+        let run_dir = std::env::temp_dir().join(format!(
+            "openmls-heap-failure-span-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&run_dir).expect("create run dir");
+
+        let completed_span = ProfileEvent {
+            ts_unix_ns: 1,
+            op: "commit_receive.path_secret_decrypt".to_string(),
+            span_name: Some("commit_receive.path_secret_decrypt".to_string()),
+            span_id: Some(77),
+            parent_operation: Some("commit_receive_protocol".to_string()),
+            implementation: "openmls".to_string(),
+            ..ProfileEvent::default()
+        };
+        let mut failure = ProfileEvent {
+            ts_unix_ns: 2,
+            op: "benchmark.worker_failure".to_string(),
+            failure_class: Some("app_heap_budget_exceeded".to_string()),
+            failure_detail: Some(
+                "APP_HEAP_BUDGET_EXCEEDED operation_family=commit_receive failure_span_id=77 heap_failure_context=openmls_span_execution".to_string(),
+            ),
+            implementation: "benchmark_runner".to_string(),
+            ..ProfileEvent::default()
+        };
+        apply_app_heap_budget_failure_fields(&mut failure);
+        assert_eq!(failure.span_id, Some(77));
+
+        let profile = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&completed_span).expect("serialize span"),
+            serde_json::to_string(&failure).expect("serialize failure")
+        );
+        std::fs::write(run_dir.join("client-00001.jsonl"), profile).expect("write profile");
+
+        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+        let mut reader = csv::Reader::from_path(run_dir.join("events.csv")).expect("open csv");
+        let headers = reader.headers().expect("headers").clone();
+        let failure_row = reader
+            .records()
+            .map(|record| record.expect("valid row"))
+            .find(|record| {
+                let index = headers
+                    .iter()
+                    .position(|header| header == "failure_class")
+                    .expect("failure_class header");
+                record.get(index) == Some("app_heap_budget_exceeded")
+            })
+            .expect("failure row");
+        let value = |name: &str| {
+            let index = headers
+                .iter()
+                .position(|header| header == name)
+                .expect("header exists");
+            failure_row.get(index).expect("value")
+        };
+        assert_eq!(value("span_id"), "77");
+        assert_eq!(value("span_name"), "commit_receive.path_secret_decrypt");
+        assert_eq!(value("parent_operation"), "commit_receive_protocol");
+        assert_eq!(value("heap_failure_context"), "openmls_span_execution");
+
+        let _ = std::fs::remove_dir_all(run_dir);
+    }
+
+    #[test]
     fn aggregate_csv_appends_resource_limit_columns_from_layout() {
         let unique = format!(
             "openmls-aggregate-resource-test-{}-{}",
@@ -7564,6 +7695,40 @@ mod aggregate_csv_resource_tests {
             "scenario_seed": 1u64
         });
         let event_object = event.as_object_mut().expect("fixture must be an object");
+        event_object.insert("cpu_nr_periods_delta".to_string(), serde_json::json!(10));
+        event_object.insert("cpu_nr_throttled_delta".to_string(), serde_json::json!(1));
+        event_object.insert(
+            "cpu_throttled_usec_delta".to_string(),
+            serde_json::json!(50000),
+        );
+        event_object.insert(
+            "cpu_throttled_period_fraction".to_string(),
+            serde_json::json!(0.1),
+        );
+        event_object.insert(
+            "cpu_nr_periods_cumulative".to_string(),
+            serde_json::json!(20),
+        );
+        event_object.insert(
+            "cpu_nr_throttled_cumulative".to_string(),
+            serde_json::json!(1),
+        );
+        event_object.insert(
+            "cpu_throttled_usec_cumulative".to_string(),
+            serde_json::json!(50000),
+        );
+        event_object.insert(
+            "cpu_throttled_period_fraction_cumulative".to_string(),
+            serde_json::json!(0.05),
+        );
+        event_object.insert(
+            "cpu_throttled_period_threshold".to_string(),
+            serde_json::json!(0.05),
+        );
+        event_object.insert(
+            "cpu_throttled_period_threshold_crossing".to_string(),
+            serde_json::json!(true),
+        );
         event_object.insert("group_info_bytes".to_string(), serde_json::json!(256usize));
         event_object.insert(
             "group_info_plaintext_bytes".to_string(),
@@ -7588,7 +7753,9 @@ mod aggregate_csv_resource_tests {
         )
         .expect("write jsonl");
 
-        aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+        let events_written =
+            aggregate_csv(&run_dir, &["00001".to_string()], &None).expect("aggregate csv");
+        assert_eq!(events_written, 1);
 
         let mut reader = csv::Reader::from_path(run_dir.join("events.csv")).expect("open csv");
         let headers = reader.headers().expect("headers").clone();
@@ -7627,6 +7794,16 @@ mod aggregate_csv_resource_tests {
         );
         assert_eq!(value("cpu_envelope_utilization"), "0.9");
         assert_eq!(value("cpu_throttled_time_ratio"), "0.1");
+        assert_eq!(value("cpu_nr_periods_delta"), "10");
+        assert_eq!(value("cpu_nr_throttled_delta"), "1");
+        assert_eq!(value("cpu_throttled_usec_delta"), "50000");
+        assert_eq!(value("cpu_throttled_period_fraction"), "0.1");
+        assert_eq!(value("cpu_nr_periods_cumulative"), "20");
+        assert_eq!(value("cpu_nr_throttled_cumulative"), "1");
+        assert_eq!(value("cpu_throttled_usec_cumulative"), "50000");
+        assert_eq!(value("cpu_throttled_period_fraction_cumulative"), "0.05");
+        assert_eq!(value("cpu_throttled_period_threshold"), "0.05");
+        assert_eq!(value("cpu_throttled_period_threshold_crossing"), "true");
         assert_eq!(value("l1d_cache_accesses"), "1000");
         assert_eq!(value("l1d_cache_misses"), "25");
         assert_eq!(value("ram_rss_delta_bytes"), "4096");

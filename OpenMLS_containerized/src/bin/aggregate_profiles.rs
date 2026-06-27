@@ -127,10 +127,20 @@ fn main() -> Result<()> {
         ids
     };
 
-    let expected_count = worker_ids.len();
+    let expected_worker_ids: Vec<String> = if let Some(layout) = &layout {
+        layout
+            .clients
+            .iter()
+            .filter(|client| client.profile_enabled)
+            .map(|client| client.client_id.clone())
+            .collect()
+    } else {
+        worker_ids.clone()
+    };
+    let expected_count = expected_worker_ids.len();
     let mut found_count: usize = 0;
     let mut missing_files: Vec<String> = Vec::new();
-    for id in &worker_ids {
+    for id in &expected_worker_ids {
         let path = run_dir.join(format!("client-{}.jsonl", id));
         if path.exists() {
             found_count += 1;
@@ -157,7 +167,11 @@ fn main() -> Result<()> {
 
     let finished_at = timestamp_now();
     let mut manifest = AggregationManifest {
-        run_id: args.run_id.clone(),
+        run_id: args.run_id.clone().or_else(|| {
+            run_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        }),
         started_at: started_at.clone(),
         finished_at: finished_at.clone(),
         aggregation_mode: if args.allow_partial {
@@ -172,19 +186,21 @@ fn main() -> Result<()> {
         input_files_missing: missing_files,
         malformed_records: Vec::new(),
         truncated_records: Vec::new(),
-        runner_events_included: run_dir.join("runner_events.jsonl").exists(),
+        runner_events_included: run_dir.join("runner_events.jsonl").exists()
+            || run_dir.join("runner-events.jsonl").exists(),
         output_path: events_path.to_string_lossy().to_string(),
         error_message: None,
         temporary_file_retained: None,
     };
 
     match agg_result {
-        Ok(()) => {
+        Ok(events_written) => {
             manifest.aggregation_status = if args.allow_partial {
                 "partial_success".to_string()
             } else {
                 "complete_success".to_string()
             };
+            manifest.events_written = events_written;
             println!("Aggregation complete: {}", events_path.display());
         }
         Err(e) => {

@@ -2595,6 +2595,7 @@ class ResourceMonitor:
                     "cpu_usage_usec_delta": row.get("cpu_usage_usec_delta"),
                     "cpu_nr_throttled_delta": row.get("cpu_nr_throttled_delta"),
                     "cpu_throttled_usec_delta": row.get("cpu_throttled_usec_delta"),
+                    # Legacy column name: this is nr_throttled / nr_periods, not throttled time.
                     "cpu_throttled_time_fraction": row.get("throttled_period_fraction"),
                     "max_thread_count": row.get("pids_current_max"),
                     "max_process_count": "",
@@ -3298,6 +3299,16 @@ def standalone_aggregation_inputs(run_dir: Path) -> tuple[Optional[Path], Option
     return (
         layout_file if layout_file.exists() else None,
         workers_file if workers_file.exists() else None,
+    )
+
+
+def should_run_cleanup_aggregation(args: argparse.Namespace, run_dir: Path) -> bool:
+    events_path = run_dir / "events.csv"
+    return (
+        not args.preflight_only
+        and not args.enable_external_devices
+        and (not events_path.exists() or events_path.stat().st_size == 0)
+        and any(run_dir.glob("client-*.jsonl"))
     )
 
 
@@ -5235,6 +5246,22 @@ def main() -> int:
                 external_oom_monitor_stopped = True
             except Exception as exc:
                 print(f"[resources] external OOM monitor stop failed (non-fatal): {exc}", flush=True)
+
+        if should_run_cleanup_aggregation(args, run_dir):
+            try:
+                layout_file_cleanup, workers_file_cleanup = standalone_aggregation_inputs(run_dir)
+                run_standalone_aggregation(
+                    run_dir,
+                    layout_file_cleanup,
+                    workers_file_cleanup,
+                    allow_partial=True,
+                    manifest_path=run_dir / "aggregation_manifest.json",
+                )
+            except Exception as exc:
+                print(
+                    f"[aggregate] cleanup-time partial aggregation failed (non-fatal): {exc}",
+                    flush=True,
+                )
 
         if external_device_stop_required:
             stop_external_device_workers(args, root)

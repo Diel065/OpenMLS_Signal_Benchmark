@@ -1,6 +1,7 @@
 import csv
 import json
 import sys
+from argparse import Namespace
 from pathlib import Path
 
 
@@ -8,6 +9,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 from run_compose_benchmark import (
+    should_run_cleanup_aggregation,
     validate_artifacts,
     write_artifact_validation,
     write_integrated_aggregation_manifest,
@@ -49,6 +51,16 @@ def test_validate_artifacts_requires_events_for_integrated_aggregate(tmp_path):
         assert "Missing aggregated CSV" in str(exc)
     else:
         raise AssertionError("expected missing events.csv to fail aggregate validation")
+
+
+def test_cleanup_aggregation_runs_for_interrupted_local_profile(tmp_path):
+    args = Namespace(preflight_only=False, enable_external_devices=False)
+    (tmp_path / "client-00001.jsonl").write_text("{}\n", encoding="utf-8")
+
+    assert should_run_cleanup_aggregation(args, tmp_path)
+
+    (tmp_path / "events.csv").write_text("op\none\n", encoding="utf-8")
+    assert not should_run_cleanup_aggregation(args, tmp_path)
 
 
 def test_artifact_validation_treats_events_as_optional_without_aggregation(tmp_path):
