@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, VecDeque},
     error::Error as StdError,
-    time::{Duration, Instant},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -22,6 +23,7 @@ use crate::key_repository::{
     OneTimePrekeyStorable, PrekeyBundleBatchStorable, PrekeyBundleStorable, PrekeyStock,
 };
 use crate::l1d_cache::{L1DCacheCounterScope, L1DCacheCounts};
+use crate::signal_metrics::SignalProfileEvent;
 use crate::signal_participant::SignalParticipant;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -253,6 +255,109 @@ fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
             ..Default::default()
         },
     )
+}
+
+pub fn write_subspan_event(profile_path: Option<&PathBuf>, event: &SignalProfileEvent) {
+    if let Some(path) = profile_path {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            if let Ok(json_line) = serde_json::to_string(event) {
+                let _ = std::io::Write::write(&mut file, json_line.as_bytes());
+                let _ = std::io::Write::write(&mut file, b"\n");
+            }
+        }
+    }
+}
+
+pub fn make_subspan_event(
+    op: &str,
+    event_family: &str,
+    event_subtype: &str,
+    span_layer: &str,
+    measurement_class: &str,
+    participant_id: &str,
+    wall_ns: u128,
+    cpu_thread_ns: Option<u128>,
+    alloc_bytes: Option<u64>,
+    alloc_count: Option<u64>,
+    success: bool,
+) -> SignalProfileEvent {
+    let heap_snapshot = allocation_counter::embedded_heap_budget::snapshot();
+    SignalProfileEvent {
+        profile_schema_version: 4,
+        ts_unix_ns: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        op: op.to_string(),
+        span_layer: span_layer.to_string(),
+        protocol_stack: "signal".to_string(),
+        implementation: "libsignal".to_string(),
+        measurement_class: measurement_class.to_string(),
+        event_family: event_family.to_string(),
+        event_subtype: event_subtype.to_string(),
+        participant_id: Some(participant_id.to_string()),
+        success,
+        wall_ns,
+        cpu_thread_ns,
+        alloc_bytes,
+        alloc_count,
+        cpu_model: env_nonempty("SIGNAL_RESOURCE_CPU_MODEL"),
+        requested_cpu_fraction: env_nonempty("SIGNAL_RESOURCE_REQUESTED_CPU_FRACTION")
+            .and_then(|v| v.parse().ok()),
+        applied_cpu_fraction: env_nonempty("SIGNAL_RESOURCE_APPLIED_CPU_FRACTION")
+            .and_then(|v| v.parse().ok()),
+        cpu_period_us: env_nonempty("SIGNAL_RESOURCE_CPU_PERIOD_US")
+            .and_then(|v| v.parse().ok()),
+        cpu_quota_us: env_nonempty("SIGNAL_RESOURCE_CPU_QUOTA_US")
+            .and_then(|v| v.parse().ok()),
+        cgroup_cpu_max: env_nonempty("SIGNAL_RESOURCE_CGROUP_CPU_MAX"),
+        cpuset_cpus_requested: env_nonempty("SIGNAL_RESOURCE_CPUSET_CPUS_REQUESTED"),
+        cpuset_cpus_effective: read_cgroup_cpuset_effective()
+            .or_else(|| env_nonempty("SIGNAL_RESOURCE_CPUSET_CPUS_EFFECTIVE")),
+        memory_model: env_nonempty("SIGNAL_RESOURCE_MEMORY_MODEL"),
+        requested_memory_limit: env_nonempty("SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT"),
+        requested_memory_limit_bytes: env_nonempty("SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT_BYTES")
+            .and_then(|v| v.parse().ok()),
+        applied_memory_limit_bytes: env_nonempty("SIGNAL_RESOURCE_APPLIED_MEMORY_LIMIT_BYTES")
+            .and_then(|v| v.parse().ok()),
+        app_heap_budget: env_nonempty("SIGNAL_APP_HEAP_BUDGET"),
+        app_heap_budget_bytes: env_nonempty("SIGNAL_APP_HEAP_BUDGET_BYTES")
+            .and_then(|v| v.parse().ok()),
+        app_heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+            .then_some(heap_snapshot.current_live_heap_bytes),
+        app_heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+            .then_some(heap_snapshot.peak_live_heap_bytes),
+        resource_profile_id: env_nonempty("SIGNAL_RESOURCE_PROFILE_ID"),
+        resource_profile_index: env_nonempty("SIGNAL_RESOURCE_PROFILE_INDEX")
+            .and_then(|v| v.parse().ok()),
+        ..SignalProfileEvent::default()
+    }
+}
+
+fn env_nonempty(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+fn read_cgroup_cpuset_effective() -> Option<String> {
+    for path in [
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.cpus",
+    ] {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -847,8 +952,28 @@ async fn receive_message_delivery(
     profile: bool,
     conversation_size: usize,
     phase: Option<&str>,
+    profile_path: Option<&PathBuf>,
 ) -> Result<CommandOutcome> {
+    let io_start = Instant::now();
     let delivery = relay_get_pending_message(relay_url, &participant.name).await?;
+    let io_wall = io_start.elapsed().as_nanos();
+    write_subspan_event(
+        profile_path,
+        &make_subspan_event(
+            "signal_application_message_receive.relay_fetch_pending_message_io",
+            "message_recovery",
+            "receive_relay_fetch",
+            "repository_or_relay_io",
+            "io",
+            &participant.name,
+            io_wall,
+            None,
+            None,
+            None,
+            true,
+        ),
+    );
+
     let message_bytes = hex::decode(&delivery.message_hex).with_context(|| {
         format!(
             "decode pending message id={} conversation={} sender={}",
@@ -863,7 +988,25 @@ async fn receive_message_delivery(
     let ciphertext = match ciphertext_from_bytes(message_bytes.as_slice()) {
         Ok(ct) => ct,
         Err(_) => {
+            let io_start = Instant::now();
             relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_receive.relay_ack_message_io",
+                    "message_recovery",
+                    "receive_relay_ack",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
             return Ok(CommandOutcome::new(
                 format!(
                     "message already processed (deserialize failed): message_id={} conversation={} sender={}",
@@ -888,7 +1031,25 @@ async fn receive_message_delivery(
 
     match decrypt_result {
         Ok(plaintext) => {
+            let io_start = Instant::now();
             relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_receive.relay_ack_message_io",
+                    "message_recovery",
+                    "receive_relay_ack",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
             let text = String::from_utf8_lossy(&plaintext).to_string();
             let plaintext_len = plaintext.len();
             profile_metrics.artifact_size_bytes = Some(message_bytes.len());
@@ -907,7 +1068,25 @@ async fn receive_message_delivery(
         Err(err) => {
             let text = format!("{:#}", err);
             if looks_like_duplicate_receive(&text) {
+                let io_start = Instant::now();
                 relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
+                let io_wall = io_start.elapsed().as_nanos();
+                write_subspan_event(
+                    profile_path,
+                    &make_subspan_event(
+                        "signal_application_message_receive.relay_ack_message_io",
+                        "message_recovery",
+                        "receive_relay_ack",
+                        "repository_or_relay_io",
+                        "io",
+                        &participant.name,
+                        io_wall,
+                        None,
+                        None,
+                        None,
+                        true,
+                    ),
+                );
                 profile_metrics.artifact_size_bytes = Some(message_bytes.len());
                 profile_metrics.conversation_size = Some(conversation_size);
                 profile_metrics.ciphertext_bytes = Some(message_bytes.len());
@@ -929,6 +1108,7 @@ async fn process_pending(
     participant: &mut SignalParticipant,
     relay_url: &str,
     max_messages: Option<usize>,
+    profile_path: Option<&PathBuf>,
 ) -> Result<CommandOutcome> {
     let max_messages = max_messages.unwrap_or(usize::MAX);
     let mut remaining = max_messages;
@@ -938,7 +1118,7 @@ async fn process_pending(
     let mut errors = Vec::new();
 
     while remaining > 0 {
-        match receive_message_delivery(participant, relay_url, false, 2, None).await {
+        match receive_message_delivery(participant, relay_url, true, 2, None, profile_path).await {
             Ok(outcome) => {
                 messages_processed += 1;
                 metrics.merge_message(&outcome.metrics);
@@ -1045,6 +1225,7 @@ pub async fn handle_command(
     relay_url: &str,
     command: Command,
     phase: Option<&str>,
+    profile_path: Option<&std::path::PathBuf>,
 ) -> Result<CommandOutcome> {
     match command {
         Command::RegisterParticipant => Ok(CommandOutcome::new(
@@ -1064,7 +1245,28 @@ pub async fn handle_command(
             let bundle_count =
                 batch.one_time_prekeys.len() + usize::from(batch.signed_prekey_fallback);
             let one_time_count = batch.one_time_prekeys.len();
+
+            let io_start = Instant::now();
             let stock_before = published_prekey_stock(kr_url, &participant.name).await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_prekey_bundle_create.stock_fetch_repository_io",
+                    "prekey_publication",
+                    "prekey_bundle_create_stock_fetch",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
+
+            let io_start = Instant::now();
             let path = format!("/prekey-bundles/{}", participant.name);
             kr_put_json(
                 kr_url,
@@ -1074,7 +1276,44 @@ pub async fn handle_command(
                 &participant.name,
             )
             .await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_prekey_bundle_create.bundle_publish_repository_io",
+                    "prekey_publication",
+                    "prekey_bundle_create_publish",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
+
+            let io_start = Instant::now();
             let stock_after = published_prekey_stock(kr_url, &participant.name).await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_prekey_bundle_create.stock_after_fetch_repository_io",
+                    "prekey_publication",
+                    "prekey_bundle_create_stock_after_fetch",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
+
             Ok(CommandOutcome::new(
                 format!(
                     "prekey bundle generated and published for {}; bundles={}",
@@ -1182,8 +1421,26 @@ pub async fn handle_command(
                 }
 
                 let path = format!("/prekey-bundle/{peer}");
+                let io_start = Instant::now();
                 let bundle_bytes =
                     kr_get_bytes(kr_url, &path, "fetch_prekey_bundle", &participant.name).await?;
+                let io_wall = io_start.elapsed().as_nanos();
+                write_subspan_event(
+                    profile_path,
+                    &make_subspan_event(
+                        "signal_session_establish.prekey_bundle_fetch_repository_io",
+                        "session_establishment",
+                        "session_establish_prekey_fetch",
+                        "repository_or_relay_io",
+                        "io",
+                        &participant.name,
+                        io_wall,
+                        None,
+                        None,
+                        None,
+                        true,
+                    ),
+                );
                 artifact_size_bytes = artifact_size_bytes.saturating_add(bundle_bytes.len());
                 let bundle_storable: PrekeyBundleStorable =
                     serde_json::from_slice(&bundle_bytes)
@@ -1301,6 +1558,7 @@ pub async fn handle_command(
             let ciphertext_len = ciphertext_bytes.len();
 
             let conversation_id = format!("conversation-{}", participant.name);
+            let io_start = Instant::now();
             relay_post_message(
                 relay_url,
                 &conversation_id,
@@ -1309,6 +1567,23 @@ pub async fn handle_command(
                 ciphertext_bytes,
             )
             .await?;
+            let io_wall = io_start.elapsed().as_nanos();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_create.relay_publish_message_io",
+                    "message_protection",
+                    "encrypt_relay_publish",
+                    "repository_or_relay_io",
+                    "io",
+                    &participant.name,
+                    io_wall,
+                    None,
+                    None,
+                    None,
+                    true,
+                ),
+            );
 
             Ok(CommandOutcome::new(
                 format!("pairwise message encrypted and sent to {}", recipient),
@@ -1334,12 +1609,13 @@ pub async fn handle_command(
                 profile,
                 conversation_size.unwrap_or(2),
                 phase,
+                profile_path,
             )
             .await
         }
 
         Command::ProcessPending { max_messages } => {
-            process_pending(participant, relay_url, max_messages).await
+            process_pending(participant, relay_url, max_messages, profile_path).await
         }
 
         Command::ShowParticipantState => Ok(CommandOutcome::message(format!(

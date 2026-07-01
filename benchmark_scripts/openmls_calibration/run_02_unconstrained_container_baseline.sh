@@ -2,13 +2,18 @@
 #
 # Calibration run 02: unconstrained container baseline.
 # Produces events.csv for every run.
+#
+# PROTOCOL env: openmls | signal | both (default: openmls)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OPENMLS_DIR="$REPO_ROOT/OpenMLS_containerized"
+SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
+
+PROTOCOL="${PROTOCOL:-openmls}"
 
 N="${N:-3}"
 STRICT_CPUSET="${STRICT_CPUSET:-1}"
@@ -41,6 +46,14 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
+# Signal-specific defaults (smaller sizes, pairwise semantics)
+SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-256}"
+SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
+SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
+SIGNAL_APP_ROUNDS="${SIGNAL_APP_ROUNDS:-4}"
+SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
+SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
+
 export PATH="$HOME/.cargo/bin:$PATH"
 
 raise_nofile_limit() {
@@ -53,6 +66,10 @@ python_bin() {
   [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
 }
 
+python_bin_signal() {
+  [ -x "$SIGNAL_DIR/.venv/bin/python" ] && printf '%s\n' "$SIGNAL_DIR/.venv/bin/python" || printf '%s\n' python3
+}
+
 cleanup_docker() {
   docker compose -f "$OPENMLS_DIR/docker-compose.yml" down --timeout 2 2>/dev/null || true
   for f in "$OPENMLS_DIR"/docker-compose_benchmark_*.yml "$OPENMLS_DIR"/docker-compose.*.generated.yml; do
@@ -60,6 +77,14 @@ cleanup_docker() {
   done
   docker container ls -aq --filter "name=mls-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
   docker network ls -q --filter "name=mls-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
+}
+
+cleanup_docker_signal() {
+  for f in "$SIGNAL_DIR"/docker-compose.*.generated.yml; do
+    [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
+  done
+  docker container ls -aq --filter "name=signal-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+  docker network ls -q --filter "name=signal-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
 }
 
 require_events_csv() {
@@ -146,9 +171,74 @@ run_baseline() {
   cleanup_docker
 }
 
+run_signal_baseline() {
+  local iter="$1"
+  local run_id="cal02_signal_unconstrained_baseline_i${iter}_${DATE_TAG}"
+  local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
+  local singleton_selection_seed py
+  local -a image_args
+
+  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
+  py="$(python_bin_signal)"
+  image_args=()
+  if [ "$BUILD_IMAGES" = "1" ]; then
+    image_args=(--build-images)
+  fi
+
+  echo "===== [02/Signal-baseline] iteration $iter/$N run_id=$run_id ====="
+  cd "$SIGNAL_DIR"
+  "$py" scripts/run_compose_benchmark.py \
+    --workers "$SIGNAL_WORKERS" \
+    --run-id "$run_id" \
+    --singleton-selection-seed "$singleton_selection_seed" \
+    --output-dir benchmark_output \
+    --worker-layout-mode hybrid \
+    --singleton-min-count "$SINGLETON_MIN_COUNT" \
+    --singleton-fraction "$SINGLETON_FRACTION" \
+    --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
+    --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
+    --bridge-count "$BRIDGE_COUNT" \
+    --health-timeout-seconds "$HEALTH_TIMEOUT" \
+    --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
+    --health-poll-seconds 0.5 \
+    --worker-health-poll-ms 250 \
+    --min-size 2 \
+    --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
+    --step-size "$SIGNAL_STEP_SIZE" \
+    --roundtrips "$SIGNAL_ROUNDTRIPS" \
+    --app-rounds "$SIGNAL_APP_ROUNDS" \
+    --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
+    --payload-sizes "$PAYLOAD_SIZES" \
+    --http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+    --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+    --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
+    --max-fanout-parallelism "$FANOUT_PARALLELISM" \
+    --force-cleanup-signal-ports \
+    --runner-in-docker \
+    "${image_args[@]}"
+  require_events_csv "$run_dir"
+  cd "$REPO_ROOT"
+  cleanup_docker_signal
+}
+
 raise_nofile_limit
-cleanup_docker
-for iter in $(seq 1 "$N"); do
-  run_baseline "$iter"
-done
+
+# ── OpenMLS baseline ────────────────────────────────────────────────────────
+if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
+  cleanup_docker
+  for iter in $(seq 1 "$N"); do
+    run_baseline "$iter"
+  done
+  echo "All unconstrained container OpenMLS baseline runs completed."
+fi
+
+# ── Signal baseline ─────────────────────────────────────────────────────────
+if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
+  cleanup_docker_signal
+  for iter in $(seq 1 "$N"); do
+    run_signal_baseline "$iter"
+  done
+  echo "All unconstrained container Signal baseline runs completed."
+fi
+
 echo "All unconstrained container baseline runs completed."

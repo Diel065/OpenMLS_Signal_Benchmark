@@ -2,13 +2,18 @@
 #
 # Calibration run 01: constrained container RAM/CPU sweeps.
 # Produces events.csv for every run.
+#
+# PROTOCOL env: openmls | signal | both (default: openmls)
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OPENMLS_DIR="$REPO_ROOT/OpenMLS_containerized"
+SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
+
+PROTOCOL="${PROTOCOL:-openmls}"
 
 N="${N:-3}"
 SWEEP="${SWEEP:-both}"
@@ -45,6 +50,14 @@ FANOUT_MIN="${FANOUT_MIN:-16}"
 CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01}"
 CPU_THROTTLED_PERIOD_THRESHOLD="${CPU_THROTTLED_PERIOD_THRESHOLD:-0.05}"
 
+# Signal-specific defaults (smaller sizes, pairwise semantics)
+SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-256}"
+SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
+SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
+SIGNAL_APP_ROUNDS="${SIGNAL_APP_ROUNDS:-2}"
+SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
+SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
+
 export PATH="$HOME/.cargo/bin:$PATH"
 export OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD="$CPU_THROTTLED_PERIOD_THRESHOLD"
 
@@ -58,6 +71,10 @@ python_bin() {
   [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
 }
 
+python_bin_signal() {
+  [ -x "$SIGNAL_DIR/.venv/bin/python" ] && printf '%s\n' "$SIGNAL_DIR/.venv/bin/python" || printf '%s\n' python3
+}
+
 cleanup_docker() {
   docker compose -f "$OPENMLS_DIR/docker-compose.yml" down --timeout 2 2>/dev/null || true
   for f in "$OPENMLS_DIR"/docker-compose_benchmark_*.yml "$OPENMLS_DIR"/docker-compose.*.generated.yml; do
@@ -65,6 +82,14 @@ cleanup_docker() {
   done
   docker container ls -aq --filter "name=mls-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
   docker network ls -q --filter "name=mls-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
+}
+
+cleanup_docker_signal() {
+  for f in "$SIGNAL_DIR"/docker-compose.*.generated.yml; do
+    [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
+  done
+  docker container ls -aq --filter "name=signal-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
+  docker network ls -q --filter "name=signal-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
 }
 
 require_events_csv() {
@@ -79,6 +104,17 @@ validate_resource_output() {
   local run_dir="$1"
   [ "$RESOURCE_OUTPUT_VALIDATION" = "1" ] || return 0
   python3 "$OPENMLS_DIR/scripts/validate_resource_experiment_outputs.py" "$run_dir"
+}
+
+validate_resource_output_signal() {
+  local run_dir="$1"
+  [ "$RESOURCE_OUTPUT_VALIDATION" = "1" ] || return 0
+  local validator="$SIGNAL_DIR/scripts/validate_resource_experiment_outputs.py"
+  if [ -f "$validator" ]; then
+    python3 "$validator" "$run_dir"
+  else
+    echo "WARN: Signal validator not found at $validator; skipping" >&2
+  fi
 }
 
 online_cpus() {
@@ -173,17 +209,134 @@ run_sweep() {
   cleanup_docker
 }
 
-raise_nofile_limit
-cleanup_docker
-for iter in $(seq 1 "$N"); do
-  case "$SWEEP" in
-    ram) run_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep" ;;
-    cpu) run_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep" ;;
-    both)
-      run_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep"
-      run_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep"
+run_signal_sweep() {
+  local iter="$1"
+  local sweep_type="$2"
+  local label="$3"
+  local run_id="cal01_signal_${sweep_type}_i${iter}_${DATE_TAG}"
+  local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
+  local singleton_selection_seed py
+  local -a image_args
+
+  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
+  py="$(python_bin_signal)"
+  image_args=()
+  if [ "$BUILD_IMAGES" = "1" ]; then
+    image_args=(--build-images)
+  fi
+
+  echo "===== [01/Signal-$label] iteration $iter/$N run_id=$run_id ====="
+  cd "$SIGNAL_DIR"
+
+  case "$sweep_type" in
+    cpu-quota-sweep)
+      "$py" scripts/run_compose_benchmark.py \
+        --workers "$SIGNAL_WORKERS" \
+        --run-id "$run_id" \
+        --singleton-selection-seed "$singleton_selection_seed" \
+        --output-dir benchmark_output \
+        --worker-layout-mode hybrid \
+        --singleton-min-count "$SINGLETON_MIN_COUNT" \
+        --singleton-fraction "$SINGLETON_FRACTION" \
+        --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
+        --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
+        --bridge-count "$BRIDGE_COUNT" \
+        --health-timeout-seconds "$HEALTH_TIMEOUT" \
+        --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
+        --health-poll-seconds 0.5 \
+        --worker-health-poll-ms 250 \
+        --min-size 2 \
+        --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
+        --step-size "$SIGNAL_STEP_SIZE" \
+        --roundtrips "$SIGNAL_ROUNDTRIPS" \
+        --app-rounds "$SIGNAL_APP_ROUNDS" \
+        --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
+        --payload-sizes "$PAYLOAD_SIZES" \
+        --http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+        --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+        --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
+        --max-fanout-parallelism "$FANOUT_PARALLELISM" \
+        --force-cleanup-signal-ports \
+        --runner-in-docker \
+        "${image_args[@]}"
       ;;
-    *) echo "ERROR: SWEEP must be ram, cpu, or both" >&2; exit 1 ;;
+    ram-docker-cgroup-sweep)
+      "$py" scripts/run_compose_benchmark.py \
+        --workers "$SIGNAL_WORKERS" \
+        --run-id "$run_id" \
+        --singleton-selection-seed "$singleton_selection_seed" \
+        --output-dir benchmark_output \
+        --worker-layout-mode hybrid \
+        --singleton-min-count "$SINGLETON_MIN_COUNT" \
+        --singleton-fraction "$SINGLETON_FRACTION" \
+        --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
+        --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
+        --bridge-count "$BRIDGE_COUNT" \
+        --health-timeout-seconds "$HEALTH_TIMEOUT" \
+        --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
+        --health-poll-seconds 0.5 \
+        --worker-health-poll-ms 250 \
+        --min-size 2 \
+        --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
+        --step-size "$SIGNAL_STEP_SIZE" \
+        --roundtrips "$SIGNAL_ROUNDTRIPS" \
+        --app-rounds "$SIGNAL_APP_ROUNDS" \
+        --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
+        --payload-sizes "$PAYLOAD_SIZES" \
+        --http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+        --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
+        --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
+        --max-fanout-parallelism "$FANOUT_PARALLELISM" \
+        --force-cleanup-signal-ports \
+        --runner-in-docker \
+        "${image_args[@]}"
+      ;;
+    *)
+      echo "ERROR: unknown signal sweep type '$sweep_type'" >&2
+      return 1
+      ;;
   esac
-done
+
+  require_events_csv "$run_dir"
+  validate_resource_output_signal "$run_dir"
+  cd "$REPO_ROOT"
+  cleanup_docker_signal
+}
+
+raise_nofile_limit
+
+# ── OpenMLS sweeps ──────────────────────────────────────────────────────────
+if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
+  cleanup_docker
+  for iter in $(seq 1 "$N"); do
+    case "$SWEEP" in
+      ram) run_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep" ;;
+      cpu) run_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep" ;;
+      both)
+        run_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep"
+        run_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep"
+        ;;
+      *) echo "ERROR: SWEEP must be ram, cpu, or both" >&2; exit 1 ;;
+    esac
+  done
+  echo "All constrained container OpenMLS calibration sweeps completed."
+fi
+
+# ── Signal sweeps ───────────────────────────────────────────────────────────
+if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
+  cleanup_docker_signal
+  for iter in $(seq 1 "$N"); do
+    case "$SWEEP" in
+      ram) run_signal_sweep "$iter" "ram-docker-cgroup-sweep" "RAM cgroup sweep" ;;
+      cpu) run_signal_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep" ;;
+      both)
+        run_signal_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep"
+        run_signal_sweep "$iter" "ram-docker-cgroup-sweep" "RAM cgroup sweep"
+        ;;
+      *) echo "ERROR: SWEEP must be ram, cpu, or both" >&2; exit 1 ;;
+    esac
+  done
+  echo "All constrained container Signal calibration sweeps completed."
+fi
+
 echo "All constrained container calibration sweeps completed."

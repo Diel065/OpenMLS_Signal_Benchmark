@@ -1,0 +1,9 @@
+[package]
+name = "allocation-counter"
+version = "0.8.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Allocation counter with thread-local measurements and process-wide snapshots"
+
+[lib]
+path = "src/lib.rs"

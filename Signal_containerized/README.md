@@ -86,7 +86,7 @@ The Signal benchmark is a pairwise fan-out benchmark. Each application send encr
 
 Current session establishment uses PQXDH. Classical X3DH-only handshakes are not faked; rows should be filtered with `handshake_protocol=pqxdh` when studying setup cost. The key repository distinguishes classical one-time prekeys, signed classical prekeys, one-time signed PQ prekeys, and the signed PQ last-resort prekey. Each recipient device uploads a small initial stock for itself. The server hands out one-time classical and one-time PQ material first, then falls back to no classical one-time prekey plus the PQ last-resort prekey. After a recipient accepts an inbound initial session, its worker performs its own low-watermark stock check and uploads a measured OPK refill batch when its published stock is low; the runner does not pre-generate key material for the future staircase size.
 
-Scientific protocol rows are emitted from `libsignal-main` with `profile_schema_version=3`, `span_layer=libsignal_main`, and `measurement_class=protocol`. Wrapper rows are emitted by the benchmark worker with `span_layer=benchmark_wrapper` and `measurement_class=wrapper`; they include queueing, HTTP, relay, serialization, repository, and command bookkeeping and must not be compared to OpenMLS library-internal spans.
+Scientific protocol rows are emitted from `libsignal-main` with `profile_schema_version=4`, `span_layer=libsignal_main`, and `measurement_class=protocol`. Wrapper rows are emitted by the benchmark worker with `span_layer=benchmark_wrapper` and `measurement_class=wrapper`; they include queueing, HTTP, relay, serialization, repository, and command bookkeeping and must not be compared to OpenMLS library-internal spans.
 
 Protocol event names:
 
@@ -106,7 +106,7 @@ Non-protocol wrapper/helper event names include `participant_register_lifecycle`
 To filter scientific rows from `events.csv`, require:
 
 ```text
-profile_schema_version == 3
+profile_schema_version == 4
 span_layer == libsignal_main
 measurement_class == protocol
 success == true
@@ -148,15 +148,21 @@ Initial session setup is explicit: the initiator processes a bundle, encrypts a 
 --singleton-cpus 0.25
 --singleton-memory 128m
 --singleton-memory-swap 128m
+--singleton-app-heap-budget 32m
+--strict-cpuset
 --singleton-pids-limit 128
 ```
 
-The generator writes the envelope into `worker_layout.json` and applies it to every containerized singleton worker service. Packed workers and real devices remain unconstrained and are marked with empty Docker resource-limit fields.
+The generator writes the envelope into `worker_layout.json` and applies it to every containerized singleton worker service. `--singleton-app-heap-budget` labels the run as `memory_model=app-heap-budget` and enforces the budget through Signal's global allocator. `--strict-cpuset` assigns profiled singleton workers to dedicated CPUs and background services to the remaining CPUs, then writes `cpu_affinity_preflight.csv` and `cpu_affinity_preflight_summary.json`.
+
+Packed workers and real devices remain unconstrained and are marked with empty Docker resource-limit fields.
 
 Operation-local protocol rows include thread CPU time, allocation bytes/count, process CPU envelope utilization, throttling ratio, RSS delta, and RSS utilization where the local platform exposes those counters. Run-level resource artifacts are separate:
 
 - `benchmark_run_metadata.json`: run configuration, host CPU/platform data, Git provenance for this benchmark and libsignal, Docker version/info, and external-device binary hashes when available.
 - `resource_limits_verified.json`: Docker inspect verification that requested singleton caps were applied.
+- `cpu_affinity_preflight.csv`: strict-cpuset verification for profiled workers and running background services.
+- `cpu_affinity_preflight_summary.json`: strict-cpuset pass/fail summary.
 - `resource_samples.jsonl`: cgroup samples for constrained singleton containers while the runner is active.
 - `resource_summary.csv`: per-container memory, CPU throttling, pids, OOM, and exit-status summary.
 - `benchmark_outcome.json`: success/failure class with resource-pressure evidence when applicable.
@@ -169,6 +175,6 @@ External devices such as LuckFox Pico Plus and Raspberry Pi workers are real-dev
 
 ## Migration Notes
 
-Schema version 3 is not poolable with older Signal output directories. Older outputs may use command names such as `EncryptMessage`, `DecryptMessage`, or `EstablishSessions`, may mix wrapper wall time with narrower CPU/allocation measurements, and may contain synthetic ratchet counts. Use only schema-3 `libsignal_main` protocol rows for OpenMLS-vs-Signal protocol-cost analysis.
+Schema version 4 is not poolable with older Signal output directories. Older outputs may use command names such as `EncryptMessage`, `DecryptMessage`, or `EstablishSessions`, may mix wrapper wall time with narrower CPU/allocation measurements, and may contain synthetic ratchet counts. Use only schema-4 `libsignal_main` protocol rows for OpenMLS-vs-Signal protocol-cost analysis.
 
 For comparable infrastructure experiments, use the same worker layout mode, bridge count, health/fanout settings, and singleton resource envelope flags on both stacks. Compare resource and orchestration metrics through shared infrastructure columns; compare cryptographic behavior only through each stack's protocol-native event families.

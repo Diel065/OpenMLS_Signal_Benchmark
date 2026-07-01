@@ -1087,72 +1087,98 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     let mut active: Vec<WorkerSpec> = Vec::new();
     let mut idle: VecDeque<WorkerSpec> = config.workers.iter().cloned().collect();
 
-    for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
-        eprintln!(
-            "\n=== Plateau {}/{} | target active participants = {} ===",
-            plateau_idx + 1,
-            plateau_sequence.len(),
-            target_size
-        );
+    let run_result = {
+        let mut plateau_result = Ok(());
+        for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
+            eprintln!(
+                "\n=== Plateau {}/{} | target active participants = {} ===",
+                plateau_idx + 1,
+                plateau_sequence.len(),
+                target_size
+            );
 
-        transition_to_size(
-            &http,
-            &kr_url,
-            &relay_url,
-            &mut active,
-            &mut idle,
-            target_size,
-            &mut fanout,
-            &mut progress,
-            plateau_idx + 1,
-            &runner_events,
-        )
-        .await?;
+            if let Err(e) = transition_to_size(
+                &http,
+                &kr_url,
+                &relay_url,
+                &mut active,
+                &mut idle,
+                target_size,
+                &mut fanout,
+                &mut progress,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await
+            {
+                plateau_result = Err(e);
+                break;
+            }
 
-        eprintln!(
-            "\n[plateau {}] active participants = {} established_sessions = {}",
-            target_size,
-            active.len(),
-            active
-                .len()
-                .saturating_sub(1)
-                .saturating_mul(active.len())
-                .saturating_div(2),
-        );
+            eprintln!(
+                "\n[plateau {}] active participants = {} established_sessions = {}",
+                target_size,
+                active.len(),
+                active
+                    .len()
+                    .saturating_sub(1)
+                    .saturating_mul(active.len())
+                    .saturating_div(2),
+            );
 
-        run_application_phase(
-            &http,
-            &kr_url,
-            &relay_url,
-            &mut active,
-            target_size,
-            config.app_rounds,
-            config.max_app_samples_per_payload,
-            &config.payload_sizes,
-            &mut fanout,
-            &mut progress,
-            plateau_idx + 1,
-            &runner_events,
-        )
-        .await?;
+            if let Err(e) = run_application_phase(
+                &http,
+                &kr_url,
+                &relay_url,
+                &mut active,
+                target_size,
+                config.app_rounds,
+                config.max_app_samples_per_payload,
+                &config.payload_sizes,
+                &mut fanout,
+                &mut progress,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await
+            {
+                plateau_result = Err(e);
+                break;
+            }
 
-        eprintln!("\n=== Plateau {} complete ===", target_size);
-    }
+            eprintln!("\n=== Plateau {} complete ===", target_size);
+        }
+        plateau_result
+    };
 
     progress.finish();
 
+    if let Err(ref e) = run_result {
+        eprintln!("[runner] benchmark terminated with error: {:#}", e);
+    }
+
     let worker_ids: Vec<String> = config.workers.iter().map(|w| w.id.clone()).collect();
     if !config.no_aggregate {
-        aggregate_csv(&run_dir, &worker_ids, &config.worker_layout)?;
+        if let Err(e) = aggregate_csv(&run_dir, &worker_ids, &config.worker_layout) {
+            eprintln!("[aggregate] CSV aggregation failed: {:#}", e);
+        }
     } else {
         eprintln!("[aggregate] --no-aggregate set, skipping CSV aggregation");
     }
 
-    println!(
-        "Signal staircase benchmark finished. Output in {}",
-        run_dir.display()
-    );
-    Ok(())
+    // Always write sidecars, even on failure
+    if let Err(e) = write_post_benchmark_sidecars(&run_dir, &config.run_id) {
+        eprintln!("[sidecars] failed to write post-benchmark sidecars: {:#}", e);
+    }
+
+    if run_result.is_ok() {
+        println!(
+            "Signal staircase benchmark finished. Output in {}",
+            run_dir.display()
+        );
+    }
+
+    run_result
 }
 
 fn effective_max_fanout_parallelism(configured: usize) -> usize {
@@ -3039,6 +3065,7 @@ pub fn aggregate_csv(
                 profile_schema_version: u32,
                 ts_unix_ns: u128,
                 op: String,
+                span_name: String,
                 span_layer: String,
                 protocol_stack: String,
                 implementation: String,
@@ -3136,6 +3163,38 @@ pub fn aggregate_csv(
                 resource_limit_memory_swap_bytes: Option<u64>,
                 resource_limit_pids: Option<u64>,
                 resource_profile: &'a str,
+                cpu_model: Option<String>,
+                requested_cpu_fraction: Option<f64>,
+                applied_cpu_fraction: Option<f64>,
+                cpu_period_us: Option<u64>,
+                cpu_quota_us: Option<u64>,
+                cgroup_cpu_max: Option<String>,
+                cpuset_cpus_requested: Option<String>,
+                cpuset_cpus_effective: Option<String>,
+                cpu_nr_periods: Option<u64>,
+                cpu_nr_throttled: Option<u64>,
+                cpu_throttled_usec: Option<u64>,
+                memory_model: Option<String>,
+                requested_memory_limit: Option<String>,
+                requested_memory_limit_bytes: Option<u64>,
+                applied_memory_limit_bytes: Option<u64>,
+                memory_current_bytes: Option<u64>,
+                memory_peak_bytes: Option<u64>,
+                memory_events_max: Option<u64>,
+                memory_events_oom: Option<u64>,
+                memory_events_oom_kill: Option<u64>,
+                app_heap_budget: Option<String>,
+                app_heap_budget_bytes: Option<u64>,
+                app_heap_current_live_bytes: Option<u64>,
+                app_heap_peak_live_bytes: Option<u64>,
+                resource_profile_id: Option<String>,
+                resource_profile_index: Option<i32>,
+                failure_class: Option<String>,
+                failure_operation: Option<String>,
+                failure_span: Option<String>,
+                failure_phase: Option<String>,
+                container_exit_code: Option<i32>,
+                oom_killed: Option<bool>,
             }
 
             let row = CsvRow {
@@ -3162,7 +3221,8 @@ pub fn aggregate_csv(
                 ),
                 profile_schema_version: event.profile_schema_version,
                 ts_unix_ns: event.ts_unix_ns,
-                op: event.op,
+                op: event.op.clone(),
+                span_name: event.op,
                 span_layer: event.span_layer,
                 protocol_stack: event.protocol_stack,
                 implementation: event.implementation,
@@ -3262,6 +3322,38 @@ pub fn aggregate_csv(
                     .and_then(|m| m.resource_limit_memory_swap_bytes),
                 resource_limit_pids: phys.and_then(|m| m.resource_limit_pids),
                 resource_profile: non_empty_or(phys.map(|m| m.resource_profile.as_str()), ""),
+                cpu_model: event.cpu_model,
+                requested_cpu_fraction: event.requested_cpu_fraction,
+                applied_cpu_fraction: event.applied_cpu_fraction,
+                cpu_period_us: event.cpu_period_us,
+                cpu_quota_us: event.cpu_quota_us,
+                cgroup_cpu_max: event.cgroup_cpu_max,
+                cpuset_cpus_requested: event.cpuset_cpus_requested,
+                cpuset_cpus_effective: event.cpuset_cpus_effective,
+                cpu_nr_periods: event.cpu_nr_periods,
+                cpu_nr_throttled: event.cpu_nr_throttled,
+                cpu_throttled_usec: event.cpu_throttled_usec,
+                memory_model: event.memory_model,
+                requested_memory_limit: event.requested_memory_limit,
+                requested_memory_limit_bytes: event.requested_memory_limit_bytes,
+                applied_memory_limit_bytes: event.applied_memory_limit_bytes,
+                memory_current_bytes: event.memory_current_bytes,
+                memory_peak_bytes: event.memory_peak_bytes,
+                memory_events_max: event.memory_events_max,
+                memory_events_oom: event.memory_events_oom,
+                memory_events_oom_kill: event.memory_events_oom_kill,
+                app_heap_budget: event.app_heap_budget,
+                app_heap_budget_bytes: event.app_heap_budget_bytes,
+                app_heap_current_live_bytes: event.app_heap_current_live_bytes,
+                app_heap_peak_live_bytes: event.app_heap_peak_live_bytes,
+                resource_profile_id: event.resource_profile_id,
+                resource_profile_index: event.resource_profile_index,
+                failure_class: event.failure_class,
+                failure_operation: event.failure_operation,
+                failure_span: event.failure_span,
+                failure_phase: event.failure_phase,
+                container_exit_code: event.container_exit_code,
+                oom_killed: event.oom_killed,
             };
 
             wtr.serialize(row)?;
@@ -3269,6 +3361,170 @@ pub fn aggregate_csv(
     }
 
     wtr.flush()?;
+    Ok(())
+}
+
+// ── Post-benchmark sidecars ────────────────────────────────────────────────
+
+pub fn write_worker_failures_csv(run_dir: &Path, run_id: &str) -> Result<()> {
+    let path = run_dir.join("worker_failures.csv");
+    let mut wtr = csv::Writer::from_path(&path)?;
+    wtr.write_record(&[
+        "run_id", "worker_id", "physical_worker_id", "participant_id",
+        "resource_profile_id", "failure_class", "failure_detail",
+        "failure_operation", "failure_span", "failure_phase",
+        "benchmark_target_size", "benchmark_active_size",
+        "container_exit_code", "oom_killed", "action_taken",
+    ])?;
+
+    let events_path = run_dir.join("runner-events.jsonl");
+    if events_path.exists() {
+        let file = File::open(&events_path)?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: RunnerEvent = serde_json::from_str(&line)?;
+            let target_size = event.benchmark_target_size.to_string();
+            let active_size = event.benchmark_active_size.to_string();
+            let oom = event.failure_class == "oom_kill";
+            wtr.write_record(&[
+                run_id,
+                &event.failed_worker_id,
+                &event.failed_physical_worker_id,
+                &event.failed_worker_id,
+                "",
+                &event.failure_class,
+                &event.failure_detail,
+                &event.benchmark_operation,
+                "",
+                &event.benchmark_phase,
+                &target_size,
+                &active_size,
+                "",
+                if oom { "true" } else { "false" },
+                &event.failure_action,
+            ])?;
+        }
+    }
+
+    wtr.flush()?;
+    Ok(())
+}
+
+pub fn write_run_status_csv(run_dir: &Path, run_id: &str, events_csv_exists: bool) -> Result<()> {
+    let path = run_dir.join("run_status.csv");
+    let mut wtr = csv::Writer::from_path(&path)?;
+    wtr.write_record(&["run_id", "run_status", "events_csv_generated"])?;
+    let status = if events_csv_exists { "completed" } else { "failed" };
+    wtr.write_record(&[run_id, status, if events_csv_exists { "true" } else { "false" }])?;
+    wtr.flush()?;
+    Ok(())
+}
+
+pub fn write_benchmark_outcome_json(run_dir: &Path, run_id: &str, events_csv_exists: bool, has_failures: bool) -> Result<()> {
+    let path = run_dir.join("benchmark_outcome.json");
+    let outcome = serde_json::json!({
+        "run_id": run_id,
+        "success": events_csv_exists && !has_failures,
+        "events_csv_generated": events_csv_exists,
+        "failures_detected": has_failures,
+        "timestamp_ns": unix_time_ns(),
+    });
+    fs::write(&path, serde_json::to_string_pretty(&outcome)?)?;
+    Ok(())
+}
+
+pub fn write_validation_report_json(run_dir: &Path, run_id: &str, events_csv_exists: bool, events_csv_non_empty: bool) -> Result<()> {
+    let path = run_dir.join("validation_report.json");
+    let csv_path = run_dir.join("events.csv");
+    let mut has_protocol_core = false;
+    if csv_path.exists() {
+        if let Ok(mut reader) = csv::Reader::from_path(&csv_path) {
+            let span_layer_idx = reader
+                .headers()
+                .ok()
+                .and_then(|h| h.iter().position(|s| s == "span_layer"));
+            let measurement_class_idx = reader
+                .headers()
+                .ok()
+                .and_then(|h| h.iter().position(|s| s == "measurement_class"));
+            for record in reader.records().flatten() {
+                if let Some(idx) = span_layer_idx {
+                    if record.get(idx).map(|s| s == "protocol_core" || s == "libsignal_main").unwrap_or(false) {
+                        has_protocol_core = true;
+                        break;
+                    }
+                }
+                if let Some(idx) = measurement_class_idx {
+                    if record.get(idx).map(|s| s == "protocol").unwrap_or(false) {
+                        has_protocol_core = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    let failures_path = run_dir.join("worker_failures.csv");
+    let failures_csv_exists = failures_path.exists();
+    let report = serde_json::json!({
+        "run_id": run_id,
+        "timestamp_ns": unix_time_ns(),
+        "checks": {
+            "events_csv_exists": events_csv_exists,
+            "events_csv_non_empty": events_csv_non_empty,
+            "events_csv_has_protocol_core_subspans": has_protocol_core,
+            "worker_failures_csv_exists": failures_csv_exists,
+            "run_status_csv_exists": run_dir.join("run_status.csv").exists(),
+            "benchmark_outcome_json_exists": run_dir.join("benchmark_outcome.json").exists(),
+        },
+        "valid": events_csv_exists && events_csv_non_empty,
+    });
+    fs::write(&path, serde_json::to_string_pretty(&report)?)?;
+    Ok(())
+}
+
+pub fn write_post_benchmark_sidecars(run_dir: &Path, run_id: &str) -> Result<()> {
+    let events_csv_path = run_dir.join("events.csv");
+
+    write_worker_failures_csv(run_dir, run_id)?;
+
+    let events_csv_exists = events_csv_path.exists();
+    let events_csv_non_empty = if events_csv_exists {
+        fs::metadata(&events_csv_path).map(|m| m.len() > 0).unwrap_or(false)
+    } else {
+        false
+    };
+
+    // If no events.csv exists (failure before aggregation), write a minimal one
+    if !events_csv_exists {
+        let mut wtr = csv::Writer::from_path(&events_csv_path)?;
+        wtr.write_record(&[
+            "run_id", "scenario", "protocol_stack", "implementation",
+            "profile_schema_version", "client_id", "participant_id",
+            "worker_id", "physical_worker_id", "op", "span_name",
+            "span_layer", "measurement_class", "event_family", "event_subtype",
+            "success", "error_class", "failure_class", "failure_detail",
+            "wall_ns", "cpu_thread_ns",
+        ])?;
+        wtr.flush()?;
+    }
+
+    let events_csv_exists = events_csv_path.exists();
+    let events_csv_non_empty = if events_csv_exists {
+        fs::metadata(&events_csv_path).map(|m| m.len() > 0).unwrap_or(false)
+    } else {
+        false
+    };
+
+    let runner_events_path = run_dir.join("runner-events.jsonl");
+    let has_failures = runner_events_path.exists() && fs::metadata(&runner_events_path).map(|m| m.len() > 0).unwrap_or(false);
+
+    write_run_status_csv(run_dir, run_id, events_csv_non_empty)?;
+    write_benchmark_outcome_json(run_dir, run_id, events_csv_non_empty, has_failures)?;
+    write_validation_report_json(run_dir, run_id, events_csv_non_empty, events_csv_non_empty)?;
+
     Ok(())
 }
 

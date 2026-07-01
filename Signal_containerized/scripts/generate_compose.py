@@ -4,9 +4,18 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 import re
 from pathlib import Path
+
+from cpu_affinity_planner import (
+    create_affinity_plan,
+    get_background_cpuset,
+    get_profiled_cpuset,
+    validate_affinity_plan,
+    write_affinity_plan_json,
+)
 
 
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
@@ -139,6 +148,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Optional Docker pids_limit for every singleton worker service.",
+    )
+    p.add_argument(
+        "--singleton-app-heap-budget",
+        default=None,
+        help="Application heap budget for profiled singleton workers, e.g. 512k or 8m.",
+    )
+    p.add_argument(
+        "--strict-cpuset",
+        action="store_true",
+        help="Assign non-overlapping Docker cpusets to profiled singleton workers.",
+    )
+    p.add_argument(
+        "--cpu-affinity-sample-seconds",
+        type=float,
+        default=20.0,
+        help="Seconds to sample per-CPU load before strict cpuset assignment.",
     )
 
     return p
@@ -276,6 +301,13 @@ def normalize_resource_args(args: argparse.Namespace) -> None:
 
     if args.singleton_pids_limit is not None and args.singleton_pids_limit < 1:
         raise SystemExit("--singleton-pids-limit must be >= 1")
+    if args.singleton_app_heap_budget is not None:
+        args.singleton_app_heap_budget = str(args.singleton_app_heap_budget).strip()
+        args.singleton_app_heap_budget_bytes = parse_memory_bytes(args.singleton_app_heap_budget)
+    else:
+        args.singleton_app_heap_budget_bytes = None
+    if args.cpu_affinity_sample_seconds < 0:
+        raise SystemExit("--cpu-affinity-sample-seconds must be >= 0")
 
 
 def resource_profile_for(args: argparse.Namespace) -> str:
@@ -284,6 +316,7 @@ def resource_profile_for(args: argparse.Namespace) -> str:
     singleton_memory = getattr(args, "singleton_memory", None)
     singleton_memory_swap = getattr(args, "singleton_memory_swap", None)
     singleton_pids_limit = getattr(args, "singleton_pids_limit", None)
+    singleton_app_heap_budget = getattr(args, "singleton_app_heap_budget", None)
     if singleton_cpus is not None:
         parts.append(f"cpus-{singleton_cpus}")
     if singleton_memory is not None:
@@ -292,6 +325,10 @@ def resource_profile_for(args: argparse.Namespace) -> str:
         parts.append(f"swap-{singleton_memory_swap}")
     if singleton_pids_limit is not None:
         parts.append(f"pids-{singleton_pids_limit}")
+    if singleton_app_heap_budget is not None:
+        parts.append(f"appheap-{singleton_app_heap_budget}")
+    if getattr(args, "strict_cpuset", False):
+        parts.append("strict-cpuset")
     if not parts:
         return ""
     return "singleton-resource-envelope_" + "_".join(parts)
@@ -306,6 +343,11 @@ def singleton_resource_limits(args: argparse.Namespace) -> dict:
         "resource_limit_memory_swap": getattr(args, "singleton_memory_swap", None),
         "resource_limit_memory_swap_bytes": getattr(args, "singleton_memory_swap_bytes", None),
         "resource_limit_pids": getattr(args, "singleton_pids_limit", None),
+        "app_heap_budget": getattr(args, "singleton_app_heap_budget", None),
+        "app_heap_budget_bytes": getattr(args, "singleton_app_heap_budget_bytes", None),
+        "resource_limit_cpuset": None,
+        "resource_limit_cpuset_mask": None,
+        "strict_cpuset_satisfied": False,
         "resource_profile": profile,
     }
 
@@ -318,6 +360,11 @@ def empty_resource_limits() -> dict:
         "resource_limit_memory_swap": None,
         "resource_limit_memory_swap_bytes": None,
         "resource_limit_pids": None,
+        "app_heap_budget": None,
+        "app_heap_budget_bytes": None,
+        "resource_limit_cpuset": None,
+        "resource_limit_cpuset_mask": None,
+        "strict_cpuset_satisfied": False,
         "resource_profile": "",
     }
 
@@ -471,7 +518,7 @@ def build_hybrid_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
-            resource_limits=configured_singleton_limits,
+            resource_limits=dict(configured_singleton_limits),
         ))
         singleton_counter += 1
 
@@ -530,10 +577,82 @@ def build_legacy_layout(
             client_ids=[cid],
             base_url=base_url,
             profile_enabled_client_ids=[cid],
-            resource_limits=configured_singleton_limits,
+            resource_limits=dict(configured_singleton_limits),
         ))
 
     return clients, physical_workers
+
+
+def apply_strict_cpuset_plan(
+    args: argparse.Namespace,
+    physical_workers: list[PhysicalWorkerEntry],
+) -> None:
+    args.strict_cpuset_satisfied = False
+    args.background_cpuset = ""
+    args.background_cpuset_mask = ""
+    if not args.strict_cpuset:
+        return
+
+    profiled_specs = []
+    background_specs = [
+        {"container_name": "kr", "container_role": "infrastructure"},
+        {"container_name": "relay", "container_role": "infrastructure"},
+    ]
+    if args.include_runner:
+        background_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
+    if args.include_netcheck:
+        background_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
+
+    for worker in physical_workers:
+        if worker.container_mode == "singleton" and worker.profile_enabled_client_ids:
+            profiled_specs.append({
+                "worker_id": worker.physical_worker_id,
+                "container_name": worker.physical_worker_id,
+                "logical_client_id": worker.profile_enabled_client_ids[0],
+                "experiment_kind": "singleton_resource_envelope",
+                "resource_profile_id": worker.resource_limits.get("resource_profile", ""),
+                "rayon_num_threads": 1,
+            })
+        else:
+            background_specs.append({
+                "container_name": worker.physical_worker_id,
+                "container_role": worker.container_mode,
+            })
+
+    plan = create_affinity_plan(
+        run_id=args.run_id,
+        profiled_worker_specs=profiled_specs,
+        background_specs=background_specs,
+        cpu_affinity_mode="profiled-nor-background",
+        sample_seconds=args.cpu_affinity_sample_seconds,
+    )
+    errors = validate_affinity_plan(plan)
+    if errors:
+        raise SystemExit("Invalid CPU affinity plan: " + "; ".join(errors))
+
+    run_dir = Path(args.output_dir)
+    if not run_dir.is_absolute():
+        run_dir = Path.cwd() / run_dir
+    run_dir = run_dir / args.run_id
+    write_affinity_plan_json(plan, str(run_dir))
+    args.background_cpuset = get_background_cpuset(plan)
+    args.background_cpuset_mask = plan.background_mask_hex
+    args.strict_cpuset_satisfied = True
+
+    for worker in physical_workers:
+        if worker.container_mode == "singleton" and worker.profile_enabled_client_ids:
+            cpuset = get_profiled_cpuset(plan, worker.physical_worker_id)
+            assignment = next(
+                (a for a in plan.profiled_assignments if a.worker_id == worker.physical_worker_id),
+                None,
+            )
+            worker.resource_limits["resource_limit_cpuset"] = cpuset
+            worker.resource_limits["resource_limit_cpuset_mask"] = assignment.assigned_mask_hex if assignment else ""
+            worker.resource_limits["strict_cpuset_satisfied"] = True
+        else:
+            worker.resource_limits["resource_limit_cpuset"] = args.background_cpuset
+            worker.resource_limits["resource_limit_cpuset_mask"] = args.background_cpuset_mask
+            worker.resource_limits["strict_cpuset_satisfied"] = True
 
 
 def generate_worker_layout_json(
@@ -549,6 +668,8 @@ def generate_worker_layout_json(
             "resource_limit_memory",
             "resource_limit_memory_swap",
             "resource_limit_pids",
+            "app_heap_budget",
+            "resource_limit_cpuset",
         )
     )
     return {
@@ -576,6 +697,11 @@ def generate_worker_layout_json(
                 args, "singleton_memory_swap_defaulted", False
             ),
             "pids_limit": singleton_limits["resource_limit_pids"],
+            "app_heap_budget": singleton_limits["app_heap_budget"],
+            "app_heap_budget_bytes": singleton_limits["app_heap_budget_bytes"],
+            "strict_cpuset": getattr(args, "strict_cpuset", False),
+            "background_cpuset": getattr(args, "background_cpuset", ""),
+            "background_cpuset_mask": getattr(args, "background_cpuset_mask", ""),
             "resource_profile": singleton_limits["resource_profile"],
         },
         "clients": [c.to_dict() for c in clients],
@@ -765,8 +891,12 @@ done
     lines.append("    depends_on:")
     lines.append("      - kr")
     lines.append("      - relay")
+    if getattr(args, "background_cpuset", ""):
+        lines.append(f'    cpuset: "{args.background_cpuset}"')
     lines.append("    volumes:")
-    lines.append(f"      - ./{args.output_dir}:/results")
+    _out = args.output_dir
+    _vol = _out if _out.startswith('/') else f'./{_out}'
+    lines.append(f"      - {_vol}:/results")
     lines.append("    command:")
     lines.append("      - sh")
     lines.append("      - -lc")
@@ -830,8 +960,10 @@ def generate_compose_text(
     lines.append("  depends_on:")
     lines.append("    - kr")
     lines.append("    - relay")
+    _out2 = args.output_dir
+    _vol2 = _out2 if _out2.startswith('/') else f'./{_out2}'
     lines.append("  volumes:")
-    lines.append(f"    - ./{args.output_dir}:/results")
+    lines.append(f"    - {_vol2}:/results")
     append_bounded_logging(lines, indent="  ")
     lines.append("")
     lines.append("services:")
@@ -843,6 +975,8 @@ def generate_compose_text(
     lines.append("      SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT: ${SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT:-128}")
     lines.append("    ports:")
     lines.append(f'      - "{args.kr_port}:{args.kr_port}"')
+    if getattr(args, "background_cpuset", ""):
+        lines.append(f'    cpuset: "{args.background_cpuset}"')
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
@@ -856,6 +990,8 @@ def generate_compose_text(
     lines.append("      SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT: ${SIGNAL_SERVICE_METRICS_WARN_IN_FLIGHT:-128}")
     lines.append("    ports:")
     lines.append(f'      - "{args.relay_port}:{args.relay_port}"')
+    if getattr(args, "background_cpuset", ""):
+        lines.append(f'    cpuset: "{args.background_cpuset}"')
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
@@ -878,6 +1014,8 @@ def generate_compose_text(
                 lines.append(f'    memswap_limit: "{limits["resource_limit_memory_swap"]}"')
             if limits.get("resource_limit_pids") is not None:
                 lines.append(f'    pids_limit: {limits["resource_limit_pids"]}')
+        if pw.resource_limits.get("resource_limit_cpuset"):
+            lines.append(f'    cpuset: "{pw.resource_limits["resource_limit_cpuset"]}"')
         lines.append("    command:")
         lines.append('      - "--name"')
         lines.append(f'      - "{pw.physical_worker_id}"')
@@ -915,6 +1053,42 @@ def generate_compose_text(
             lines.append(f'      SIGNAL_PROFILE_PATH_TEMPLATE: "/results/{args.run_id}/participant-{{participant_id}}.jsonl"')
             first_cid = pw.profile_enabled_client_ids[0]
             lines.append(f'      SIGNAL_PROFILE_PATH: "/results/{args.run_id}/participant-{first_cid}.jsonl"')
+            # Resource model env vars for constrained singletons
+            if args.singleton_cpus is not None:
+                lines.append('      SIGNAL_RESOURCE_CPU_MODEL: "docker-cfs-hard-quota"')
+                lines.append(f'      SIGNAL_RESOURCE_REQUESTED_CPU_FRACTION: "{args.singleton_cpus_float}"')
+                lines.append(f'      SIGNAL_RESOURCE_APPLIED_CPU_FRACTION: "{args.singleton_cpus_float}"')
+                lines.append('      SIGNAL_RESOURCE_CPU_PERIOD_US: "100000"')
+                lines.append(f'      SIGNAL_RESOURCE_CPU_QUOTA_US: "{int(args.singleton_cpus_float * 100000)}"')
+                lines.append(f'      SIGNAL_RESOURCE_CGROUP_CPU_MAX: "{int(args.singleton_cpus_float * 100000)} 100000"')
+            elif args.singleton_memory is not None:
+                lines.append('      SIGNAL_RESOURCE_CPU_MODEL: "non_limiting_control"')
+            if args.singleton_memory is not None:
+                lines.append(f'      SIGNAL_DOCKER_MEMORY_LIMIT: "{args.singleton_memory}"')
+            singleton_app_heap_budget = getattr(args, "singleton_app_heap_budget", None)
+            singleton_app_heap_budget_bytes = getattr(args, "singleton_app_heap_budget_bytes", None)
+            if singleton_app_heap_budget is not None:
+                lines.append('      SIGNAL_MEMORY_MODEL: "app-heap-budget"')
+                lines.append('      SIGNAL_RESOURCE_MEMORY_MODEL: "app-heap-budget"')
+                lines.append(f'      SIGNAL_APP_HEAP_BUDGET: "{singleton_app_heap_budget}"')
+                lines.append(f'      SIGNAL_APP_HEAP_BUDGET_BYTES: "{singleton_app_heap_budget_bytes}"')
+                lines.append(f'      SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT: "{singleton_app_heap_budget}"')
+                lines.append(f'      SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT_BYTES: "{singleton_app_heap_budget_bytes}"')
+                lines.append(f'      SIGNAL_RESOURCE_APPLIED_MEMORY_LIMIT_BYTES: "{singleton_app_heap_budget_bytes}"')
+            elif args.singleton_memory is not None:
+                lines.append('      SIGNAL_RESOURCE_MEMORY_MODEL: "docker-cgroup"')
+                lines.append(f'      SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT: "{args.singleton_memory}"')
+                if args.singleton_memory_bytes:
+                    lines.append(f'      SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT_BYTES: "{args.singleton_memory_bytes}"')
+                    lines.append(f'      SIGNAL_RESOURCE_APPLIED_MEMORY_LIMIT_BYTES: "{args.singleton_memory_bytes}"')
+            elif args.singleton_cpus is not None:
+                lines.append('      SIGNAL_RESOURCE_MEMORY_MODEL: "non_limiting_control"')
+            if pw.resource_limits.get("resource_limit_cpuset"):
+                lines.append(f'      SIGNAL_RESOURCE_CPUSET_CPUS_REQUESTED: "{pw.resource_limits["resource_limit_cpuset"]}"')
+                lines.append(f'      SIGNAL_RESOURCE_CPUSET_CPUS_EFFECTIVE: "{pw.resource_limits["resource_limit_cpuset"]}"')
+            if pw.resource_limits.get("resource_profile"):
+                lines.append(f'      SIGNAL_RESOURCE_PROFILE_ID: "{pw.resource_limits["resource_profile"]}"')
+                lines.append('      SIGNAL_RESOURCE_PROFILE_INDEX: "0"')
         else:
             lines.append('      SIGNAL_PROFILE_ENABLED: "false"')
             lines.append('      SIGNAL_PROFILE_PARTICIPANT_IDS: ""')
@@ -957,12 +1131,16 @@ def generate_compose_text(
         lines.append("    environment:")
         lines.append("      SIGNAL_RUNNER_HTTP_CONNECT_TIMEOUT_MS: ${SIGNAL_RUNNER_HTTP_CONNECT_TIMEOUT_MS:-2000}")
         lines.append("      SIGNAL_RUNNER_HTTP_REQUEST_TIMEOUT_MS: ${SIGNAL_RUNNER_HTTP_REQUEST_TIMEOUT_MS:-60000}")
+        if getattr(args, "background_cpuset", ""):
+            lines.append(f'    cpuset: "{args.background_cpuset}"')
         lines.append("    ulimits:")
         lines.append("      nofile:")
         lines.append("        soft: 1048576")
         lines.append("        hard: 1048576")
+        _out3 = args.output_dir
+        _vol3 = _out3 if _out3.startswith('/') else f'./{_out3}'
         lines.append("    volumes:")
-        lines.append(f"      - ./{args.output_dir}:/results")
+        lines.append(f"      - {_vol3}:/results")
         lines.append("    networks:")
         for bridge in bridges:
             lines.append(f"      - {bridge}")
@@ -1060,6 +1238,8 @@ def main() -> None:
             "packed_container_count": 0,
             "physical_worker_count": args.workers,
         }
+
+    apply_strict_cpuset_plan(args, physical_workers)
 
     layout_json = generate_worker_layout_json(args, clients, physical_workers)
     write_text(layout_out, json.dumps(layout_json, indent=2) + "\n")

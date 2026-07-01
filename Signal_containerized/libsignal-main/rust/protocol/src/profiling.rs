@@ -11,7 +11,7 @@ use std::{
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
-use allocation_counter::AllocationInfo;
+use allocation_counter::{embedded_heap_budget, AllocationInfo};
 use cpu_time::{ProcessTime, ThreadTime};
 use l1d_cache_counter::L1DCacheCounterScope;
 use serde::Serialize;
@@ -122,6 +122,14 @@ fn env_or_none(key: &str) -> Option<String> {
 }
 
 fn env_u64_or_none(key: &str) -> Option<u64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+fn env_f64_or_none(key: &str) -> Option<f64> {
+    std::env::var(key).ok()?.parse().ok()
+}
+
+fn env_i32_or_none(key: &str) -> Option<i32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
@@ -445,6 +453,24 @@ pub(crate) struct ProfileEvent {
     pub pod_name: Option<String>,
     pub device_kind: Option<String>,
     pub execution_backend: Option<String>,
+    pub cpu_model: Option<String>,
+    pub requested_cpu_fraction: Option<f64>,
+    pub applied_cpu_fraction: Option<f64>,
+    pub cpu_period_us: Option<u64>,
+    pub cpu_quota_us: Option<u64>,
+    pub cgroup_cpu_max: Option<String>,
+    pub cpuset_cpus_requested: Option<String>,
+    pub cpuset_cpus_effective: Option<String>,
+    pub memory_model: Option<String>,
+    pub requested_memory_limit: Option<String>,
+    pub requested_memory_limit_bytes: Option<u64>,
+    pub applied_memory_limit_bytes: Option<u64>,
+    pub app_heap_budget: Option<String>,
+    pub app_heap_budget_bytes: Option<u64>,
+    pub app_heap_current_live_bytes: Option<u64>,
+    pub app_heap_peak_live_bytes: Option<u64>,
+    pub resource_profile_id: Option<String>,
+    pub resource_profile_index: Option<i32>,
 }
 
 pub(crate) fn emit_event(event: &ProfileEvent) {
@@ -536,6 +562,7 @@ impl ProfileScope {
         };
         let metadata = self.metadata;
         let context = self.context;
+        let heap_snapshot = embedded_heap_budget::snapshot();
 
         ProfileEvent {
             profile_schema_version: 4,
@@ -604,8 +631,44 @@ impl ProfileScope {
             pod_name: env_or_none("HOSTNAME"),
             device_kind: env_or_none("SIGNAL_PROFILE_DEVICE_KIND"),
             execution_backend: env_or_none("SIGNAL_PROFILE_EXECUTION_BACKEND"),
+            cpu_model: env_or_none("SIGNAL_RESOURCE_CPU_MODEL"),
+            requested_cpu_fraction: env_f64_or_none("SIGNAL_RESOURCE_REQUESTED_CPU_FRACTION"),
+            applied_cpu_fraction: env_f64_or_none("SIGNAL_RESOURCE_APPLIED_CPU_FRACTION"),
+            cpu_period_us: env_u64_or_none("SIGNAL_RESOURCE_CPU_PERIOD_US"),
+            cpu_quota_us: env_u64_or_none("SIGNAL_RESOURCE_CPU_QUOTA_US"),
+            cgroup_cpu_max: env_or_none("SIGNAL_RESOURCE_CGROUP_CPU_MAX"),
+            cpuset_cpus_requested: env_or_none("SIGNAL_RESOURCE_CPUSET_CPUS_REQUESTED"),
+            cpuset_cpus_effective: read_cgroup_cpuset_effective()
+                .or_else(|| env_or_none("SIGNAL_RESOURCE_CPUSET_CPUS_EFFECTIVE")),
+            memory_model: env_or_none("SIGNAL_RESOURCE_MEMORY_MODEL"),
+            requested_memory_limit: env_or_none("SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT"),
+            requested_memory_limit_bytes: env_u64_or_none("SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT_BYTES"),
+            applied_memory_limit_bytes: env_u64_or_none("SIGNAL_RESOURCE_APPLIED_MEMORY_LIMIT_BYTES"),
+            app_heap_budget: env_or_none("SIGNAL_APP_HEAP_BUDGET"),
+            app_heap_budget_bytes: env_u64_or_none("SIGNAL_APP_HEAP_BUDGET_BYTES"),
+            app_heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+                .then_some(heap_snapshot.current_live_heap_bytes),
+            app_heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+                .then_some(heap_snapshot.peak_live_heap_bytes),
+            resource_profile_id: env_or_none("SIGNAL_RESOURCE_PROFILE_ID"),
+            resource_profile_index: env_i32_or_none("SIGNAL_RESOURCE_PROFILE_INDEX"),
         }
     }
+}
+
+fn read_cgroup_cpuset_effective() -> Option<String> {
+    for path in [
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.cpus",
+    ] {
+        if let Ok(value) = fs::read_to_string(path) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
 }
 
 pub(crate) fn measure_result<T, E>(

@@ -16,6 +16,11 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use signal_benchmark::debug::{debug_logs_enabled, worker_debug_logs_enabled};
+use signal_benchmark::embedded_heap_budget::{
+    begin_operation as begin_heap_budget_operation, configure_from_env as configure_heap_budget,
+    mark_worker_command_execution, operation_family_for_command, EmbeddedHeapBudgetConfig,
+    OperationAttribution,
+};
 use signal_benchmark::signal_metrics::SignalProfileEvent;
 use signal_benchmark::signal_participant::SignalParticipant;
 use signal_benchmark::worker_api::{
@@ -43,6 +48,7 @@ struct WorkerProcessState {
     internal_parallelism: usize,
     participant_ids: Vec<String>,
     profile_enabled_ids: Vec<String>,
+    embedded_heap_budget: EmbeddedHeapBudgetConfig,
 }
 
 struct WorkerCommandEnvelope {
@@ -510,6 +516,7 @@ async fn participant_command_actor(
     mut slot: ParticipantSlot,
     kr_url: String,
     relay_url: String,
+    embedded_heap_budget: EmbeddedHeapBudgetConfig,
 ) {
     while let Some(envelope) = rx.recv().await {
         let request_id = envelope.request_id.as_deref().unwrap_or("-");
@@ -560,16 +567,52 @@ async fn participant_command_actor(
             &participant_id,
             envelope.phase.as_deref(),
         );
-        let result = handle_command(
+        let heap_budget_guard = if slot.profile_enabled && embedded_heap_budget.enabled {
+            let operation_family = operation_family_for_command(command_name);
+            Some(begin_heap_budget_operation(OperationAttribution {
+                operation_family: operation_family.clone(),
+                benchmark_operation: operation_family,
+                span_or_phase: phase.to_string(),
+                member_count: event_context.peer_count,
+                epoch: None,
+                worker_id: participant_id.clone(),
+                resource_profile_id: embedded_heap_budget.resource_profile_id.clone(),
+                resource_profile_index: embedded_heap_budget.resource_profile_index,
+                app_heap_budget: embedded_heap_budget.app_heap_budget.clone(),
+                app_heap_budget_bytes: embedded_heap_budget.app_heap_budget_bytes,
+            }))
+            .flatten()
+        } else {
+            None
+        };
+        if heap_budget_guard.is_some() {
+            mark_worker_command_execution();
+        }
+
+        let mut result = handle_command(
             &mut slot.participant,
             &kr_url,
             &relay_url,
             envelope.command,
             envelope.phase.as_deref(),
+            slot.profile_path.as_ref(),
         )
         .await;
 
+        if let Some(guard) = heap_budget_guard.as_ref() {
+            if let Some(failure) = guard.failure_if_exceeded() {
+                result = Err(anyhow!(failure.to_worker_error_message()));
+            }
+        }
+        drop(heap_budget_guard);
+
         let wall_ns = start.elapsed().as_nanos();
+        let deadline_ns: u128 = 1_000_000_000;
+        let deadline_failure = if wall_ns > deadline_ns {
+            Some("cpu_walltime_deadline_exceeded".to_string())
+        } else {
+            None
+        };
         let mut metrics = None;
         let response = match result {
             Ok(outcome) => {
@@ -589,6 +632,19 @@ async fn participant_command_actor(
                 .open(profile_path)
             {
                 let metrics = metrics.unwrap_or_default();
+                let failure_class = if response.message.contains("APP_HEAP_BUDGET_EXCEEDED") {
+                    Some("app_heap_budget_exceeded".to_string())
+                } else {
+                    (response.status != "ok")
+                        .then(|| "protocol_error".to_string())
+                        .or_else(|| deadline_failure.clone())
+                };
+                let cpu_throttled = if wall_ns > 0 && wall_ns > deadline_ns {
+                    Some((wall_ns.saturating_sub(deadline_ns)) as f64 / wall_ns as f64)
+                } else {
+                    None
+                };
+                let heap_snapshot = signal_benchmark::embedded_heap_budget::snapshot();
                 let event = SignalProfileEvent {
                     profile_schema_version: 4,
                     ts_unix_ns: start_unix_ms * 1_000_000,
@@ -614,7 +670,7 @@ async fn participant_command_actor(
                     wall_ns,
                     cpu_thread_ns: metrics.cpu_thread_ns,
                     cpu_envelope_utilization: None,
-                    cpu_throttled_time_ratio: None,
+                    cpu_throttled_time_ratio: cpu_throttled,
                     alloc_bytes: metrics.alloc_bytes,
                     alloc_count: metrics.alloc_count,
                     l1d_cache_accesses: metrics.l1d_cache_accesses,
@@ -668,6 +724,43 @@ async fn participant_command_actor(
                     pod_name: env_nonempty("HOSTNAME").or_else(|| Some(physical_worker_id.clone())),
                     device_kind: env_nonempty("SIGNAL_PROFILE_DEVICE_KIND"),
                     execution_backend: env_nonempty("SIGNAL_PROFILE_EXECUTION_BACKEND"),
+                    cpu_model: env_nonempty("SIGNAL_RESOURCE_CPU_MODEL"),
+                    requested_cpu_fraction: env_nonempty("SIGNAL_RESOURCE_REQUESTED_CPU_FRACTION")
+                        .and_then(|v| v.parse().ok()),
+                    applied_cpu_fraction: env_nonempty("SIGNAL_RESOURCE_APPLIED_CPU_FRACTION")
+                        .and_then(|v| v.parse().ok()),
+                    cpu_period_us: env_nonempty("SIGNAL_RESOURCE_CPU_PERIOD_US")
+                        .and_then(|v| v.parse().ok()),
+                    cpu_quota_us: env_nonempty("SIGNAL_RESOURCE_CPU_QUOTA_US")
+                        .and_then(|v| v.parse().ok()),
+                    cgroup_cpu_max: env_nonempty("SIGNAL_RESOURCE_CGROUP_CPU_MAX"),
+                    cpuset_cpus_requested: env_nonempty("SIGNAL_RESOURCE_CPUSET_CPUS_REQUESTED"),
+                    cpuset_cpus_effective: read_cgroup_cpuset_effective()
+                        .or_else(|| env_nonempty("SIGNAL_RESOURCE_CPUSET_CPUS_EFFECTIVE")),
+                    memory_model: env_nonempty("SIGNAL_RESOURCE_MEMORY_MODEL"),
+                    requested_memory_limit: env_nonempty("SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT"),
+                    requested_memory_limit_bytes: env_nonempty(
+                        "SIGNAL_RESOURCE_REQUESTED_MEMORY_LIMIT_BYTES",
+                    )
+                    .and_then(|v| v.parse().ok()),
+                    applied_memory_limit_bytes: env_nonempty(
+                        "SIGNAL_RESOURCE_APPLIED_MEMORY_LIMIT_BYTES",
+                    )
+                    .and_then(|v| v.parse().ok()),
+                    resource_profile_id: env_nonempty("SIGNAL_RESOURCE_PROFILE_ID"),
+                    resource_profile_index: env_nonempty("SIGNAL_RESOURCE_PROFILE_INDEX")
+                        .and_then(|v| v.parse().ok()),
+                    failure_class,
+                    app_heap_budget: env_nonempty("SIGNAL_APP_HEAP_BUDGET"),
+                    app_heap_budget_bytes: env_nonempty("SIGNAL_APP_HEAP_BUDGET_BYTES")
+                        .and_then(|v| v.parse().ok()),
+                    app_heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+                        .then_some(heap_snapshot.current_live_heap_bytes),
+                    app_heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+                        .then_some(heap_snapshot.peak_live_heap_bytes),
+                    failure_operation: (response.status != "ok")
+                        .then(|| operation_family_for_command(command_name)),
+                    failure_phase: (response.status != "ok").then(|| phase.to_string()),
                     ..SignalProfileEvent::default()
                 };
                 if let Ok(json_line) = serde_json::to_string(&event) {
@@ -704,6 +797,21 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
+fn read_cgroup_cpuset_effective() -> Option<String> {
+    for path in [
+        "/sys/fs/cgroup/cpuset.cpus.effective",
+        "/sys/fs/cgroup/cpuset.cpus",
+    ] {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            let trimmed = value.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    None
+}
+
 async fn debug_layout(State(state): State<Arc<WorkerProcessState>>) -> Json<serde_json::Value> {
     let participants_info: Vec<serde_json::Value> = state
         .participant_ids
@@ -722,6 +830,15 @@ async fn debug_layout(State(state): State<Arc<WorkerProcessState>>) -> Json<serd
         "relay_url": state.relay_url,
         "internal_parallelism": state.internal_parallelism,
         "participants": participants_info,
+        "embedded_heap_budget": {
+            "enabled": state.embedded_heap_budget.enabled,
+            "memory_model": state.embedded_heap_budget.memory_model.clone(),
+            "app_heap_budget": state.embedded_heap_budget.app_heap_budget.clone(),
+            "app_heap_budget_bytes": state.embedded_heap_budget.app_heap_budget_bytes,
+            "docker_memory_limit": state.embedded_heap_budget.docker_memory_limit.clone(),
+            "resource_profile_id": state.embedded_heap_budget.resource_profile_id.clone(),
+            "resource_profile_index": state.embedded_heap_budget.resource_profile_index,
+        },
     }))
 }
 
@@ -776,6 +893,7 @@ async fn main() -> Result<()> {
         .collect();
 
     let profile_template = profile_path_template_opt;
+    let embedded_heap_budget = configure_heap_budget();
 
     let queue_capacity = command_queue_capacity();
     let cache_size = idempotency_cache_size();
@@ -828,6 +946,7 @@ async fn main() -> Result<()> {
             slot,
             kr,
             relay,
+            embedded_heap_budget.clone(),
         ));
         participant_ids_list.push(participant_id.clone());
         if is_profile_enabled {
@@ -843,6 +962,7 @@ async fn main() -> Result<()> {
         internal_parallelism,
         participant_ids: participant_ids_list,
         profile_enabled_ids: profile_enabled_ids_list,
+        embedded_heap_budget,
     });
 
     let app = Router::new()

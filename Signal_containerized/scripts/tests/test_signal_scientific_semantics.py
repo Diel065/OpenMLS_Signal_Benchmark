@@ -100,8 +100,8 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "pod_name",
     ]
     assert_contains_all(csv, required, "SignalCsvRow")
-    assert "profile_schema_version: 3" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
-    assert "profile_schema_version: 3" in read("Signal_containerized/src/bin/worker.rs")
+    assert "profile_schema_version: 4" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
+    assert "profile_schema_version: 4" in read("Signal_containerized/src/bin/worker.rs")
 
 
 def test_event_taxonomy_separates_wrapper_and_protocol_rows() -> None:

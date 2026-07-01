@@ -161,6 +161,70 @@ pub struct SignalProfileEvent {
     pub pod_name: Option<String>,
     pub device_kind: Option<String>,
     pub execution_backend: Option<String>,
+    #[serde(default)]
+    pub cpu_model: Option<String>,
+    #[serde(default)]
+    pub requested_cpu_fraction: Option<f64>,
+    #[serde(default)]
+    pub applied_cpu_fraction: Option<f64>,
+    #[serde(default)]
+    pub cpu_period_us: Option<u64>,
+    #[serde(default)]
+    pub cpu_quota_us: Option<u64>,
+    #[serde(default)]
+    pub cgroup_cpu_max: Option<String>,
+    #[serde(default)]
+    pub cpuset_cpus_requested: Option<String>,
+    #[serde(default)]
+    pub cpuset_cpus_effective: Option<String>,
+    #[serde(default)]
+    pub cpu_nr_periods: Option<u64>,
+    #[serde(default)]
+    pub cpu_nr_throttled: Option<u64>,
+    #[serde(default)]
+    pub cpu_throttled_usec: Option<u64>,
+    #[serde(default)]
+    pub memory_model: Option<String>,
+    #[serde(default)]
+    pub requested_memory_limit: Option<String>,
+    #[serde(default)]
+    pub requested_memory_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub applied_memory_limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_current_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_peak_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_events_max: Option<u64>,
+    #[serde(default)]
+    pub memory_events_oom: Option<u64>,
+    #[serde(default)]
+    pub memory_events_oom_kill: Option<u64>,
+    #[serde(default)]
+    pub app_heap_budget: Option<String>,
+    #[serde(default)]
+    pub app_heap_budget_bytes: Option<u64>,
+    #[serde(default)]
+    pub app_heap_current_live_bytes: Option<u64>,
+    #[serde(default)]
+    pub app_heap_peak_live_bytes: Option<u64>,
+    #[serde(default)]
+    pub resource_profile_id: Option<String>,
+    #[serde(default)]
+    pub resource_profile_index: Option<i32>,
+    #[serde(default)]
+    pub failure_class: Option<String>,
+    #[serde(default)]
+    pub failure_operation: Option<String>,
+    #[serde(default)]
+    pub failure_span: Option<String>,
+    #[serde(default)]
+    pub failure_phase: Option<String>,
+    #[serde(default)]
+    pub container_exit_code: Option<i32>,
+    #[serde(default)]
+    pub oom_killed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,6 +242,7 @@ pub struct SignalCsvRow<'a> {
     pub profile_schema_version: u32,
     pub ts_unix_ns: u128,
     pub op: String,
+    pub span_name: String,
     pub span_layer: String,
     pub protocol_stack: String,
     pub implementation: String,
@@ -276,4 +341,36 @@ pub struct SignalCsvRow<'a> {
     pub resource_limit_memory_swap_bytes: Option<u64>,
     pub resource_limit_pids: Option<u64>,
     pub resource_profile: &'a str,
+    pub cpu_model: Option<String>,
+    pub requested_cpu_fraction: Option<f64>,
+    pub applied_cpu_fraction: Option<f64>,
+    pub cpu_period_us: Option<u64>,
+    pub cpu_quota_us: Option<u64>,
+    pub cgroup_cpu_max: Option<String>,
+    pub cpuset_cpus_requested: Option<String>,
+    pub cpuset_cpus_effective: Option<String>,
+    pub cpu_nr_periods: Option<u64>,
+    pub cpu_nr_throttled: Option<u64>,
+    pub cpu_throttled_usec: Option<u64>,
+    pub memory_model: Option<String>,
+    pub requested_memory_limit: Option<String>,
+    pub requested_memory_limit_bytes: Option<u64>,
+    pub applied_memory_limit_bytes: Option<u64>,
+    pub memory_current_bytes: Option<u64>,
+    pub memory_peak_bytes: Option<u64>,
+    pub memory_events_max: Option<u64>,
+    pub memory_events_oom: Option<u64>,
+    pub memory_events_oom_kill: Option<u64>,
+    pub app_heap_budget: Option<String>,
+    pub app_heap_budget_bytes: Option<u64>,
+    pub app_heap_current_live_bytes: Option<u64>,
+    pub app_heap_peak_live_bytes: Option<u64>,
+    pub resource_profile_id: Option<String>,
+    pub resource_profile_index: Option<i32>,
+    pub failure_class: Option<String>,
+    pub failure_operation: Option<String>,
+    pub failure_span: Option<String>,
+    pub failure_phase: Option<String>,
+    pub container_exit_code: Option<i32>,
+    pub oom_killed: Option<bool>,
 }

@@ -3,6 +3,11 @@
 # Calibration run 03: external-device calibration.
 # Docker containers are unprofiled; external devices are profiled.
 # Produces events.csv for every run.
+#
+# PROTOCOL env: openmls | signal | both (default: openmls)
+#   NOTE: PROTOCOL=signal and PROTOCOL=both are not yet supported for
+#   external-device calibration (too complex with external devices).
+#   Signal external-device support will be added in a future iteration.
 
 set -euo pipefail
 
@@ -10,6 +15,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 OPENMLS_DIR="$REPO_ROOT/OpenMLS_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
+
+PROTOCOL="${PROTOCOL:-openmls}"
 
 N="${N:-3}"
 DEVICES_FILE="${DEVICES_FILE:-devices.yaml}"
@@ -139,6 +146,16 @@ run_external() {
   cd "$REPO_ROOT"
   cleanup_docker
 }
+
+if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
+  echo "NOTE: PROTOCOL=$PROTOCOL requested, but external-device calibration is not yet supported for Signal."
+  echo "      Only OpenMLS external-device runs will be executed."
+  if [ "$PROTOCOL" = "signal" ]; then
+    echo "ERROR: PROTOCOL=signal is not supported for run_03 (external-device calibration)."
+    echo "       Use run_01 or run_02 for Signal calibration."
+    exit 1
+  fi
+fi
 
 cleanup_docker
 for iter in $(seq 1 "$N"); do

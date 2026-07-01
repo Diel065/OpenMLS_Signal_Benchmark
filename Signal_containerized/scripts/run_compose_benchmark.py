@@ -24,6 +24,24 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+try:
+    from resource_experiment_failures import (
+        build_run_status,
+        collect_worker_failures_from_artifacts,
+        enrich_worker_failures_with_cursors,
+        worker_failure_info_to_dict,
+    )
+    from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
+except ModuleNotFoundError:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from resource_experiment_failures import (
+        build_run_status,
+        collect_worker_failures_from_artifacts,
+        enrich_worker_failures_with_cursors,
+        worker_failure_info_to_dict,
+    )
+    from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
+
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
@@ -383,6 +401,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional Docker pids_limit for all containerized singleton workers.",
     )
     p.add_argument(
+        "--singleton-app-heap-budget",
+        default=None,
+        help="Application heap budget for profiled singleton workers, e.g. 512k or 8m.",
+    )
+    p.add_argument(
+        "--strict-cpuset",
+        action="store_true",
+        help="Require non-overlapping Docker cpuset assignment for profiled singleton workers.",
+    )
+    p.add_argument(
+        "--cpu-affinity-sample-seconds",
+        type=float,
+        default=20.0,
+        help="Seconds to sample per-CPU load before strict cpuset assignment.",
+    )
+    p.add_argument(
         "--resource-monitor-interval-ms",
         type=int,
         default=500,
@@ -539,6 +573,14 @@ def normalize_resource_args(args: argparse.Namespace) -> None:
 
     if args.singleton_pids_limit is not None and args.singleton_pids_limit < 1:
         raise SystemExit("--singleton-pids-limit must be >= 1")
+    if args.singleton_app_heap_budget is not None:
+        args.singleton_app_heap_budget = str(args.singleton_app_heap_budget).strip()
+        args.singleton_app_heap_budget_bytes = parse_memory_bytes(args.singleton_app_heap_budget)
+    else:
+        args.singleton_app_heap_budget_bytes = None
+    if args.cpu_affinity_sample_seconds < 0:
+        raise SystemExit("--cpu-affinity-sample-seconds must be >= 0")
+    args.strict_cpuset_satisfied = False
 
 
 def singleton_resource_envelope(args: argparse.Namespace) -> dict:
@@ -549,6 +591,8 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
             args.singleton_memory,
             args.singleton_memory_swap,
             args.singleton_pids_limit,
+            args.singleton_app_heap_budget,
+            args.strict_cpuset,
         )
     )
     profile_parts = []
@@ -560,6 +604,10 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
         profile_parts.append(f"swap-{args.singleton_memory_swap}")
     if args.singleton_pids_limit is not None:
         profile_parts.append(f"pids-{args.singleton_pids_limit}")
+    if args.singleton_app_heap_budget is not None:
+        profile_parts.append(f"appheap-{args.singleton_app_heap_budget}")
+    if args.strict_cpuset:
+        profile_parts.append("strict-cpuset")
     resource_profile = (
         "singleton-resource-envelope_" + "_".join(profile_parts)
         if profile_parts
@@ -574,6 +622,12 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
         "memory_swap_bytes": args.singleton_memory_swap_bytes,
         "memory_swap_defaulted_to_memory": args.singleton_memory_swap_defaulted,
         "pids_limit": args.singleton_pids_limit,
+        "app_heap_budget": args.singleton_app_heap_budget,
+        "app_heap_budget_bytes": args.singleton_app_heap_budget_bytes,
+        "strict_cpuset": args.strict_cpuset,
+        "strict_cpuset_satisfied": getattr(args, "strict_cpuset_satisfied", False),
+        "background_cpuset": getattr(args, "background_cpuset", ""),
+        "background_cpuset_mask": getattr(args, "background_cpuset_mask", ""),
         "applies_to": "all_containerized_singletons",
         "resource_profile": resource_profile,
         "scientific_interpretation": (
@@ -1256,7 +1310,13 @@ def write_run_outcome(
         "written_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "evidence": evidence or {},
     }
-    (run_dir / "benchmark_outcome.json").write_text(
+    outcome_path = run_dir / "benchmark_outcome.json"
+    if outcome_path.exists():
+        try:
+            os.unlink(outcome_path)
+        except OSError:
+            pass
+    outcome_path.write_text(
         json.dumps(payload, indent=2, sort_keys=True),
         encoding="utf-8",
     )
@@ -1306,6 +1366,8 @@ def has_configured_resource_limit(entry: dict) -> bool:
             "resource_limit_memory_bytes",
             "resource_limit_memory_swap_bytes",
             "resource_limit_pids",
+            "app_heap_budget_bytes",
+            "resource_limit_cpuset",
         )
     )
 
@@ -1320,6 +1382,8 @@ def expected_singleton_limit_targets(layout: dict) -> list[dict]:
                 "resource_limit_memory_bytes",
                 "resource_limit_memory_swap_bytes",
                 "resource_limit_pids",
+                "app_heap_budget_bytes",
+                "resource_limit_cpuset",
             )
         )
         if has_limit:
@@ -1338,6 +1402,55 @@ def observed_cpu_limit(host_config: dict) -> float | None:
         return quota / period
 
     return None
+
+
+def parse_cpuset_cpus(value: str | None) -> set[int]:
+    cpus: set[int] = set()
+    for part in (value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            low_raw, high_raw = part.split("-", 1)
+            cpus.update(range(int(low_raw), int(high_raw) + 1))
+        else:
+            cpus.add(int(part))
+    return cpus
+
+
+def cpuset_matches(expected: str | None, observed: str | None) -> bool:
+    try:
+        return parse_cpuset_cpus(expected) == parse_cpuset_cpus(observed)
+    except ValueError:
+        return False
+
+
+def cpuset_from_list(cpus: list[int]) -> str:
+    if not cpus:
+        return ""
+    values = sorted(set(int(cpu) for cpu in cpus))
+    ranges = []
+    start = end = values[0]
+    for cpu in values[1:]:
+        if cpu == end + 1:
+            end = cpu
+            continue
+        ranges.append(f"{start}" if start == end else f"{start}-{end}")
+        start = end = cpu
+    ranges.append(f"{start}" if start == end else f"{start}-{end}")
+    return ",".join(ranges)
+
+
+def proc_cpus_allowed_list(pid: int) -> str:
+    if pid <= 0:
+        return ""
+    try:
+        for line in Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace").splitlines():
+            if line.startswith("Cpus_allowed_list:"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        return ""
+    return ""
 
 
 def verify_resource_limits(
@@ -1395,6 +1508,8 @@ def verify_resource_limits(
             "memory_bytes": target.get("resource_limit_memory_bytes"),
             "memory_swap_bytes": target.get("resource_limit_memory_swap_bytes"),
             "pids_limit": target.get("resource_limit_pids"),
+            "cpuset_cpus": target.get("resource_limit_cpuset"),
+            "app_heap_budget_bytes": target.get("app_heap_budget_bytes"),
             "resource_profile": target.get("resource_profile", ""),
         }
         observed: dict = {"container_id": container_id}
@@ -1437,6 +1552,7 @@ def verify_resource_limits(
             "nano_cpus": host_config.get("NanoCpus"),
             "cpu_quota": host_config.get("CpuQuota"),
             "cpu_period": host_config.get("CpuPeriod"),
+            "cpuset_cpus": host_config.get("CpusetCpus"),
             "effective_cpus": observed_cpu_limit(host_config),
             "pids_limit": host_config.get("PidsLimit"),
         })
@@ -1473,6 +1589,16 @@ def verify_resource_limits(
                 messages.append(
                     f"pids_limit expected {expected['pids_limit']} observed {host_config.get('PidsLimit')}"
                 )
+
+        if expected["cpuset_cpus"]:
+            checks["cpuset"] = cpuset_matches(expected["cpuset_cpus"], host_config.get("CpusetCpus"))
+            if not checks["cpuset"]:
+                messages.append(
+                    f"cpuset expected {expected['cpuset_cpus']} observed {host_config.get('CpusetCpus')}"
+                )
+
+        if expected["app_heap_budget_bytes"] is not None:
+            checks["app_heap_budget_configured"] = int(expected["app_heap_budget_bytes"]) > 0
 
         status = "pass" if checks and all(checks.values()) else "fail"
         if not checks:
@@ -1524,6 +1650,108 @@ def verify_resource_limits(
         flush=True,
     )
     return records
+
+
+def write_cpu_affinity_preflight(
+    *,
+    root: Path,
+    compose_file: Path,
+    run_dir: Path,
+    run_id: str,
+    args: argparse.Namespace,
+    compose_env: dict[str, str] | None,
+) -> bool:
+    plan_path = run_dir / "cpu_affinity_plan.json"
+    writer = SidecarWriter(str(run_dir))
+    if not args.strict_cpuset or not plan_path.exists():
+        writer.write_preflight_results(run_id, [])
+        (run_dir / "cpu_affinity_preflight_summary.json").write_text(
+            json.dumps({"status": "not_applicable", "all_passed": True}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+        return False
+
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    rows = []
+
+    def add_check(container_name: str, role: str, expected: str) -> None:
+        container_id = compose_container_id(root, compose_file, container_name, compose_env)
+        inspect = docker_inspect_one(root, container_id, compose_env) if container_id else None
+        host_config = (inspect or {}).get("HostConfig") or {}
+        state = (inspect or {}).get("State") or {}
+        docker_cpuset = host_config.get("CpusetCpus") or ""
+        pid = int(state.get("Pid") or 0)
+        running = bool(state.get("Running")) and pid > 0
+        if not running and role == "runner_or_helper":
+            rows.append({
+                "check_name": "docker_cpuset_effective",
+                "container_name": container_name,
+                "container_role": role,
+                "expected_cpuset": expected,
+                "docker_cpuset": docker_cpuset,
+                "host_pid": pid,
+                "proc_cpus_allowed_list": "",
+                "thread_cpus_allowed_lists": "",
+                "observed_psr_cpus": "",
+                "status": "skipped",
+                "message": "container not running during preflight",
+            })
+            return
+        proc_allowed = proc_cpus_allowed_list(pid)
+        ok = running and bool(expected) and cpuset_matches(expected, docker_cpuset) and cpuset_matches(expected, proc_allowed)
+        rows.append({
+            "check_name": "docker_cpuset_effective",
+            "container_name": container_name,
+            "container_role": role,
+            "expected_cpuset": expected,
+            "docker_cpuset": docker_cpuset,
+            "host_pid": pid,
+            "proc_cpus_allowed_list": proc_allowed,
+            "thread_cpus_allowed_lists": proc_allowed,
+            "observed_psr_cpus": "",
+            "status": "pass" if ok else "fail",
+            "message": "" if ok else ("container not running" if not running else "cpuset mismatch"),
+        })
+
+    for pa in plan.get("profiled_assignments", []):
+        add_check(pa.get("container_name", ""), "profiled_singleton", cpuset_from_list(pa.get("assigned_cpus", [])))
+    for ba in plan.get("background_assignments", []):
+        expected = cpuset_from_list(ba.get("assigned_cpus", []))
+        if expected:
+            add_check(ba.get("container_name", ""), ba.get("container_role", "background"), expected)
+
+    writer.write_preflight_results(run_id, rows)
+    required_rows = [row for row in rows if row["status"] != "skipped"]
+    all_passed = bool(required_rows) and all(row["status"] == "pass" for row in required_rows)
+    (run_dir / "cpu_affinity_preflight_summary.json").write_text(
+        json.dumps(
+            {
+                "status": "pass" if all_passed else "fail",
+                "all_passed": all_passed,
+                "checked_container_count": len(required_rows),
+                "skipped_container_count": len(rows) - len(required_rows),
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+    if all_passed:
+        print(f"[resources] strict cpuset preflight passed for {len(rows)} container(s)", flush=True)
+    return all_passed
+
+
+def update_resource_limits_cpuset_status(run_dir: Path, satisfied: bool) -> None:
+    artifact_path = run_dir / "resource_limits_verified.json"
+    try:
+        artifact = json.loads(artifact_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    envelope = artifact.get("singleton_resource_envelope")
+    if isinstance(envelope, dict):
+        envelope["strict_cpuset_satisfied"] = bool(satisfied)
+    artifact["strict_cpuset_satisfied"] = bool(satisfied)
+    artifact_path.write_text(json.dumps(artifact, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def read_key_value_file(path: Path) -> dict[str, int]:
@@ -1614,10 +1842,20 @@ class ResourceMonitor:
         self.targets = [self._build_target(record) for record in targets]
         self.summary: dict[str, dict] = {
             target["physical_worker_id"]: {
+                "run_id": run_id,
                 "physical_worker_id": target["physical_worker_id"],
+                "worker_id": target["physical_worker_id"].removeprefix("worker-"),
+                "logical_client_id": target["physical_worker_id"].removeprefix("worker-"),
+                "container_name": target["physical_worker_id"],
                 "container_id": target["container_id"],
+                "resource_profile_id": target["resource_profile"],
+                "experiment_kind": "singleton_resource_envelope",
+                "cpuset_cpus": target.get("resource_limit_cpuset") or "",
                 "resource_limit_cpus": target["resource_limit_cpus"],
                 "resource_limit_memory_bytes": target["resource_limit_memory_bytes"],
+                "memory_limit": target["resource_limit_memory_bytes"],
+                "memory_swap": "",
+                "rayon_num_threads": 1,
                 "samples": 0,
                 "max_memory_current": None,
                 "last_memory_current": None,
@@ -1652,6 +1890,8 @@ class ResourceMonitor:
             "container_id": container_id,
             "resource_limit_cpus": expected.get("cpus"),
             "resource_limit_memory_bytes": expected.get("memory_bytes"),
+            "resource_limit_cpuset": expected.get("cpuset_cpus"),
+            "app_heap_budget_bytes": expected.get("app_heap_budget_bytes"),
             "resource_profile": expected.get("resource_profile", ""),
             "pid": pid,
             "cgroups": cgroups,
@@ -1747,6 +1987,8 @@ class ResourceMonitor:
             "container_id": target.get("container_id"),
             "resource_limit_cpus": target.get("resource_limit_cpus"),
             "resource_limit_memory_bytes": target.get("resource_limit_memory_bytes"),
+            "resource_limit_cpuset": target.get("resource_limit_cpuset"),
+            "app_heap_budget_bytes": target.get("app_heap_budget_bytes"),
             "resource_profile": target.get("resource_profile", ""),
             "memory.current": read_cgroup_scalar(memory_path / "memory.current") if memory_path else None,
             "memory.max": read_cgroup_scalar(memory_path / "memory.max") if memory_path else None,
@@ -1845,44 +2087,43 @@ class ResourceMonitor:
             out.write(json.dumps(event, sort_keys=True) + "\n")
 
     def _write_summary(self) -> None:
-        fieldnames = [
-            "physical_worker_id",
+        fieldnames = RESOURCE_SUMMARY_HEADER + [
             "container_id",
-            "resource_limit_cpus",
-            "resource_limit_memory_bytes",
-            "samples",
-            "max_memory_current",
-            "last_memory_current",
             "memory_events_low",
             "memory_events_high",
             "memory_events_max",
-            "memory_events_oom",
-            "memory_events_oom_kill",
-            "cpu_usage_usec_delta",
-            "cpu_nr_throttled_delta",
-            "cpu_throttled_usec_delta",
-            "pids_current_max",
-            "last_container_status",
-            "last_container_exit_code",
-            "last_container_oom_killed",
+            "resource_limit_cpus",
+            "resource_limit_memory_bytes",
         ]
         with self.summary_path.open("w", encoding="utf-8", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             for raw in self.summary.values():
                 row = dict(raw)
-                row["cpu_usage_usec_delta"] = delta(
+                cpu_usage_usec_delta = delta(
                     row.pop("cpu_usage_usec_first"),
                     row.pop("cpu_usage_usec_last"),
                 )
+                cpu_throttled_usec_delta = delta(
+                    row.pop("cpu_throttled_usec_first"),
+                    row.pop("cpu_throttled_usec_last"),
+                )
+                row["sample_count"] = row.get("samples")
+                row["cpu_limit_cpus"] = row.get("resource_limit_cpus")
+                row["memory_limit"] = row.get("resource_limit_memory_bytes") or ""
+                row["cpu_usage_usec_delta"] = cpu_usage_usec_delta
                 row["cpu_nr_throttled_delta"] = delta(
                     row.pop("cpu_nr_throttled_first"),
                     row.pop("cpu_nr_throttled_last"),
                 )
-                row["cpu_throttled_usec_delta"] = delta(
-                    row.pop("cpu_throttled_usec_first"),
-                    row.pop("cpu_throttled_usec_last"),
+                row["cpu_throttled_usec_delta"] = cpu_throttled_usec_delta
+                row["cpu_throttled_time_fraction"] = (
+                    cpu_throttled_usec_delta / cpu_usage_usec_delta
+                    if cpu_usage_usec_delta and cpu_throttled_usec_delta
+                    else 0
                 )
+                row["max_thread_count"] = ""
+                row["max_process_count"] = row.get("pids_current_max") or ""
                 writer.writerow({key: row.get(key) for key in fieldnames})
 
 
@@ -2060,6 +2301,215 @@ def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
         return "resource_pressure_memory", evidence
 
     return "infrastructure_failure", evidence
+
+
+def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_success: bool) -> None:
+    summary_path = run_dir / "resource_summary.csv"
+    resource_summaries = []
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8", newline="") as handle:
+            resource_summaries = list(csv.DictReader(handle))
+    profiles_path = run_dir / "resource_profiles.csv"
+    profile_rows = []
+    if profiles_path.exists():
+        with profiles_path.open("r", encoding="utf-8", newline="") as handle:
+            profile_rows = list(csv.DictReader(handle))
+    selected_profile = next(
+        (row for row in profile_rows if str(row.get("selected_for_this_run", "")).lower() in ("true", "1", "yes")),
+        profile_rows[0] if profile_rows else {},
+    )
+    memory_model = next((row.get("memory_model", "") for row in profile_rows if row.get("memory_model")), "")
+    if not memory_model:
+        memory_model = (
+            "docker-cgroup"
+            if any(row.get("resource_limit_memory_bytes") for row in resource_summaries)
+            else "non_limiting_control"
+        )
+    preflight_passed = run_success
+    preflight_summary_path = run_dir / "cpu_affinity_preflight_summary.json"
+    if preflight_summary_path.exists():
+        try:
+            preflight_summary = json.loads(preflight_summary_path.read_text(encoding="utf-8"))
+            preflight_passed = bool(preflight_summary.get("all_passed", run_success))
+        except (OSError, json.JSONDecodeError):
+            preflight_passed = False
+
+    failures = collect_worker_failures_from_artifacts(
+        str(run_dir / "events.csv"),
+        resource_summaries,
+        str(run_dir / "oom_events.jsonl"),
+        str(run_dir / "terminal_output.txt"),
+    )
+    failures = enrich_worker_failures_with_cursors(failures, str(run_dir / "events.csv"))
+
+    writer = SidecarWriter(str(run_dir))
+    writer.write_worker_failures(
+        run_id,
+        [worker_failure_info_to_dict(failure) for failure in failures],
+    )
+    writer.write_run_status(
+        run_id,
+        build_run_status(
+            run_id=run_id,
+            run_mode="docker_compose",
+            experiment_kind="signal_docker_compose",
+            run_success=run_success,
+            worker_failures=failures,
+            resource_experiment=(
+                "singleton-resource-envelope" if summary_path.exists() else "none"
+            ),
+            resource_failure_policy="stop-on-failure",
+            preflight_passed=preflight_passed,
+            output_validation_passed=run_success,
+            notes="generated from resource_summary.csv/oom_events.jsonl after runner exit",
+            memory_model=memory_model,
+            docker_memory_limit=selected_profile.get("docker_memory_limit", ""),
+            app_heap_budget=selected_profile.get("app_heap_budget", ""),
+            app_heap_budget_bytes=int_or_zero(selected_profile.get("app_heap_budget_bytes")),
+            resource_profile_id=selected_profile.get("resource_profile_id", ""),
+            resource_profile_index=int_or_zero(selected_profile.get("resource_profile_index")),
+            strict_cpuset_satisfied=str(selected_profile.get("strict_cpuset_satisfied", "")).lower() in ("true", "1", "yes"),
+        ),
+    )
+
+
+def write_singleton_resource_profile_sidecars(
+    run_dir: Path,
+    run_id: str,
+    layout_path: Path,
+    targets: list[dict],
+    args: argparse.Namespace,
+) -> None:
+    envelope = singleton_resource_envelope(args)
+    if not envelope["enabled"]:
+        return
+
+    profile_id = envelope["resource_profile"] or "singleton-resource-envelope"
+    cpu_period_us = 100000 if envelope.get("cpus") is not None else ""
+    cpu_quota_us = (
+        int(float(envelope["cpus"]) * 100000)
+        if envelope.get("cpus") is not None
+        else ""
+    )
+    memory_model = "app-heap-budget" if envelope.get("app_heap_budget") else (
+        "docker-cgroup" if envelope.get("memory") else "non_limiting_control"
+    )
+    app_heap_interpretation = "global_allocator_enforced" if envelope.get("app_heap_budget") else (
+        "not_used" if envelope.get("memory") else "non_limiting_control"
+    )
+    profile = {
+        "resource_profile_id": profile_id,
+        "experiment_kind": "singleton_resource_envelope",
+        "resource_profile_index": 0,
+        "profile_label": profile_id,
+        "selected_for_this_run": True,
+        "cpu_limit_cpus": envelope.get("cpus"),
+        "capacity_fraction": envelope.get("cpus"),
+        "assigned_cpu_count": 1,
+        "memory_limit": envelope.get("memory") or "",
+        "memory_swap": envelope.get("memory_swap") or "",
+        "memory_model": memory_model,
+        "docker_memory_limit": envelope.get("memory") or "",
+        "app_heap_budget": envelope.get("app_heap_budget") or "",
+        "app_heap_budget_bytes": envelope.get("app_heap_budget_bytes") or "",
+        "rayon_num_threads": 1,
+        "cpuset_cpus": "",
+        "cpuset_mask_hex": "",
+        "cpuset_role": "profiled_singleton" if envelope.get("strict_cpuset") else "",
+        "profile_notes": envelope.get("scientific_interpretation", ""),
+        "sweep_kind": "singleton_resource_envelope",
+        "app_heap_interpretation": app_heap_interpretation,
+        "cpu_interpretation": "docker-cfs-hard-quota" if envelope.get("cpus") else "non_limiting_control",
+        "cpu_period_us": cpu_period_us,
+        "cpu_quota_us": cpu_quota_us,
+        "group_creator": False,
+        "group_creator_reason": "",
+        "strict_cpuset_satisfied": bool(getattr(args, "strict_cpuset_satisfied", False)),
+    }
+
+    layout = json.loads(layout_path.read_text(encoding="utf-8"))
+    physical = {p.get("physical_worker_id"): p for p in layout.get("physical_workers", [])}
+    assignments = []
+    for index, target in enumerate(targets):
+        physical_id = target.get("physical_worker_id", "")
+        worker = physical.get(physical_id, {})
+        client_ids = worker.get("profile_enabled_client_ids") or worker.get("client_ids") or []
+        client_id = client_ids[0] if client_ids else physical_id.removeprefix("worker-")
+        observed = target.get("observed") or {}
+        cpuset = worker.get("resource_limit_cpuset") or target.get("expected", {}).get("cpuset_cpus") or ""
+        cpuset_mask = worker.get("resource_limit_cpuset_mask") or ""
+        if cpuset and not profile["cpuset_cpus"]:
+            profile["cpuset_cpus"] = cpuset
+            profile["cpuset_mask_hex"] = cpuset_mask
+        assignments.append({
+            "logical_client_id": client_id,
+            "worker_id": client_id,
+            "physical_worker_id": physical_id,
+            "container_name": physical_id,
+            "container_id": target.get("container_id") or observed.get("container_id") or "",
+            "container_mode": worker.get("container_mode", "singleton"),
+            "profile_enabled": True,
+            "resource_profile_index": 0,
+            "resource_profile_id": profile_id,
+            "experiment_kind": "singleton_resource_envelope",
+            "selected_for_this_run": index == 0,
+            "cpu_affinity_role": "",
+            "cpuset_cpus": cpuset,
+            "cpuset_mask_hex": cpuset_mask,
+            "cpu_limit_cpus": envelope.get("cpus"),
+            "capacity_fraction": envelope.get("cpus"),
+            "assigned_cpu_count": 1,
+            "memory_limit": envelope.get("memory") or "",
+            "memory_swap": envelope.get("memory_swap") or "",
+            "memory_model": memory_model,
+            "docker_memory_limit": envelope.get("memory") or "",
+            "app_heap_budget": envelope.get("app_heap_budget") or "",
+            "app_heap_budget_bytes": envelope.get("app_heap_budget_bytes") or "",
+            "rayon_num_threads": 1,
+            "background_cpuset_cpus": singleton_resource_envelope(args).get("background_cpuset") or "",
+            "background_mask_hex": "",
+            "profile_label": profile_id,
+            "sweep_kind": "singleton_resource_envelope",
+            "app_heap_interpretation": app_heap_interpretation,
+            "cpu_interpretation": "docker-cfs-hard-quota" if envelope.get("cpus") else "non_limiting_control",
+            "cpu_period_us": cpu_period_us,
+            "cpu_quota_us": cpu_quota_us,
+            "group_creator": False,
+            "group_creator_reason": "",
+            "strict_cpuset_satisfied": bool(getattr(args, "strict_cpuset_satisfied", False)),
+        })
+
+    writer = SidecarWriter(str(run_dir))
+    writer.write_resource_profiles(run_id, [profile])
+    writer.write_worker_resource_assignments(run_id, assignments)
+    if not (run_dir / "cpu_affinity_preflight.csv").exists():
+        writer.write_preflight_results(run_id, [])
+    if not (run_dir / "cpu_affinity_plan.json").exists():
+        (run_dir / "cpu_affinity_plan.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "mode": "not_applicable",
+                "online_cpu_mask_hex": "0x0",
+                "profiled_mask_hex": "0x0",
+                "background_mask_hex": "0x0",
+                "profiled_assignments": [],
+                "background_assignments": [],
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+        )
+    if not (run_dir / "cpu_affinity_preflight_summary.json").exists():
+        (run_dir / "cpu_affinity_preflight_summary.json").write_text(
+            json.dumps({"status": "not_applicable", "all_passed": True}, indent=2, sort_keys=True),
+            encoding="utf-8",
+        )
+    (run_dir / "resource_profiles.json").write_text(
+        json.dumps({"run_id": run_id, "profiles": [profile], "assignments": assignments}, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
 
 
 def int_or_zero(value) -> int:
@@ -2941,6 +3391,14 @@ def main() -> int:
             generator_cmd += ["--singleton-memory-swap", args.singleton_memory_swap]
         if args.singleton_pids_limit is not None:
             generator_cmd += ["--singleton-pids-limit", str(args.singleton_pids_limit)]
+        if args.singleton_app_heap_budget is not None:
+            generator_cmd += ["--singleton-app-heap-budget", args.singleton_app_heap_budget]
+        if args.strict_cpuset:
+            generator_cmd += [
+                "--strict-cpuset",
+                "--cpu-affinity-sample-seconds",
+                str(args.cpu_affinity_sample_seconds),
+            ]
 
         if args.runner_in_docker:
             generator_cmd.append("--include-runner")
@@ -2956,6 +3414,10 @@ def main() -> int:
         copy_if_exists(workers_internal_tmp, run_dir / "workers.txt")
         copy_if_exists(workers_host_tmp, run_dir / "workers.host.txt")
         copy_if_exists(layout_tmp, run_dir / "worker_layout.json")
+        layout_after_generate = json.loads((run_dir / "worker_layout.json").read_text(encoding="utf-8"))
+        generated_envelope = layout_after_generate.get("singleton_resource_envelope") or {}
+        args.background_cpuset = generated_envelope.get("background_cpuset", "")
+        args.background_cpuset_mask = generated_envelope.get("background_cpuset_mask", "")
         warn_if_neighbor_cache_tight(layout_tmp)
 
         try:
@@ -3044,6 +3506,27 @@ def main() -> int:
             args=args,
             compose_env=compose_env,
         )
+        args.strict_cpuset_satisfied = write_cpu_affinity_preflight(
+            root=root,
+            compose_file=compose_tmp,
+            run_dir=run_dir,
+            run_id=run_id,
+            args=args,
+            compose_env=compose_env,
+        )
+        if args.strict_cpuset:
+            update_resource_limits_cpuset_status(run_dir, args.strict_cpuset_satisfied)
+        write_singleton_resource_profile_sidecars(
+            run_dir=run_dir,
+            run_id=run_id,
+            layout_path=run_dir / "worker_layout.json",
+            targets=resource_targets,
+            args=args,
+        )
+        if args.strict_cpuset and not args.strict_cpuset_satisfied:
+            raise ResourceLimitVerificationError(
+                "strict cpuset preflight failed; see cpu_affinity_preflight.csv"
+            )
         if resource_targets and not args.no_resource_monitor:
             resource_monitor = ResourceMonitor(
                 root=root,
@@ -3301,6 +3784,7 @@ def main() -> int:
             outcome_class, evidence = classify_failure_from_resource_summary(run_dir)
             evidence["runner_exit_code"] = exit_code
             write_run_outcome(run_dir, outcome_class, evidence)
+            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=False)
             collect_failure_diagnostics(
                 root=root,
                 compose_file=compose_tmp,
@@ -3330,6 +3814,7 @@ def main() -> int:
 
         if not args.preflight_only:
             validate_artifacts(run_dir, args.worker_layout_mode)
+            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=True)
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 
