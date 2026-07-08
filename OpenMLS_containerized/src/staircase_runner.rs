@@ -989,7 +989,9 @@ pub fn measured_active_clients(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
 }
 
-fn spread_profile_enabled_singletons_in_idle(idle: VecDeque<WorkerSpec>) -> VecDeque<WorkerSpec> {
+fn frontload_profile_enabled_singletons_in_idle(
+    idle: VecDeque<WorkerSpec>,
+) -> VecDeque<WorkerSpec> {
     let mut external_devices = Vec::new();
     let mut profiled_singletons = Vec::new();
     let mut other_workers = Vec::new();
@@ -1004,48 +1006,11 @@ fn spread_profile_enabled_singletons_in_idle(idle: VecDeque<WorkerSpec>) -> VecD
         }
     }
 
-    if profiled_singletons.is_empty() || other_workers.is_empty() {
-        return external_devices
-            .into_iter()
-            .chain(profiled_singletons)
-            .chain(other_workers)
-            .collect();
-    }
-
-    let total_slots = profiled_singletons.len() + other_workers.len();
-    let mut profile_slot = vec![false; total_slots];
-    let mut previous_slot = 0usize;
-
-    for i in 0..profiled_singletons.len() {
-        let mut slot = ((i + 1) * total_slots) / (profiled_singletons.len() + 1);
-        if slot <= previous_slot && i > 0 {
-            slot = previous_slot + 1;
-        }
-        slot = slot.min(total_slots - 1);
-        while profile_slot[slot] && slot + 1 < total_slots {
-            slot += 1;
-        }
-        profile_slot[slot] = true;
-        previous_slot = slot;
-    }
-
-    let mut profiled_iter = profiled_singletons.into_iter();
-    let mut other_iter = other_workers.into_iter();
-    let mut spread = VecDeque::with_capacity(external_devices.len() + total_slots);
-
-    spread.extend(external_devices);
-    for is_profile_slot in profile_slot {
-        if is_profile_slot {
-            if let Some(worker) = profiled_iter.next() {
-                spread.push_back(worker);
-            }
-        } else if let Some(worker) = other_iter.next() {
-            spread.push_back(worker);
-        }
-    }
-    spread.extend(profiled_iter);
-    spread.extend(other_iter);
-    spread
+    external_devices
+        .into_iter()
+        .chain(profiled_singletons)
+        .chain(other_workers)
+        .collect()
 }
 
 pub fn physical_groups<'a>(
@@ -2021,9 +1986,9 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     let mut active = vec![leader.clone()];
     let mut idle: VecDeque<WorkerSpec> = config.workers.iter().skip(1).cloned().collect();
     if config.profile_only_singletons {
-        idle = spread_profile_enabled_singletons_in_idle(idle);
+        idle = frontload_profile_enabled_singletons_in_idle(idle);
         eprintln!(
-            "[sampling] spread profile-enabled singleton joiners across idle queue; packed clients remain unprofiled"
+            "[sampling] front-loaded profile-enabled singleton joiners for AddCommit coverage; packed clients remain unprofiled"
         );
     }
     if config.external_coverage_lane {
@@ -2035,6 +2000,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         MembershipBatchPlans::new(config.scenario_seed ^ ADD_BATCH_SEED_DOMAIN);
     let mut remove_membership_batches =
         MembershipBatchPlans::new(config.scenario_seed ^ REMOVE_BATCH_SEED_DOMAIN);
+    let mut profiled_add_actor_seen = HashSet::new();
 
     create_group(&http, &leader, &mut progress).await?;
     let active_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
@@ -2064,6 +2030,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             config.process_pending_fanout,
             config.external_coverage_lane,
             config.profile_only_singletons,
+            &mut profiled_add_actor_seen,
             config.max_commit_receive_samples_per_plateau,
             config.commit_receive_sampling_seed,
             &mut scenario_rng,
@@ -6093,6 +6060,7 @@ async fn transition_to_size(
     process_pending_fanout: bool,
     external_coverage_lane: bool,
     protect_profile_enabled_members: bool,
+    profiled_add_actor_seen: &mut HashSet<String>,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
@@ -6125,16 +6093,33 @@ async fn transition_to_size(
             .iter()
             .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
             .map(|pos| external_add_actor_ids.remove(pos));
-        let forced_actor_id = external_actor_id.clone().or_else(|| {
-            protect_profile_enabled_members
-                .then(|| {
-                    active
-                        .iter()
-                        .find(|worker| worker.profile_enabled)
-                        .map(|worker| worker.id.clone())
+        let profiled_actor_id = if protect_profile_enabled_members {
+            let mut unseen_profiled = active
+                .iter()
+                .filter(|worker| {
+                    worker.profile_enabled && !profiled_add_actor_seen.contains(&worker.id)
                 })
-                .flatten()
-        });
+                .map(|worker| worker.id.clone())
+                .collect::<Vec<_>>();
+            unseen_profiled.shuffle(rng);
+            unseen_profiled.pop().or_else(|| {
+                active
+                    .iter()
+                    .find(|worker| worker.profile_enabled)
+                    .map(|worker| worker.id.clone())
+            })
+        } else {
+            None
+        };
+        let forced_actor_id = external_actor_id.clone().or(profiled_actor_id);
+        if let Some(actor_id) = forced_actor_id.as_ref() {
+            if active
+                .iter()
+                .any(|worker| worker.id == *actor_id && worker.profile_enabled)
+            {
+                profiled_add_actor_seen.insert(actor_id.clone());
+            }
+        }
         let reserved_for_external = external_add_actor_ids
             .len()
             .min(max_allowed.saturating_sub(1));

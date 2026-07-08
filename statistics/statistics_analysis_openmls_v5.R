@@ -936,11 +936,12 @@ important_missingness <- function(df, fields = openmls_v5_required_fields) {
 check_required_metrics <- function(df) {
   plot_requirements <- openmls_v5_plot_requirements()
   purrr::map_dfr(plot_requirements, function(spec) {
+    required <- as.character(spec$required)
     tibble(
       plot_name = spec$name,
-      required_field = spec$required,
-      column_present = spec$required %in% names(df),
-      populated_rows = if (spec$required %in% names(df)) sum(!is_blank_vec(df[[spec$required]])) else 0L,
+      required_field = required,
+      column_present = required %in% names(df),
+      populated_rows = purrr::map_int(required, ~ if (.x %in% names(df)) sum(!is_blank_vec(df[[.x]])) else 0L),
       total_rows = nrow(df)
     )
   })

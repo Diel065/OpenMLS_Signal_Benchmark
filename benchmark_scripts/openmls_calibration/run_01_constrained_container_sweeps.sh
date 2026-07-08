@@ -14,6 +14,7 @@ SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
 PROTOCOL="${PROTOCOL:-openmls}"
+OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
 N="${N:-3}"
 SWEEP="${SWEEP:-both}"
@@ -48,6 +49,7 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01}"
+SIGNAL_RAM_SWEEP_VALUES="${SIGNAL_RAM_SWEEP_VALUES:-8m,16m,32m,64m,128m,256m,512m,1g,2g,3g}"
 CPU_THROTTLED_PERIOD_THRESHOLD="${CPU_THROTTLED_PERIOD_THRESHOLD:-0.05}"
 
 # Signal-specific defaults (smaller sizes, pairwise semantics)
@@ -90,6 +92,27 @@ cleanup_docker_signal() {
   done
   docker container ls -aq --filter "name=signal-" 2>/dev/null | xargs -r docker rm -f 2>/dev/null || true
   docker network ls -q --filter "name=signal-" 2>/dev/null | xargs -r docker network rm 2>/dev/null || true
+}
+
+output_dir_arg_for() {
+  local base_dir="$1"
+  if [ -n "$OUTPUT_ROOT" ]; then
+    python3 - "$OUTPUT_ROOT" "$base_dir" <<'PY'
+import os, sys
+print(os.path.relpath(sys.argv[1], sys.argv[2]))
+PY
+  else
+    printf '%s\n' benchmark_output
+  fi
+}
+
+run_dir_for() {
+  local base_dir="$1" run_id="$2"
+  if [ -n "$OUTPUT_ROOT" ]; then
+    printf '%s/%s\n' "$OUTPUT_ROOT" "$run_id"
+  else
+    printf '%s/benchmark_output/%s\n' "$base_dir" "$run_id"
+  fi
 }
 
 require_events_csv() {
@@ -141,7 +164,7 @@ run_sweep() {
   local sweep_type="$2"
   local label="$3"
   local run_id="cal01_${sweep_type}_i${iter}_${DATE_TAG}"
-  local run_dir="$OPENMLS_DIR/benchmark_output/$run_id"
+  local run_dir output_arg
   local scenario_seed singleton_selection_seed mode py
   local -a image_args validation_args
 
@@ -149,6 +172,8 @@ run_sweep() {
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   mode="$(affinity_mode)"
   py="$(python_bin)"
+  output_arg="$(output_dir_arg_for "$OPENMLS_DIR")"
+  run_dir="$(run_dir_for "$OPENMLS_DIR" "$run_id")"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
@@ -165,7 +190,7 @@ run_sweep() {
     --run-id "$run_id" \
     --scenario-seed "$scenario_seed" \
     --singleton-selection-seed "$singleton_selection_seed" \
-    --output-dir benchmark_output \
+    --output-dir "$output_arg" \
     --worker-layout-mode hybrid \
     --singleton-min-count "$SINGLETON_MIN_COUNT" \
     --singleton-fraction "$SINGLETON_FRACTION" \
@@ -214,12 +239,13 @@ run_signal_sweep() {
   local sweep_type="$2"
   local label="$3"
   local run_id="cal01_signal_${sweep_type}_i${iter}_${DATE_TAG}"
-  local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
-  local singleton_selection_seed py
+  local run_dir output_arg singleton_selection_seed py
   local -a image_args
 
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   py="$(python_bin_signal)"
+  output_arg="$(output_dir_arg_for "$SIGNAL_DIR")"
+  run_dir="$(run_dir_for "$SIGNAL_DIR" "$run_id")"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
@@ -234,13 +260,20 @@ run_signal_sweep() {
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
         --singleton-selection-seed "$singleton_selection_seed" \
-        --output-dir benchmark_output \
+        --output-dir "$output_arg" \
         --worker-layout-mode hybrid \
         --singleton-min-count "$SINGLETON_MIN_COUNT" \
         --singleton-fraction "$SINGLETON_FRACTION" \
         --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
         --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
         --bridge-count "$BRIDGE_COUNT" \
+        --resource-experiment cpu-quota-sweep \
+        --profiled-singleton-count "$PROFILED_SINGLETON_COUNT" \
+        --resource-failure-policy stop-on-profiled-failure \
+        --strict-cpuset \
+        --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
+        --embedded-docker-memory 4g \
+        --cpu-sweep-fractions "$CPU_SWEEP_FRACTIONS" \
         --health-timeout-seconds "$HEALTH_TIMEOUT" \
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
         --health-poll-seconds 0.5 \
@@ -256,6 +289,7 @@ run_signal_sweep() {
         --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
         --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
         --max-fanout-parallelism "$FANOUT_PARALLELISM" \
+        --min-fanout-parallelism "$FANOUT_MIN" \
         --force-cleanup-signal-ports \
         --runner-in-docker \
         "${image_args[@]}"
@@ -265,13 +299,20 @@ run_signal_sweep() {
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
         --singleton-selection-seed "$singleton_selection_seed" \
-        --output-dir benchmark_output \
+        --output-dir "$output_arg" \
         --worker-layout-mode hybrid \
         --singleton-min-count "$SINGLETON_MIN_COUNT" \
         --singleton-fraction "$SINGLETON_FRACTION" \
         --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
         --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
         --bridge-count "$BRIDGE_COUNT" \
+        --resource-experiment ram-docker-cgroup-sweep \
+        --profiled-singleton-count "$PROFILED_SINGLETON_COUNT" \
+        --resource-failure-policy stop-on-profiled-failure \
+        --strict-cpuset \
+        --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
+        --embedded-docker-memory 4g \
+        --ram-sweep-values "$SIGNAL_RAM_SWEEP_VALUES" \
         --health-timeout-seconds "$HEALTH_TIMEOUT" \
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
         --health-poll-seconds 0.5 \
@@ -287,6 +328,7 @@ run_signal_sweep() {
         --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \
         --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
         --max-fanout-parallelism "$FANOUT_PARALLELISM" \
+        --min-fanout-parallelism "$FANOUT_MIN" \
         --force-cleanup-signal-ports \
         --runner-in-docker \
         "${image_args[@]}"

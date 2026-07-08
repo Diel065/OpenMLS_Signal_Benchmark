@@ -333,8 +333,8 @@ def generate_parallel_ram_sweep_profiles(
     """
     if heap_budgets is None:
         heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
-    if len(heap_budgets) != 10:
-        raise ValueError(f"Parallel RAM sweep requires exactly 10 memory limits, got {len(heap_budgets)}")
+    if not heap_budgets:
+        raise ValueError("Parallel RAM sweep requires at least one memory limit")
 
     if not validate_memory_string(docker_memory_limit):
         raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")
@@ -352,6 +352,11 @@ def generate_parallel_ram_sweep_profiles(
         mbytes = parse_memory_to_bytes(mv)
         if mbytes <= 0:
             raise ValueError(f"Invalid docker-cgroup memory limit '{mv}'")
+        if mbytes < DOCKER_MIN_MEMORY_BYTES:
+            raise ValueError(
+                f"Docker memory limit '{mv}' is below the daemon minimum "
+                f"of 6 MiB ({DOCKER_MIN_MEMORY_BYTES} bytes)"
+            )
         if mbytes >= docker_memory_bytes:
             raise ValueError(
                 f"Docker memory limit '{mv}' must be below max control '{docker_memory_limit}'"
@@ -431,8 +436,8 @@ def generate_parallel_cpu_sweep_profiles(
     """
     if cpu_fractions is None:
         cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
-    if len(cpu_fractions) != 10:
-        raise ValueError(f"Parallel CPU sweep requires exactly 10 fractions, got {len(cpu_fractions)}")
+    if not cpu_fractions:
+        raise ValueError("Parallel CPU sweep requires at least one fraction")
 
     for fraction in cpu_fractions:
         if fraction < DOCKER_HARD_QUOTA_CPU_FLOOR:

@@ -312,6 +312,18 @@ def test_worker_compose_enables_perf_event_access():
     print("PASS: worker containers retain perf access with reversible L1D profiling disabled")
 
 
+def test_profiled_workers_pass_through_heap_tracking_env():
+    args = generate_compose.build_parser().parse_args(["--workers", "2"])
+    generate_compose.validate_args(args)
+    clients, physical_workers = build_legacy_layout(args)
+    compose = generate_compose.generate_compose_text(args, physical_workers)
+    worker_section = compose.split("  worker-00001:", 1)[1].split("\n  worker-", 1)[0]
+    assert "OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-}" in worker_section
+    assert "OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-}" in worker_section
+    assert "OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-}" in worker_section
+    print("PASS: profiled workers can opt into heap peak tracking via existing env vars")
+
+
 def main() -> int:
     tests = [
         test_layout_16_workers,
@@ -329,6 +341,7 @@ def main() -> int:
         test_disable_container_profiling_marks_container_workers_unprofiled,
         test_resource_limits_apply_to_singletons_only,
         test_worker_compose_enables_perf_event_access,
+        test_profiled_workers_pass_through_heap_tracking_env,
     ]
 
     passed = 0

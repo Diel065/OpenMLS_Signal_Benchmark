@@ -1207,6 +1207,18 @@ pub struct ProfileEvent {
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
 
+    pub memory_model: Option<String>,
+    pub app_heap_budget: Option<String>,
+    pub app_heap_budget_bytes: Option<u64>,
+    pub heap_current_live_bytes: Option<u64>,
+    pub heap_peak_live_bytes: Option<u64>,
+    pub heap_operation_peak_live_bytes: Option<u64>,
+    pub heap_total_allocated_bytes: Option<u64>,
+    pub heap_allocation_count: Option<u64>,
+    pub heap_deallocation_count: Option<u64>,
+    pub heap_failed_allocation_size_bytes: Option<u64>,
+    pub heap_failure_context: Option<String>,
+
     pub artifact_size_bytes: Option<usize>,
     pub welcome_bytes: Option<usize>,
     pub ratchet_tree_bytes: Option<usize>,
@@ -1888,6 +1900,18 @@ impl ProfileScope {
             ram_rss_delta_bytes,
             ram_rss_utilization,
 
+            memory_model: None,
+            app_heap_budget: None,
+            app_heap_budget_bytes: None,
+            heap_current_live_bytes: None,
+            heap_peak_live_bytes: None,
+            heap_operation_peak_live_bytes: None,
+            heap_total_allocated_bytes: None,
+            heap_allocation_count: None,
+            heap_deallocation_count: None,
+            heap_failed_allocation_size_bytes: None,
+            heap_failure_context: None,
+
             artifact_size_bytes: None,
             welcome_bytes: None,
             ratchet_tree_bytes: None,
@@ -2023,6 +2047,23 @@ impl ProfileScope {
             membership_batch_transition_cap: None,
             membership_batch_source: None,
         };
+
+        if allocation_counter::embedded_heap_budget::enabled() {
+            let snapshot = allocation_counter::embedded_heap_budget::snapshot();
+            event.memory_model = env_or_none("OPENMLS_MEMORY_MODEL");
+            event.app_heap_budget = env_or_none("OPENMLS_APP_HEAP_BUDGET");
+            event.app_heap_budget_bytes = Some(snapshot.configured_heap_budget_bytes);
+            event.heap_current_live_bytes = Some(snapshot.current_live_heap_bytes);
+            event.heap_peak_live_bytes = Some(snapshot.peak_live_heap_bytes);
+            event.heap_operation_peak_live_bytes = Some(snapshot.operation_peak_live_heap_bytes);
+            event.heap_total_allocated_bytes = Some(snapshot.total_allocated_bytes);
+            event.heap_allocation_count = Some(snapshot.allocation_count);
+            event.heap_deallocation_count = Some(snapshot.deallocation_count);
+            if snapshot.budget_exceeded {
+                event.heap_failed_allocation_size_bytes = snapshot.failed_allocation_size_bytes;
+                event.heap_failure_context = Some(snapshot.failure_context.as_str().to_string());
+            }
+        }
 
         COMMIT_RECEIVE_CONTEXT.with(|slot| {
             if let Some(ctx) = slot.borrow().as_ref() {

@@ -954,6 +954,7 @@ async fn receive_message_delivery(
     phase: Option<&str>,
     profile_path: Option<&PathBuf>,
 ) -> Result<CommandOutcome> {
+    let total_start = Instant::now();
     let io_start = Instant::now();
     let delivery = relay_get_pending_message(relay_url, &participant.name).await?;
     let io_wall = io_start.elapsed().as_nanos();
@@ -1022,15 +1023,33 @@ async fn receive_message_delivery(
         }
     };
 
+    let decrypt_start = Instant::now();
     let (decrypt_result, mut profile_metrics) = if profile {
         measure_profile(|| participant.decrypt_message(&sender_address, &ciphertext, phase))
     } else {
         let result = participant.decrypt_message(&sender_address, &ciphertext, phase);
         (result, CommandMetrics::default())
     };
+    let decrypt_wall = decrypt_start.elapsed().as_nanos();
 
     match decrypt_result {
         Ok(plaintext) => {
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_receive.message_decrypt",
+                    "message_recovery",
+                    "signal_application_message_receive.message_decrypt",
+                    "protocol_core",
+                    "protocol_core",
+                    &participant.name,
+                    decrypt_wall,
+                    profile_metrics.cpu_thread_ns,
+                    profile_metrics.alloc_bytes,
+                    profile_metrics.alloc_count,
+                    true,
+                ),
+            );
             let io_start = Instant::now();
             relay_ack_message(relay_url, &participant.name, &delivery.id).await?;
             let io_wall = io_start.elapsed().as_nanos();
@@ -1057,6 +1076,22 @@ async fn receive_message_delivery(
             profile_metrics.session_count = Some(1);
             profile_metrics.ciphertext_bytes = Some(message_bytes.len());
             profile_metrics.plaintext_bytes = Some(plaintext_len);
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_receive.total",
+                    "message_recovery",
+                    "signal_application_message_receive.total",
+                    "benchmark_wrapper",
+                    "protocol_operation",
+                    &participant.name,
+                    total_start.elapsed().as_nanos(),
+                    profile_metrics.cpu_thread_ns,
+                    profile_metrics.alloc_bytes,
+                    profile_metrics.alloc_count,
+                    true,
+                ),
+            );
             Ok(CommandOutcome::new(
                 format!(
                     "pairwise message received: {}; message_id={} conversation={} sender={}",
@@ -1505,15 +1540,50 @@ pub async fn handle_command(
                     identity_key,
                 )?;
 
+                let total_start = Instant::now();
+                let core_start = Instant::now();
                 let (result, establish_metrics) = measure_profile(|| {
                     participant.establish_session_from_bundle(&peer_address, &bundle, phase)
                 });
+                let core_wall = core_start.elapsed().as_nanos();
                 result?;
+                write_subspan_event(
+                    profile_path,
+                    &make_subspan_event(
+                        "signal_session_establish.process_prekey_bundle",
+                        "session_establishment",
+                        "signal_session_establish.process_prekey_bundle",
+                        "protocol_core",
+                        "protocol_core",
+                        &participant.name,
+                        core_wall,
+                        establish_metrics.cpu_thread_ns,
+                        establish_metrics.alloc_bytes,
+                        establish_metrics.alloc_count,
+                        true,
+                    ),
+                );
                 profile_metrics.merge_profile(&establish_metrics);
                 let consume_path = format!("/prekey-bundle/{}/consume", peer);
                 kr_post_empty(kr_url, &consume_path, "consume_prekey", &participant.name)
                     .await
                     .ok();
+                write_subspan_event(
+                    profile_path,
+                    &make_subspan_event(
+                        "signal_session_establish.total",
+                        "session_establishment",
+                        "signal_session_establish.total",
+                        "benchmark_wrapper",
+                        "protocol_operation",
+                        &participant.name,
+                        total_start.elapsed().as_nanos(),
+                        establish_metrics.cpu_thread_ns,
+                        establish_metrics.alloc_bytes,
+                        establish_metrics.alloc_count,
+                        true,
+                    ),
+                );
                 established += 1;
             }
 
@@ -1545,17 +1615,36 @@ pub async fn handle_command(
             let conversation_size = conversation_size.unwrap_or(2);
             let plaintext = message.into_bytes();
             let plaintext_bytes = plaintext.len();
+            let total_start = Instant::now();
             let recipient_address = libsignal_core::ProtocolAddress::new(
                 recipient.clone(),
                 DeviceId::new(1).expect("valid device id"),
             );
 
+            let core_start = Instant::now();
             let (ciphertext, mut profile_metrics) = measure_profile(|| {
                 participant.encrypt_message(&recipient_address, &plaintext, phase)
             });
+            let core_wall = core_start.elapsed().as_nanos();
             let ciphertext = ciphertext?;
             let ciphertext_bytes = ciphertext.serialize().to_vec();
             let ciphertext_len = ciphertext_bytes.len();
+            write_subspan_event(
+                profile_path,
+                &make_subspan_event(
+                    "signal_application_message_create.ratchet_encrypt_payload",
+                    "message_protection",
+                    "signal_application_message_create.ratchet_encrypt_payload",
+                    "protocol_core",
+                    "protocol_core",
+                    &participant.name,
+                    core_wall,
+                    profile_metrics.cpu_thread_ns,
+                    profile_metrics.alloc_bytes,
+                    profile_metrics.alloc_count,
+                    true,
+                ),
+            );
 
             let conversation_id = format!("conversation-{}", participant.name);
             let io_start = Instant::now();
@@ -1593,6 +1682,22 @@ pub async fn handle_command(
                     profile_metrics.session_count = Some(1);
                     profile_metrics.ciphertext_bytes = Some(ciphertext_len);
                     profile_metrics.plaintext_bytes = Some(plaintext_bytes);
+                    write_subspan_event(
+                        profile_path,
+                        &make_subspan_event(
+                            "signal_application_message_create.total",
+                            "message_protection",
+                            "signal_application_message_create.total",
+                            "benchmark_wrapper",
+                            "protocol_operation",
+                            &participant.name,
+                            total_start.elapsed().as_nanos(),
+                            profile_metrics.cpu_thread_ns,
+                            profile_metrics.alloc_bytes,
+                            profile_metrics.alloc_count,
+                            true,
+                        ),
+                    );
                     profile_metrics
                 },
             ))

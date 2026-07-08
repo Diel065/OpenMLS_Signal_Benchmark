@@ -1069,7 +1069,7 @@ def generate_compose_text(
     lines.append("services:")
 
     bg_cpuset = None
-    if affinity_plan and resource_experiment != "none":
+    if affinity_plan:
         bg_cpus = affinity_plan.get("background_cpus", [])
         if bg_cpus:
             bg_cpuset = ",".join(str(c) for c in sorted(bg_cpus))
@@ -1114,12 +1114,13 @@ def generate_compose_text(
         lines.append("    <<: *worker-common")
         affinity_result = {}
         if pw.container_mode == "singleton":
-            if resource_experiment != "none" and affinity_plan:
+            if affinity_plan:
                 affinity_result = apply_affinity_to_compose(
                     lines, pw.physical_worker_id, pw.container_mode,
-                    affinity_plan, resource_profiles, singleton_idx, args,
+                    affinity_plan,
+                    resource_profiles if resource_experiment != "none" else None,
+                    singleton_idx, args,
                 ) or {}
-                singleton_idx += 1
                 if affinity_result:
                     for key in ("resource_limit_cpus", "resource_limit_memory",
                                 "resource_limit_memory_bytes",
@@ -1133,6 +1134,8 @@ def generate_compose_text(
                                 "resource_profile_index"):
                         if key in affinity_result:
                             pw.resource_limits[key] = affinity_result[key]
+                if resource_experiment != "none":
+                    singleton_idx += 1
             elif resource_experiment != "none" and resource_profiles and singleton_idx < len(resource_profiles):
                 rp = resource_profiles[singleton_idx]
                 if rp.get("cpu_quota_us") is not None and rp.get("cpu_period_us") is not None and rp.get("cpu_period_us") != 100000:
@@ -1199,19 +1202,28 @@ def generate_compose_text(
         if affinity_result.get("rayon_num_threads"):
             lines.append(f'      RAYON_NUM_THREADS: "{affinity_result["rayon_num_threads"]}"')
 
-        if affinity_result.get("memory_model"):
-            lines.append(f'      OPENMLS_MEMORY_MODEL: "{affinity_result["memory_model"]}"')
-        if affinity_result.get("docker_memory_limit"):
-            lines.append(f'      OPENMLS_DOCKER_MEMORY_LIMIT: "{affinity_result["docker_memory_limit"]}"')
-        if affinity_result.get("app_heap_budget"):
-            lines.append(f'      OPENMLS_APP_HEAP_BUDGET: "{affinity_result["app_heap_budget"]}"')
-        if affinity_result.get("app_heap_budget_bytes"):
-            lines.append(f'      OPENMLS_APP_HEAP_BUDGET_BYTES: "{affinity_result["app_heap_budget_bytes"]}"')
-        if affinity_result.get("resource_profile_id"):
-            lines.append(f'      OPENMLS_RESOURCE_PROFILE_ID: "{affinity_result["resource_profile_id"]}"')
-        resource_profile_index = affinity_result.get("resource_profile_index")
+        heap_env = affinity_result if affinity_result.get("memory_model") else pw.resource_limits
+        if heap_env.get("memory_model"):
+            lines.append(f'      OPENMLS_MEMORY_MODEL: "{heap_env["memory_model"]}"')
+        elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
+            lines.append('      OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-}')
+        if heap_env.get("docker_memory_limit"):
+            lines.append(f'      OPENMLS_DOCKER_MEMORY_LIMIT: "{heap_env["docker_memory_limit"]}"')
+        elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
+            lines.append('      OPENMLS_DOCKER_MEMORY_LIMIT: ${OPENMLS_DOCKER_MEMORY_LIMIT:-}')
+        if heap_env.get("app_heap_budget"):
+            lines.append(f'      OPENMLS_APP_HEAP_BUDGET: "{heap_env["app_heap_budget"]}"')
+        elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
+            lines.append('      OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-}')
+        if heap_env.get("app_heap_budget_bytes"):
+            lines.append(f'      OPENMLS_APP_HEAP_BUDGET_BYTES: "{heap_env["app_heap_budget_bytes"]}"')
+        elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
+            lines.append('      OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-}')
+        if heap_env.get("resource_profile_id"):
+            lines.append(f'      OPENMLS_RESOURCE_PROFILE_ID: "{heap_env["resource_profile_id"]}"')
+        resource_profile_index = heap_env.get("resource_profile_index")
         if resource_profile_index is not None and resource_profile_index != "":
-            lines.append(f'      OPENMLS_RESOURCE_PROFILE_INDEX: "{affinity_result["resource_profile_index"]}"')
+            lines.append(f'      OPENMLS_RESOURCE_PROFILE_INDEX: "{resource_profile_index}"')
 
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
             profile_csv = ",".join(pw.profile_enabled_client_ids)

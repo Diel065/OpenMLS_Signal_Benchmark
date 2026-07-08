@@ -194,13 +194,14 @@ openmls_v8_validate_contract <- function(data) {
   # The l1d_status diagnostic table reports exact coverage per span and platform.
   process_l1_scope <- data |> filter(.data$op %in% c(total_op, "commit_add.path_hpke_encrypt"))
   if (nrow(process_l1_scope) > 0 && any(
-    process_l1_scope$l1d_measurement_scope != "process_threads_at_span_start"
+    process_l1_scope$l1d_measurement_scope != "process_threads_at_span_start",
+    na.rm = TRUE
   )) {
     errors <- c(errors, "invalid_process_L1D_scope")
   }
 
   process_alloc <- data |> filter(.data$op %in% c(total_op, "commit_add.path_hpke_encrypt"))
-  if (nrow(process_alloc) > 0 && any(process_alloc$alloc_measurement_scope != "process_all_threads")) {
+  if (nrow(process_alloc) > 0 && any(process_alloc$alloc_measurement_scope != "process_all_threads", na.rm = TRUE)) {
     errors <- c(errors, "invalid_process_allocation_scope")
   }
 
@@ -230,7 +231,8 @@ openmls_v8_validate_contract <- function(data) {
     !tree_included |
       group_info$ratchet_tree_delivery_mode != "welcome_extension" |
       !is.finite(group_info$ratchet_tree_bytes) | group_info$ratchet_tree_bytes <= 0 |
-      !is.finite(group_info$group_info_plaintext_bytes) | group_info$group_info_plaintext_bytes <= 0
+      !is.finite(group_info$group_info_plaintext_bytes) | group_info$group_info_plaintext_bytes <= 0,
+    na.rm = TRUE
   )) {
     errors <- c(errors, "invalid_group_info_tree_artifact")
   }
@@ -238,7 +240,8 @@ openmls_v8_validate_contract <- function(data) {
   aead <- data |> filter(.data$op == "commit_add.group_info.aead_encrypt")
   if (nrow(aead) > 0 && any(
     aead$group_info_ciphertext_bytes != aead$encrypted_group_info_bytes |
-      aead$group_info_ciphertext_bytes <= aead$group_info_plaintext_bytes
+      aead$group_info_ciphertext_bytes <= aead$group_info_plaintext_bytes,
+    na.rm = TRUE
   )) {
     errors <- c(errors, "invalid_group_info_AEAD_sizes")
   }
@@ -246,13 +249,14 @@ openmls_v8_validate_contract <- function(data) {
   welcome <- data |> filter(.data$op == "commit_add.welcome_group_secrets_encrypt")
   if (nrow(welcome) > 0 && any(
     welcome$welcome_recipient_count != welcome$added_members_count |
-      welcome$hpke_encrypt_count != welcome$added_members_count
+      welcome$hpke_encrypt_count != welcome$added_members_count,
+    na.rm = TRUE
   )) {
     errors <- c(errors, "invalid_welcome_HPKE_counts")
   }
 
   path <- data |> filter(.data$op == "commit_add.path_hpke_encrypt")
-  if (nrow(path) > 0 && any(path$hpke_encrypt_count != path$sum_copath_resolution_sizes)) {
+  if (nrow(path) > 0 && any(path$hpke_encrypt_count != path$sum_copath_resolution_sizes, na.rm = TRUE)) {
     errors <- c(errors, "invalid_path_HPKE_counts")
   }
 
@@ -1767,6 +1771,7 @@ run_openmls_v8_welcome_receive_analysis <- function(
 
       if (nrow(totals) > 0) {
         for (xvar in c("member_count_after", "welcome_bytes")) {
+          if (!xvar %in% names(totals)) next
           tr <- totals |> mutate(xv = suppressWarnings(as.numeric(.data[[xvar]]))) |>
             filter(is.finite(.data$xv))
           s <- tr |> group_by(.data$platform_label, xv = .data$xv) |>
@@ -1800,6 +1805,7 @@ run_openmls_v8_welcome_receive_analysis <- function(
         list(span = "join_from_welcome.ratchet_tree_parse_and_validate", x = "ratchet_tree_bytes", xlab = "ratchet_tree_bytes", disc = FALSE),
         list(span = "join_from_welcome.group_state_build", x = "member_count_before", xlab = "group size (N)", disc = TRUE)
       )) {
+        if (!so$x %in% names(data)) next
         sr <- data |> filter(.data$op == so$span) |>
           mutate(mv = suppressWarnings(as.numeric(.data[[m$column]])) / 1e6,
                  xv = suppressWarnings(as.numeric(.data[[so$x]]))) |>

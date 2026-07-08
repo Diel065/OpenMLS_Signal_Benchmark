@@ -464,7 +464,7 @@ fn signal_event_context(
             phase: None,
         },
         Command::ProcessPending { .. } => SignalEventContext {
-            measurement_class: "wrapper",
+            measurement_class: "driver_helper",
             event_family: "message_recovery_helper",
             event_subtype: "relay_drain_wrapper",
             event_side: Some("receive"),
@@ -488,9 +488,9 @@ fn signal_event_context(
             phase: None,
         },
         Command::RemoveParticipants { participants } => SignalEventContext {
-            measurement_class: "wrapper",
+            measurement_class: "control_lifecycle",
             event_family: "participant_lifecycle",
-            event_subtype: "participant_remove_lifecycle",
+            event_subtype: "signal_participant_remove_local",
             event_side: Some("local"),
             direction: None,
             role: Some("notifier"),
