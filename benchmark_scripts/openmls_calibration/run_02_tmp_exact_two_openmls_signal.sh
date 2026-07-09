@@ -10,8 +10,8 @@ OPENMLS_DIR="$REPO_ROOT/OpenMLS_containerized"
 SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/tmp}"
-if [ "$OUTPUT_ROOT" != "/tmp" ]; then
-  echo "ERROR: this temporary script is pinned to output root /tmp; got OUTPUT_ROOT=$OUTPUT_ROOT" >&2
+if [ "$OUTPUT_ROOT" != "/tmp" ] && [ "$OUTPUT_ROOT" != "/dev/shm" ]; then
+  echo "ERROR: this temporary script is pinned to output root /tmp or /dev/shm; got OUTPUT_ROOT=$OUTPUT_ROOT" >&2
   exit 2
 fi
 
