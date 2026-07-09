@@ -9,14 +9,6 @@ import random
 import re
 from pathlib import Path
 
-from cpu_affinity_planner import (
-    create_affinity_plan,
-    get_background_cpuset,
-    get_profiled_cpuset,
-    validate_affinity_plan,
-    write_affinity_plan_json,
-)
-
 
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
@@ -31,6 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
     p.add_argument("--run-id", default="compose-generated-001", help="Default run id baked into the compose env")
     p.add_argument("--scenario", default="http-staircase-compose", help="Default scenario label baked into the compose env")
+    p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed baked into the profile env")
     p.add_argument("--output-dir", default="benchmark_output", help="Host results directory")
     p.add_argument("--compose-out", default="docker-compose.generated.yml", help="Generated compose file path")
     p.add_argument("--workers-out", default="workers.txt", help="Generated internal worker list path")
@@ -155,15 +148,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="Application heap budget for profiled singleton workers, e.g. 512k or 8m.",
     )
     p.add_argument(
-        "--strict-cpuset",
-        action="store_true",
-        help="Assign non-overlapping Docker cpusets to profiled singleton workers.",
-    )
-    p.add_argument(
-        "--cpu-affinity-sample-seconds",
-        type=float,
-        default=20.0,
-        help="Seconds to sample per-CPU load before strict cpuset assignment.",
+        "--affinity-plan-file",
+        default=None,
+        help="Path to a pre-computed cpu_affinity_plan.json file for this run",
     )
     p.add_argument(
         "--resource-profiles-file",
@@ -313,9 +300,6 @@ def normalize_resource_args(args: argparse.Namespace) -> None:
         args.singleton_app_heap_budget_bytes = parse_memory_bytes(args.singleton_app_heap_budget)
     else:
         args.singleton_app_heap_budget_bytes = None
-    if args.cpu_affinity_sample_seconds < 0:
-        raise SystemExit("--cpu-affinity-sample-seconds must be >= 0")
-
 
 def resource_profile_for(args: argparse.Namespace) -> str:
     parts = []
@@ -334,7 +318,7 @@ def resource_profile_for(args: argparse.Namespace) -> str:
         parts.append(f"pids-{singleton_pids_limit}")
     if singleton_app_heap_budget is not None:
         parts.append(f"appheap-{singleton_app_heap_budget}")
-    if getattr(args, "strict_cpuset", False):
+    if getattr(args, "affinity_plan_file", None):
         parts.append("strict-cpuset")
     if not parts:
         return ""
@@ -647,76 +631,48 @@ def build_legacy_layout(
     return clients, physical_workers
 
 
-def apply_strict_cpuset_plan(
+def load_and_apply_affinity_plan(
     args: argparse.Namespace,
     physical_workers: list[PhysicalWorkerEntry],
 ) -> None:
-    args.strict_cpuset_satisfied = False
     args.background_cpuset = ""
     args.background_cpuset_mask = ""
-    if not args.strict_cpuset:
+    args.strict_cpuset_satisfied = False
+    plan_file = getattr(args, "affinity_plan_file", None)
+    if not plan_file:
         return
 
-    profiled_specs = []
-    background_specs = [
-        {"container_name": "kr", "container_role": "infrastructure"},
-        {"container_name": "relay", "container_role": "infrastructure"},
-    ]
-    if args.include_runner:
-        background_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
-    if args.include_netcheck:
-        background_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
+    try:
+        with open(plan_file) as f:
+            plan = json.load(f)
+    except Exception as e:
+        print(f"[affinity] Could not load affinity plan from {plan_file}: {e}", flush=True)
+        return
 
-    for worker in physical_workers:
-        if worker.container_mode == "singleton" and worker.profile_enabled_client_ids:
-            profiled_specs.append({
-                "worker_id": worker.physical_worker_id,
-                "container_name": worker.physical_worker_id,
-                "logical_client_id": worker.profile_enabled_client_ids[0],
-                "experiment_kind": "singleton_resource_envelope",
-                "resource_profile_id": worker.resource_limits.get("resource_profile", ""),
-                "rayon_num_threads": 1,
-            })
-        else:
-            background_specs.append({
-                "container_name": worker.physical_worker_id,
-                "container_role": worker.container_mode,
-            })
+    from cpu_mask_util import cpu_list_to_docker_cpuset
+    bg_cpus = plan.get("background_cpus", [])
+    if bg_cpus:
+        args.background_cpuset = cpu_list_to_docker_cpuset(bg_cpus)
+        args.background_cpuset_mask = plan.get("background_mask_hex", "")
 
-    plan = create_affinity_plan(
-        run_id=args.run_id,
-        profiled_worker_specs=profiled_specs,
-        background_specs=background_specs,
-        cpu_affinity_mode="profiled-nor-background",
-        sample_seconds=args.cpu_affinity_sample_seconds,
-    )
-    errors = validate_affinity_plan(plan)
-    if errors:
-        raise SystemExit("Invalid CPU affinity plan: " + "; ".join(errors))
+    pa_map = {a["container_name"]: a for a in plan.get("profiled_assignments", [])}
+    ba_map = {a["container_name"]: a for a in plan.get("background_assignments", [])}
 
-    run_dir = Path(args.output_dir)
-    if not run_dir.is_absolute():
-        run_dir = Path.cwd() / run_dir
-    run_dir = run_dir / args.run_id
-    write_affinity_plan_json(plan, str(run_dir))
-    args.background_cpuset = get_background_cpuset(plan)
-    args.background_cpuset_mask = plan.background_mask_hex
+    for pw in physical_workers:
+        wid = pw.physical_worker_id
+        if wid in pa_map:
+            cpus = pa_map[wid].get("assigned_cpus", [])
+            cpuset = cpu_list_to_docker_cpuset(cpus) if cpus else ""
+            pw.resource_limits["resource_limit_cpuset"] = cpuset
+            pw.resource_limits["resource_limit_cpuset_mask"] = pa_map[wid].get("assigned_mask_hex", "")
+            pw.resource_limits["strict_cpuset_satisfied"] = True
+        elif args.background_cpuset:
+            pw.resource_limits["resource_limit_cpuset"] = args.background_cpuset
+            pw.resource_limits["resource_limit_cpuset_mask"] = args.background_cpuset_mask
+            pw.resource_limits["strict_cpuset_satisfied"] = True
+
     args.strict_cpuset_satisfied = True
-
-    for worker in physical_workers:
-        if worker.container_mode == "singleton" and worker.profile_enabled_client_ids:
-            cpuset = get_profiled_cpuset(plan, worker.physical_worker_id)
-            assignment = next(
-                (a for a in plan.profiled_assignments if a.worker_id == worker.physical_worker_id),
-                None,
-            )
-            worker.resource_limits["resource_limit_cpuset"] = cpuset
-            worker.resource_limits["resource_limit_cpuset_mask"] = assignment.assigned_mask_hex if assignment else ""
-            worker.resource_limits["strict_cpuset_satisfied"] = True
-        else:
-            worker.resource_limits["resource_limit_cpuset"] = args.background_cpuset
-            worker.resource_limits["resource_limit_cpuset_mask"] = args.background_cpuset_mask
-            worker.resource_limits["strict_cpuset_satisfied"] = True
+    print(f"[affinity] Loaded affinity plan with {len(plan.get('profiled_assignments', []))} profiled assignments", flush=True)
 
 
 def generate_worker_layout_json(
@@ -763,7 +719,7 @@ def generate_worker_layout_json(
             "pids_limit": singleton_limits["resource_limit_pids"],
             "app_heap_budget": singleton_limits["app_heap_budget"],
             "app_heap_budget_bytes": singleton_limits["app_heap_budget_bytes"],
-            "strict_cpuset": getattr(args, "strict_cpuset", False),
+            "strict_cpuset": bool(getattr(args, "affinity_plan_file", None)),
             "background_cpuset": getattr(args, "background_cpuset", ""),
             "background_cpuset_mask": getattr(args, "background_cpuset_mask", ""),
             "resource_profile": singleton_limits["resource_profile"],
@@ -1008,7 +964,7 @@ def generate_compose_text(
     lines.append("  environment:")
     lines.append(f"    SIGNAL_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    SIGNAL_PROFILE_SCENARIO: {args.scenario}")
-    lines.append(f"    SIGNAL_PROFILE_SCENARIO_SEED: {args.singleton_selection_seed}")
+    lines.append(f"    SIGNAL_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
     lines.append("    SIGNAL_DEBUG_LOGS: ${SIGNAL_DEBUG_LOGS:-}")
     lines.append("    SIGNAL_WORKER_DEBUG_IDS: ${SIGNAL_WORKER_DEBUG_IDS:-}")
     lines.append("    SIGNAL_WORKER_COMMAND_QUEUE_CAPACITY: ${SIGNAL_WORKER_COMMAND_QUEUE_CAPACITY:-}")
@@ -1111,7 +1067,7 @@ def generate_compose_text(
         lines.append("    environment:")
         lines.append(f"      SIGNAL_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      SIGNAL_PROFILE_SCENARIO: {args.scenario}")
-        lines.append(f"      SIGNAL_PROFILE_SCENARIO_SEED: {args.singleton_selection_seed}")
+        lines.append(f"      SIGNAL_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
 
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
             profile_csv = ",".join(pw.profile_enabled_client_ids)
@@ -1309,7 +1265,7 @@ def main() -> None:
         }
 
     apply_resource_profiles(physical_workers, getattr(args, "resource_profiles", []))
-    apply_strict_cpuset_plan(args, physical_workers)
+    load_and_apply_affinity_plan(args, physical_workers)
 
     layout_json = generate_worker_layout_json(args, clients, physical_workers)
     write_text(layout_out, json.dumps(layout_json, indent=2) + "\n")

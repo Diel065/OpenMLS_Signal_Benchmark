@@ -330,9 +330,9 @@ pub fn make_subspan_event(
         app_heap_budget: env_nonempty("SIGNAL_APP_HEAP_BUDGET"),
         app_heap_budget_bytes: env_nonempty("SIGNAL_APP_HEAP_BUDGET_BYTES")
             .and_then(|v| v.parse().ok()),
-        app_heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+        heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
             .then_some(heap_snapshot.current_live_heap_bytes),
-        app_heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
+        heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
             .then_some(heap_snapshot.peak_live_heap_bytes),
         resource_profile_id: env_nonempty("SIGNAL_RESOURCE_PROFILE_ID"),
         resource_profile_index: env_nonempty("SIGNAL_RESOURCE_PROFILE_INDEX")

@@ -567,7 +567,7 @@ async fn participant_command_actor(
             &participant_id,
             envelope.phase.as_deref(),
         );
-        let heap_budget_guard = if slot.profile_enabled && embedded_heap_budget.enabled {
+        let heap_budget_guard = if slot.profile_enabled {
             let operation_family = operation_family_for_command(command_name);
             Some(begin_heap_budget_operation(OperationAttribution {
                 operation_family: operation_family.clone(),
@@ -673,6 +673,7 @@ async fn participant_command_actor(
                     cpu_throttled_time_ratio: cpu_throttled,
                     alloc_bytes: metrics.alloc_bytes,
                     alloc_count: metrics.alloc_count,
+                    alloc_measurement_scope: Some("current_thread".to_string()),
                     l1d_cache_accesses: metrics.l1d_cache_accesses,
                     l1d_cache_misses: metrics.l1d_cache_misses,
                     ram_rss_delta_bytes: None,
@@ -754,10 +755,14 @@ async fn participant_command_actor(
                     app_heap_budget: env_nonempty("SIGNAL_APP_HEAP_BUDGET"),
                     app_heap_budget_bytes: env_nonempty("SIGNAL_APP_HEAP_BUDGET_BYTES")
                         .and_then(|v| v.parse().ok()),
-                    app_heap_current_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
-                        .then_some(heap_snapshot.current_live_heap_bytes),
-                    app_heap_peak_live_bytes: (heap_snapshot.configured_heap_budget_bytes > 0)
-                        .then_some(heap_snapshot.peak_live_heap_bytes),
+                    heap_current_live_bytes: Some(heap_snapshot.current_live_heap_bytes),
+                    heap_peak_live_bytes: Some(heap_snapshot.peak_live_heap_bytes),
+                    heap_operation_peak_live_bytes: Some(heap_snapshot.operation_peak_live_heap_bytes),
+                    heap_total_allocated_bytes: Some(heap_snapshot.total_allocated_bytes),
+                    heap_allocation_count: Some(heap_snapshot.allocation_count),
+                    heap_deallocation_count: Some(heap_snapshot.deallocation_count),
+                    heap_failed_allocation_size_bytes: heap_snapshot.failed_allocation_size_bytes,
+                    heap_failure_context: Some(heap_snapshot.failure_context.as_str().to_string()),
                     failure_operation: (response.status != "ok")
                         .then(|| operation_family_for_command(command_name)),
                     failure_phase: (response.status != "ok").then(|| phase.to_string()),

@@ -53,6 +53,7 @@ class FakeArgs:
         self.include_netcheck = False
         self.run_id = "test-run"
         self.scenario = "test-scenario"
+        self.scenario_seed = 1
         self.output_dir = "benchmark_output"
         self.singleton_cpus = None
         self.singleton_cpus_float = None

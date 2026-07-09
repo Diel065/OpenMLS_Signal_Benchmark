@@ -1,17 +1,68 @@
-"""CPU affinity planner compatible with the OpenMLS sidecar schema."""
+"""
+CPU affinity planner.
 
-from __future__ import annotations
+Implements the full CPU affinity planning pipeline:
+  1. Detect online CPUs and topology
+  2. Sample per-CPU load
+  3. Select least-loaded CPUs for profiled workers
+  4. Compute profiled/background masks
+  5. Write cpu_affinity_plan.json
+"""
 
 import json
 import os
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
+
+try:
+    from .cpu_mask_util import (
+        cpu_list_to_mask,
+        cpu_list_to_docker_cpuset,
+        mask_to_hex,
+        mask_to_cpu_list,
+        masks_overlap,
+        complement_mask,
+        union_masks,
+        mask_popcount,
+        ensure_non_overlapping,
+    )
+    from .cpu_topology import (
+        CpuTopology,
+        detect_cpu_topology,
+        get_online_cpu_list,
+        sample_cpu_load,
+        select_least_loaded_cpus,
+        get_smt_siblings,
+        topology_to_dict,
+    )
+except ImportError:
+    from cpu_mask_util import (
+        cpu_list_to_mask,
+        cpu_list_to_docker_cpuset,
+        mask_to_hex,
+        mask_to_cpu_list,
+        masks_overlap,
+        complement_mask,
+        union_masks,
+        mask_popcount,
+        ensure_non_overlapping,
+    )
+    from cpu_topology import (
+        CpuTopology,
+        detect_cpu_topology,
+        get_online_cpu_list,
+        sample_cpu_load,
+        select_least_loaded_cpus,
+        get_smt_siblings,
+        topology_to_dict,
+    )
 
 
 @dataclass
 class ProfiledAssignment:
+    """Assignment of a profiled singleton to specific CPUs."""
     worker_id: str
     container_name: str
     logical_client_id: str
@@ -25,20 +76,22 @@ class ProfiledAssignment:
 
 @dataclass
 class BackgroundAssignment:
+    """Assignment of a background container to the background mask."""
     container_name: str
-    container_role: str
+    container_role: str  # "packed", "infrastructure", "runner_or_helper"
     assigned_cpus: List[int]
     assigned_mask_hex: str
 
 
 @dataclass
 class AffinityPlan:
+    """Complete CPU affinity plan for a benchmark run."""
     run_id: str
     created_at: str
     hostname: str
-    cpu_affinity_mode: str
+    cpu_affinity_mode: str  # "profiled-nor-background" or "none"
     sample_seconds: float
-    selection_policy: str
+    selection_policy: str  # "least_loaded"
     online_cpus: List[int]
     online_cpu_mask_hex: str
     cpu_topology: Dict[str, Any]
@@ -53,75 +106,6 @@ class AffinityPlan:
     background_assignments: List[BackgroundAssignment] = field(default_factory=list)
 
 
-def cpu_list_to_mask(cpu_list: List[int]) -> int:
-    mask = 0
-    for cpu in sorted(set(cpu_list)):
-        if cpu < 0:
-            raise ValueError(f"negative CPU id: {cpu}")
-        mask |= 1 << cpu
-    return mask
-
-
-def mask_to_hex(mask: int) -> str:
-    return hex(mask)
-
-
-def cpu_list_to_docker_cpuset(cpus: List[int]) -> str:
-    if not cpus:
-        return ""
-    values = sorted(set(cpus))
-    ranges = []
-    start = end = values[0]
-    for cpu in values[1:]:
-        if cpu == end + 1:
-            end = cpu
-            continue
-        ranges.append(f"{start}" if start == end else f"{start}-{end}")
-        start = end = cpu
-    ranges.append(f"{start}" if start == end else f"{start}-{end}")
-    return ",".join(ranges)
-
-
-def get_online_cpu_list() -> List[int]:
-    try:
-        return sorted(os.sched_getaffinity(0))
-    except AttributeError:
-        return list(range(os.cpu_count() or 1))
-
-
-def _read_proc_stat() -> Dict[int, tuple[int, int]]:
-    stats: Dict[int, tuple[int, int]] = {}
-    try:
-        with open("/proc/stat", encoding="utf-8") as handle:
-            for line in handle:
-                parts = line.split()
-                if not parts or not parts[0].startswith("cpu") or not parts[0][3:].isdigit():
-                    continue
-                cpu = int(parts[0][3:])
-                nums = [int(v) for v in parts[1:11]]
-                total = sum(nums)
-                idle = nums[3] + (nums[4] if len(nums) > 4 else 0)
-                stats[cpu] = (total, total - idle)
-    except OSError:
-        pass
-    return stats
-
-
-def sample_cpu_load(duration_seconds: float) -> Dict[int, float]:
-    first = _read_proc_stat()
-    if duration_seconds > 0:
-        time.sleep(duration_seconds)
-    second = _read_proc_stat()
-    loads: Dict[int, float] = {}
-    for cpu, (total0, busy0) in first.items():
-        if cpu not in second:
-            continue
-        total1, busy1 = second[cpu]
-        total_delta = total1 - total0
-        loads[cpu] = max(0.0, min(1.0, (busy1 - busy0) / total_delta)) if total_delta > 0 else 0.0
-    return loads
-
-
 def create_affinity_plan(
     run_id: str,
     profiled_worker_specs: List[Dict[str, str]],
@@ -131,44 +115,140 @@ def create_affinity_plan(
     reserve_smt_siblings: bool = False,
     profiled_cpu_counts: Optional[Dict[str, int]] = None,
 ) -> AffinityPlan:
+    """Create a complete CPU affinity plan.
+
+    Args:
+        run_id: Benchmark run ID.
+        profiled_worker_specs: List of dicts with keys:
+            worker_id, container_name, logical_client_id, experiment_kind,
+            resource_profile_id
+        background_specs: List of dicts with keys:
+            container_name, container_role
+        cpu_affinity_mode: Affinity mode string.
+        sample_seconds: Duration in seconds for CPU load sampling.
+        reserve_smt_siblings: Whether to reserve SMT siblings.
+        profiled_cpu_counts: Optional dict mapping worker_id -> required CPU count.
+                             If not provided, each profiled worker gets 1 CPU.
+
+    Returns:
+        An AffinityPlan object.
+
+    Raises:
+        ValueError: If insufficient CPUs are available.
+    """
     if cpu_affinity_mode == "none":
-        return AffinityPlan(run_id, time.strftime("%Y-%m-%dT%H:%M:%S%z"), socket.gethostname(), "none", sample_seconds, "none", [], "0x0", {}, {}, [], "0x0", "0x0", [], "0x0", "no_reservation")
+        return _create_empty_affinity_plan(run_id, sample_seconds)
 
-    online_cpus = get_online_cpu_list()
-    profiled_cpu_counts = profiled_cpu_counts or {s["worker_id"]: 1 for s in profiled_worker_specs}
-    needed = sum(profiled_cpu_counts.values())
-    if needed > len(online_cpus):
-        raise ValueError(f"Insufficient online CPUs: need {needed}, have {len(online_cpus)}")
+    topology = detect_cpu_topology()
+    online_cpus = get_online_cpu_list(topology)
+    online_mask = cpu_list_to_mask(online_cpus)
 
-    loads = sample_cpu_load(sample_seconds) if needed else {}
-    selected = sorted(online_cpus, key=lambda cpu: (loads.get(cpu, 0.0), cpu))[:needed]
+    if profiled_cpu_counts is None:
+        profiled_cpu_counts = {s["worker_id"]: 1 for s in profiled_worker_specs}
 
-    profiled: List[ProfiledAssignment] = []
-    index = 0
+    total_profiled_cpus = sum(profiled_cpu_counts.values())
+
+    if total_profiled_cpus == 0:
+        load_samples = {}
+    else:
+        load_samples = sample_cpu_load(sample_seconds)
+        for cpu_id in online_cpus:
+            if cpu_id not in load_samples:
+                load_samples[cpu_id] = 0.0
+
+    if total_profiled_cpus == 0 and not profiled_worker_specs:
+        selected_cpus = []
+    elif total_profiled_cpus == 0:
+        selected_cpus = []
+    else:
+        selected_cpus = select_least_loaded_cpus(
+            topology=topology,
+            required_count=total_profiled_cpus,
+            load_samples=load_samples,
+            exclude_cpus=None,
+            prefer_physical_cores=True,
+            reserve_smt_siblings=reserve_smt_siblings,
+        )
+
+    profiled_assignments: List[ProfiledAssignment] = []
+    warnings: List[str] = []
+    cpu_index = 0
+
     for spec in profiled_worker_specs:
-        count = profiled_cpu_counts.get(spec["worker_id"], 1)
-        assigned = sorted(selected[index:index + count])
-        index += count
-        profiled.append(ProfiledAssignment(
-            worker_id=spec["worker_id"],
+        worker_id = spec["worker_id"]
+        count = profiled_cpu_counts.get(worker_id, 1)
+        assigned = selected_cpus[cpu_index:cpu_index + count]
+        cpu_index += count
+
+        rayon_n = spec.get("rayon_num_threads", count)
+        if not assigned:
+            profiled_assignments.append(ProfiledAssignment(
+                worker_id=worker_id,
+                container_name=spec["container_name"],
+                logical_client_id=spec["logical_client_id"],
+                assigned_cpus=[],
+                assigned_mask_hex="0x0",
+                assigned_cpu_count=0,
+                rayon_num_threads=rayon_n,
+                experiment_kind=spec.get("experiment_kind", ""),
+                resource_profile_id=spec.get("resource_profile_id", ""),
+            ))
+            continue
+
+        mask = cpu_list_to_mask(assigned)
+        profiled_assignments.append(ProfiledAssignment(
+            worker_id=worker_id,
             container_name=spec["container_name"],
             logical_client_id=spec["logical_client_id"],
-            assigned_cpus=assigned,
-            assigned_mask_hex=mask_to_hex(cpu_list_to_mask(assigned)),
+            assigned_cpus=sorted(assigned),
+            assigned_mask_hex=mask_to_hex(mask),
             assigned_cpu_count=len(assigned),
-            rayon_num_threads=int(spec.get("rayon_num_threads", count)),
+            rayon_num_threads=rayon_n,
             experiment_kind=spec.get("experiment_kind", ""),
             resource_profile_id=spec.get("resource_profile_id", ""),
         ))
 
-    profiled_set: Set[int] = set()
-    for assignment in profiled:
-        profiled_set.update(assignment.assigned_cpus)
-    background_cpus = [cpu for cpu in online_cpus if cpu not in profiled_set]
-    bg_mask = mask_to_hex(cpu_list_to_mask(background_cpus))
-    background = [BackgroundAssignment(s["container_name"], s["container_role"], background_cpus, bg_mask) for s in background_specs]
+    assigned_cpu_set: Set[int] = set()
+    for pa in profiled_assignments:
+        assigned_cpu_set.update(pa.assigned_cpus)
 
-    return AffinityPlan(
+    profiled_mask = cpu_list_to_mask(sorted(assigned_cpu_set))
+
+    if reserve_smt_siblings and topology.smt_enabled:
+        smt_siblings = get_smt_siblings(topology, sorted(assigned_cpu_set))
+        reserved_set = set(assigned_cpu_set) | set(smt_siblings)
+        reserved_mask = cpu_list_to_mask(sorted(reserved_set))
+    else:
+        reserved_mask = profiled_mask
+
+    background_mask = complement_mask(reserved_mask, online_mask)
+    background_cpus = mask_to_cpu_list(background_mask)
+
+    if not background_cpus and background_specs:
+        warnings.append(
+            f"Background mask is empty after reserving profiled CPUs "
+            f"(profiled={len(assigned_cpu_set)}, online={len(online_cpus)})"
+        )
+
+    background_assignments: List[BackgroundAssignment] = []
+    bg_mask_hex = mask_to_hex(background_mask)
+    for spec in background_specs:
+        background_assignments.append(BackgroundAssignment(
+            container_name=spec["container_name"],
+            container_role=spec["container_role"],
+            assigned_cpus=background_cpus,
+            assigned_mask_hex=bg_mask_hex,
+        ))
+
+    if len(online_cpus) < total_profiled_cpus:
+        warnings.append(
+            f"Host has {len(online_cpus)} online CPUs but {total_profiled_cpus} "
+            f"profiled CPUs are requested"
+        )
+
+    smt_policy = "reserve_siblings" if reserve_smt_siblings else "no_reservation"
+
+    plan = AffinityPlan(
         run_id=run_id,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         hostname=socket.gethostname(),
@@ -176,31 +256,56 @@ def create_affinity_plan(
         sample_seconds=sample_seconds,
         selection_policy="least_loaded",
         online_cpus=online_cpus,
-        online_cpu_mask_hex=mask_to_hex(cpu_list_to_mask(online_cpus)),
-        cpu_topology={"online_cpu_count": len(online_cpus), "total_cpu_count": os.cpu_count() or len(online_cpus)},
-        sampled_cpu_load=loads,
-        profiled_assignments=profiled,
-        profiled_mask_hex=mask_to_hex(cpu_list_to_mask(sorted(profiled_set))),
-        reserved_mask_hex=mask_to_hex(cpu_list_to_mask(sorted(profiled_set))),
+        online_cpu_mask_hex=mask_to_hex(online_mask),
+        cpu_topology=topology_to_dict(topology),
+        sampled_cpu_load=load_samples,
+        profiled_assignments=profiled_assignments,
+        profiled_mask_hex=mask_to_hex(profiled_mask),
+        reserved_mask_hex=mask_to_hex(reserved_mask),
         background_cpus=background_cpus,
-        background_mask_hex=bg_mask,
-        smt_sibling_policy="reserve_siblings" if reserve_smt_siblings else "no_reservation",
-        warnings=[] if background_cpus or not background_specs else ["Background mask is empty after reserving profiled CPUs"],
-        background_assignments=background,
+        background_mask_hex=bg_mask_hex,
+        smt_sibling_policy=smt_policy,
+        warnings=warnings,
+        background_assignments=background_assignments,
+    )
+
+    return plan
+
+
+def _create_empty_affinity_plan(run_id: str, sample_seconds: float) -> AffinityPlan:
+    """Create an empty affinity plan when affinity mode is 'none'."""
+    return AffinityPlan(
+        run_id=run_id,
+        created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        hostname=socket.gethostname(),
+        cpu_affinity_mode="none",
+        sample_seconds=sample_seconds,
+        selection_policy="none",
+        online_cpus=[],
+        online_cpu_mask_hex="0x0",
+        cpu_topology={},
+        sampled_cpu_load={},
+        profiled_assignments=[],
+        profiled_mask_hex="0x0",
+        reserved_mask_hex="0x0",
+        background_cpus=[],
+        background_mask_hex="0x0",
+        smt_sibling_policy="no_reservation",
+        warnings=[],
+        background_assignments=[],
     )
 
 
-def _assignment_to_dict(pa: ProfiledAssignment) -> Dict[str, Any]:
-    return pa.__dict__.copy()
-
-
-def _background_to_dict(ba: BackgroundAssignment) -> Dict[str, Any]:
-    return ba.__dict__.copy()
-
-
 def write_affinity_plan_json(plan: AffinityPlan, output_dir: str) -> str:
+    """Write the affinity plan to cpu_affinity_plan.json.
+
+    Returns the path to the written file.
+    """
     os.makedirs(output_dir, exist_ok=True)
-    path = os.path.join(output_dir, "cpu_affinity_plan.json")
+    filepath = os.path.join(output_dir, "cpu_affinity_plan.json")
+
+    sampled_load_serializable = {str(k): v for k, v in plan.sampled_cpu_load.items()}
+
     data = {
         "run_id": plan.run_id,
         "created_at": plan.created_at,
@@ -211,44 +316,106 @@ def write_affinity_plan_json(plan: AffinityPlan, output_dir: str) -> str:
         "online_cpus": plan.online_cpus,
         "online_cpu_mask_hex": plan.online_cpu_mask_hex,
         "cpu_topology": plan.cpu_topology,
-        "sampled_cpu_load": {str(k): v for k, v in plan.sampled_cpu_load.items()},
-        "profiled_assignments": [_assignment_to_dict(pa) for pa in plan.profiled_assignments],
+        "sampled_cpu_load": sampled_load_serializable,
+        "profiled_assignments": [
+            {
+                "worker_id": pa.worker_id,
+                "container_name": pa.container_name,
+                "logical_client_id": pa.logical_client_id,
+                "assigned_cpus": pa.assigned_cpus,
+                "assigned_mask_hex": pa.assigned_mask_hex,
+                "assigned_cpu_count": pa.assigned_cpu_count,
+                "rayon_num_threads": pa.rayon_num_threads,
+                "experiment_kind": pa.experiment_kind,
+                "resource_profile_id": pa.resource_profile_id,
+            }
+            for pa in plan.profiled_assignments
+        ],
         "profiled_mask_hex": plan.profiled_mask_hex,
         "reserved_mask_hex": plan.reserved_mask_hex,
         "background_cpus": plan.background_cpus,
         "background_mask_hex": plan.background_mask_hex,
         "smt_sibling_policy": plan.smt_sibling_policy,
         "warnings": plan.warnings,
-        "background_assignments": [_background_to_dict(ba) for ba in plan.background_assignments],
+        "background_assignments": [
+            {
+                "container_name": ba.container_name,
+                "container_role": ba.container_role,
+                "assigned_cpus": ba.assigned_cpus,
+                "assigned_mask_hex": ba.assigned_mask_hex,
+            }
+            for ba in plan.background_assignments
+        ],
     }
-    with open(path, "w", encoding="utf-8") as handle:
-        json.dump(data, handle, indent=2, sort_keys=True)
-    return path
+
+    with open(filepath, "w") as f:
+        json.dump(data, f, indent=2)
+
+    return filepath
 
 
 def get_background_cpuset(plan: AffinityPlan) -> str:
+    """Get the Docker cpuset string for background containers."""
     return cpu_list_to_docker_cpuset(plan.background_cpus)
 
 
 def get_profiled_cpuset(plan: AffinityPlan, worker_id: str) -> Optional[str]:
-    for assignment in plan.profiled_assignments:
-        if assignment.worker_id == worker_id:
-            return cpu_list_to_docker_cpuset(assignment.assigned_cpus)
+    """Get the Docker cpuset string for a specific profiled worker."""
+    for pa in plan.profiled_assignments:
+        if pa.worker_id == worker_id:
+            return cpu_list_to_docker_cpuset(pa.assigned_cpus)
+    return None
+
+
+def get_rayon_num_threads(plan: AffinityPlan, worker_id: str) -> Optional[int]:
+    """Get the RAYON_NUM_THREADS value for a specific profiled worker."""
+    for pa in plan.profiled_assignments:
+        if pa.worker_id == worker_id:
+            return pa.rayon_num_threads
     return None
 
 
 def validate_affinity_plan(plan: AffinityPlan) -> List[str]:
-    if plan.cpu_affinity_mode == "none":
-        return []
+    """Validate an affinity plan for correctness.
+
+    Returns a list of error messages (empty if valid).
+    """
     errors: List[str] = []
-    assigned: Set[int] = set()
-    for assignment in plan.profiled_assignments:
-        if assignment.assigned_cpu_count == 0:
-            errors.append(f"Profiled worker {assignment.worker_id} has 0 assigned CPUs")
-        if assignment.rayon_num_threads != assignment.assigned_cpu_count:
-            errors.append(f"Profiled worker {assignment.worker_id}: rayon_num_threads does not match assigned_cpu_count")
-        for cpu in assignment.assigned_cpus:
-            if cpu in assigned:
-                errors.append(f"CPU {cpu} assigned to multiple profiled workers")
-            assigned.add(cpu)
+
+    if plan.cpu_affinity_mode == "none":
+        return errors
+
+    assigned_set: Set[int] = set()
+    for pa in plan.profiled_assignments:
+        for cpu in pa.assigned_cpus:
+            if cpu in assigned_set:
+                errors.append(
+                    f"CPU {cpu} assigned to multiple profiled workers"
+                )
+            assigned_set.add(cpu)
+
+    profiled_mask = cpu_list_to_mask(sorted(assigned_set))
+    background_mask = complement_mask(profiled_mask, cpu_list_to_mask(plan.online_cpus))
+
+    if masks_overlap(profiled_mask, background_mask):
+        errors.append(
+            "Profiled mask overlaps with background mask"
+        )
+
+    if not plan.background_cpus and plan.background_assignments:
+        plan.warnings.append(
+            "Background mask is empty but background containers are assigned"
+        )
+
+    for pa in plan.profiled_assignments:
+        if pa.assigned_cpu_count == 0:
+            errors.append(
+                f"Profiled worker {pa.worker_id} has 0 assigned CPUs"
+            )
+        if pa.rayon_num_threads != pa.assigned_cpu_count:
+            errors.append(
+                f"Profiled worker {pa.worker_id}: RAYON_NUM_THREADS={pa.rayon_num_threads} "
+                f"does not match assigned_cpu_count={pa.assigned_cpu_count}"
+            )
+
     return errors

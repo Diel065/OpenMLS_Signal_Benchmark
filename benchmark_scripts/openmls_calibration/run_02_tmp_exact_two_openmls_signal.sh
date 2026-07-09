@@ -234,9 +234,10 @@ run_openmls() {
 }
 
 run_signal() {
-  local py output_arg singleton_seed
+  local py output_arg scenario_seed singleton_seed
   py="$(python_bin_for "$SIGNAL_DIR")"
   output_arg="$(relpath_from "$OUTPUT_ROOT" "$SIGNAL_DIR")"
+  scenario_seed="$(random_seed)"
   singleton_seed="$(random_seed)"
   local image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
@@ -247,6 +248,7 @@ run_signal() {
     --workers "$WORKERS"
     --run-id "$SIGNAL_RUN_ID"
     --scenario tmp-two-run-unconstrained-container-baseline
+    --scenario-seed "$scenario_seed"
     --singleton-selection-seed "$singleton_seed"
     --output-dir "$output_arg"
     --worker-layout-mode hybrid
@@ -255,7 +257,8 @@ run_signal() {
     --packed-clients-per-container "$PACKED_PER_CONTAINER"
     --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM"
     --bridge-count "$BRIDGE_COUNT"
-    --strict-cpuset
+    --profiled-singleton-count "$PROFILED_SINGLETON_COUNT"
+    --cpu-affinity-mode profiled-nor-background
     --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE"
     --health-timeout-seconds "$HEALTH_TIMEOUT"
     --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT"
@@ -264,6 +267,7 @@ run_signal() {
     --min-size 2
     --max-size "$MAX_SIZE"
     --step-size "$STEP_SIZE"
+    --plateau-order staircase
     --roundtrips "$ROUNDTRIPS"
     --update-rounds "$UPDATE_ROUNDS"
     --app-rounds "$APP_ROUNDS"

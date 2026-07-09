@@ -16,6 +16,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use futures_util::stream::{self, StreamExt};
 use rand::Rng;
+use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
 use crate::http_retry::{
@@ -45,6 +46,39 @@ const MAX_RANDOM_BATCH_SIZE: usize = 8;
 
 static WORKER_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlateauOrder {
+    Staircase,
+    Ascending,
+    Randomized,
+}
+
+impl FromStr for PlateauOrder {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "staircase" => Ok(Self::Staircase),
+            "ascending" | "asc" => Ok(Self::Ascending),
+            "randomized" | "random" => Ok(Self::Randomized),
+            other => Err(format!(
+                "--plateau-order expected 'staircase', 'ascending', or 'randomized', got '{other}'"
+            )),
+        }
+    }
+}
+
+impl fmt::Display for PlateauOrder {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Staircase => formatter.write_str("staircase"),
+            Self::Ascending => formatter.write_str("ascending"),
+            Self::Randomized => formatter.write_str("randomized"),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
     pub preflight_only: bool,
@@ -54,6 +88,7 @@ pub struct StaircaseConfig {
     pub min_size: usize,
     pub max_size: Option<usize>,
     pub step_size: StepSize,
+    pub plateau_order: PlateauOrder,
     pub roundtrips: usize,
     pub app_rounds: usize,
     pub max_app_samples_per_payload: usize,
@@ -537,7 +572,7 @@ impl RunnerEventLog {
 
 impl RunnerEvent {
     fn to_profile_event(&self) -> SignalProfileEvent {
-        SignalProfileEvent {
+        let mut event = SignalProfileEvent {
             profile_schema_version: self.profile_schema_version,
             ts_unix_ns: self.ts_unix_ns,
             op: "benchmark.worker_failure".to_string(),
@@ -569,7 +604,9 @@ impl RunnerEvent {
             pid: std::process::id(),
             thread_id: "benchmark-runner".to_string(),
             ..SignalProfileEvent::default()
-        }
+        };
+        apply_app_heap_budget_failure_fields(&mut event);
+        event
     }
 }
 
@@ -640,6 +677,102 @@ fn unix_time_ns() -> u128 {
 
 fn non_empty_string(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
+}
+
+fn classify_worker_error(error: &anyhow::Error) -> &'static str {
+    if let Some(req_err) = error.downcast_ref::<reqwest::Error>() {
+        if req_err.is_connect() {
+            if let Some(src) = req_err.source() {
+                let src_str = format!("{}", src);
+                if src_str.contains("Connection refused") || src_str.contains("connection refused")
+                {
+                    return "container_exit";
+                }
+            }
+            return "worker_unreachable";
+        }
+        if req_err.is_timeout() {
+            return "cpu_starvation_timeout";
+        }
+        if req_err.is_body() || req_err.is_decode() {
+            return "protocol_failure";
+        }
+    }
+    let error_str = format!("{:#}", error).to_lowercase();
+    if error_str.contains("app_heap_budget_exceeded") {
+        return "app_heap_budget_exceeded";
+    }
+    if error_str.contains("app_heap_budget_allocator_abort") {
+        return "app_heap_budget_allocator_abort";
+    }
+    if error_str.contains("embedded_budget_timeout") {
+        return "embedded_budget_timeout";
+    }
+    if error_str.contains("connection refused") {
+        return "container_exit";
+    }
+    if error_str.contains("timeout")
+        || error_str.contains("deadline")
+        || error_str.contains("timed out")
+    {
+        return "cpu_starvation_timeout";
+    }
+    if error_str.contains("connect") {
+        return "worker_unreachable";
+    }
+    "infrastructure_failure"
+}
+
+fn app_heap_field(detail: &str, key: &str) -> Option<String> {
+    for part in detail.split_whitespace() {
+        if let Some((k, v)) = part.split_once('=') {
+            if k == key {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn apply_app_heap_budget_failure_fields(event: &mut SignalProfileEvent) {
+    let Some(detail) = event.failure_detail.clone() else {
+        return;
+    };
+    if !detail.contains("APP_HEAP_BUDGET_EXCEEDED") {
+        return;
+    }
+    let detail = detail.as_str();
+
+    event.memory_model = app_heap_field(detail, "memory_model");
+    event.app_heap_budget = app_heap_field(detail, "app_heap_budget");
+    event.app_heap_budget_bytes =
+        app_heap_field(detail, "app_heap_budget_bytes").and_then(|v| v.parse::<u64>().ok());
+    event.heap_current_live_bytes = app_heap_field(detail, "current_live_heap_bytes")
+        .and_then(|v| v.parse::<u64>().ok());
+    event.heap_peak_live_bytes =
+        app_heap_field(detail, "peak_live_heap_bytes").and_then(|v| v.parse::<u64>().ok());
+    event.heap_operation_peak_live_bytes =
+        app_heap_field(detail, "operation_peak_live_heap_bytes")
+            .and_then(|v| v.parse::<u64>().ok());
+    event.heap_total_allocated_bytes =
+        app_heap_field(detail, "total_allocated_bytes").and_then(|v| v.parse::<u64>().ok());
+    event.heap_allocation_count =
+        app_heap_field(detail, "allocation_count").and_then(|v| v.parse::<u64>().ok());
+    event.heap_deallocation_count =
+        app_heap_field(detail, "deallocation_count").and_then(|v| v.parse::<u64>().ok());
+    event.heap_failed_allocation_size_bytes =
+        app_heap_field(detail, "failed_allocation_size_bytes")
+            .and_then(|v| v.parse::<u64>().ok());
+    event.heap_failure_context = app_heap_field(detail, "heap_failure_context");
+
+    if event.failure_operation.is_none() {
+        event.failure_operation = app_heap_field(detail, "operation_family");
+    }
+    if let Some(member_count) =
+        app_heap_field(detail, "member_count").and_then(|v| v.parse::<usize>().ok())
+    {
+        event.peer_count = Some(member_count);
+    }
 }
 
 fn latest_oom_evidence_for(path: &Path, worker: &WorkerSpec) -> Option<OomEvidence> {
@@ -1054,11 +1187,12 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     }
 
     let mut plateau_rng = rand::rng();
-    let plateau_sequence = build_plateau_sequence_for_step_size(
+    let plateau_sequence = build_plateau_sequence_for_order(
         config.min_size,
         max_size,
         &config.step_size,
         config.roundtrips,
+        config.plateau_order,
         &mut plateau_rng,
     );
 
@@ -1070,7 +1204,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     );
 
     eprintln!(
-        "Scenario plan: plateaus={:?}, step_size={}, payload_sizes={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, app_cap={}, total_units≈{}",
+        config.plateau_order,
         plateau_sequence,
         config.step_size,
         config.payload_sizes,
@@ -2265,6 +2400,19 @@ async fn run_application_phase(
                         .await?
                         {
                             oom_ids.insert(failure.worker.id.clone());
+                        } else if failure.worker.profile_enabled
+                            && failure.worker.container_mode == ContainerMode::Singleton
+                        {
+                            let failure_class = classify_worker_error(&failure.error);
+                            if matches!(
+                                failure_class,
+                                "app_heap_budget_exceeded"
+                                    | "app_heap_budget_allocator_abort"
+                                    | "embedded_budget_timeout"
+                                    | "cpu_starvation_timeout"
+                            ) {
+                                oom_ids.insert(failure.worker.id.clone());
+                            }
                         }
                     }
                     if oom_ids.len() == batch_error.failures.len() {
@@ -2445,6 +2593,75 @@ fn build_plateau_sequence_for_step_size<R: Rng + ?Sized>(
         }
     }
 
+    sequence
+}
+
+fn build_ascending_plateau_sequence_for_step_size<R: Rng + ?Sized>(
+    min_size: usize,
+    max_size: usize,
+    step_size: &StepSize,
+    rng: &mut R,
+) -> Vec<usize> {
+    if let StepSize::Fixed(step_size) = step_size {
+        return building_plateau_sequence(min_size, max_size, *step_size, 0);
+    }
+
+    let mut sequence = Vec::new();
+    let mut current = min_size;
+    if sequence.last().copied() != Some(current) {
+        sequence.push(current);
+    }
+    while current < max_size {
+        current = current.saturating_add(step_size.sample(rng)).min(max_size);
+        if sequence.last().copied() != Some(current) {
+            sequence.push(current);
+        }
+    }
+    sequence
+}
+
+fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
+    min_size: usize,
+    max_size: usize,
+    step_size: &StepSize,
+    roundtrips: usize,
+    plateau_order: PlateauOrder,
+    rng: &mut R,
+) -> Vec<usize> {
+    if plateau_order == PlateauOrder::Staircase {
+        return build_plateau_sequence_for_step_size(
+            min_size, max_size, step_size, roundtrips, rng,
+        );
+    }
+    if plateau_order == PlateauOrder::Ascending {
+        return build_ascending_plateau_sequence_for_step_size(
+            min_size, max_size, step_size, rng,
+        );
+    }
+
+    // Randomized
+    let mut candidates = vec![min_size];
+    let mut current = min_size;
+    while current < max_size {
+        current = current.saturating_add(step_size.sample(rng)).min(max_size);
+        if candidates.last().copied() != Some(current) {
+            candidates.push(current);
+        }
+    }
+
+    let mut sequence = Vec::new();
+    for _ in 0..roundtrips {
+        let mut randomized = candidates.clone();
+        randomized.shuffle(rng);
+        if randomized.len() > 1 && sequence.last() == randomized.first() {
+            randomized.rotate_left(1);
+        }
+        for size in randomized {
+            if sequence.last().copied() != Some(size) {
+                sequence.push(size);
+            }
+        }
+    }
     sequence
 }
 
@@ -3104,6 +3321,7 @@ pub fn aggregate_csv(
                 cpu_throttled_time_ratio: Option<f64>,
                 alloc_bytes: Option<u64>,
                 alloc_count: Option<u64>,
+                alloc_measurement_scope: Option<String>,
                 l1d_cache_accesses: Option<u64>,
                 l1d_cache_misses: Option<u64>,
                 ram_rss_delta_bytes: Option<i64>,
@@ -3185,8 +3403,14 @@ pub fn aggregate_csv(
                 memory_events_oom_kill: Option<u64>,
                 app_heap_budget: Option<String>,
                 app_heap_budget_bytes: Option<u64>,
-                app_heap_current_live_bytes: Option<u64>,
-                app_heap_peak_live_bytes: Option<u64>,
+                heap_current_live_bytes: Option<u64>,
+                heap_peak_live_bytes: Option<u64>,
+                heap_operation_peak_live_bytes: Option<u64>,
+                heap_total_allocated_bytes: Option<u64>,
+                heap_allocation_count: Option<u64>,
+                heap_deallocation_count: Option<u64>,
+                heap_failed_allocation_size_bytes: Option<u64>,
+                heap_failure_context: Option<String>,
                 resource_profile_id: Option<String>,
                 resource_profile_index: Option<i32>,
                 failure_class: Option<String>,
@@ -3261,6 +3485,7 @@ pub fn aggregate_csv(
                 cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
+                alloc_measurement_scope: event.alloc_measurement_scope.clone(),
                 l1d_cache_accesses: event.l1d_cache_accesses,
                 l1d_cache_misses: event.l1d_cache_misses,
                 ram_rss_delta_bytes: event.ram_rss_delta_bytes,
@@ -3344,8 +3569,14 @@ pub fn aggregate_csv(
                 memory_events_oom_kill: event.memory_events_oom_kill,
                 app_heap_budget: event.app_heap_budget,
                 app_heap_budget_bytes: event.app_heap_budget_bytes,
-                app_heap_current_live_bytes: event.app_heap_current_live_bytes,
-                app_heap_peak_live_bytes: event.app_heap_peak_live_bytes,
+                heap_current_live_bytes: event.heap_current_live_bytes,
+                heap_peak_live_bytes: event.heap_peak_live_bytes,
+                heap_operation_peak_live_bytes: event.heap_operation_peak_live_bytes,
+                heap_total_allocated_bytes: event.heap_total_allocated_bytes,
+                heap_allocation_count: event.heap_allocation_count,
+                heap_deallocation_count: event.heap_deallocation_count,
+                heap_failed_allocation_size_bytes: event.heap_failed_allocation_size_bytes,
+                heap_failure_context: event.heap_failure_context.clone(),
                 resource_profile_id: event.resource_profile_id,
                 resource_profile_index: event.resource_profile_index,
                 failure_class: event.failure_class,

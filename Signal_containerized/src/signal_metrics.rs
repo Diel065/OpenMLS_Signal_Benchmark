@@ -80,6 +80,8 @@ pub struct SignalProfileEvent {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     #[serde(default)]
+    pub alloc_measurement_scope: Option<String>,
+    #[serde(default)]
     pub l1d_cache_accesses: Option<u64>,
     #[serde(default)]
     pub l1d_cache_misses: Option<u64>,
@@ -206,9 +208,21 @@ pub struct SignalProfileEvent {
     #[serde(default)]
     pub app_heap_budget_bytes: Option<u64>,
     #[serde(default)]
-    pub app_heap_current_live_bytes: Option<u64>,
+    pub heap_current_live_bytes: Option<u64>,
     #[serde(default)]
-    pub app_heap_peak_live_bytes: Option<u64>,
+    pub heap_peak_live_bytes: Option<u64>,
+    #[serde(default)]
+    pub heap_operation_peak_live_bytes: Option<u64>,
+    #[serde(default)]
+    pub heap_total_allocated_bytes: Option<u64>,
+    #[serde(default)]
+    pub heap_allocation_count: Option<u64>,
+    #[serde(default)]
+    pub heap_deallocation_count: Option<u64>,
+    #[serde(default)]
+    pub heap_failed_allocation_size_bytes: Option<u64>,
+    #[serde(default)]
+    pub heap_failure_context: Option<String>,
     #[serde(default)]
     pub resource_profile_id: Option<String>,
     #[serde(default)]
@@ -282,6 +296,7 @@ pub struct SignalCsvRow<'a> {
     pub cpu_throttled_time_ratio: Option<f64>,
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
+    pub alloc_measurement_scope: Option<String>,
     pub l1d_cache_accesses: Option<u64>,
     pub l1d_cache_misses: Option<u64>,
     pub ram_rss_delta_bytes: Option<i64>,
@@ -363,8 +378,14 @@ pub struct SignalCsvRow<'a> {
     pub memory_events_oom_kill: Option<u64>,
     pub app_heap_budget: Option<String>,
     pub app_heap_budget_bytes: Option<u64>,
-    pub app_heap_current_live_bytes: Option<u64>,
-    pub app_heap_peak_live_bytes: Option<u64>,
+    pub heap_current_live_bytes: Option<u64>,
+    pub heap_peak_live_bytes: Option<u64>,
+    pub heap_operation_peak_live_bytes: Option<u64>,
+    pub heap_total_allocated_bytes: Option<u64>,
+    pub heap_allocation_count: Option<u64>,
+    pub heap_deallocation_count: Option<u64>,
+    pub heap_failed_allocation_size_bytes: Option<u64>,
+    pub heap_failure_context: Option<String>,
     pub resource_profile_id: Option<String>,
     pub resource_profile_index: Option<i32>,
     pub failure_class: Option<String>,

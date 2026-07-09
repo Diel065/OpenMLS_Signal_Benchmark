@@ -125,16 +125,18 @@ pub fn configured_budget_bytes() -> Option<u64> {
 }
 
 pub fn begin_operation() -> HeapBudgetOperationGuard {
-    if !enabled() {
-        return HeapBudgetOperationGuard { active: false };
+    let budget_active = enabled();
+    if budget_active {
+        reset_operation_state();
     }
-    reset_operation_state();
     let current = accounted_live_bytes();
     OPERATION_PEAK_LIVE_BYTES.store(current, Ordering::Release);
     ACTIVE_OPERATION_COUNT.fetch_add(1, Ordering::Relaxed);
     ACTIVE_SPAN_ID.store(0, Ordering::Release);
     ACTIVE_CONTEXT.store(HeapBudgetContext::OperationEntry as u64, Ordering::Release);
-    check_budget(0);
+    if budget_active {
+        check_budget(0);
+    }
     HeapBudgetOperationGuard { active: true }
 }
 
@@ -190,23 +192,21 @@ pub(crate) fn record_alloc(size: usize) {
         .saturating_add(size);
     update_max(&PEAK_LIVE_BYTES, current);
 
-    if enabled() {
-        TOTAL_ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
-        ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-        if ACTIVE_OPERATION_COUNT.load(Ordering::Relaxed) > 0 {
-            let accounted = current.saturating_sub(BASELINE_LIVE_BYTES.load(Ordering::Acquire));
-            update_max(&OPERATION_PEAK_LIVE_BYTES, accounted);
-            check_budget(size);
-        }
+    if ACTIVE_OPERATION_COUNT.load(Ordering::Relaxed) > 0 {
+        let accounted = current.saturating_sub(BASELINE_LIVE_BYTES.load(Ordering::Acquire));
+        update_max(&OPERATION_PEAK_LIVE_BYTES, accounted);
+    }
+    TOTAL_ALLOCATED_BYTES.fetch_add(size, Ordering::Relaxed);
+    ALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
+    if enabled() && ACTIVE_OPERATION_COUNT.load(Ordering::Relaxed) > 0 {
+        check_budget(size);
     }
 }
 
 pub(crate) fn record_dealloc(size: usize) {
     let size = size as u64;
     subtract_saturating(&CURRENT_LIVE_BYTES, size);
-    if enabled() {
-        DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
-    }
+    DEALLOCATION_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 fn reset_operation_state() {

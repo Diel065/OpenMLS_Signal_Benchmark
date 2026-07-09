@@ -63,9 +63,6 @@ pub fn configure_from_env() -> EmbeddedHeapBudgetConfig {
 }
 
 pub fn begin_operation(attribution: OperationAttribution) -> Option<OperationBudgetGuard> {
-    if !tracker::enabled() {
-        return None;
-    }
     Some(OperationBudgetGuard { attribution, _guard: tracker::begin_operation() })
 }
 

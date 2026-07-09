@@ -6,7 +6,7 @@ use clap::ArgAction;
 
 use signal_benchmark::staircase_runner::{
     parse_worker_layout, parse_worker_specs, run_staircase_benchmark, workers_from_layout,
-    PayloadSizes, StaircaseConfig, StepSize,
+    PayloadSizes, PlateauOrder, StaircaseConfig, StepSize,
 };
 
 #[derive(clap::Parser, Debug)]
@@ -43,6 +43,9 @@ struct Args {
 
     #[arg(long, default_value = "1")]
     step_size: StepSize,
+
+    #[arg(long, default_value = "staircase")]
+    plateau_order: PlateauOrder,
 
     #[arg(long, default_value_t = 1)]
     roundtrips: usize,
@@ -182,6 +185,7 @@ fn main() -> Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         step_size: args.step_size,
+        plateau_order: args.plateau_order,
         roundtrips: args.roundtrips,
         app_rounds: args.app_rounds,
         max_app_samples_per_payload: args.max_app_samples_per_payload,

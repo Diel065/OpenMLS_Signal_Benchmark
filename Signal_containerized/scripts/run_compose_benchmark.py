@@ -62,11 +62,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
     p.add_argument("--run-id", default=None, help="Optional explicit run id")
     p.add_argument("--scenario", default="http-staircase-compose", help="Scenario label")
+    p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed")
     p.add_argument("--output-dir", default="benchmark_output", help="Base output directory")
 
     p.add_argument("--min-size", type=int, default=2)
     p.add_argument("--max-size", type=int, default=None)
     p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
+    p.add_argument(
+        "--plateau-order",
+        choices=("staircase", "ascending", "randomized"),
+        default="staircase",
+        help="Order target group-size plateaus as up/down staircase, ascending-only, or randomized",
+    )
     p.add_argument("--roundtrips", type=int, default=1)
 
     p.add_argument("--update-rounds", type=int, default=2)
@@ -414,15 +421,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Application heap budget for profiled singleton workers, e.g. 512k or 8m.",
     )
     p.add_argument(
-        "--strict-cpuset",
-        action="store_true",
-        help="Require non-overlapping Docker cpuset assignment for profiled singleton workers.",
+        "--cpu-affinity-mode",
+        choices=["none", "profiled-nor-background"],
+        default="none",
+        help="CPU affinity planning mode",
     )
     p.add_argument(
         "--cpu-affinity-sample-seconds",
         type=float,
         default=20.0,
-        help="Seconds to sample per-CPU load before strict cpuset assignment.",
+        help="Duration in seconds for CPU load sampling",
+    )
+    p.add_argument(
+        "--reserve-smt-siblings",
+        action="store_true",
+        help="Reserve SMT/hyperthread siblings of profiled CPUs",
     )
     p.add_argument(
         "--resource-monitor-interval-ms",
@@ -634,7 +647,7 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
             args.singleton_memory_swap,
             args.singleton_pids_limit,
             args.singleton_app_heap_budget,
-            args.strict_cpuset,
+            args.cpu_affinity_mode != "none",
         )
     )
     profile_parts = []
@@ -648,7 +661,7 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
         profile_parts.append(f"pids-{args.singleton_pids_limit}")
     if args.singleton_app_heap_budget is not None:
         profile_parts.append(f"appheap-{args.singleton_app_heap_budget}")
-    if args.strict_cpuset:
+    if args.cpu_affinity_mode != "none":
         profile_parts.append("strict-cpuset")
     resource_profile = (
         "singleton-resource-envelope_" + "_".join(profile_parts)
@@ -666,7 +679,7 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
         "pids_limit": args.singleton_pids_limit,
         "app_heap_budget": args.singleton_app_heap_budget,
         "app_heap_budget_bytes": args.singleton_app_heap_budget_bytes,
-        "strict_cpuset": args.strict_cpuset,
+        "strict_cpuset": args.cpu_affinity_mode != "none",
         "strict_cpuset_satisfied": getattr(args, "strict_cpuset_satisfied", False),
         "background_cpuset": getattr(args, "background_cpuset", ""),
         "background_cpuset_mask": getattr(args, "background_cpuset_mask", ""),
@@ -1773,7 +1786,7 @@ def write_cpu_affinity_preflight(
 ) -> bool:
     plan_path = run_dir / "cpu_affinity_plan.json"
     writer = SidecarWriter(str(run_dir))
-    if not args.strict_cpuset or not plan_path.exists():
+    if args.cpu_affinity_mode == "none" or not plan_path.exists():
         writer.write_preflight_results(run_id, [])
         (run_dir / "cpu_affinity_preflight_summary.json").write_text(
             json.dumps({"status": "not_applicable", "all_passed": True}, indent=2, sort_keys=True),
@@ -2982,7 +2995,7 @@ def launch_external_devices(
             listen_addr=listen_addr,
             run_id=run_id,
             scenario=args.scenario,
-            scenario_seed=args.singleton_selection_seed,
+            scenario_seed=args.scenario_seed,
             profile_path_template=profile_template,
             remote_results_root=remote_results_root,
             remote_tmp=remote_tmp,
@@ -3310,13 +3323,14 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
         "profile_schema_version": 3,
         "run_id": run_id,
         "scenario": scenario,
-        "scenario_seed": args.singleton_selection_seed,
+        "scenario_seed": args.scenario_seed,
         "created_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
         "benchmark_profile": {
             "workers": args.workers,
             "min_size": args.min_size,
             "max_size": args.max_size if args.max_size is not None else args.workers,
             "step_size": args.step_size,
+            "plateau_order": args.plateau_order,
             "roundtrips": args.roundtrips,
             "app_rounds": args.app_rounds,
             "max_app_samples_per_payload": args.max_app_samples_per_payload,
@@ -3448,8 +3462,8 @@ def main() -> int:
 
     if args.resource_experiment != "none" and args.profiled_singleton_count > args.singleton_min_count:
         raise SystemExit("resource sweeps require --singleton-min-count >= --profiled-singleton-count")
-    if args.resource_experiment != "none" and not args.strict_cpuset:
-        raise SystemExit("Signal resource sweeps require --strict-cpuset")
+    if args.resource_experiment != "none" and args.cpu_affinity_mode == "none":
+        raise SystemExit("Signal resource sweeps require --cpu-affinity-mode profiled-nor-background")
 
     normalize_resource_args(args)
 
@@ -3565,6 +3579,8 @@ def main() -> int:
             run_id,
             "--scenario",
             scenario,
+            "--scenario-seed",
+            str(args.scenario_seed),
             "--output-dir",
             output_dir_name,
             "--compose-out",
@@ -3618,12 +3634,88 @@ def main() -> int:
             generator_cmd += ["--singleton-pids-limit", str(args.singleton_pids_limit)]
         if args.singleton_app_heap_budget is not None:
             generator_cmd += ["--singleton-app-heap-budget", args.singleton_app_heap_budget]
-        if args.strict_cpuset:
-            generator_cmd += [
-                "--strict-cpuset",
-                "--cpu-affinity-sample-seconds",
-                str(args.cpu_affinity_sample_seconds),
+        # ── Affinity planning (OpenMLS-compatible) ───
+        if (
+            args.resource_experiment == "none"
+            and args.cpu_affinity_mode != "none"
+            and args.profiled_singleton_count > 0
+            and not getattr(args, "disable_container_profiling", False)
+        ):
+            from generate_compose import select_singleton_ids, compute_hybrid_layout
+            from cpu_affinity_planner import (
+                create_affinity_plan,
+                validate_affinity_plan,
+                write_affinity_plan_json,
+            )
+
+            layout_info = compute_hybrid_layout(
+                args.workers, args.singleton_min_count,
+                args.singleton_fraction, args.packed_clients_per_container,
+            )
+            singleton_ids = select_singleton_ids(
+                args.workers, layout_info["singleton_count"],
+                args.singleton_selection_seed, args.singleton_selection_strategy,
+            )
+            count = min(len(singleton_ids), args.profiled_singleton_count)
+            profiled_singleton_ids = singleton_ids[:count]
+            profiled_worker_ids = [f"worker-{cid}" for cid in profiled_singleton_ids]
+            profiled_specs = [
+                {
+                    "worker_id": wid,
+                    "container_name": f"worker-{cid}",
+                    "logical_client_id": cid,
+                    "experiment_kind": "unconstrained_container_baseline",
+                    "resource_profile_id": "",
+                    "rayon_num_threads": 1,
+                }
+                for wid, cid in zip(profiled_worker_ids, profiled_singleton_ids)
             ]
+            profiled_cpu_counts = {wid: 1 for wid in profiled_worker_ids}
+            bg_specs = [
+                {"container_name": "kr", "container_role": "infrastructure"},
+                {"container_name": "relay", "container_role": "infrastructure"},
+            ]
+            if args.runner_in_docker:
+                bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
+            if args.include_netcheck:
+                bg_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
+            profiled_id_set = set(profiled_singleton_ids)
+            for cid in singleton_ids:
+                if cid not in profiled_id_set:
+                    bg_specs.append({
+                        "container_name": f"worker-{cid}",
+                        "container_role": "unprofiled_singleton",
+                    })
+            for p in range(layout_info["packed_container_count"]):
+                bg_specs.append({
+                    "container_name": f"worker-pack-{p:03d}",
+                    "container_role": "packed",
+                })
+
+            print(f"[affinity] Computing baseline CPU affinity plan "
+                  f"({len(profiled_specs)} profiled workers, "
+                  f"{sum(profiled_cpu_counts.values())} total CPUs)...", flush=True)
+            plan = create_affinity_plan(
+                run_id=run_id,
+                profiled_worker_specs=profiled_specs,
+                background_specs=bg_specs,
+                cpu_affinity_mode=args.cpu_affinity_mode,
+                sample_seconds=args.cpu_affinity_sample_seconds,
+                reserve_smt_siblings=args.reserve_smt_siblings,
+                profiled_cpu_counts=profiled_cpu_counts,
+            )
+            affinity_errors = validate_affinity_plan(plan)
+            if affinity_errors:
+                raise RuntimeError(
+                    "Invalid CPU affinity plan: " + "; ".join(affinity_errors)
+                )
+            for w in plan.warnings:
+                print(f"[affinity] WARNING: {w}", flush=True)
+            for pa in plan.profiled_assignments:
+                print(f"[affinity]   {pa.container_name}: cpus={pa.assigned_cpus} "
+                      f"rayon_threads={pa.rayon_num_threads}", flush=True)
+            affinity_plan_path = write_affinity_plan_json(plan, str(run_dir))
+            generator_cmd += ["--affinity-plan-file", affinity_plan_path]
 
         if args.runner_in_docker:
             generator_cmd.append("--include-runner")
@@ -3739,7 +3831,7 @@ def main() -> int:
             args=args,
             compose_env=compose_env,
         )
-        if args.strict_cpuset:
+        if args.cpu_affinity_mode != "none":
             update_resource_limits_cpuset_status(run_dir, args.strict_cpuset_satisfied)
         write_singleton_resource_profile_sidecars(
             run_dir=run_dir,
@@ -3748,7 +3840,7 @@ def main() -> int:
             targets=resource_targets,
             args=args,
         )
-        if args.strict_cpuset and not args.strict_cpuset_satisfied:
+        if args.cpu_affinity_mode != "none" and not args.strict_cpuset_satisfied:
             raise ResourceLimitVerificationError(
                 "strict cpuset preflight failed; see cpu_affinity_preflight.csv"
             )
@@ -3897,6 +3989,8 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                "--plateau-order",
+                args.plateau_order,
                 "--roundtrips",
                 str(args.roundtrips),
                 "--app-rounds",
@@ -3952,6 +4046,8 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                "--plateau-order",
+                args.plateau_order,
                 "--roundtrips",
                 str(args.roundtrips),
                 "--app-rounds",
