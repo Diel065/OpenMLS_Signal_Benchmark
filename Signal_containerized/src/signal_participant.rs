@@ -87,7 +87,7 @@ fn generate_kyber_prekey_record(
     identity_key_pair: &IdentityKeyPair,
     csprng: &mut StdRng,
 ) -> Result<KyberPreKeyRecord> {
-    let key_pair = kem::KeyPair::generate(kem::KeyType::Kyber1024, csprng);
+    let key_pair = kem::KeyPair::generate(kem::KeyType::Kyber768, csprng);
     let public_key = key_pair.public_key.serialize();
     let signature = identity_key_pair
         .private_key()
