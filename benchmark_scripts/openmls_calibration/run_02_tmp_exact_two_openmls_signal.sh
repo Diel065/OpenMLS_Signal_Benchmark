@@ -26,19 +26,23 @@ esac
 
 WORKERS="${WORKERS:-1024}"
 MAX_SIZE="${MAX_SIZE:-1024}"
-PROFILED_SINGLETON_COUNT=10
-SINGLETON_MIN_COUNT=10
-SINGLETON_FRACTION="0.000000001"
-PACKED_PER_CONTAINER=64
-PACKED_INTERNAL_PARALLELISM=16
-BRIDGE_COUNT=2
-STEP_SIZE="16"
-APP_ROUNDS=4
-UPDATE_ROUNDS=4
-ROUNDTRIPS=1
-MAX_APP_SAMPLES_PER_PAYLOAD=4
-MAX_UPDATE_SAMPLES_PER_PLATEAU=4
-PAYLOAD_SIZES="32,512,2048"
+PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
+SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
+SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
+SINGLETON_SELECTION_STRATEGY="${SINGLETON_SELECTION_STRATEGY:-stratified-random}"
+PACKED_PER_CONTAINER="${PACKED_PER_CONTAINER:-64}"
+PACKED_INTERNAL_PARALLELISM="${PACKED_INTERNAL_PARALLELISM:-16}"
+BRIDGE_COUNT="${BRIDGE_COUNT:-2}"
+STEP_SIZE="${STEP_SIZE:-16}"
+STEP_SIZE_SWITCH_AT="${STEP_SIZE_SWITCH_AT:-}"
+STEP_SIZE_AFTER_SWITCH="${STEP_SIZE_AFTER_SWITCH:-}"
+PLATEAU_ORDER="${PLATEAU_ORDER:-staircase}"
+APP_ROUNDS="${APP_ROUNDS:-2}"
+UPDATE_ROUNDS="${UPDATE_ROUNDS:-4}"
+ROUNDTRIPS="${ROUNDTRIPS:-1}"
+MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
+MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
+PAYLOAD_SIZES="${PAYLOAD_SIZES:-[32,4096]}"
 CPU_AFFINITY_SAMPLE="${CPU_AFFINITY_SAMPLE:-20}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
 WORKER_HEALTH_TIMEOUT="${WORKER_HEALTH_TIMEOUT:-600}"
@@ -149,6 +153,10 @@ preflight() {
   docker info >/dev/null
   docker compose version >/dev/null
   python3 --version >/dev/null
+  if { [ -n "$STEP_SIZE_SWITCH_AT" ] && [ -z "$STEP_SIZE_AFTER_SWITCH" ]; } || { [ -z "$STEP_SIZE_SWITCH_AT" ] && [ -n "$STEP_SIZE_AFTER_SWITCH" ]; }; then
+    log "ERROR: STEP_SIZE_SWITCH_AT and STEP_SIZE_AFTER_SWITCH must be set together"
+    exit 2
+  fi
   log "docker_ready=yes"
   log "docker_compose_ready=yes"
   log "python_ready=yes"
@@ -163,7 +171,6 @@ preflight() {
   log ""
   log "configuration_common: workers=$WORKERS max_size=$MAX_SIZE step_size=$STEP_SIZE app_rounds=$APP_ROUNDS update_rounds=$UPDATE_ROUNDS profiled_containers=$PROFILED_SINGLETON_COUNT output_root=$OUTPUT_ROOT"
   log "payload_sizes=$PAYLOAD_SIZES"
-  log "payload_limitation=existing runners enumerate fixed payload sizes; exact per-message random discrete choice from {32,512,2048} is not supported without a Rust runner patch"
   log "signal_update_limitation=Signal runner accepts --update-rounds but current pairwise Signal path has no MLS-style self-update phase"
   log "output_separation=openmls:$OPENMLS_RUN_DIR signal:$SIGNAL_RUN_DIR"
   log ""
@@ -186,6 +193,7 @@ run_openmls() {
     --scenario tmp-two-run-unconstrained-container-baseline
     --scenario-seed "$scenario_seed"
     --singleton-selection-seed "$singleton_seed"
+    --singleton-selection-strategy "$SINGLETON_SELECTION_STRATEGY"
     --output-dir "$output_arg"
     --worker-layout-mode hybrid
     --singleton-min-count "$SINGLETON_MIN_COUNT"
@@ -203,7 +211,7 @@ run_openmls() {
     --min-size 2
     --max-size "$MAX_SIZE"
     --step-size "$STEP_SIZE"
-    --plateau-order staircase
+    --plateau-order "$PLATEAU_ORDER"
     --roundtrips "$ROUNDTRIPS"
     --update-rounds "$UPDATE_ROUNDS"
     --app-rounds "$APP_ROUNDS"
@@ -243,6 +251,10 @@ run_signal() {
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
   fi
+  local piecewise_step_args=()
+  if [ -n "$STEP_SIZE_SWITCH_AT" ] || [ -n "$STEP_SIZE_AFTER_SWITCH" ]; then
+    piecewise_step_args=(--step-size-switch-at "$STEP_SIZE_SWITCH_AT" --step-size-after-switch "$STEP_SIZE_AFTER_SWITCH")
+  fi
   local cmd=(
     "$py" scripts/run_compose_benchmark.py
     --workers "$WORKERS"
@@ -250,6 +262,7 @@ run_signal() {
     --scenario tmp-two-run-unconstrained-container-baseline
     --scenario-seed "$scenario_seed"
     --singleton-selection-seed "$singleton_seed"
+    --singleton-selection-strategy "$SINGLETON_SELECTION_STRATEGY"
     --output-dir "$output_arg"
     --worker-layout-mode hybrid
     --singleton-min-count "$SINGLETON_MIN_COUNT"
@@ -267,13 +280,15 @@ run_signal() {
     --min-size 2
     --max-size "$MAX_SIZE"
     --step-size "$STEP_SIZE"
-    --plateau-order staircase
+    "${piecewise_step_args[@]}"
+    --plateau-order "$PLATEAU_ORDER"
     --roundtrips "$ROUNDTRIPS"
     --update-rounds "$UPDATE_ROUNDS"
     --app-rounds "$APP_ROUNDS"
     --max-update-samples-per-plateau "$MAX_UPDATE_SAMPLES_PER_PLATEAU"
     --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD"
     --payload-sizes "$PAYLOAD_SIZES"
+    --profile-only-singletons
     --http-pool-max-idle-per-host "$WORKER_HTTP_POOL"
     --worker-http-pool-max-idle-per-host "$WORKER_HTTP_POOL"
     --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS"
@@ -299,7 +314,7 @@ run_signal() {
 
 verify_run() {
   local protocol="$1" run_dir="$2" run_id="$3" profile_glob="$4"
-  PROTOCOL="$protocol" RUN_DIR="$run_dir" RUN_ID="$run_id" PROFILE_GLOB="$profile_glob" REPORT="$REPORT" python3 <<'PY'
+  PROTOCOL="$protocol" RUN_DIR="$run_dir" RUN_ID="$run_id" PROFILE_GLOB="$profile_glob" REPORT="$REPORT" EXPECTED_MAX_SIZE="$MAX_SIZE" EXPECTED_STEP_SIZE="$STEP_SIZE" EXPECTED_STEP_SIZE_SWITCH_AT="$STEP_SIZE_SWITCH_AT" EXPECTED_STEP_SIZE_AFTER_SWITCH="$STEP_SIZE_AFTER_SWITCH" EXPECTED_PAYLOAD_SIZES="$PAYLOAD_SIZES" EXPECTED_PROFILED_COUNT="$PROFILED_SINGLETON_COUNT" python3 <<'PY'
 import csv, json, math, os, re, subprocess, sys
 from pathlib import Path
 
@@ -308,6 +323,12 @@ run_dir = Path(os.environ["RUN_DIR"])
 run_id = os.environ["RUN_ID"]
 profile_glob = os.environ["PROFILE_GLOB"]
 report = Path(os.environ["REPORT"])
+expected_max_size = int(os.environ.get("EXPECTED_MAX_SIZE") or 0)
+expected_step_size = int(os.environ.get("EXPECTED_STEP_SIZE") or 0)
+expected_switch_at = int(os.environ.get("EXPECTED_STEP_SIZE_SWITCH_AT") or 0)
+expected_after_switch = int(os.environ.get("EXPECTED_STEP_SIZE_AFTER_SWITCH") or 0)
+expected_payload_sizes = os.environ.get("EXPECTED_PAYLOAD_SIZES", "")
+expected_profiled_count = int(os.environ.get("EXPECTED_PROFILED_COUNT") or 10)
 
 def parse_cpuset(value):
     cpus = set()
@@ -371,7 +392,7 @@ summary = {
     "empty_files": [],
     "profile_file_count": 0,
     "profile_nonempty_count": 0,
-    "profile_exactly_10": False,
+    "profile_count_ok": False,
     "layout_profile_enabled_count": None,
     "affinity_plan_profiled_count": None,
     "affinity_distinct_single_cpu_assignments": False,
@@ -381,6 +402,8 @@ summary = {
     "log_issue_samples": [],
     "signal_subspans_valid": None,
     "signal_subspan_details": {},
+    "coverage_valid": None,
+    "coverage_details": {},
 }
 
 if run_dir.exists():
@@ -407,7 +430,7 @@ if events_path.exists():
 profile_files = sorted(run_dir.glob(profile_glob)) if run_dir.exists() else []
 summary["profile_file_count"] = len(profile_files)
 summary["profile_nonempty_count"] = sum(1 for p in profile_files if p.stat().st_size > 0)
-summary["profile_exactly_10"] = summary["profile_nonempty_count"] == 10
+summary["profile_count_ok"] = summary["profile_nonempty_count"] == expected_profiled_count
 
 layout_path = run_dir / "worker_layout.json"
 if layout_path.exists():
@@ -428,7 +451,7 @@ if plan_path.exists():
         assigned = [a.get("assigned_cpus", []) for a in assignments]
         flat = [cpu for cpus in assigned for cpu in cpus]
         summary["affinity_distinct_single_cpu_assignments"] = (
-            len(assignments) == 10 and all(len(cpus) == 1 for cpus in assigned) and len(flat) == len(set(flat))
+            len(assignments) == expected_profiled_count and all(len(cpus) == 1 for cpus in assigned) and len(flat) == len(set(flat))
         )
         checks = []
         if compose_file.exists():
@@ -482,11 +505,38 @@ if protocol == "signal":
     ]
     names = set()
     numeric_values = []
+    conversation_sizes = set()
+    payload_sizes = set()
+    successful_required_wrapper_rows = 0
+    required_wrappers = {
+        "session_establish_pair_wrapper",
+        "pairwise_fanout_send_wrapper",
+        "pairwise_fanout_receive_wrapper",
+    }
+    seen_wrappers = set()
     run_id_matches = 0
     protocol_rows = 0
     protocol_core_rows = 0
     for row in rows:
         names.update(v for v in (row.get("span_name"), row.get("op"), row.get("event_subtype")) if v)
+        wrapper = row.get("event_subtype") or row.get("op") or ""
+        if wrapper in required_wrappers:
+            seen_wrappers.add(wrapper)
+            if (row.get("success") or "").lower() == "true":
+                successful_required_wrapper_rows += 1
+        for col, target in (("conversation_size", conversation_sizes), ("benchmark_active_size", conversation_sizes)):
+            val = row.get(col)
+            if val not in (None, ""):
+                try:
+                    target.add(int(val))
+                except ValueError:
+                    pass
+        val = row.get("benchmark_payload_size")
+        if val not in (None, ""):
+            try:
+                payload_sizes.add(int(val))
+            except ValueError:
+                pass
         if row.get("run_id") == run_id:
             run_id_matches += 1
         stack = (row.get("protocol_stack") or row.get("implementation") or "").lower()
@@ -524,6 +574,43 @@ if protocol == "signal":
         and len(numeric_values) > 0
         and nonzero
     )
+    expected_payload_set = set()
+    if expected_payload_sizes.strip().isdigit():
+        expected_payload_set.add(int(expected_payload_sizes.strip()))
+    min_plateaus = 0
+    if expected_max_size >= 2 and expected_step_size > 0:
+        current = 2
+        expected_sizes = [current]
+        while current < expected_max_size:
+            if expected_switch_at > 0 and expected_after_switch > 0 and current < expected_switch_at:
+                current = min(current + expected_step_size, expected_switch_at, expected_max_size)
+            elif expected_switch_at > 0 and expected_after_switch > 0:
+                current = min(current + expected_after_switch, expected_max_size)
+            else:
+                current = min(current + expected_step_size, expected_max_size)
+            if expected_sizes[-1] != current:
+                expected_sizes.append(current)
+        min_plateaus = len(expected_sizes)
+    summary["coverage_details"] = {
+        "expected_max_size": expected_max_size,
+        "expected_step_size": expected_step_size,
+        "expected_step_size_switch_at": expected_switch_at,
+        "expected_step_size_after_switch": expected_after_switch,
+        "expected_payload_sizes": sorted(expected_payload_set),
+        "observed_max_size": max(conversation_sizes) if conversation_sizes else None,
+        "observed_plateau_count": len(conversation_sizes),
+        "observed_payload_sizes": sorted(payload_sizes),
+        "required_wrappers_missing": sorted(required_wrappers - seen_wrappers),
+        "successful_required_wrapper_rows": successful_required_wrapper_rows,
+    }
+    summary["coverage_valid"] = (
+        bool(conversation_sizes)
+        and max(conversation_sizes) >= expected_max_size - expected_step_size
+        and len(conversation_sizes) >= max(1, min_plateaus - 1)
+        and (not expected_payload_set or payload_sizes == expected_payload_set)
+        and not (required_wrappers - seen_wrappers)
+        and successful_required_wrapper_rows > 0
+    )
 
 verification_path = run_dir / f"tmp_two_run_verification_{protocol}.json"
 if run_dir.exists():
@@ -532,12 +619,13 @@ if run_dir.exists():
 ok = (
     summary["events_csv_exists"]
     and summary["events_csv_non_empty"]
-    and summary["profile_exactly_10"]
+    and summary["profile_count_ok"]
     and summary["affinity_distinct_single_cpu_assignments"]
     and summary["actual_cpuset_pass"]
 )
 if protocol == "signal":
     ok = ok and bool(summary["signal_subspans_valid"])
+    ok = ok and bool(summary["coverage_valid"])
 
 with report.open('a', encoding='utf-8') as handle:
     handle.write(f"\n===== {protocol} output inspection =====\n")
@@ -546,7 +634,7 @@ with report.open('a', encoding='utf-8') as handle:
     handle.write(f"artifact_count={summary['artifact_count']}\n")
     handle.write("artifacts=" + ", ".join(f"{a['name']}:{a['type']}:{a['size']}" for a in summary['artifacts']) + "\n")
     handle.write(f"empty_files={summary['empty_files']}\n")
-    handle.write(f"profile_files={summary['profile_file_count']} nonempty={summary['profile_nonempty_count']} exactly_10={summary['profile_exactly_10']}\n")
+    handle.write(f"profile_files={summary['profile_file_count']} nonempty={summary['profile_nonempty_count']} expected={expected_profiled_count} count_ok={summary['profile_count_ok']}\n")
     handle.write(f"layout_profile_enabled_count={summary['layout_profile_enabled_count']}\n")
     handle.write(f"affinity_plan_profiled_count={summary['affinity_plan_profiled_count']} distinct_single_cpu={summary['affinity_distinct_single_cpu_assignments']} actual_cpuset_pass={summary['actual_cpuset_pass']}\n")
     handle.write(f"log_issue_count={summary['log_issue_count']}\n")
@@ -554,6 +642,7 @@ with report.open('a', encoding='utf-8') as handle:
         handle.write(f"log_issue_sample={sample}\n")
     if protocol == "signal":
         handle.write(f"signal_subspans_valid={summary['signal_subspans_valid']} details={json.dumps(summary['signal_subspan_details'], sort_keys=True)}\n")
+        handle.write(f"coverage_valid={summary['coverage_valid']} details={json.dumps(summary['coverage_details'], sort_keys=True)}\n")
     handle.write(f"verification_json={verification_path}\n")
     handle.write(f"verification_status={'pass' if ok else 'fail'}\n")
 

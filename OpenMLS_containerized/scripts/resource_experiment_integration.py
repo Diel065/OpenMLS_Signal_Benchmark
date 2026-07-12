@@ -71,6 +71,7 @@ class ResourceExperimentIntegration:
         embedded_cpu_fractions: Optional[List[float]] = None,
         embedded_cpu_cores: Optional[List[int]] = None,
         embedded_docker_memory: str = "256m",
+        ram_app_heap_sweep_values: Optional[List[str]] = None,
         cpu_affinity_mode: str = "none",
         cpu_affinity_sample_seconds: float = 20.0,
         reserve_smt_siblings: bool = False,
@@ -87,6 +88,7 @@ class ResourceExperimentIntegration:
         self.embedded_cpu_fractions = embedded_cpu_fractions or [1.00, 0.50, 0.25, 0.10, 0.05]
         self.embedded_cpu_cores = embedded_cpu_cores or [1]
         self.embedded_docker_memory = embedded_docker_memory
+        self.ram_app_heap_sweep_values = ram_app_heap_sweep_values or []
         self.cpu_affinity_mode = cpu_affinity_mode
         self.cpu_affinity_sample_seconds = cpu_affinity_sample_seconds
         self.reserve_smt_siblings = reserve_smt_siblings
@@ -146,7 +148,9 @@ class ResourceExperimentIntegration:
                 run_id=self.run_id,
             )
         elif self.resource_experiment == "ram-app-heap-sweep":
+            heap_budgets = self.ram_app_heap_sweep_values if self.ram_app_heap_sweep_values else None
             self.profiles = generate_parallel_ram_sweep_profiles(
+                heap_budgets=heap_budgets,
                 docker_memory_limit=self.embedded_docker_memory,
                 assigned_cpu_count=1,
                 run_id=self.run_id,
@@ -389,6 +393,11 @@ def add_resource_experiment_args(parser):
         help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     re_group.add_argument(
+        "--ram-app-heap-sweep-values",
+        default="",
+        help="Comma-separated list of 10 application heap budgets for ram-app-heap-sweep",
+    )
+    re_group.add_argument(
         "--profiled-singleton-count",
         type=int,
         default=1,
@@ -467,6 +476,12 @@ def parse_resource_experiment_args(args) -> ResourceExperimentIntegration:
     if isinstance(embedded_cpu_cores, str):
         embedded_cpu_cores = [int(v.strip()) for v in embedded_cpu_cores.split(",") if v.strip()]
 
+    ram_app_heap_sweep_values = getattr(args, "ram_app_heap_sweep_values", "") or ""
+    ram_app_heap_sweep_values = (
+        [v.strip() for v in ram_app_heap_sweep_values.split(",") if v.strip()]
+        if ram_app_heap_sweep_values else []
+    )
+
     return ResourceExperimentIntegration(
         run_id=getattr(args, "run_id", "unknown"),
         run_dir=run_dir,
@@ -480,6 +495,7 @@ def parse_resource_experiment_args(args) -> ResourceExperimentIntegration:
         embedded_cpu_fractions=embedded_cpu_fractions,
         embedded_cpu_cores=embedded_cpu_cores,
         embedded_docker_memory=getattr(args, "embedded_docker_memory", "256m"),
+        ram_app_heap_sweep_values=ram_app_heap_sweep_values,
         cpu_affinity_mode=getattr(args, "cpu_affinity_mode", "none"),
         cpu_affinity_sample_seconds=getattr(args, "cpu_affinity_sample_seconds", 20.0),
         reserve_smt_siblings=getattr(args, "reserve_smt_siblings", False),

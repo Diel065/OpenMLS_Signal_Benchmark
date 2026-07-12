@@ -50,6 +50,36 @@ pub struct SignalProfileEvent {
     #[serde(default)]
     pub benchmark_payload_size: Option<usize>,
     #[serde(default)]
+    pub benchmark_workflow_id: Option<u64>,
+    #[serde(default)]
+    pub workflow_pair_index: Option<u32>,
+    #[serde(default)]
+    pub workflow_pair_count: Option<u32>,
+    #[serde(default)]
+    pub new_session_established: Option<bool>,
+    #[serde(default)]
+    pub span_id: Option<u64>,
+    #[serde(default)]
+    pub parent_span_id: Option<u64>,
+    #[serde(default)]
+    pub parent_operation: Option<String>,
+    #[serde(default)]
+    pub span_name: Option<String>,
+    #[serde(default)]
+    pub span_kind: Option<String>,
+    #[serde(default)]
+    pub measurement_plane: Option<String>,
+    #[serde(default)]
+    pub span_inclusive: Option<bool>,
+    #[serde(default)]
+    pub worker_id: Option<String>,
+    #[serde(default)]
+    pub global_span_id: Option<String>,
+    #[serde(default)]
+    pub parent_global_span_id: Option<String>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default)]
     pub participant_id: Option<String>,
     #[serde(default)]
     pub participant_device_id: Option<u32>,
@@ -73,6 +103,8 @@ pub struct SignalProfileEvent {
     pub success: bool,
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
+    #[serde(default)]
+    pub cpu_process_ns: Option<u128>,
     #[serde(default)]
     pub cpu_envelope_utilization: Option<f64>,
     #[serde(default)]
@@ -280,6 +312,20 @@ pub struct SignalCsvRow<'a> {
     pub benchmark_operation: Option<String>,
     pub benchmark_operation_seq: Option<usize>,
     pub benchmark_payload_size: Option<usize>,
+    pub benchmark_workflow_id: Option<u64>,
+    pub workflow_pair_index: Option<u32>,
+    pub workflow_pair_count: Option<u32>,
+    pub new_session_established: Option<bool>,
+    pub span_id: Option<u64>,
+    pub parent_span_id: Option<u64>,
+    pub parent_operation: Option<String>,
+    pub span_kind: Option<String>,
+    pub measurement_plane: Option<String>,
+    pub span_inclusive: Option<bool>,
+    pub global_span_id: Option<String>,
+    pub parent_global_span_id: Option<String>,
+    pub profiling_worker_id: Option<String>,
+    pub request_id: Option<String>,
     pub participant_id: Option<String>,
     pub participant_device_id: Option<u32>,
     pub role: Option<String>,
@@ -292,6 +338,7 @@ pub struct SignalCsvRow<'a> {
     pub phase: Option<String>,
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
+    pub cpu_process_ns: Option<u128>,
     pub cpu_envelope_utilization: Option<f64>,
     pub cpu_throttled_time_ratio: Option<f64>,
     pub alloc_bytes: Option<u64>,

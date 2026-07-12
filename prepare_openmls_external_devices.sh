@@ -8,6 +8,7 @@
 # Useful overrides:
 #   LUCKFOX_IFACE=enx... ./prepare_openmls_external_devices.sh
 #   BUILD_EXTERNAL_WORKERS=0 ./prepare_openmls_external_devices.sh
+#   VM_IP=192.168.11.127 ./prepare_openmls_external_devices.sh
 
 set -euo pipefail
 
@@ -25,6 +26,11 @@ LUCKFOX_IFACE="${LUCKFOX_IFACE:-}"
 RASPI_HOST="${RASPI_HOST:-192.168.178.33}"
 RASPI_USER="${RASPI_USER:-diel}"
 RASPI_PASS="${RASPI_PASS:-diel}"
+
+# Raspberry Pi 3 Model B+ (32-bit OS -> armv7l worker, same as the Luckfox).
+RASPI3BP_HOST="${RASPI3BP_HOST:-192.168.178.35}"
+RASPI3BP_USER="${RASPI3BP_USER:-diel}"
+RASPI3BP_PASS="${RASPI3BP_PASS:-diel}"
 
 BUILD_EXTERNAL_WORKERS="${BUILD_EXTERNAL_WORKERS:-missing}"
 
@@ -190,6 +196,48 @@ prepare_raspi() {
   '
 }
 
+prepare_raspi_3bplus() {
+  log "Raspberry Pi 3 Model B+ over SSH/Wi-Fi (32-bit, armv7l)"
+
+  if ping -c 1 -W 2 "$RASPI3BP_HOST" >/dev/null 2>&1; then
+    echo "[raspi3b+] ping ok: $RASPI3BP_HOST"
+  else
+    warn "Raspberry Pi 3B+ ping failed. It may be powered off, on another IP, or blocking ICMP."
+  fi
+
+  local ssh_cmd=(
+    ssh
+    -o StrictHostKeyChecking=no
+    -o UserKnownHostsFile=/dev/null
+    -o LogLevel=ERROR
+    -o BatchMode=no
+    -o ConnectTimeout=10
+    "$RASPI3BP_USER@$RASPI3BP_HOST"
+  )
+
+  if [[ -n "$RASPI3BP_PASS" ]] && command -v sshpass >/dev/null 2>&1; then
+    ssh_cmd=(sshpass -p "$RASPI3BP_PASS" "${ssh_cmd[@]}")
+  elif [[ -n "$RASPI3BP_PASS" ]]; then
+    warn "sshpass not found; SSH may prompt for the Raspberry Pi 3B+ password."
+  fi
+
+  "${ssh_cmd[@]}" '
+    set -e
+    hostname
+    whoami
+    uname -m
+    killall worker 2>/dev/null || pkill worker 2>/dev/null || true
+    mkdir -p /home/diel/openmls-benchmark/bin \
+             /home/diel/openmls-benchmark/results/openmls \
+             /home/diel/openmls-benchmark/tmp
+    if test -x /home/diel/openmls-benchmark/bin/worker; then
+      echo "remote worker binary present"
+    else
+      echo "remote worker binary missing; benchmark runner will push the local armv7 binary if present"
+    fi
+  '
+}
+
 main() {
   need_cmd adb
   need_cmd ip
@@ -202,9 +250,13 @@ main() {
 
   prepare_luckfox
   prepare_raspi
+  prepare_raspi_3bplus
+
+  log "Setting up external-device benchmark bridges"
+  "$SCRIPT_DIR/benchmark_scripts/setup_external_device_benchmark_bridges.sh"
 
   log "Ready"
-  echo "External-device prep finished."
+  echo "External-device prep and bridge setup finished."
   echo "Next benchmark entrypoint: ./run_benchmark_openmls.sh"
 }
 

@@ -94,6 +94,7 @@ pub struct StaircaseConfig {
     pub no_aggregate: bool,
     pub failure_experiment: bool,
     pub profiled_failure_policy: ProfiledFailurePolicy,
+    pub remove_rejoin: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2057,59 +2058,78 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size, state.epoch, state.members
         );
 
-        run_update_phase(
-            &http,
-            &mut active,
-            target_size,
-            config.update_rounds,
-            config.max_update_samples_per_plateau,
-            config.max_commit_receive_samples_per_plateau,
-            config.commit_receive_sampling_seed,
-            &mut fanout,
-            &mut progress,
-            config.process_pending_fanout,
-            config.external_coverage_lane,
-            &mut scenario_rng,
-            plateau_idx + 1,
-            &runner_events,
-        )
-        .await?;
+        if config.remove_rejoin {
+            run_remove_rejoin_phase(
+                &http,
+                &mut active,
+                &mut idle,
+                &mut fanout,
+                config.process_pending_fanout,
+                target_size,
+                config.max_commit_receive_samples_per_plateau,
+                config.commit_receive_sampling_seed,
+                &mut scenario_rng,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await?;
+        }
 
-        let state_after_updates = ensure_converged_with_attrition(
-            &http,
-            &mut active,
-            &mut fanout,
-            config.process_pending_fanout,
-            target_size,
-            config.max_commit_receive_samples_per_plateau,
-            config.commit_receive_sampling_seed,
-            max_fanout_parallelism,
-            plateau_idx + 1,
-            &runner_events,
-        )
-        .await?;
-        eprintln!(
-            "\n[plateau {}] post-update convergence at epoch {}",
-            target_size, state_after_updates.epoch
-        );
+        if !config.remove_rejoin {
+            run_update_phase(
+                &http,
+                &mut active,
+                target_size,
+                config.update_rounds,
+                config.max_update_samples_per_plateau,
+                config.max_commit_receive_samples_per_plateau,
+                config.commit_receive_sampling_seed,
+                &mut fanout,
+                &mut progress,
+                config.process_pending_fanout,
+                config.external_coverage_lane,
+                &mut scenario_rng,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await?;
 
-        run_application_phase(
-            &http,
-            &mut active,
-            target_size,
-            config.app_rounds,
-            config.max_app_samples_per_payload,
-            config.max_commit_receive_samples_per_plateau,
-            config.commit_receive_sampling_seed,
-            &config.payload_sizes,
-            &mut fanout,
-            &mut progress,
-            config.external_coverage_lane,
-            &mut scenario_rng,
-            plateau_idx + 1,
-            &runner_events,
-        )
-        .await?;
+            let state_after_updates = ensure_converged_with_attrition(
+                &http,
+                &mut active,
+                &mut fanout,
+                config.process_pending_fanout,
+                target_size,
+                config.max_commit_receive_samples_per_plateau,
+                config.commit_receive_sampling_seed,
+                max_fanout_parallelism,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await?;
+            eprintln!(
+                "\n[plateau {}] post-update convergence at epoch {}",
+                target_size, state_after_updates.epoch
+            );
+
+            run_application_phase(
+                &http,
+                &mut active,
+                target_size,
+                config.app_rounds,
+                config.max_app_samples_per_payload,
+                config.max_commit_receive_samples_per_plateau,
+                config.commit_receive_sampling_seed,
+                &config.payload_sizes,
+                &mut fanout,
+                &mut progress,
+                config.external_coverage_lane,
+                &mut scenario_rng,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await?;
+        }
 
         eprintln!("\n=== Plateau {} complete ===", target_size);
     }
@@ -5111,13 +5131,16 @@ async fn add_n_members(
         )
         .await?
         {
+            let mut dead_workers = Vec::with_capacity(joiners.len() + 1);
+            dead_workers.push(actor.clone());
+            dead_workers.extend(joiners.iter().cloned());
             for joiner in joiners.into_iter().rev() {
                 idle.push_front(joiner);
             }
             evict_oom_group_members(
                 http,
                 active,
-                &[actor],
+                &dead_workers,
                 fanout,
                 process_pending_fanout,
                 target_size,
@@ -5130,7 +5153,7 @@ async fn add_n_members(
         }
         return Err(error);
     }
-    if process_pending_fanout {
+    let actor_commit_result = if process_pending_fanout {
         process_pending_commit_expect(
             http,
             &actor,
@@ -5138,7 +5161,7 @@ async fn add_n_members(
             "add_member.actor_process_pending",
             Some(&cursor),
         )
-        .await?;
+        .await
     } else {
         receive_commit_expect(
             http,
@@ -5148,7 +5171,40 @@ async fn add_n_members(
             "add_member.actor_receive_commit",
             Some(&cursor),
         )
-        .await?;
+        .await
+    };
+    if let Err(error) = actor_commit_result {
+        if record_profiled_worker_failure(
+            runner_events,
+            &cursor,
+            &actor,
+            &error,
+            "evict_add_actor_receive_and_retry",
+            active.iter().find(|worker| worker.id != actor.id),
+        )
+        .await?
+        {
+            let mut dead_workers = Vec::with_capacity(joiners.len() + 1);
+            dead_workers.push(actor.clone());
+            dead_workers.extend(joiners.iter().cloned());
+            for joiner in joiners.into_iter().rev() {
+                idle.push_front(joiner);
+            }
+            evict_oom_group_members(
+                http,
+                active,
+                &dead_workers,
+                fanout,
+                process_pending_fanout,
+                target_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+                runner_events,
+            )
+            .await?;
+            return Ok(());
+        }
+        return Err(error);
     }
 
     let mut joined = Vec::with_capacity(joiners.len());
@@ -5686,7 +5742,7 @@ async fn best_effort_process_pending_commits_after_epoch_race(
     actor: &WorkerSpec,
     cursor: &BenchmarkCursor,
     attempt: usize,
-) {
+) -> Option<String> {
     let command = Command::ProcessPending {
         kinds: Some(vec![PendingKind::Commits]),
         max_messages: Some(8),
@@ -5708,7 +5764,7 @@ async fn best_effort_process_pending_commits_after_epoch_race(
         Some(cursor),
     );
 
-    if let Err(error) = send_cmd_expect_ok_fragment_with_context(
+    match send_cmd_expect_ok_fragment_with_context(
         http,
         actor,
         &command,
@@ -5717,11 +5773,19 @@ async fn best_effort_process_pending_commits_after_epoch_race(
     )
     .await
     {
-        eprintln!(
-            "[oom-eviction] process_pending after epoch race failed; actor={} attempt={} error={:#}; retrying from fresh group state",
-            actor.id, attempt, error
-        );
+        Ok(message) => Some(message),
+        Err(error) => {
+            eprintln!(
+                "[oom-eviction] process_pending after epoch race failed; actor={} attempt={} error={:#}; retrying from fresh group state",
+                actor.id, attempt, error
+            );
+            None
+        }
     }
+}
+
+fn queued_remove_members_republished(message: &str) -> bool {
+    message.contains("queued remove_members") && message.contains("was retried and published")
 }
 
 async fn publish_remove_members_with_epoch_race_recovery(
@@ -5738,6 +5802,22 @@ async fn publish_remove_members_with_epoch_race_recovery(
             .filter(|member| dead_ids.contains(*member))
             .cloned()
             .collect::<Vec<_>>();
+        let missing_dead_ids = dead_ids
+            .iter()
+            .filter(|dead_id| !actor_before.members.contains(*dead_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing_dead_ids.is_empty()
+            && best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
+                .await
+                .is_some()
+        {
+            eprintln!(
+                "[oom-eviction] caught up actor before removing dead members not visible at current epoch; actor={} attempt={} missing_dead_ids={:?}",
+                actor.id, attempt, missing_dead_ids
+            );
+            continue;
+        }
         let expected_members = actor_before
             .members
             .iter()
@@ -5779,8 +5859,30 @@ async fn publish_remove_members_with_epoch_race_recovery(
                     "[oom-eviction] remove_members queued after epoch race; actor={} attempt={} message={}",
                     actor.id, attempt, response.message
                 );
-                best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
-                    .await;
+                if let Some(message) =
+                    best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
+                        .await
+                {
+                    if queued_remove_members_republished(&message) {
+                        let actor_after = show_group_state(http, actor).await?;
+                        let expected_members = actor_after
+                            .members
+                            .iter()
+                            .filter(|member| !dead_ids.contains(*member))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        let expected_epoch = if expected_members.len() == actor_after.members.len() {
+                            actor_after.epoch
+                        } else {
+                            actor_after.epoch + 1
+                        };
+                        return Ok(expected_group_state(
+                            &actor_after,
+                            expected_epoch,
+                            expected_members,
+                        ));
+                    }
+                }
             }
             "ok" => {
                 return Err(anyhow!(
@@ -6198,6 +6300,420 @@ async fn transition_to_size(
         .await?;
     }
 
+    Ok(())
+}
+
+async fn run_remove_rejoin_phase(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    fanout: &mut FanoutController,
+    process_pending_fanout: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    rng: &mut StdRng,
+    plateau_index: usize,
+    _runner_events: &RunnerEventLog,
+) -> Result<()> {
+    let profiled = active_profiled_indices(active);
+    if profiled.len() < 2 {
+        eprintln!(
+            "[remove-rejoin] plateau {} skipped: need >=2 profiled, have {}",
+            plateau_size,
+            profiled.len()
+        );
+        return Ok(());
+    }
+
+    let victim_idx = profiled[rng.gen_range(0..profiled.len())];
+    let others: Vec<usize> = profiled
+        .iter()
+        .filter(|&&i| i != victim_idx)
+        .copied()
+        .collect();
+    let actor_idx = others[rng.gen_range(0..others.len())];
+    let victim = active[victim_idx].clone();
+    let actor = active[actor_idx].clone();
+    let remove_victim_active = active.len();
+
+    eprintln!(
+        "[remove-rejoin] plateau={} victim={} actor={} active={}",
+        plateau_size, victim.id, actor.id, remove_victim_active
+    );
+
+    // ── Generate KeyPackage (profiled, uploaded to DS) ──
+    let kp_cursor = BenchmarkCursor::new(
+        plateau_index,
+        plateau_size,
+        remove_victim_active,
+        "remove_rejoin",
+        "generate_key_package",
+    );
+    let kp_context = WorkerCommandContext::with_metadata(
+        &victim,
+        &Command::GenerateKeyPackage,
+        None,
+        Some("remove_rejoin.generate_key_package"),
+        Some(&kp_cursor),
+    );
+    let _ =
+        send_command_with_context(http, &victim, &Command::GenerateKeyPackage, &kp_context)
+            .await?;
+    // KeyPackage is now stored on DS at /keypackage/{victim.id}; AddMembers will fetch it.
+
+    // ── Remove victim ──
+    let remove_cursor = BenchmarkCursor::new(
+        plateau_index,
+        plateau_size,
+        remove_victim_active,
+        "remove_rejoin",
+        "remove_commit",
+    );
+    let remove_cmd = Command::RemoveMembers {
+        members: vec![victim.id.clone()],
+    };
+    let remove_ctx = WorkerCommandContext::with_metadata(
+        &actor,
+        &remove_cmd,
+        None,
+        Some("remove_rejoin.remove"),
+        Some(&remove_cursor),
+    );
+    let actor_before = show_group_state(http, &actor).await?;
+    let expected_after_remove = expected_group_state(
+        &actor_before,
+        actor_before.epoch + 1,
+        actor_before
+            .members
+            .iter()
+            .filter(|m| *m != &victim.id)
+            .cloned()
+            .collect(),
+    );
+    send_cmd_expect_ok_fragment_with_context(
+        http,
+        &actor,
+        &remove_cmd,
+        "removed locally; group commit published",
+        &remove_ctx,
+    )
+    .await?;
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_remove.clone()),
+            "remove_rejoin.actor_process_pending",
+            Some(&remove_cursor),
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_remove.clone()),
+            "remove_rejoin.actor_receive_commit",
+            Some(&remove_cursor),
+        )
+        .await?;
+    }
+
+    // Fanout RemoveCommit receivers
+    {
+        let recipients: Vec<WorkerSpec> = active
+            .iter()
+            .filter(|w| w.id != victim.id && w.id != actor.id)
+            .cloned()
+            .collect();
+        let expected_state = ExpectedReceiveCommitState::Group(expected_after_remove.clone());
+        let expected_ep = expected_epoch(&expected_state);
+        let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+            &recipients,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            plateau_size,
+            expected_after_remove.epoch,
+            0,
+        );
+        let fanout_phase = if process_pending_fanout {
+            "remove_rejoin.fanout_process_pending_remove"
+        } else {
+            "remove_rejoin.fanout_receive_commit_remove"
+        };
+        let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            let sampled = sampled_ids.contains(&worker.id);
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some(
+                            "edge_middle_seeded_v1".to_string(),
+                        ),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map
+                            .get(&worker.id)
+                            .copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                } else {
+                    Command::ReceiveCommit {
+                        profile: sampled,
+                        commit_create_op: Some("remove".to_string()),
+                        commit_receive_sampling_policy: Some(
+                            "edge_middle_seeded_v1".to_string(),
+                        ),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map
+                            .get(&worker.id)
+                            .copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: sampled.then_some(true),
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+            }
+            .with_benchmark_cursor(&remove_cursor)
+        });
+        let expected_by_client = recipients
+            .iter()
+            .map(|w| (w.id.clone(), expected_state.clone()))
+            .collect::<HashMap<_, _>>();
+        batch_fanout_workers(
+            http,
+            "remove_rejoin",
+            plateau_size,
+            "receive_commit",
+            &recipients,
+            fanout,
+            &commands_by_physical,
+            Some(&expected_by_client),
+        )
+        .await
+        .map_err(|e| anyhow!("remove fanout: {:#}", e))?;
+    }
+
+    // Move victim to idle
+    active.retain(|w| w.id != victim.id);
+    idle.push_back(victim.clone());
+
+    // ── Re-add victim ──
+    let re_add_active = active.len() + 1;
+    let add_cursor = BenchmarkCursor::new(
+        plateau_index,
+        plateau_size,
+        re_add_active,
+        "remove_rejoin",
+        "add_commit",
+    )
+    .with_membership_batch(&MembershipBatchDecision {
+        requested: 1,
+        effective: 1,
+        group_cap: membership_batch_group_cap(plateau_size),
+        transition_cap: 1,
+        source: "remove_rejoin",
+    });
+    let add_cmd = Command::AddMembers {
+        members: vec![victim.id.clone()],
+    };
+    let add_ctx = WorkerCommandContext::with_metadata(
+        &actor,
+        &add_cmd,
+        None,
+        Some("remove_rejoin.add"),
+        Some(&add_cursor),
+    );
+    let actor_before = show_group_state(http, &actor).await?;
+    let mut expected_members = actor_before.members.clone();
+    expected_members.push(victim.id.clone());
+    expected_members.sort();
+    let expected_after_add = expected_group_state(
+        &actor_before,
+        actor_before.epoch + 1,
+        expected_members,
+    );
+    send_cmd_expect_ok_fragment_with_context(
+        http,
+        &actor,
+        &add_cmd,
+        "added locally in one commit",
+        &add_ctx,
+    )
+    .await?;
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_add.clone()),
+            "remove_rejoin.actor_process_pending_add",
+            Some(&add_cursor),
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_add.clone()),
+            "remove_rejoin.actor_receive_commit_add",
+            Some(&add_cursor),
+        )
+        .await?;
+    }
+
+    // Fanout AddCommit receivers
+    {
+        let recipients: Vec<WorkerSpec> = active
+            .iter()
+            .filter(|w| w.id != actor.id)
+            .cloned()
+            .collect();
+        let expected_state = ExpectedReceiveCommitState::Group(expected_after_add.clone());
+        let expected_ep = expected_epoch(&expected_state);
+        let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+            &recipients,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            plateau_size,
+            expected_after_add.epoch,
+            0,
+        );
+        let fanout_phase = if process_pending_fanout {
+            "remove_rejoin.fanout_process_pending_add"
+        } else {
+            "remove_rejoin.fanout_receive_commit_add"
+        };
+        let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            let sampled = sampled_ids.contains(&worker.id);
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                        profile: sampled,
+                        commit_create_op: Some("add".to_string()),
+                        commit_receive_sampling_policy: Some(
+                            "edge_middle_seeded_v1".to_string(),
+                        ),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map
+                            .get(&worker.id)
+                            .copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                } else {
+                    Command::ReceiveCommit {
+                        profile: sampled,
+                        commit_create_op: Some("add".to_string()),
+                        commit_receive_sampling_policy: Some(
+                            "edge_middle_seeded_v1".to_string(),
+                        ),
+                        commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
+                        commit_receive_sample_index: sample_index_map
+                            .get(&worker.id)
+                            .copied(),
+                        commit_receive_sample_count: Some(sample_count),
+                        commit_receive_population_size: Some(recipients.len()),
+                    }
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: sampled.then_some(true),
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+            }
+            .with_benchmark_cursor(&add_cursor)
+        });
+        let expected_by_client = recipients
+            .iter()
+            .map(|w| (w.id.clone(), expected_state.clone()))
+            .collect::<HashMap<_, _>>();
+        batch_fanout_workers(
+            http,
+            "remove_rejoin",
+            plateau_size,
+            "receive_commit",
+            &recipients,
+            fanout,
+            &commands_by_physical,
+            Some(&expected_by_client),
+        )
+        .await
+        .map_err(|e| anyhow!("add fanout: {:#}", e))?;
+    }
+
+    // ── Victim processes Welcome via JoinFromWelcome (fetches from DS) ──
+    let welcome_cursor = BenchmarkCursor::new(
+        plateau_index,
+        plateau_size,
+        re_add_active,
+        "remove_rejoin",
+        "welcome_receive",
+    );
+    let welcome_cmd = Command::JoinFromWelcome;
+    let welcome_ctx = WorkerCommandContext::with_metadata(
+        &victim,
+        &welcome_cmd,
+        None,
+        Some("remove_rejoin.process_welcome"),
+        Some(&welcome_cursor),
+    );
+    match send_cmd_expect_ok_fragment_with_context(
+        http,
+        &victim,
+        &welcome_cmd,
+        "joined from welcome",
+        &welcome_ctx,
+    )
+    .await
+    {
+        Ok(_) => {
+            // Victim back into active only on success
+            idle.retain(|w| w.id != victim.id);
+            active.push(victim.clone());
+        }
+        Err(e) => {
+            eprintln!(
+                "[remove-rejoin] process_welcome for {} failed, leaving in idle: {:#}",
+                victim.id, e
+            );
+            // victim stays in idle; will be re-added by a future transition
+        }
+    }
+
+    eprintln!(
+        "[remove-rejoin] plateau={} done: victim={} active={} idle={}",
+        plateau_size,
+        victim.id,
+        active.len(),
+        idle.len()
+    );
     Ok(())
 }
 
@@ -8840,6 +9356,16 @@ mod failure_experiment_tests {
 
         store_profiled_failure_policy(ProfiledFailurePolicy::StopOnProfiledFailure);
         let _ = fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn detects_queued_remove_members_republished_by_process_pending() {
+        assert!(queued_remove_members_republished(
+            "external commit received and processed; DS group state updated; queued remove_members for [\"00688\"] was retried and published"
+        ));
+        assert!(!queued_remove_members_republished(
+            "external commit received and processed; DS group state updated; queued add_members for [\"00688\"] was retried and published"
+        ));
     }
 
     #[tokio::test]

@@ -23,13 +23,17 @@ RUN cargo build \
     --target x86_64-unknown-linux-musl \
     --bin ds \
     --bin message_relay \
-    --bin worker \
     --bin benchmark_runner_http_staircase
+
+RUN cargo build \
+    --profile minsize \
+    --target x86_64-unknown-linux-musl \
+    --bin worker
 
 RUN mkdir -p /out \
     && cp /app/target/x86_64-unknown-linux-musl/release/ds /out/ds \
     && cp /app/target/x86_64-unknown-linux-musl/release/message_relay /out/message_relay \
-    && cp /app/target/x86_64-unknown-linux-musl/release/worker /out/worker \
+    && cp /app/target/x86_64-unknown-linux-musl/minsize/worker /out/worker \
     && cp /app/target/x86_64-unknown-linux-musl/release/benchmark_runner_http_staircase /out/benchmark_runner_http_staircase
 
 # ---------- ds runtime ----------

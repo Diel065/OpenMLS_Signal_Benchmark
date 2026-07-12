@@ -16,6 +16,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import generate_compose
+import run_compose_benchmark
 from generate_compose import (
     compute_hybrid_layout,
     select_singleton_ids,
@@ -50,6 +51,7 @@ class FakeArgs:
         self.publish_workers = False
         self.project_name = "signal-layout-test"
         self.include_runner = False
+        self.runner_in_docker = False
         self.include_netcheck = False
         self.run_id = "test-run"
         self.scenario = "test-scenario"
@@ -63,6 +65,10 @@ class FakeArgs:
         self.singleton_memory_swap_bytes = None
         self.singleton_memory_swap_defaulted = False
         self.singleton_pids_limit = None
+        self.resource_experiment = "none"
+        self.profiled_singleton_count = 1
+        self.cpu_affinity_mode = "none"
+        self.strict_cpuset = False
 
 
 def test_layout_16_workers():
@@ -253,6 +259,43 @@ def test_resource_limits_apply_to_singletons_only():
     print("PASS: resource limits apply to singleton services and layout metadata only")
 
 
+def test_signal_resource_sweeps_build_affinity_inputs_from_profiles():
+    parsed = run_compose_benchmark.build_parser().parse_args(["--workers", "2", "--strict-cpuset"])
+    run_compose_benchmark.apply_strict_cpuset_alias(parsed)
+    assert parsed.cpu_affinity_mode == "profiled-nor-background"
+
+    args = FakeArgs(16, singleton_min_count=2, singleton_fraction=0.0001, packed_clients_per_container=4)
+    args.resource_experiment = "cpu-quota-sweep"
+    args.profiled_singleton_count = 2
+    args.runner_in_docker = True
+    args.strict_cpuset = True
+
+    run_compose_benchmark.apply_strict_cpuset_alias(args)
+    assert args.cpu_affinity_mode == "profiled-nor-background"
+
+    profiles = [
+        {
+            "resource_profile_id": "cpu_quota_1p0",
+            "experiment_kind": "cpu_quota_sweep",
+            "assigned_cpu_count": 1,
+            "rayon_num_threads": 1,
+        },
+        {
+            "resource_profile_id": "cpu_quota_0p5",
+            "experiment_kind": "cpu_quota_sweep",
+            "assigned_cpu_count": 2,
+            "rayon_num_threads": 2,
+        },
+    ]
+    specs, cpu_counts, bg_specs, layout_info = run_compose_benchmark.affinity_inputs_for_run(args, profiles)
+
+    assert [spec["resource_profile_id"] for spec in specs] == ["cpu_quota_1p0", "cpu_quota_0p5"]
+    assert sum(cpu_counts.values()) == 3
+    assert {spec["container_name"] for spec in bg_specs} >= {"kr", "relay", "runner", "worker-pack-000"}
+    assert layout_info["singleton_count"] == 2
+    print("PASS: Signal resource sweeps build profiled affinity inputs from resource profiles")
+
+
 def main() -> int:
     tests = [
         test_layout_16_workers,
@@ -268,6 +311,7 @@ def main() -> int:
         test_hybrid_layout_build,
         test_legacy_layout_build,
         test_resource_limits_apply_to_singletons_only,
+        test_signal_resource_sweeps_build_affinity_inputs_from_profiles,
     ]
 
     passed = 0

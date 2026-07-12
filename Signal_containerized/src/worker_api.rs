@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use cpu_time::ThreadTime;
+use cpu_time::{ProcessTime, ThreadTime};
 use libsignal_core::DeviceId;
 use libsignal_protocol::kem;
 use libsignal_protocol::{
@@ -35,6 +35,8 @@ pub enum Command {
     UpdateOneTimePrekeys,
     EstablishSessions {
         participants: Vec<String>,
+        #[serde(default)]
+        conversation_size: Option<usize>,
     },
     EncryptMessage {
         recipient: String,
@@ -95,6 +97,26 @@ pub struct CommandRequestEnvelope {
     pub command: Command,
     #[serde(default)]
     pub phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_workflow_id: Option<u64>,
+    #[serde(default)]
+    pub workflow_pair_index: Option<u32>,
+    #[serde(default)]
+    pub workflow_pair_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -104,13 +126,56 @@ pub enum IncomingCommandRequest {
     Raw(Command),
 }
 
+#[derive(Debug, Clone)]
+pub struct RequestEnvelopeParts {
+    pub request_id: Option<String>,
+    pub command: Command,
+    pub phase: Option<String>,
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    pub benchmark_workflow_id: Option<u64>,
+    pub workflow_pair_index: Option<u32>,
+    pub workflow_pair_count: Option<u32>,
+}
+
 impl IncomingCommandRequest {
-    pub fn into_parts(self) -> (Option<String>, Command, Option<String>) {
+    pub fn into_parts(self) -> RequestEnvelopeParts {
         match self {
-            IncomingCommandRequest::Envelope(envelope) => {
-                (Some(envelope.request_id), envelope.command, envelope.phase)
-            }
-            IncomingCommandRequest::Raw(command) => (None, command, None),
+            IncomingCommandRequest::Envelope(envelope) => RequestEnvelopeParts {
+                request_id: Some(envelope.request_id),
+                command: envelope.command,
+                phase: envelope.phase,
+                benchmark_plateau_index: envelope.benchmark_plateau_index,
+                benchmark_target_size: envelope.benchmark_target_size,
+                benchmark_active_size: envelope.benchmark_active_size,
+                benchmark_phase: envelope.benchmark_phase,
+                benchmark_operation: envelope.benchmark_operation,
+                benchmark_operation_seq: envelope.benchmark_operation_seq,
+                benchmark_payload_size: envelope.benchmark_payload_size,
+                benchmark_workflow_id: envelope.benchmark_workflow_id,
+                workflow_pair_index: envelope.workflow_pair_index,
+                workflow_pair_count: envelope.workflow_pair_count,
+            },
+            IncomingCommandRequest::Raw(command) => RequestEnvelopeParts {
+                request_id: None,
+                command,
+                phase: None,
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+                benchmark_workflow_id: None,
+                workflow_pair_index: None,
+                workflow_pair_count: None,
+            },
         }
     }
 }
@@ -140,6 +205,7 @@ impl CommandResponse {
 #[derive(Debug, Clone, Default)]
 pub struct CommandMetrics {
     pub cpu_thread_ns: Option<u128>,
+    pub cpu_process_ns: Option<u128>,
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     pub l1d_cache_accesses: Option<u64>,
@@ -156,6 +222,7 @@ pub struct CommandMetrics {
     pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
     pub plaintext_bytes: Option<usize>,
+    pub new_session_established: Option<bool>,
 }
 
 impl CommandMetrics {
@@ -174,6 +241,7 @@ impl CommandMetrics {
 
     fn merge_profile(&mut self, other: &CommandMetrics) {
         self.cpu_thread_ns = add_u128_options(self.cpu_thread_ns, other.cpu_thread_ns);
+        self.cpu_process_ns = add_u128_options(self.cpu_process_ns, other.cpu_process_ns);
         self.alloc_bytes = add_u64_options(self.alloc_bytes, other.alloc_bytes);
         self.alloc_count = add_u64_options(self.alloc_count, other.alloc_count);
         self.l1d_cache_accesses =
@@ -230,6 +298,7 @@ fn add_usize_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 
 fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
     let _ = L1DCacheCounterScope::counters_available();
+    let process_start = ProcessTime::now();
     let cpu_start = ThreadTime::now();
     let mut result = None;
     let mut l1d_cache_counts = L1DCacheCounts::default();
@@ -242,12 +311,14 @@ fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
     });
 
     let cpu_thread_ns = cpu_start.elapsed().as_nanos();
+    let cpu_process_ns = process_start.elapsed().as_nanos();
     let result = result.expect("allocation_counter measure closure did not run");
 
     (
         result,
         CommandMetrics {
             cpu_thread_ns: Some(cpu_thread_ns),
+            cpu_process_ns: Some(cpu_process_ns),
             alloc_bytes: Some(allocation_info.bytes_total),
             alloc_count: Some(allocation_info.count_total),
             l1d_cache_accesses: l1d_cache_counts.accesses,
@@ -288,9 +359,85 @@ pub fn make_subspan_event(
     alloc_count: Option<u64>,
     success: bool,
 ) -> SignalProfileEvent {
+    make_subspan_event_with_span(
+        op,
+        event_family,
+        event_subtype,
+        span_layer,
+        measurement_class,
+        participant_id,
+        wall_ns,
+        cpu_thread_ns,
+        alloc_bytes,
+        alloc_count,
+        success,
+        None,
+        None,
+        None,
+    )
+}
+
+pub fn make_subspan_event_with_span(
+    op: &str,
+    event_family: &str,
+    event_subtype: &str,
+    span_layer: &str,
+    measurement_class: &str,
+    participant_id: &str,
+    wall_ns: u128,
+    cpu_thread_ns: Option<u128>,
+    alloc_bytes: Option<u64>,
+    alloc_count: Option<u64>,
+    success: bool,
+    span_id: Option<u64>,
+    parent_span_id: Option<u64>,
+    parent_operation: Option<String>,
+) -> SignalProfileEvent {
     let heap_snapshot = allocation_counter::embedded_heap_budget::snapshot();
+    let worker_id = libsignal_protocol::profiling::current_worker_id();
+    let global_span_id = worker_id
+        .as_ref()
+        .zip(span_id)
+        .map(|(w, s)| format!("{}:{}", w, s));
+    let parent_global_span_id = worker_id
+        .as_ref()
+        .zip(parent_span_id)
+        .map(|(w, s)| format!("{}:{}", w, s));
+    let bench_ctx = libsignal_protocol::profiling::current_benchmark_context();
+    let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
-        profile_schema_version: 4,
+        profile_schema_version: 5,
+        span_id,
+        parent_span_id,
+        parent_operation,
+        span_name: Some(op.to_string()),
+        span_kind: if op.contains(".total") || event_subtype.ends_with(".total") {
+            Some("total".to_string())
+        } else {
+            Some("subspan".to_string())
+        },
+        measurement_plane: if op.contains(".total") {
+            Some("protocol_total".to_string())
+        } else {
+            Some("wrapper_child".to_string())
+        },
+        span_inclusive: Some(true),
+        worker_id,
+        global_span_id,
+        parent_global_span_id,
+        request_id,
+        benchmark_plateau_index: bench_ctx.as_ref().and_then(|c| c.benchmark_plateau_index),
+        benchmark_target_size: bench_ctx.as_ref().and_then(|c| c.benchmark_target_size),
+        benchmark_active_size: bench_ctx.as_ref().and_then(|c| c.benchmark_active_size),
+        benchmark_phase: bench_ctx.as_ref().and_then(|c| c.benchmark_phase.clone()),
+        benchmark_operation: bench_ctx
+            .as_ref()
+            .and_then(|c| c.benchmark_operation.clone()),
+        benchmark_operation_seq: bench_ctx.as_ref().and_then(|c| c.benchmark_operation_seq),
+        benchmark_payload_size: bench_ctx.as_ref().and_then(|c| c.benchmark_payload_size),
+        benchmark_workflow_id: bench_ctx.as_ref().and_then(|c| c.benchmark_workflow_id),
+        workflow_pair_index: bench_ctx.as_ref().and_then(|c| c.workflow_pair_index),
+        workflow_pair_count: bench_ctx.as_ref().and_then(|c| c.workflow_pair_count),
         ts_unix_ns: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -313,10 +460,8 @@ pub fn make_subspan_event(
             .and_then(|v| v.parse().ok()),
         applied_cpu_fraction: env_nonempty("SIGNAL_RESOURCE_APPLIED_CPU_FRACTION")
             .and_then(|v| v.parse().ok()),
-        cpu_period_us: env_nonempty("SIGNAL_RESOURCE_CPU_PERIOD_US")
-            .and_then(|v| v.parse().ok()),
-        cpu_quota_us: env_nonempty("SIGNAL_RESOURCE_CPU_QUOTA_US")
-            .and_then(|v| v.parse().ok()),
+        cpu_period_us: env_nonempty("SIGNAL_RESOURCE_CPU_PERIOD_US").and_then(|v| v.parse().ok()),
+        cpu_quota_us: env_nonempty("SIGNAL_RESOURCE_CPU_QUOTA_US").and_then(|v| v.parse().ok()),
         cgroup_cpu_max: env_nonempty("SIGNAL_RESOURCE_CGROUP_CPU_MAX"),
         cpuset_cpus_requested: env_nonempty("SIGNAL_RESOURCE_CPUSET_CPUS_REQUESTED"),
         cpuset_cpus_effective: read_cgroup_cpuset_effective()
@@ -375,6 +520,26 @@ pub struct BatchCommandItem {
     pub phase: Option<String>,
     #[serde(default)]
     pub profile: Option<bool>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_workflow_id: Option<u64>,
+    #[serde(default)]
+    pub workflow_pair_index: Option<u32>,
+    #[serde(default)]
+    pub workflow_pair_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1025,9 +1190,21 @@ async fn receive_message_delivery(
 
     let decrypt_start = Instant::now();
     let (decrypt_result, mut profile_metrics) = if profile {
-        measure_profile(|| participant.decrypt_message(&sender_address, &ciphertext, phase))
+        measure_profile(|| {
+            participant.decrypt_message(
+                &sender_address,
+                &ciphertext,
+                phase,
+                Some(conversation_size),
+            )
+        })
     } else {
-        let result = participant.decrypt_message(&sender_address, &ciphertext, phase);
+        let result = participant.decrypt_message(
+            &sender_address,
+            &ciphertext,
+            phase,
+            Some(conversation_size),
+        );
         (result, CommandMetrics::default())
     };
     let decrypt_wall = decrypt_start.elapsed().as_nanos();
@@ -1434,7 +1611,12 @@ pub async fn handle_command(
             ))
         }
 
-        Command::EstablishSessions { participants } => {
+        Command::EstablishSessions {
+            participants,
+            conversation_size,
+        } => {
+            let conversation_size =
+                conversation_size.unwrap_or(participants.len().saturating_add(1));
             let mut established = 0usize;
             let mut existing = 0usize;
             let mut fetched = 0usize;
@@ -1543,7 +1725,12 @@ pub async fn handle_command(
                 let total_start = Instant::now();
                 let core_start = Instant::now();
                 let (result, establish_metrics) = measure_profile(|| {
-                    participant.establish_session_from_bundle(&peer_address, &bundle, phase)
+                    participant.establish_session_from_bundle(
+                        &peer_address,
+                        &bundle,
+                        phase,
+                        Some(conversation_size),
+                    )
                 });
                 let core_wall = core_start.elapsed().as_nanos();
                 result?;
@@ -1596,9 +1783,10 @@ pub async fn handle_command(
                 ),
                 {
                     profile_metrics.participant_count = Some(participants.len().saturating_add(1));
-                    profile_metrics.conversation_size = Some(participants.len().saturating_add(1));
+                    profile_metrics.conversation_size = Some(conversation_size);
                     profile_metrics.prekey_bundle_count = Some(fetched);
                     profile_metrics.session_count = Some(established.saturating_add(existing));
+                    profile_metrics.new_session_established = Some(established > 0);
                     if artifact_size_bytes > 0 {
                         profile_metrics.artifact_size_bytes = Some(artifact_size_bytes);
                     }
@@ -1623,7 +1811,12 @@ pub async fn handle_command(
 
             let core_start = Instant::now();
             let (ciphertext, mut profile_metrics) = measure_profile(|| {
-                participant.encrypt_message(&recipient_address, &plaintext, phase)
+                participant.encrypt_message(
+                    &recipient_address,
+                    &plaintext,
+                    phase,
+                    Some(conversation_size),
+                )
             });
             let core_wall = core_start.elapsed().as_nanos();
             let ciphertext = ciphertext?;

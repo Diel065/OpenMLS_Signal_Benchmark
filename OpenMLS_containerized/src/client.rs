@@ -409,6 +409,18 @@ impl Client {
     }
 
     pub fn join_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
+        // A remove-rejoin victim never processes its own removal commit, so it
+        // still holds the stale pre-removal group under the same GroupId. Delete
+        // that persisted state first, otherwise the rejoin welcome collides with
+        // "A group with this GroupId already exists". delete() leaves the
+        // signature keypair and generated KeyPackage private keys intact.
+        if let Some(mut stale_group) = self.group.take() {
+            stale_group
+                .delete(self.crypto.storage())
+                .map_err(|e| anyhow!("Could not delete stale group before rejoin: {e}"))?;
+        }
+        self.clear_pending_local_state();
+
         let welcome_len = welcome_bytes.len();
         set_welcome_receive_context(WelcomeReceiveContext::new(0));
         let total_scope = ProfileScope::start("welcome_receive_total_local", "openmls");

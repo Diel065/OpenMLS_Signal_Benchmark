@@ -645,25 +645,27 @@ class Validator:
         profiles = self._read_rows(os.path.join(self.run_dir, "resource_profiles.csv"))
 
         if is_ram:
-            expected_heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
-            profiled_budgets = sorted(
+            expected_budgets = sorted(
+                [p.get("app_heap_budget", "").strip().lower() for p in profiles if p.get("app_heap_budget")]
+            )
+            actual_budgets = sorted(
                 [r.get("app_heap_budget", "").strip().lower() for r in profiled_singletons if r.get("app_heap_budget")]
             )
-            expected_sorted = sorted([b.lower() for b in expected_heap_budgets])
-            if profiled_budgets != expected_sorted:
-                self.error(f"RAM sweep profiled workers have wrong heap budgets: {profiled_budgets} vs expected {expected_sorted}")
+            if expected_budgets and actual_budgets and actual_budgets != expected_budgets:
+                self.error(f"RAM sweep profiled workers have mismatched heap budgets vs profiles: {actual_budgets} vs expected {expected_budgets}")
 
             group_creators = [
                 r for r in profiled_singletons
                 if (r.get("group_creator") or "").lower() in ("true", "1")
             ]
-            if group_creators:
+            if group_creators and actual_budgets:
                 gc = group_creators[0]
                 gc_budget = (gc.get("app_heap_budget") or "").strip().lower()
-                if gc_budget != "1g":
+                max_budget = max(actual_budgets, key=lambda b: parse_memory_to_bytes(b))
+                if gc_budget and max_budget and gc_budget != max_budget:
                     self.error(
                         f"RAM sweep group creator has heap budget '{gc_budget}', "
-                        f"but must be the 1 GiB app-heap worker"
+                        f"but must be the highest budget worker ('{max_budget}')"
                     )
 
             for r in profiled_singletons:

@@ -188,31 +188,81 @@ fn current_bin_dir() -> Result<PathBuf> {
 }
 
 fn ensure_binaries_available(bin_dir: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
-    let kr_bin = bin_dir.join(executable_name("key_repository"));
-    let relay_bin = bin_dir.join(executable_name("message_relay"));
-    let worker_bin = bin_dir.join(executable_name("worker"));
+    let worker_profile_dir = if bin_dir.ends_with("minsize") {
+        "minsize"
+    } else if bin_dir.ends_with("release") {
+        "release"
+    } else {
+        "minsize"
+    };
+    let release_dir = bin_dir
+        .parent()
+        .map(|p| p.join("release"))
+        .unwrap_or_else(|| bin_dir.with_file_name("release"));
+    let worker_dir = if worker_profile_dir == "release" {
+        bin_dir.to_path_buf()
+    } else {
+        bin_dir
+            .parent()
+            .map(|p| p.join("minsize"))
+            .unwrap_or_else(|| bin_dir.with_file_name("minsize"))
+    };
+
+    let kr_bin = release_dir.join(executable_name("key_repository"));
+    let relay_bin = release_dir.join(executable_name("message_relay"));
+    let worker_bin = worker_dir.join(executable_name("worker"));
 
     if kr_bin.exists() && relay_bin.exists() && worker_bin.exists() {
         return Ok((kr_bin, relay_bin, worker_bin));
     }
 
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(&cargo)
-        .current_dir(env!("CARGO_MANIFEST_DIR"))
-        .arg("build")
-        .arg("--bins")
-        .status()
-        .with_context(|| format!("Failed to invoke '{}' to build binaries", cargo))?;
 
-    if !status.success() {
-        return Err(anyhow!("'cargo build --bins' failed"));
+    if !kr_bin.exists() || !relay_bin.exists() {
+        let status = Command::new(&cargo)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("build")
+            .arg("--release")
+            .arg("--bin")
+            .arg("key_repository")
+            .arg("--bin")
+            .arg("message_relay")
+            .status()
+            .with_context(|| "Failed to build key_repository and message_relay with --release")?;
+        if !status.success() {
+            return Err(anyhow!(
+                "'cargo build --release --bin key_repository --bin message_relay' failed"
+            ));
+        }
+    }
+
+    if !worker_bin.exists() {
+        let worker_profile_flag = if worker_profile_dir == "release" {
+            "--release".to_string()
+        } else {
+            format!("--profile={}", worker_profile_dir)
+        };
+        let status = Command::new(&cargo)
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("build")
+            .arg(&worker_profile_flag)
+            .arg("--bin")
+            .arg("worker")
+            .status()
+            .with_context(|| format!("Failed to build worker with {}", worker_profile_flag))?;
+        if !status.success() {
+            return Err(anyhow!(
+                "'cargo build {} --bin worker' failed",
+                worker_profile_flag
+            ));
+        }
     }
 
     if kr_bin.exists() && relay_bin.exists() && worker_bin.exists() {
         Ok((kr_bin, relay_bin, worker_bin))
     } else {
         Err(anyhow!(
-            "Expected KR, relay, and worker binaries at '{}', '{}', and '{}'",
+            "Expected KR ({}) relay ({}) and worker ({}) binaries",
             kr_bin.display(),
             relay_bin.display(),
             worker_bin.display()

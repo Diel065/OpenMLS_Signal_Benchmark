@@ -1,0 +1,18 @@
+# Phase 1 — normal constrained mode (RAM + CPU sweeps, RFC-7228bis values)
+# 10 iterations × 2 sweeps = 20 runs total
+OPENMLS_RAM_SWEEP_VALUES="10k,50k,100k,500k,1m,5m,10m,50m,100m,500m" \
+PROTOCOL=openmls SWEEP=both N=4 OUTPUT_ROOT=/tmp \
+  bash benchmark_scripts/openmls_calibration/run_01_constrained_container_sweeps.sh
+  
+OPENMLS_RAM_SWEEP_VALUES="250k,300k,400k,600k,700k,800k,2m,3m,4m,6m" \
+PROTOCOL=openmls SWEEP=both N=4 OUTPUT_ROOT=/tmp \
+  bash benchmark_scripts/openmls_calibration/run_01_constrained_container_sweeps.sh
+
+
+# Phase 2 — constrained Remove-Rejoin (RAM + CPU sweeps with --remove-rejoin)
+# 10 iterations × 2 sweeps = 20 runs total
+N=10 OUTPUT_ROOT=/tmp \
+  bash benchmark_scripts/openmls_calibration/run_04_constrained_remove_rejoin_openmls.sh
+
+# These must be run from the repository root:
+#  cd /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark

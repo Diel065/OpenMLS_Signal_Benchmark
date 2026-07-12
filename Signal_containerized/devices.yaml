@@ -75,3 +75,42 @@ devices:
       device_kind: "raspberry_pi_5"
       transport: "wifi_lan"
       access_backend: "ssh"
+
+  - id: raspberry-pi-3bplus-01
+    enabled: true
+    kind: raspberry_pi_3b_plus
+
+    connection:
+      type: ssh
+      host: "192.168.178.35"
+      user: "diel"
+      password: "diel"
+      host_candidates:
+        - host: "100.71.112.120"
+          port: 10023
+
+    transport:
+      type: wifi_lan
+      device_ip: "192.168.178.35"
+      host_ip: "192.168.178.21"
+      worker_port: 8080
+      worker_url_candidates:
+        - "http://100.71.112.120:18082"
+
+    target:
+      arch: "armv7l"
+      rust_target: "armv7-unknown-linux-musleabihf"
+      binary: "target/armv7-unknown-linux-musleabihf/minsize/worker"
+
+    worker:
+      id: "raspi3bp-00001"
+      mode: "singleton"
+      remote_binary: "/home/diel/signal-benchmark/bin/worker"
+      remote_results_root: "/home/diel/signal-benchmark/results/signal"
+      remote_tmp: "/home/diel/signal-benchmark/tmp"
+
+    metadata:
+      execution_backend: "real_device"
+      device_kind: "raspberry_pi_3b_plus"
+      transport: "wifi_lan"
+      access_backend: "ssh"

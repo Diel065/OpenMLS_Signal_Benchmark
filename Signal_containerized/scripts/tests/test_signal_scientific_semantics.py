@@ -55,6 +55,7 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "phase",
         "wall_ns",
         "cpu_thread_ns",
+        "cpu_process_ns",
         "cpu_envelope_utilization",
         "cpu_throttled_time_ratio",
         "alloc_bytes",
@@ -96,12 +97,16 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "run_id",
         "scenario",
         "scenario_seed",
+        "benchmark_workflow_id",
+        "workflow_pair_index",
+        "workflow_pair_count",
+        "new_session_established",
         "node_name",
         "pod_name",
     ]
     assert_contains_all(csv, required, "SignalCsvRow")
     assert "profile_schema_version: 4" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
-    assert "profile_schema_version: 4" in read("Signal_containerized/src/bin/worker.rs")
+    assert "profile_schema_version: 5" in read("Signal_containerized/src/bin/worker.rs")
 
 
 def test_event_taxonomy_separates_wrapper_and_protocol_rows() -> None:

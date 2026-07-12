@@ -63,7 +63,10 @@ pub fn configure_from_env() -> EmbeddedHeapBudgetConfig {
 }
 
 pub fn begin_operation(attribution: OperationAttribution) -> Option<OperationBudgetGuard> {
-    Some(OperationBudgetGuard { attribution, _guard: tracker::begin_operation() })
+    Some(OperationBudgetGuard {
+        attribution,
+        _guard: tracker::begin_operation(),
+    })
 }
 
 pub fn mark_worker_command_execution() {

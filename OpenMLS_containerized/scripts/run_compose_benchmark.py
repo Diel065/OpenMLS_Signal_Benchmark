@@ -503,6 +503,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--ram-app-heap-sweep-values",
+        default="",
+        help=(
+            "Comma-separated list of 10 application heap budgets for "
+            "ram-app-heap-sweep (e.g. 10k,50k,100k,500k,1m,5m,10m,50m,100m,500m). "
+            "Defaults to resource_profiles.py builtins when empty."
+        ),
+    )
+    p.add_argument(
         "--cpu-affinity-mode",
         choices=["none", "profiled-nor-background"],
         default="none",
@@ -547,9 +556,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--resource-failure-policy",
-        choices=["stop-on-profiled-failure", "remove-and-continue"],
         default="stop-on-profiled-failure",
-        help="Action when the profiled singleton fails (default: stop-on-profiled-failure)",
+        choices=["stop-on-profiled-failure", "remove-and-continue"],
+        help="Policy for handling profiled worker failures (default: stop-on-profiled-failure)",
+    )
+    p.add_argument(
+        "--remove-rejoin",
+        action="store_true",
+        default=False,
+        help="At each plateau, remove a random profiled singleton and immediately re-add them for clean RemoveCommit/ProcessWelcome data",
     )
     p.add_argument(
         "--resource-output-validation",
@@ -3891,7 +3906,13 @@ def main() -> int:
                     run_id=run_id,
                 )
             elif resource_experiment == "ram-app-heap-sweep":
+                heap_budgets_arg = getattr(args, "ram_app_heap_sweep_values", "") or ""
+                heap_budgets = (
+                    [h.strip() for h in heap_budgets_arg.split(",") if h.strip()]
+                    if heap_budgets_arg else None
+                )
                 profiles = generate_parallel_ram_sweep_profiles(
+                    heap_budgets=heap_budgets,
                     docker_memory_limit=getattr(args, "embedded_docker_memory", "4g"),
                     assigned_cpu_count=1,
                     run_id=run_id,
@@ -4093,6 +4114,7 @@ def main() -> int:
                 "--embedded-cpu-fractions", args.embedded_cpu_fractions,
                 "--embedded-cpu-cores", args.embedded_cpu_cores,
                 "--embedded-docker-memory", args.embedded_docker_memory,
+                "--ram-app-heap-sweep-values", getattr(args, "ram_app_heap_sweep_values", "") or "",
                 "--affinity-plan-file", plan_path,
                 "--resource-profiles-file", profiles_path,
             ]
@@ -4552,6 +4574,7 @@ def main() -> int:
                 *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 *(["--failure-experiment"] if args.failure_experiment else []),
+                *(["--remove-rejoin"] if args.remove_rejoin else []),
                 "--profiled-failure-policy",
                 args.resource_failure_policy,
                 "--run-id",
@@ -4618,6 +4641,7 @@ def main() -> int:
                 *(["--external-coverage-lane"] if args.external_coverage_lane else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 *(["--failure-experiment"] if args.failure_experiment else []),
+                *(["--remove-rejoin"] if args.remove_rejoin else []),
                 "--profiled-failure-policy",
                 args.resource_failure_policy,
                 "--run-id",

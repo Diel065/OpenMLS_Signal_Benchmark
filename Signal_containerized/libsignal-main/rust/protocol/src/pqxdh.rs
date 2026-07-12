@@ -23,6 +23,7 @@ use libsignal_core::derive_arrays;
 use rand::{CryptoRng, Rng};
 
 use crate::handshake::Handshake;
+use crate::profiling;
 use crate::ratchet::{ChainKey, RootKey};
 use crate::{
     CiphertextMessageType, IdentityKey, IdentityKeyPair, KeyPair, PublicKey, Result,
@@ -199,38 +200,48 @@ pub(crate) fn pqxdh_initiate<R: Rng + CryptoRng>(
 
     secrets.extend_from_slice(&[0xFFu8; 32]); // discontinuity bytes
 
-    secrets.extend_from_slice(
-        &parameters
-            .our_identity_key_pair
-            .private_key()
-            .calculate_agreement(&parameters.their_signed_pre_key)?,
-    );
-
-    let our_ephemeral_private_key = parameters.our_ephemeral_key_pair.private_key;
-
-    secrets.extend_from_slice(
-        &our_ephemeral_private_key
-            .calculate_agreement(parameters.their_identity_key.public_key())?,
-    );
-
-    secrets.extend_from_slice(
-        &our_ephemeral_private_key.calculate_agreement(&parameters.their_signed_pre_key)?,
-    );
-
-    if let Some(their_one_time_prekey) = &parameters.their_one_time_pre_key {
+    profiling::measure_result("pqxdh_initiator_ec_dh_agreements", || {
         secrets.extend_from_slice(
-            &our_ephemeral_private_key.calculate_agreement(their_one_time_prekey)?,
+            &parameters
+                .our_identity_key_pair
+                .private_key()
+                .calculate_agreement(&parameters.their_signed_pre_key)?,
         );
-    }
+
+        let our_ephemeral_private_key = parameters.our_ephemeral_key_pair.private_key;
+
+        secrets.extend_from_slice(
+            &our_ephemeral_private_key
+                .calculate_agreement(parameters.their_identity_key.public_key())?,
+        );
+
+        secrets.extend_from_slice(
+            &our_ephemeral_private_key.calculate_agreement(&parameters.their_signed_pre_key)?,
+        );
+
+        if let Some(their_one_time_prekey) = &parameters.their_one_time_pre_key {
+            secrets.extend_from_slice(
+                &our_ephemeral_private_key.calculate_agreement(their_one_time_prekey)?,
+            );
+        }
+
+        Ok::<_, SignalProtocolError>(())
+    })?;
 
     let kyber_ciphertext = {
-        let (ss, ct) = parameters.their_kyber_pre_key.encapsulate(&mut csprng)?;
-        secrets.extend_from_slice(ss.as_ref());
-        ct
+        profiling::measure_result("pqxdh_initiator_kem_encapsulate", || {
+            let (ss, ct) = parameters.their_kyber_pre_key.encapsulate(&mut csprng)?;
+            secrets.extend_from_slice(ss.as_ref());
+            Ok::<_, SignalProtocolError>(ct)
+        })?
     };
 
+    let keys = profiling::measure_result("pqxdh_initiator_kdf_derive", || {
+        Ok::<_, SignalProtocolError>(HandshakeKeys::derive(&secrets))
+    })?;
+
     Ok(InitiatorAgreement {
-        keys: HandshakeKeys::derive(&secrets),
+        keys,
         kyber_ciphertext,
     })
 }
@@ -336,41 +347,50 @@ pub(crate) fn pqxdh_accept(parameters: &RecipientParameters) -> Result<Handshake
 
     secrets.extend_from_slice(&[0xFFu8; 32]); // discontinuity bytes
 
-    secrets.extend_from_slice(
-        &parameters
-            .our_signed_pre_key_pair
-            .private_key
-            .calculate_agreement(parameters.their_identity_key.public_key())?,
-    );
-
-    secrets.extend_from_slice(
-        &parameters
-            .our_identity_key_pair
-            .private_key()
-            .calculate_agreement(&parameters.their_ephemeral_key)?,
-    );
-
-    secrets.extend_from_slice(
-        &parameters
-            .our_signed_pre_key_pair
-            .private_key
-            .calculate_agreement(&parameters.their_ephemeral_key)?,
-    );
-
-    if let Some(our_one_time_pre_key_pair) = &parameters.our_one_time_pre_key_pair {
+    profiling::measure_result("pqxdh_responder_ec_dh_agreements", || {
         secrets.extend_from_slice(
-            &our_one_time_pre_key_pair
+            &parameters
+                .our_signed_pre_key_pair
+                .private_key
+                .calculate_agreement(parameters.their_identity_key.public_key())?,
+        );
+
+        secrets.extend_from_slice(
+            &parameters
+                .our_identity_key_pair
+                .private_key()
+                .calculate_agreement(&parameters.their_ephemeral_key)?,
+        );
+
+        secrets.extend_from_slice(
+            &parameters
+                .our_signed_pre_key_pair
                 .private_key
                 .calculate_agreement(&parameters.their_ephemeral_key)?,
         );
-    }
 
-    secrets.extend_from_slice(
-        &parameters
-            .our_kyber_pre_key_pair
-            .secret_key
-            .decapsulate(parameters.their_kyber_ciphertext)?,
-    );
+        if let Some(our_one_time_pre_key_pair) = &parameters.our_one_time_pre_key_pair {
+            secrets.extend_from_slice(
+                &our_one_time_pre_key_pair
+                    .private_key
+                    .calculate_agreement(&parameters.their_ephemeral_key)?,
+            );
+        }
 
-    Ok(HandshakeKeys::derive(&secrets))
+        Ok::<_, SignalProtocolError>(())
+    })?;
+
+    profiling::measure_result("pqxdh_responder_kem_decapsulate", || {
+        secrets.extend_from_slice(
+            &parameters
+                .our_kyber_pre_key_pair
+                .secret_key
+                .decapsulate(parameters.their_kyber_ciphertext)?,
+        );
+        Ok::<_, SignalProtocolError>(())
+    })?;
+
+    profiling::measure_result("pqxdh_responder_kdf_derive", || {
+        Ok::<_, SignalProtocolError>(HandshakeKeys::derive(&secrets))
+    })
 }

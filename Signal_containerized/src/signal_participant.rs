@@ -362,13 +362,14 @@ impl SignalParticipant {
         remote_address: &ProtocolAddress,
         bundle: &PreKeyBundle,
         phase: Option<&str>,
+        conversation_size: Option<usize>,
     ) -> Result<()> {
         let context = self.profile_context(
             remote_address,
             "initiator",
             "outbound",
             phase.unwrap_or("handshake.process_bundle"),
-            None,
+            conversation_size,
         );
         with_profile_context(context, || {
             block_on_protocol(async {
@@ -393,13 +394,14 @@ impl SignalParticipant {
         remote_address: &ProtocolAddress,
         plaintext: &[u8],
         phase: Option<&str>,
+        conversation_size: Option<usize>,
     ) -> Result<CiphertextMessage> {
         let context = self.profile_context(
             remote_address,
             "sender",
             "outbound",
             phase.unwrap_or("message.encrypt"),
-            None,
+            conversation_size,
         );
         let msg = with_profile_context(context, || {
             block_on_protocol(async {
@@ -424,13 +426,14 @@ impl SignalParticipant {
         remote_address: &ProtocolAddress,
         ciphertext: &CiphertextMessage,
         phase: Option<&str>,
+        conversation_size: Option<usize>,
     ) -> Result<Vec<u8>> {
         let context = self.profile_context(
             remote_address,
             "recipient",
             "inbound",
             phase.unwrap_or("message.decrypt"),
-            None,
+            conversation_size,
         );
         let plaintext = with_profile_context(context, || {
             block_on_protocol(async {

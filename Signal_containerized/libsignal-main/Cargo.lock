@@ -78,6 +78,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "allocation-counter"
+version = "0.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "beb9e990c0a33699f1984d85a6abead615ccc72dd8130bf3e15dcabe2ca149c9"
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -814,6 +820,16 @@ dependencies = [
  "hax-lib",
  "pastey",
  "rand 0.9.4",
+]
+
+[[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
 ]
 
 [[package]]
@@ -2252,6 +2268,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "l1d-cache-counter"
+version = "0.1.0"
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3010,11 +3030,13 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "aes-gcm-siv",
+ "allocation-counter",
  "assert_matches",
  "async-trait",
  "bitflags",
  "clap",
  "const-str",
+ "cpu-time",
  "criterion",
  "ctr",
  "curve25519-dalek",
@@ -3029,6 +3051,7 @@ dependencies = [
  "hmac",
  "indexmap 2.13.0",
  "itertools 0.14.0",
+ "l1d-cache-counter",
  "libcrux-ml-kem",
  "libsignal-core",
  "libsignal-debug",
@@ -3043,6 +3066,7 @@ dependencies = [
  "rand_core 0.9.3",
  "rayon",
  "serde",
+ "serde_json",
  "sha2",
  "signal-crypto",
  "spqr",

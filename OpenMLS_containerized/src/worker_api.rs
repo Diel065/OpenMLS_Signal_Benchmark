@@ -442,6 +442,16 @@ mod tests {
         assert!(cache.get("req-2").is_some());
         assert!(cache.get("req-3").is_some());
     }
+
+    #[test]
+    fn detects_stale_group_state_update_conflict() {
+        let err = anyhow!(
+            "DS PUT failed with status 409 Conflict: Group state update mismatch for group 'g': expected epoch 8, got 6"
+        );
+
+        assert!(is_stale_group_state_update_error(&err, 6));
+        assert!(!is_stale_group_state_update_error(&err, 8));
+    }
 }
 
 pub enum DsPostResult {
@@ -1001,7 +1011,43 @@ pub async fn update_ds_group_state(client: &Client, ds_url: &str) -> Result<()> 
     let path = format!("/group/{group_id}/state/{epoch}");
     let body = GroupStatePutRequest { members };
 
-    ds_put_json(ds_url, &path, &body, "update_group_state", &client.name).await
+    match ds_put_json(ds_url, &path, &body, "update_group_state", &client.name).await {
+        Ok(()) => Ok(()),
+        Err(error) if is_stale_group_state_update_error(&error, epoch) => {
+            eprintln!(
+                "[group-state] skipped stale DS update client={} epoch={} error={:#}",
+                client.name, epoch, error
+            );
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn parse_group_state_update_mismatch(message: &str) -> Option<(u64, u64)> {
+    let expected_marker = "expected epoch ";
+    let got_marker = ", got ";
+    let expected_start = message.find(expected_marker)? + expected_marker.len();
+    let expected_rest = &message[expected_start..];
+    let expected_end = expected_rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(expected_rest.len());
+    let expected = expected_rest[..expected_end].parse().ok()?;
+
+    let got_start = message[expected_start..].find(got_marker)? + expected_start + got_marker.len();
+    let got_rest = &message[got_start..];
+    let got_end = got_rest
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(got_rest.len());
+    let got = got_rest[..got_end].parse().ok()?;
+
+    Some((expected, got))
+}
+
+fn is_stale_group_state_update_error(error: &anyhow::Error, epoch: u64) -> bool {
+    parse_group_state_update_mismatch(&format!("{:#}", error))
+        .map(|(expected, got)| got == epoch && expected > got)
+        .unwrap_or(false)
 }
 
 pub async fn publish_epoch_change(
@@ -1220,6 +1266,7 @@ async fn receive_commit_delivery(
     benchmark_context: BenchmarkContext,
 ) -> Result<String> {
     let mut stale_acked = 0usize;
+    let mut processed = 0usize;
 
     loop {
         let delivery = match ds_get_pending_commit_delivery(ds_url, &client.name).await {
@@ -1290,10 +1337,23 @@ async fn receive_commit_delivery(
         )
         .await?;
         ack_commit_delivery_best_effort(ds_url, &client.name, &delivery.id, delivery.epoch).await;
+        processed += 1;
+
+        if let Some(expected) = expected_epoch {
+            if !current_epoch_reached(client, expected) {
+                continue;
+            }
+        }
 
         return Ok(format!(
-            "{}; commit_delivery_id={} group={} epoch={} sender={} stale_acked={}",
-            result, delivery.id, delivery.group_id, delivery.epoch, delivery.sender, stale_acked
+            "{}; commit_delivery_id={} group={} epoch={} sender={} stale_acked={} commits_processed={}",
+            result,
+            delivery.id,
+            delivery.group_id,
+            delivery.epoch,
+            delivery.sender,
+            stale_acked,
+            processed
         ));
     }
 }
@@ -1399,6 +1459,7 @@ async fn process_pending(
     let mut commits_processed = 0usize;
     let mut welcomes_processed = 0usize;
     let mut application_messages_processed = 0usize;
+    let mut commit_results = Vec::new();
     let mut errors = Vec::new();
 
     if remaining > 0 && kinds.contains(&PendingKind::Commits) {
@@ -1423,7 +1484,10 @@ async fn process_pending(
             )
             .await
             {
-                Ok(_) => {
+                Ok(message) => {
+                    if message.contains("queued ") {
+                        commit_results.push(message);
+                    }
                     commits_processed += 1;
                     remaining = remaining.saturating_sub(1);
                 }
@@ -1485,21 +1549,23 @@ async fn process_pending(
 
     if errors.is_empty() {
         Ok(format!(
-            "process_pending processed; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors=[]",
-            commits_processed,
-            welcomes_processed,
-            application_messages_processed,
-            final_epoch,
-            current_member_count
-        ))
-    } else {
-        Err(anyhow!(
-            "process_pending errors; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors={:?}",
+            "process_pending processed; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} commit_results={:?} errors=[]",
             commits_processed,
             welcomes_processed,
             application_messages_processed,
             final_epoch,
             current_member_count,
+            commit_results
+        ))
+    } else {
+        Err(anyhow!(
+            "process_pending errors; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} commit_results={:?} errors={:?}",
+            commits_processed,
+            welcomes_processed,
+            application_messages_processed,
+            final_epoch,
+            current_member_count,
+            commit_results,
             errors
         ))
     }

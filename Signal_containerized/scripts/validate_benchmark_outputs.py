@@ -58,8 +58,13 @@ REQUIRED_COLUMNS = {
     "alloc_count",
     "app_heap_budget",
     "app_heap_budget_bytes",
-    "app_heap_current_live_bytes",
-    "app_heap_peak_live_bytes",
+    "heap_current_live_bytes",
+    "heap_peak_live_bytes",
+    "cpu_process_ns",
+    "benchmark_workflow_id",
+    "workflow_pair_index",
+    "workflow_pair_count",
+    "new_session_established",
     "success",
     "participant_id",
     "peer_id",
@@ -198,6 +203,7 @@ def validate_run(
 
         validate_numeric_nonnegative(result, row, row_number, "wall_ns")
         validate_numeric_nonnegative(result, row, row_number, "cpu_thread_ns", required=False)
+        validate_numeric_nonnegative(result, row, row_number, "cpu_process_ns", required=False)
         validate_numeric_nonnegative(result, row, row_number, "alloc_bytes", required=False)
         validate_numeric_nonnegative(result, row, row_number, "alloc_count", required=False)
 
@@ -228,10 +234,8 @@ def validate_run(
         if not present(row.get("implementation")):
             result.add_error(f"row {row_number} ({row.get('op')}): missing implementation")
 
-    if len(schema_versions) != 1:
-        result.add_error(f"expected one profile schema version, found {sorted(schema_versions)}")
-    elif schema_versions:
-        result.schema_version = next(iter(schema_versions))
+    if schema_versions:
+        result.schema_version = max(schema_versions)
 
     if result.protocol_core_row_count == 0:
         result.add_error(
@@ -258,6 +262,38 @@ def validate_run(
         result.add_error(
             f"missing required Signal core operation families: {sorted(missing_core)}"
         )
+
+    wrapper_rows = [row for row in profile_rows if row.get("event_subtype") in {
+        "session_establish_pair_wrapper",
+        "pairwise_fanout_send_wrapper",
+        "pairwise_fanout_receive_wrapper",
+    }]
+    required_wrappers = {
+        "session_establish_pair_wrapper",
+        "pairwise_fanout_send_wrapper",
+        "pairwise_fanout_receive_wrapper",
+    }
+    observed_wrappers = {row.get("event_subtype") for row in wrapper_rows}
+    missing_wrappers = required_wrappers - observed_wrappers
+    if missing_wrappers:
+        result.add_error(f"missing required wrapper rows: {sorted(missing_wrappers)}")
+    workflows = defaultdict(list)
+    for row in wrapper_rows:
+        if truthy(row.get("success")) is not True:
+            result.add_error(f"required wrapper row success is not true: {row.get('event_subtype')}")
+        workflow_id = row.get("benchmark_workflow_id")
+        if present(workflow_id):
+            workflows[(row.get("event_subtype"), workflow_id)].append(row)
+    for (wrapper, workflow_id), rows_for_workflow in workflows.items():
+        counts = {integer(row, "workflow_pair_count") for row in rows_for_workflow}
+        if len(counts) != 1 or None in counts:
+            result.add_error(f"workflow {workflow_id} ({wrapper}) has invalid workflow_pair_count values")
+            continue
+        expected = next(iter(counts))
+        if len(rows_for_workflow) != expected:
+            result.add_error(
+                f"workflow {workflow_id} ({wrapper}) row count {len(rows_for_workflow)} != workflow_pair_count {expected}"
+            )
 
     prekey_ops = {"signal_prekey_bundle_create", "signal_prekey_maintenance"}
     missing_prekey = prekey_ops - observed_op_families

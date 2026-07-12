@@ -12,6 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use cpu_time::ProcessTime;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
@@ -25,6 +26,7 @@ use signal_benchmark::signal_metrics::SignalProfileEvent;
 use signal_benchmark::signal_participant::SignalParticipant;
 use signal_benchmark::worker_api::{
     handle_command, Command, CommandResponse, CompletedCommandCache, IncomingCommandRequest,
+    RequestEnvelopeParts,
 };
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -55,6 +57,16 @@ struct WorkerCommandEnvelope {
     request_id: Option<String>,
     command: Command,
     phase: Option<String>,
+    benchmark_plateau_index: Option<usize>,
+    benchmark_target_size: Option<usize>,
+    benchmark_active_size: Option<usize>,
+    benchmark_phase: Option<String>,
+    benchmark_operation: Option<String>,
+    benchmark_operation_seq: Option<usize>,
+    benchmark_payload_size: Option<usize>,
+    benchmark_workflow_id: Option<u64>,
+    workflow_pair_index: Option<u32>,
+    workflow_pair_count: Option<u32>,
     enqueued_at: Instant,
     enqueued_unix_ms: u128,
     queue_depth_estimate: usize,
@@ -77,6 +89,26 @@ struct BatchCommandItem {
     pub phase: Option<String>,
     #[serde(default)]
     pub profile: Option<bool>,
+    #[serde(default)]
+    pub benchmark_plateau_index: Option<usize>,
+    #[serde(default)]
+    pub benchmark_target_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_active_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_phase: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation: Option<String>,
+    #[serde(default)]
+    pub benchmark_operation_seq: Option<usize>,
+    #[serde(default)]
+    pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub benchmark_workflow_id: Option<u64>,
+    #[serde(default)]
+    pub workflow_pair_index: Option<u32>,
+    #[serde(default)]
+    pub workflow_pair_count: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,18 +250,11 @@ async fn run_command(
     State(state): State<Arc<WorkerProcessState>>,
     Json(request): Json<IncomingCommandRequest>,
 ) -> Json<CommandResponse> {
-    let (request_id, command, phase) = request.into_parts();
+    let parts = request.into_parts();
 
     if state.participant_handles.len() == 1 {
         let (participant_id, handle) = state.participant_handles.iter().next().unwrap();
-        let (_, response) = send_to_participant_actor(
-            handle,
-            participant_id,
-            request_id,
-            command,
-            phase.as_deref(),
-        )
-        .await;
+        let (_, response) = send_to_participant_actor(handle, participant_id, &parts).await;
         return Json(response);
     }
 
@@ -243,7 +268,7 @@ async fn run_command_for_participant(
     State(state): State<Arc<WorkerProcessState>>,
     Json(request): Json<IncomingCommandRequest>,
 ) -> Json<CommandResponse> {
-    let (request_id, command, phase) = request.into_parts();
+    let parts = request.into_parts();
 
     let handle = match state.participant_handles.get(&participant_id) {
         Some(h) => h,
@@ -255,14 +280,7 @@ async fn run_command_for_participant(
         }
     };
 
-    let (_, response) = send_to_participant_actor(
-        handle,
-        &participant_id,
-        request_id,
-        command,
-        phase.as_deref(),
-    )
-    .await;
+    let (_, response) = send_to_participant_actor(handle, &participant_id, &parts).await;
     Json(response)
 }
 
@@ -292,14 +310,24 @@ async fn run_batch_command(
                 }
             };
 
-            let (_, response) = send_to_participant_actor(
-                handle,
-                &item.participant_id,
-                item.request_id.clone(),
-                item.command,
-                item.phase.as_deref(),
-            )
-            .await;
+            let parts = RequestEnvelopeParts {
+                request_id: item.request_id.clone(),
+                command: item.command,
+                phase: item.phase.clone(),
+                benchmark_plateau_index: item.benchmark_plateau_index,
+                benchmark_target_size: item.benchmark_target_size,
+                benchmark_active_size: item.benchmark_active_size,
+                benchmark_phase: item.benchmark_phase,
+                benchmark_operation: item.benchmark_operation,
+                benchmark_operation_seq: item.benchmark_operation_seq,
+                benchmark_payload_size: item.benchmark_payload_size,
+                benchmark_workflow_id: item.benchmark_workflow_id,
+                workflow_pair_index: item.workflow_pair_index,
+                workflow_pair_count: item.workflow_pair_count,
+            };
+
+            let (_, response) =
+                send_to_participant_actor(handle, &item.participant_id, &parts).await;
 
             BatchCommandResult {
                 participant_id: item.participant_id,
@@ -322,9 +350,7 @@ async fn run_batch_command(
 async fn send_to_participant_actor(
     handle: &ParticipantActorHandle,
     _participant_id: &str,
-    request_id: Option<String>,
-    command: Command,
-    phase: Option<&str>,
+    parts: &RequestEnvelopeParts,
 ) -> (String, CommandResponse) {
     let (response_tx, response_rx) = oneshot::channel();
     let queue_depth_estimate = handle
@@ -333,9 +359,19 @@ async fn send_to_participant_actor(
         .saturating_sub(handle.tx.capacity());
 
     let envelope = WorkerCommandEnvelope {
-        request_id: request_id.clone(),
-        command,
-        phase: phase.map(ToOwned::to_owned),
+        request_id: parts.request_id.clone(),
+        command: parts.command.clone(),
+        phase: parts.phase.clone(),
+        benchmark_plateau_index: parts.benchmark_plateau_index,
+        benchmark_target_size: parts.benchmark_target_size,
+        benchmark_active_size: parts.benchmark_active_size,
+        benchmark_phase: parts.benchmark_phase.clone(),
+        benchmark_operation: parts.benchmark_operation.clone(),
+        benchmark_operation_seq: parts.benchmark_operation_seq,
+        benchmark_payload_size: parts.benchmark_payload_size,
+        benchmark_workflow_id: parts.benchmark_workflow_id,
+        workflow_pair_index: parts.workflow_pair_index,
+        workflow_pair_count: parts.workflow_pair_count,
         enqueued_at: Instant::now(),
         enqueued_unix_ms: unix_ms_now(),
         queue_depth_estimate,
@@ -343,7 +379,10 @@ async fn send_to_participant_actor(
     };
 
     if handle.tx.send(envelope).await.is_err() {
-        let rid = request_id.unwrap_or_else(|| "unknown".to_string());
+        let rid = parts
+            .request_id
+            .clone()
+            .unwrap_or_else(|| "unknown".to_string());
         return (
             rid,
             CommandResponse::error("worker command actor is not running"),
@@ -355,7 +394,10 @@ async fn send_to_participant_actor(
         Err(e) => CommandResponse::error(format!("worker command actor dropped response: {}", e)),
     };
 
-    let rid = request_id.unwrap_or_else(|| "unknown".to_string());
+    let rid = parts
+        .request_id
+        .clone()
+        .unwrap_or_else(|| "unknown".to_string());
     (rid, response)
 }
 
@@ -427,7 +469,7 @@ fn signal_event_context(
             peer_count: None,
             phase: None,
         },
-        Command::EstablishSessions { participants } => SignalEventContext {
+        Command::EstablishSessions { participants, .. } => SignalEventContext {
             measurement_class: "wrapper",
             event_family: "session_establishment",
             event_subtype: "session_establish_pair_wrapper",
@@ -546,6 +588,7 @@ async fn participant_command_actor(
         }
 
         let start = Instant::now();
+        let process_start = ProcessTime::now();
         let start_unix_ms = unix_ms_now();
 
         if slot.debug_enabled {
@@ -589,6 +632,40 @@ async fn participant_command_actor(
             mark_worker_command_execution();
         }
 
+        if slot.profile_enabled {
+            libsignal_protocol::profiling::clear_benchmark_context();
+            libsignal_protocol::profiling::set_worker_id(participant_id.clone());
+            let has_benchmark = envelope.benchmark_phase.is_some()
+                || envelope.benchmark_operation.is_some()
+                || envelope.benchmark_plateau_index.is_some();
+            if has_benchmark {
+                libsignal_protocol::profiling::set_benchmark_context(
+                    libsignal_protocol::profiling::BenchmarkContext {
+                        benchmark_plateau_index: envelope.benchmark_plateau_index,
+                        benchmark_target_size: envelope.benchmark_target_size,
+                        benchmark_active_size: envelope.benchmark_active_size,
+                        benchmark_phase: envelope.benchmark_phase.clone(),
+                        benchmark_operation: envelope.benchmark_operation.clone(),
+                        benchmark_operation_seq: envelope.benchmark_operation_seq,
+                        benchmark_payload_size: envelope.benchmark_payload_size,
+                        benchmark_workflow_id: envelope.benchmark_workflow_id,
+                        workflow_pair_index: envelope.workflow_pair_index,
+                        workflow_pair_count: envelope.workflow_pair_count,
+                        request_id: envelope.request_id.clone(),
+                    },
+                );
+            }
+        }
+        let wrapper_span_id = if slot.profile_enabled {
+            let sid = libsignal_protocol::profiling::next_span_id();
+            let op_name = format!("benchmark_wrapper.{}", event_context.event_subtype);
+            libsignal_protocol::profiling::push_span_id(sid, op_name);
+            allocation_counter::embedded_heap_budget::set_active_span_id(Some(sid));
+            Some(sid)
+        } else {
+            None
+        };
+
         let mut result = handle_command(
             &mut slot.participant,
             &kr_url,
@@ -615,7 +692,8 @@ async fn participant_command_actor(
         };
         let mut metrics = None;
         let response = match result {
-            Ok(outcome) => {
+            Ok(mut outcome) => {
+                outcome.metrics.cpu_process_ns = Some(process_start.elapsed().as_nanos());
                 metrics = Some(outcome.metrics);
                 CommandResponse::ok(outcome.message)
             }
@@ -645,8 +723,35 @@ async fn participant_command_actor(
                     None
                 };
                 let heap_snapshot = signal_benchmark::embedded_heap_budget::snapshot();
+                let worker_id_opt = libsignal_protocol::profiling::current_worker_id();
+                let global_span_id = worker_id_opt
+                    .as_ref()
+                    .zip(wrapper_span_id)
+                    .map(|(w, s)| format!("{}:{}", w, s));
                 let event = SignalProfileEvent {
-                    profile_schema_version: 4,
+                    profile_schema_version: 5,
+                    span_id: wrapper_span_id,
+                    parent_span_id: None,
+                    parent_operation: None,
+                    span_name: Some(format!("benchmark_wrapper.{}", event_context.event_subtype)),
+                    span_kind: Some("total".to_string()),
+                    measurement_plane: Some("wrapper_total".to_string()),
+                    span_inclusive: Some(true),
+                    worker_id: worker_id_opt,
+                    global_span_id,
+                    parent_global_span_id: None,
+                    request_id: envelope.request_id.clone(),
+                    benchmark_plateau_index: envelope.benchmark_plateau_index,
+                    benchmark_target_size: envelope.benchmark_target_size,
+                    benchmark_active_size: envelope.benchmark_active_size,
+                    benchmark_phase: envelope.benchmark_phase.clone(),
+                    benchmark_operation: envelope.benchmark_operation.clone(),
+                    benchmark_operation_seq: envelope.benchmark_operation_seq,
+                    benchmark_payload_size: envelope.benchmark_payload_size,
+                    benchmark_workflow_id: envelope.benchmark_workflow_id,
+                    workflow_pair_index: envelope.workflow_pair_index,
+                    workflow_pair_count: envelope.workflow_pair_count,
+                    new_session_established: metrics.new_session_established,
                     ts_unix_ns: start_unix_ms * 1_000_000,
                     op: event_context.event_subtype.to_string(),
                     span_layer: "benchmark_wrapper".to_string(),
@@ -669,6 +774,7 @@ async fn participant_command_actor(
                     success: response.status == "ok",
                     wall_ns,
                     cpu_thread_ns: metrics.cpu_thread_ns,
+                    cpu_process_ns: metrics.cpu_process_ns,
                     cpu_envelope_utilization: None,
                     cpu_throttled_time_ratio: cpu_throttled,
                     alloc_bytes: metrics.alloc_bytes,
@@ -757,7 +863,9 @@ async fn participant_command_actor(
                         .and_then(|v| v.parse().ok()),
                     heap_current_live_bytes: Some(heap_snapshot.current_live_heap_bytes),
                     heap_peak_live_bytes: Some(heap_snapshot.peak_live_heap_bytes),
-                    heap_operation_peak_live_bytes: Some(heap_snapshot.operation_peak_live_heap_bytes),
+                    heap_operation_peak_live_bytes: Some(
+                        heap_snapshot.operation_peak_live_heap_bytes,
+                    ),
                     heap_total_allocated_bytes: Some(heap_snapshot.total_allocated_bytes),
                     heap_allocation_count: Some(heap_snapshot.allocation_count),
                     heap_deallocation_count: Some(heap_snapshot.deallocation_count),
@@ -773,6 +881,10 @@ async fn participant_command_actor(
                     let _ = std::io::Write::write(&mut file, b"\n");
                 }
             }
+        }
+
+        if let Some(sid) = wrapper_span_id {
+            libsignal_protocol::profiling::pop_span_id(sid);
         }
 
         if slot.debug_enabled {
@@ -918,7 +1030,9 @@ async fn main() -> Result<()> {
                     template.replace("{participant_id}", participant_id),
                 ))
             } else {
-                None
+                std::env::var_os("SIGNAL_PROFILE_PATH")
+                    .map(PathBuf::from)
+                    .filter(|p| !p.as_os_str().is_empty())
             }
         } else {
             None

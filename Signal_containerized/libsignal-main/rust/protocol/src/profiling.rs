@@ -6,7 +6,7 @@ use std::{
     io::{BufWriter, Write},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Mutex, OnceLock},
+    sync::{atomic::{AtomicU64, Ordering}, Mutex, OnceLock},
     task::Poll,
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -21,9 +21,13 @@ static CPU_STAT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static CPU_LIMIT_CORES: OnceLock<Option<f64>> = OnceLock::new();
 static MEMORY_LIMIT_BYTES: OnceLock<Option<u64>> = OnceLock::new();
 static PAGE_SIZE_BYTES: OnceLock<u64> = OnceLock::new();
+static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
     static PROFILE_CONTEXT: RefCell<ProfileContext> = RefCell::new(ProfileContext::default());
+    static SPAN_STACK: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
+    static WORKER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    static BENCHMARK_CONTEXT: RefCell<Option<BenchmarkContext>> = const { RefCell::new(None) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -68,6 +72,113 @@ pub(crate) struct SpanMetadata {
     pub spqr_step_performed: Option<bool>,
     pub ratchet_progression_kind: Option<&'static str>,
     pub ratchet_progression_value: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct BenchmarkContext {
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    pub benchmark_workflow_id: Option<u64>,
+    pub workflow_pair_index: Option<u32>,
+    pub workflow_pair_count: Option<u32>,
+    pub request_id: Option<String>,
+}
+
+pub fn next_span_id() -> u64 {
+    NEXT_SPAN_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub fn current_parent_span_id() -> Option<u64> {
+    SPAN_STACK.with(|stack| stack.borrow().last().map(|&(id, _)| id))
+}
+
+pub fn current_parent_operation() -> Option<String> {
+    SPAN_STACK.with(|stack| stack.borrow().last().map(|(_, op)| op.clone()))
+}
+
+pub fn push_span_id(span_id: u64, op_name: String) {
+    SPAN_STACK.with(|stack| stack.borrow_mut().push((span_id, op_name)));
+}
+
+pub fn pop_span_id(span_id: u64) {
+    SPAN_STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if stack.last().map(|&(id, _)| id) == Some(span_id) {
+            stack.pop();
+        } else if let Some(position) = stack.iter().rposition(|&(id, _)| id == span_id) {
+            stack.remove(position);
+        }
+    });
+}
+
+pub fn set_worker_id(id: String) {
+    WORKER_ID.with(|slot| {
+        *slot.borrow_mut() = Some(id);
+    });
+}
+
+pub fn clear_worker_id() {
+    WORKER_ID.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+pub fn set_benchmark_context(ctx: BenchmarkContext) {
+    BENCHMARK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(ctx);
+    });
+}
+
+pub fn clear_benchmark_context() {
+    BENCHMARK_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = None;
+    });
+}
+
+pub fn current_benchmark_context() -> Option<BenchmarkContext> {
+    BENCHMARK_CONTEXT.with(|slot| slot.borrow().clone())
+}
+
+pub fn current_worker_id() -> Option<String> {
+    WORKER_ID.with(|slot| slot.borrow().clone())
+}
+
+fn current_worker_id_str() -> String {
+    current_worker_id().unwrap_or_default()
+}
+
+pub fn current_global_span_id() -> Option<String> {
+    WORKER_ID.with(|slot| {
+        slot.borrow().as_ref().and_then(|wid| {
+            SPAN_STACK.with(|stack| {
+                stack.borrow().last().map(|&(id, _)| format!("{}:{}", wid, id))
+            })
+        })
+    })
+}
+
+pub fn current_parent_global_span_id() -> Option<String> {
+    WORKER_ID.with(|slot| {
+        slot.borrow().as_ref().and_then(|wid| {
+            SPAN_STACK.with(|stack| {
+                let v = stack.borrow();
+                if v.len() >= 2 {
+                    Some(format!("{}:{}", wid, v[v.len() - 2].0))
+                } else {
+                    None
+                }
+            })
+        })
+    })
+}
+
+pub(crate) fn build_global_span_id(worker_id: &str, span_id: u64) -> String {
+    format!("{}:{}", worker_id, span_id)
 }
 
 pub fn with_profile_context<R>(context: ProfileContext, run: impl FnOnce() -> R) -> R {
@@ -385,17 +496,55 @@ fn event_family_for_op(op: &str) -> &'static str {
     }
 }
 
+fn span_kind_for_op(op: &str) -> &'static str {
+    if op.contains(".total") || op.ends_with("_protocol") {
+        "total"
+    } else {
+        "subspan"
+    }
+}
+
+fn measurement_plane_for_op(op: &str) -> &'static str {
+    if op.ends_with("_protocol") {
+        "protocol_total"
+    } else if op.contains("_aead_") || op.contains("_ratchet_") || op.contains("_spqr_") {
+        "crypto_child"
+    } else if op.starts_with("pqxdh_") && !op.ends_with("_protocol") {
+        "pqxdh_child"
+    } else {
+        "helper"
+    }
+}
+
 #[derive(Serialize, Debug)]
 pub(crate) struct ProfileEvent {
     pub profile_schema_version: u32,
     pub ts_unix_ns: u128,
     pub op: String,
+    pub span_name: Option<String>,
+    pub span_kind: Option<String>,
+    pub measurement_plane: Option<String>,
+    pub span_inclusive: Option<bool>,
     pub span_layer: String,
     pub protocol_stack: String,
     pub implementation: String,
     pub measurement_class: String,
     pub event_family: String,
     pub event_subtype: String,
+    pub span_id: Option<u64>,
+    pub parent_span_id: Option<u64>,
+    pub parent_operation: Option<String>,
+    pub worker_id: Option<String>,
+    pub global_span_id: Option<String>,
+    pub parent_global_span_id: Option<String>,
+    pub request_id: Option<String>,
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
     pub cpu_envelope_utilization: Option<f64>,
@@ -502,6 +651,10 @@ struct ProfileScope {
     cpu_start: Option<ThreadTime>,
     resource_start: ResourceSnapshot,
     l1d_cache_start: Option<L1DCacheCounterScope>,
+    span_id: u64,
+    parent_span_id: Option<u64>,
+    parent_operation: Option<String>,
+    finished: bool,
 }
 
 impl ProfileScope {
@@ -510,25 +663,38 @@ impl ProfileScope {
             return None;
         }
         let _ = L1DCacheCounterScope::counters_available();
+        let span_id = next_span_id();
+        let op_name: String = op.into();
+        let parent_span_id = current_parent_span_id();
+        let parent_operation = current_parent_operation();
+        push_span_id(span_id, op_name.clone());
         Some(Self {
-            op: op.into(),
+            op: op_name,
             metadata,
             context: current_context(),
             wall_start: Instant::now(),
             cpu_start: Some(ThreadTime::now()),
             resource_start: ResourceSnapshot::capture_start(),
             l1d_cache_start: L1DCacheCounterScope::start(),
+            span_id,
+            parent_span_id,
+            parent_operation,
+            finished: false,
         })
     }
 
     fn finish(
-        self,
+        mut self,
         allocation_info: AllocationInfo,
         success: bool,
         error_class: Option<String>,
     ) -> ProfileEvent {
+        self.finished = true;
+        pop_span_id(self.span_id);
+
         let l1d_cache_counts = self
             .l1d_cache_start
+            .take()
             .map(L1DCacheCounterScope::finish)
             .unwrap_or_default();
         let wall_ns = self.wall_start.elapsed().as_nanos();
@@ -567,20 +733,49 @@ impl ProfileScope {
             }
             _ => None,
         };
-        let metadata = self.metadata;
-        let context = self.context;
+        let metadata = self.metadata.clone();
+        let context = self.context.clone();
         let heap_snapshot = embedded_heap_budget::snapshot();
+        let worker_id = current_worker_id_str();
+        let worker_id_opt = current_worker_id();
+        let global_span_id = worker_id_opt
+            .as_ref()
+            .map(|wid| build_global_span_id(wid, self.span_id));
+        let parent_global_span_id = worker_id_opt.as_ref().and_then(|wid| {
+            self.parent_span_id
+                .map(|pid| build_global_span_id(wid, pid))
+        });
+        let bench_ctx = current_benchmark_context();
+        let op_clone = self.op.clone();
 
         ProfileEvent {
             profile_schema_version: 4,
             ts_unix_ns: unix_timestamp_ns(),
+            op: op_clone.clone(),
+            span_name: Some(self.op.clone()),
+            span_kind: Some(span_kind_for_op(&self.op).to_string()),
+            measurement_plane: Some(measurement_plane_for_op(&self.op).to_string()),
+            span_inclusive: Some(true),
             span_layer: "libsignal_main".to_string(),
             protocol_stack: "signal".to_string(),
             implementation: "libsignal".to_string(),
             measurement_class: measurement_class_for_op(&self.op).to_string(),
             event_family: event_family_for_op(&self.op).to_string(),
             event_subtype: self.op.clone(),
-            op: self.op,
+            span_id: Some(self.span_id),
+            parent_span_id: self.parent_span_id,
+            parent_operation: self.parent_operation.clone(),
+            worker_id: (if worker_id.is_empty() { None } else { Some(worker_id) }),
+            global_span_id,
+            parent_global_span_id,
+            request_id: bench_ctx.as_ref().and_then(|c| c.request_id.clone()),
+            benchmark_plateau_index: bench_ctx.as_ref().and_then(|c| c.benchmark_plateau_index),
+            benchmark_target_size: bench_ctx.as_ref().and_then(|c| c.benchmark_target_size),
+            benchmark_active_size: bench_ctx.as_ref().and_then(|c| c.benchmark_active_size),
+            benchmark_phase: bench_ctx.as_ref().and_then(|c| c.benchmark_phase.clone()),
+            benchmark_operation: bench_ctx.as_ref().and_then(|c| c.benchmark_operation.clone()),
+            benchmark_operation_seq: bench_ctx.as_ref().and_then(|c| c.benchmark_operation_seq),
+            benchmark_payload_size: bench_ctx.as_ref().and_then(|c| c.benchmark_payload_size),
             wall_ns,
             cpu_thread_ns,
             cpu_envelope_utilization,
@@ -664,6 +859,14 @@ impl ProfileScope {
             heap_failure_context: Some(heap_snapshot.failure_context.as_str().to_string()),
             resource_profile_id: env_or_none("SIGNAL_RESOURCE_PROFILE_ID"),
             resource_profile_index: env_i32_or_none("SIGNAL_RESOURCE_PROFILE_INDEX"),
+        }
+    }
+}
+
+impl Drop for ProfileScope {
+    fn drop(&mut self) {
+        if !self.finished {
+            pop_span_id(self.span_id);
         }
     }
 }

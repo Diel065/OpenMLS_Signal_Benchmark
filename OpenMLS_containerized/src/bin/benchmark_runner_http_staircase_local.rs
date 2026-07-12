@@ -161,6 +161,7 @@ fn main() -> Result<()> {
         no_aggregate: false,
         failure_experiment: false,
         profiled_failure_policy: ProfiledFailurePolicy::StopOnProfiledFailure,
+        remove_rejoin: false,
         worker_layout: None,
         run_id: args.run_id,
         scenario: args.scenario,

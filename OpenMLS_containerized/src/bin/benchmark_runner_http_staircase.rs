@@ -131,6 +131,11 @@ struct Args {
 
     #[arg(long, default_value = "stop-on-profiled-failure")]
     profiled_failure_policy: ProfiledFailurePolicy,
+
+    /// At each plateau, remove a random profiled singleton and re-add them
+    /// immediately to collect clean RemoveCommit + ProcessWelcome data.
+    #[arg(long, action = ArgAction::SetTrue)]
+    remove_rejoin: bool,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -240,6 +245,7 @@ fn main() -> Result<()> {
         no_aggregate: args.no_aggregate,
         failure_experiment: args.failure_experiment,
         profiled_failure_policy: args.profiled_failure_policy,
+        remove_rejoin: args.remove_rejoin,
         worker_layout,
     })
 }

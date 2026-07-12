@@ -68,6 +68,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-size", type=int, default=2)
     p.add_argument("--max-size", type=int, default=None)
     p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
+    p.add_argument("--step-size-switch-at", type=int, default=None)
+    p.add_argument("--step-size-after-switch", type=int, default=None)
     p.add_argument(
         "--plateau-order",
         choices=("staircase", "ascending", "randomized"),
@@ -427,6 +429,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="CPU affinity planning mode",
     )
     p.add_argument(
+        "--strict-cpuset",
+        action="store_true",
+        help="Alias for --cpu-affinity-mode profiled-nor-background",
+    )
+    p.add_argument(
         "--cpu-affinity-sample-seconds",
         type=float,
         default=20.0,
@@ -751,6 +758,73 @@ def build_resource_profiles_for_run(args: argparse.Namespace, run_id: str) -> li
         profile.selected_for_this_run = True
         result.append(profile.to_dict())
     return result
+
+
+def apply_strict_cpuset_alias(args: argparse.Namespace) -> None:
+    if getattr(args, "strict_cpuset", False) and args.cpu_affinity_mode == "none":
+        args.cpu_affinity_mode = "profiled-nor-background"
+
+
+def affinity_inputs_for_run(
+    args: argparse.Namespace,
+    resource_profiles: list[dict],
+) -> tuple[list[dict], dict[str, int], list[dict], dict]:
+    from generate_compose import select_singleton_ids, compute_hybrid_layout
+
+    layout_info = compute_hybrid_layout(
+        args.workers, args.singleton_min_count,
+        args.singleton_fraction, args.packed_clients_per_container,
+    )
+    singleton_ids = select_singleton_ids(
+        args.workers, layout_info["singleton_count"],
+        args.singleton_selection_seed, args.singleton_selection_strategy,
+    )
+    count = min(len(singleton_ids), args.profiled_singleton_count)
+    profiled_singleton_ids = singleton_ids[:count]
+    profiled_worker_ids = [f"worker-{cid}" for cid in profiled_singleton_ids]
+
+    profiled_specs = []
+    profiled_cpu_counts = {}
+    for i, (wid, cid) in enumerate(zip(profiled_worker_ids, profiled_singleton_ids)):
+        profile = resource_profiles[i] if i < len(resource_profiles) else {}
+        assigned_cpu_count = int(profile.get("assigned_cpu_count") or 1)
+        rayon_threads = int(profile.get("rayon_num_threads") or assigned_cpu_count)
+        profiled_specs.append({
+            "worker_id": wid,
+            "container_name": f"worker-{cid}",
+            "logical_client_id": cid,
+            "experiment_kind": profile.get("experiment_kind") or (
+                "unconstrained_container_baseline"
+                if args.resource_experiment == "none"
+                else args.resource_experiment
+            ),
+            "resource_profile_id": profile.get("resource_profile_id", ""),
+            "rayon_num_threads": rayon_threads,
+        })
+        profiled_cpu_counts[wid] = assigned_cpu_count
+
+    bg_specs = [
+        {"container_name": "kr", "container_role": "infrastructure"},
+        {"container_name": "relay", "container_role": "infrastructure"},
+    ]
+    if args.runner_in_docker:
+        bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
+    if args.include_netcheck:
+        bg_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
+    profiled_id_set = set(profiled_singleton_ids)
+    for cid in singleton_ids:
+        if cid not in profiled_id_set:
+            bg_specs.append({
+                "container_name": f"worker-{cid}",
+                "container_role": "unprofiled_singleton",
+            })
+    for p in range(layout_info["packed_container_count"]):
+        bg_specs.append({
+            "container_name": f"worker-pack-{p:03d}",
+            "container_role": "packed",
+        })
+
+    return profiled_specs, profiled_cpu_counts, bg_specs, layout_info
 
 
 def output_root_for(root: Path, output_dir_name: str) -> Path:
@@ -3205,6 +3279,18 @@ def run_standalone_aggregation(
     if workers_file:
         cmd += ["--workers-file", str(workers_file)]
 
+    # Remove stale aggregation outputs before regenerating. The in-docker runner
+    # runs as root and may leave root-owned placeholders (e.g. a header-only
+    # events.csv) that this host-side aggregator cannot overwrite in place,
+    # which fails with EACCES. run_dir is owned by the calling user, so unlink
+    # works even for root-owned files inside it.
+    for stale in (run_dir / "events.csv", run_dir / "aggregation_manifest.json"):
+        if stale.is_file():
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+
     print(f"[aggregate] running standalone aggregation", flush=True)
     result = subprocess.run(cmd, cwd=str(root), capture_output=True, text=True)
     if result.returncode != 0:
@@ -3330,6 +3416,8 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "min_size": args.min_size,
             "max_size": args.max_size if args.max_size is not None else args.workers,
             "step_size": args.step_size,
+            "step_size_switch_at": args.step_size_switch_at,
+            "step_size_after_switch": args.step_size_after_switch,
             "plateau_order": args.plateau_order,
             "roundtrips": args.roundtrips,
             "app_rounds": args.app_rounds,
@@ -3372,6 +3460,9 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
 def main() -> int:
     args = build_parser().parse_args()
     root = repo_root()
+
+    if (args.step_size_switch_at is None) != (args.step_size_after_switch is None):
+        raise SystemExit("--step-size-switch-at and --step-size-after-switch must be set together")
 
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
@@ -3459,6 +3550,8 @@ def main() -> int:
 
     if args.profiled_singleton_count < 1:
         raise SystemExit("--profiled-singleton-count must be >= 1")
+
+    apply_strict_cpuset_alias(args)
 
     if args.resource_experiment != "none" and args.profiled_singleton_count > args.singleton_min_count:
         raise SystemExit("resource sweeps require --singleton-min-count >= --profiled-singleton-count")
@@ -3636,63 +3729,22 @@ def main() -> int:
             generator_cmd += ["--singleton-app-heap-budget", args.singleton_app_heap_budget]
         # ── Affinity planning (OpenMLS-compatible) ───
         if (
-            args.resource_experiment == "none"
-            and args.cpu_affinity_mode != "none"
+            args.cpu_affinity_mode != "none"
             and args.profiled_singleton_count > 0
             and not getattr(args, "disable_container_profiling", False)
         ):
-            from generate_compose import select_singleton_ids, compute_hybrid_layout
             from cpu_affinity_planner import (
                 create_affinity_plan,
                 validate_affinity_plan,
                 write_affinity_plan_json,
             )
 
-            layout_info = compute_hybrid_layout(
-                args.workers, args.singleton_min_count,
-                args.singleton_fraction, args.packed_clients_per_container,
+            profiled_specs, profiled_cpu_counts, bg_specs, _layout_info = affinity_inputs_for_run(
+                args, resource_profiles,
             )
-            singleton_ids = select_singleton_ids(
-                args.workers, layout_info["singleton_count"],
-                args.singleton_selection_seed, args.singleton_selection_strategy,
-            )
-            count = min(len(singleton_ids), args.profiled_singleton_count)
-            profiled_singleton_ids = singleton_ids[:count]
-            profiled_worker_ids = [f"worker-{cid}" for cid in profiled_singleton_ids]
-            profiled_specs = [
-                {
-                    "worker_id": wid,
-                    "container_name": f"worker-{cid}",
-                    "logical_client_id": cid,
-                    "experiment_kind": "unconstrained_container_baseline",
-                    "resource_profile_id": "",
-                    "rayon_num_threads": 1,
-                }
-                for wid, cid in zip(profiled_worker_ids, profiled_singleton_ids)
-            ]
-            profiled_cpu_counts = {wid: 1 for wid in profiled_worker_ids}
-            bg_specs = [
-                {"container_name": "kr", "container_role": "infrastructure"},
-                {"container_name": "relay", "container_role": "infrastructure"},
-            ]
-            if args.runner_in_docker:
-                bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
-            if args.include_netcheck:
-                bg_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
-            profiled_id_set = set(profiled_singleton_ids)
-            for cid in singleton_ids:
-                if cid not in profiled_id_set:
-                    bg_specs.append({
-                        "container_name": f"worker-{cid}",
-                        "container_role": "unprofiled_singleton",
-                    })
-            for p in range(layout_info["packed_container_count"]):
-                bg_specs.append({
-                    "container_name": f"worker-pack-{p:03d}",
-                    "container_role": "packed",
-                })
 
-            print(f"[affinity] Computing baseline CPU affinity plan "
+            label = "baseline" if args.resource_experiment == "none" else args.resource_experiment
+            print(f"[affinity] Computing {label} CPU affinity plan "
                   f"({len(profiled_specs)} profiled workers, "
                   f"{sum(profiled_cpu_counts.values())} total CPUs)...", flush=True)
             plan = create_affinity_plan(
@@ -3989,6 +4041,12 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                *([
+                    "--step-size-switch-at",
+                    str(args.step_size_switch_at),
+                    "--step-size-after-switch",
+                    str(args.step_size_after_switch),
+                ] if args.step_size_switch_at is not None or args.step_size_after_switch is not None else []),
                 "--plateau-order",
                 args.plateau_order,
                 "--roundtrips",
@@ -4046,6 +4104,12 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                *([
+                    "--step-size-switch-at",
+                    str(args.step_size_switch_at),
+                    "--step-size-after-switch",
+                    str(args.step_size_after_switch),
+                ] if args.step_size_switch_at is not None or args.step_size_after_switch is not None else []),
                 "--plateau-order",
                 args.plateau_order,
                 "--roundtrips",

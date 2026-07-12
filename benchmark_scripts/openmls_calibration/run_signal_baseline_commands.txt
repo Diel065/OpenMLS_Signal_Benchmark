@@ -1,0 +1,12 @@
+WORKERS=1024 MAX_SIZE=1024 STEP_SIZE=64 \
+  benchmark_scripts/openmls_calibration/run_02_devshm_signal_1x.sh
+
+WORKERS=1024 MAX_SIZE=1024 STEP_SIZE=64 PLATEAU_ORDER=ascending \
+  MAX_APP_SAMPLES_PER_PAYLOAD=2 BUILD_IMAGES=1 \
+  benchmark_scripts/openmls_calibration/run_02_devshm_signal_1x.sh
+
+WORKERS=1024 MAX_SIZE=1024 STEP_SIZE=64 STEP_SIZE_SWITCH_AT=256 \
+  STEP_SIZE_AFTER_SWITCH=196 PLATEAU_ORDER=ascending \
+  PROFILED_SINGLETON_COUNT=10 SINGLETON_MIN_COUNT=10 \
+  MAX_APP_SAMPLES_PER_PAYLOAD=2 BUILD_IMAGES=1 \
+  benchmark_scripts/openmls_calibration/run_02_devshm_signal_1x.sh

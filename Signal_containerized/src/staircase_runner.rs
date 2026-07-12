@@ -15,8 +15,8 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::stream::{self, StreamExt};
-use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::http_retry::{
@@ -45,6 +45,11 @@ const DEFAULT_FANOUT_RETRY_PASSES: usize = 1;
 const MAX_RANDOM_BATCH_SIZE: usize = 8;
 
 static WORKER_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
+static WORKFLOW_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+fn next_workflow_id() -> u64 {
+    WORKFLOW_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -88,6 +93,8 @@ pub struct StaircaseConfig {
     pub min_size: usize,
     pub max_size: Option<usize>,
     pub step_size: StepSize,
+    pub step_size_switch_at: Option<usize>,
+    pub step_size_after_switch: Option<usize>,
     pub plateau_order: PlateauOrder,
     pub roundtrips: usize,
     pub app_rounds: usize,
@@ -483,6 +490,9 @@ struct RunnerEvent {
     benchmark_operation: String,
     benchmark_operation_seq: Option<usize>,
     benchmark_payload_size: Option<usize>,
+    benchmark_workflow_id: Option<u64>,
+    workflow_pair_index: Option<u32>,
+    workflow_pair_count: Option<u32>,
 }
 
 struct RunnerEventLog {
@@ -541,6 +551,9 @@ impl RunnerEventLog {
             benchmark_operation: cursor.operation.clone(),
             benchmark_operation_seq: cursor.operation_seq,
             benchmark_payload_size: cursor.payload_size,
+            benchmark_workflow_id: None,
+            workflow_pair_index: None,
+            workflow_pair_count: None,
         };
         let mut out = OpenOptions::new()
             .create(true)
@@ -747,13 +760,12 @@ fn apply_app_heap_budget_failure_fields(event: &mut SignalProfileEvent) {
     event.app_heap_budget = app_heap_field(detail, "app_heap_budget");
     event.app_heap_budget_bytes =
         app_heap_field(detail, "app_heap_budget_bytes").and_then(|v| v.parse::<u64>().ok());
-    event.heap_current_live_bytes = app_heap_field(detail, "current_live_heap_bytes")
-        .and_then(|v| v.parse::<u64>().ok());
+    event.heap_current_live_bytes =
+        app_heap_field(detail, "current_live_heap_bytes").and_then(|v| v.parse::<u64>().ok());
     event.heap_peak_live_bytes =
         app_heap_field(detail, "peak_live_heap_bytes").and_then(|v| v.parse::<u64>().ok());
-    event.heap_operation_peak_live_bytes =
-        app_heap_field(detail, "operation_peak_live_heap_bytes")
-            .and_then(|v| v.parse::<u64>().ok());
+    event.heap_operation_peak_live_bytes = app_heap_field(detail, "operation_peak_live_heap_bytes")
+        .and_then(|v| v.parse::<u64>().ok());
     event.heap_total_allocated_bytes =
         app_heap_field(detail, "total_allocated_bytes").and_then(|v| v.parse::<u64>().ok());
     event.heap_allocation_count =
@@ -761,8 +773,7 @@ fn apply_app_heap_budget_failure_fields(event: &mut SignalProfileEvent) {
     event.heap_deallocation_count =
         app_heap_field(detail, "deallocation_count").and_then(|v| v.parse::<u64>().ok());
     event.heap_failed_allocation_size_bytes =
-        app_heap_field(detail, "failed_allocation_size_bytes")
-            .and_then(|v| v.parse::<u64>().ok());
+        app_heap_field(detail, "failed_allocation_size_bytes").and_then(|v| v.parse::<u64>().ok());
     event.heap_failure_context = app_heap_field(detail, "heap_failure_context");
 
     if event.failure_operation.is_none() {
@@ -824,6 +835,24 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
 
 pub fn measured_active_participants(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+fn frontload_profile_enabled_singletons_in_idle(
+    idle: VecDeque<WorkerSpec>,
+) -> VecDeque<WorkerSpec> {
+    let mut profiled_singletons = Vec::new();
+    let mut other_workers = Vec::new();
+    for worker in idle {
+        if worker.profile_enabled && worker.container_mode == ContainerMode::Singleton {
+            profiled_singletons.push(worker);
+        } else {
+            other_workers.push(worker);
+        }
+    }
+    profiled_singletons
+        .into_iter()
+        .chain(other_workers)
+        .collect()
 }
 
 pub fn physical_groups<'a>(
@@ -1186,6 +1215,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         return Ok(());
     }
 
+    let piecewise_step = match (config.step_size_switch_at, config.step_size_after_switch) {
+        (None, None) => None,
+        (Some(switch_at), Some(after_switch)) if switch_at > 0 && after_switch > 0 => {
+            Some((switch_at, after_switch))
+        }
+        _ => return Err(anyhow!("--step-size-switch-at and --step-size-after-switch must be provided together and be greater than 0")),
+    };
+
     let mut plateau_rng = rand::rng();
     let plateau_sequence = build_plateau_sequence_for_order(
         config.min_size,
@@ -1193,6 +1230,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         &config.step_size,
         config.roundtrips,
         config.plateau_order,
+        piecewise_step,
         &mut plateau_rng,
     );
 
@@ -1221,6 +1259,12 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let mut active: Vec<WorkerSpec> = Vec::new();
     let mut idle: VecDeque<WorkerSpec> = config.workers.iter().cloned().collect();
+    if config.profile_only_singletons {
+        idle = frontload_profile_enabled_singletons_in_idle(idle);
+        eprintln!(
+            "[sampling] front-loaded profile-enabled singleton joiners for PQXDH initiator coverage; packed clients remain unprofiled"
+        );
+    }
 
     let run_result = {
         let mut plateau_result = Ok(());
@@ -1243,6 +1287,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &mut progress,
                 plateau_idx + 1,
                 &runner_events,
+                config.profile_only_singletons,
             )
             .await
             {
@@ -1303,7 +1348,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     // Always write sidecars, even on failure
     if let Err(e) = write_post_benchmark_sidecars(&run_dir, &config.run_id) {
-        eprintln!("[sidecars] failed to write post-benchmark sidecars: {:#}", e);
+        eprintln!(
+            "[sidecars] failed to write post-benchmark sidecars: {:#}",
+            e
+        );
     }
 
     if run_result.is_ok() {
@@ -1557,6 +1605,16 @@ async fn wait_for_all_workers_healthy(
 struct WorkerCommandContext {
     request_id: String,
     phase: Option<String>,
+    benchmark_plateau_index: Option<usize>,
+    benchmark_target_size: Option<usize>,
+    benchmark_active_size: Option<usize>,
+    benchmark_phase: Option<String>,
+    benchmark_operation: Option<String>,
+    benchmark_operation_seq: Option<usize>,
+    benchmark_payload_size: Option<usize>,
+    benchmark_workflow_id: Option<u64>,
+    workflow_pair_index: Option<u32>,
+    workflow_pair_count: Option<u32>,
 }
 
 impl WorkerCommandContext {
@@ -1565,6 +1623,15 @@ impl WorkerCommandContext {
     }
 
     fn with_metadata(worker: &WorkerSpec, command: &Command, phase: Option<&str>) -> Self {
+        Self::with_cursor(worker, command, phase, None)
+    }
+
+    fn with_cursor(
+        worker: &WorkerSpec,
+        command: &Command,
+        phase: Option<&str>,
+        cursor: Option<&BenchmarkCursor>,
+    ) -> Self {
         let seq = WORKER_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
         let request_id = format!(
             "runner-{}-{}-{}-{}",
@@ -1577,7 +1644,24 @@ impl WorkerCommandContext {
         Self {
             request_id,
             phase: phase.map(ToOwned::to_owned),
+            benchmark_plateau_index: cursor.map(|c| c.plateau_index),
+            benchmark_target_size: cursor.map(|c| c.target_size),
+            benchmark_active_size: cursor.map(|c| c.active_size),
+            benchmark_phase: cursor.as_ref().map(|c| c.phase.clone()),
+            benchmark_operation: cursor.as_ref().map(|c| c.operation.clone()),
+            benchmark_operation_seq: cursor.and_then(|c| c.operation_seq),
+            benchmark_payload_size: cursor.and_then(|c| c.payload_size),
+            benchmark_workflow_id: None,
+            workflow_pair_index: None,
+            workflow_pair_count: None,
         }
+    }
+
+    fn with_workflow(mut self, workflow_id: u64, pair_index: usize, pair_count: usize) -> Self {
+        self.benchmark_workflow_id = Some(workflow_id);
+        self.workflow_pair_index = Some(pair_index as u32);
+        self.workflow_pair_count = Some(pair_count as u32);
+        self
     }
 }
 
@@ -1706,6 +1790,16 @@ async fn send_command_with_context(
         request_id: context.request_id.clone(),
         command: command.clone(),
         phase: context.phase.clone(),
+        benchmark_plateau_index: context.benchmark_plateau_index,
+        benchmark_target_size: context.benchmark_target_size,
+        benchmark_active_size: context.benchmark_active_size,
+        benchmark_phase: context.benchmark_phase.clone(),
+        benchmark_operation: context.benchmark_operation.clone(),
+        benchmark_operation_seq: context.benchmark_operation_seq,
+        benchmark_payload_size: context.benchmark_payload_size,
+        benchmark_workflow_id: context.benchmark_workflow_id,
+        workflow_pair_index: context.workflow_pair_index,
+        workflow_pair_count: context.workflow_pair_count,
     };
 
     for attempt in 1..=WORKER_COMMAND_MAX_ATTEMPTS {
@@ -1911,20 +2005,28 @@ async fn establish_sessions(
     actor: &WorkerSpec,
     existing_participants: &[WorkerSpec],
     _fanout: &mut FanoutController,
+    conversation_size: usize,
+    cursor: &BenchmarkCursor,
+    decrypt_on_peer: bool,
 ) -> Result<()> {
     if existing_participants.is_empty() {
         return Ok(());
     }
 
-    for peer in existing_participants {
+    let workflow_id = next_workflow_id();
+    let pair_count = existing_participants.len();
+    for (pair_index, peer) in existing_participants.iter().enumerate() {
         let establish_command = Command::EstablishSessions {
             participants: vec![peer.id.clone()],
+            conversation_size: Some(conversation_size),
         };
-        let establish_context = WorkerCommandContext::with_metadata(
+        let establish_context = WorkerCommandContext::with_cursor(
             actor,
             &establish_command,
             Some("handshake.initiator_process_bundle"),
-        );
+            Some(cursor),
+        )
+        .with_workflow(workflow_id, pair_index, pair_count);
         send_cmd_expect_ok_fragment_with_context(
             http,
             actor,
@@ -1954,39 +2056,41 @@ async fn establish_sessions(
         )
         .await?;
 
-        let decrypt_command = Command::DecryptMessage {
-            sender: actor.id.clone(),
-            profile: true,
-            conversation_size: Some(2),
-        };
-        let decrypt_context = WorkerCommandContext::with_metadata(
-            peer,
-            &decrypt_command,
-            Some("handshake.initial_message_decrypt"),
-        );
-        send_cmd_expect_ok_fragment_with_context(
-            http,
-            peer,
-            &decrypt_command,
-            "pairwise message received",
-            &decrypt_context,
-        )
-        .await?;
+        if decrypt_on_peer {
+            let decrypt_command = Command::DecryptMessage {
+                sender: actor.id.clone(),
+                profile: true,
+                conversation_size: Some(2),
+            };
+            let decrypt_context = WorkerCommandContext::with_metadata(
+                peer,
+                &decrypt_command,
+                Some("handshake.initial_message_decrypt"),
+            );
+            send_cmd_expect_ok_fragment_with_context(
+                http,
+                peer,
+                &decrypt_command,
+                "pairwise message received",
+                &decrypt_context,
+            )
+            .await?;
 
-        let update_opks_command = Command::UpdateOneTimePrekeys;
-        let update_opks_context = WorkerCommandContext::with_metadata(
-            peer,
-            &update_opks_command,
-            Some("prekey.maintenance_after_handshake"),
-        );
-        send_cmd_expect_ok_fragment_with_context(
-            http,
-            peer,
-            &update_opks_command,
-            "one-time prekey stock",
-            &update_opks_context,
-        )
-        .await?;
+            let update_opks_command = Command::UpdateOneTimePrekeys;
+            let update_opks_context = WorkerCommandContext::with_metadata(
+                peer,
+                &update_opks_command,
+                Some("prekey.maintenance_after_handshake"),
+            );
+            send_cmd_expect_ok_fragment_with_context(
+                http,
+                peer,
+                &update_opks_command,
+                "one-time prekey stock",
+                &update_opks_context,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -1999,13 +2103,25 @@ async fn broadcast_message(
     payload: &str,
     fanout: &mut FanoutController,
     profiling_recipient_id: Option<&str>,
+    cursor: &BenchmarkCursor,
 ) -> Result<()> {
-    let _batch_size = recipients.len();
     let conversation_size = recipients.len() + 1;
 
-    // Send pairwise encrypted messages
-    for recipient in recipients {
-        send_cmd_expect_ok_fragment(
+    let send_workflow_id = next_workflow_id();
+    let pair_count = recipients.len();
+    for (pair_index, recipient) in recipients.iter().enumerate() {
+        let ctx = WorkerCommandContext::with_cursor(
+            sender,
+            &Command::EncryptMessage {
+                recipient: recipient.id.clone(),
+                message: payload.to_string(),
+                conversation_size: Some(conversation_size),
+            },
+            None,
+            Some(cursor),
+        )
+        .with_workflow(send_workflow_id, pair_index, pair_count);
+        send_cmd_expect_ok_fragment_with_context(
             http,
             sender,
             &Command::EncryptMessage {
@@ -2014,6 +2130,7 @@ async fn broadcast_message(
                 conversation_size: Some(conversation_size),
             },
             "encrypted and sent",
+            &ctx,
         )
         .await?;
     }
@@ -2021,6 +2138,7 @@ async fn broadcast_message(
     // Receive at each recipient
     let commands_by_physical = build_batch_commands(recipients, |worker| {
         let is_profiled = profiling_recipient_id == Some(worker.id.as_str());
+        let receive_workflow_id = is_profiled.then(next_workflow_id);
         BatchFanoutCommand {
             participant_id: worker.id.clone(),
             request_id: None,
@@ -2031,6 +2149,16 @@ async fn broadcast_message(
             },
             phase: Some("application.fanout_receive_message".to_string()),
             profile: is_profiled.then_some(true),
+            benchmark_plateau_index: is_profiled.then_some(cursor.plateau_index),
+            benchmark_target_size: is_profiled.then_some(cursor.target_size),
+            benchmark_active_size: is_profiled.then_some(cursor.active_size),
+            benchmark_phase: is_profiled.then(|| cursor.phase.clone()),
+            benchmark_operation: is_profiled.then(|| "receive_message_delivery".to_string()),
+            benchmark_operation_seq: is_profiled.then_some(cursor.operation_seq).flatten(),
+            benchmark_payload_size: is_profiled.then_some(cursor.payload_size).flatten(),
+            benchmark_workflow_id: receive_workflow_id,
+            workflow_pair_index: is_profiled.then_some(0),
+            workflow_pair_count: is_profiled.then_some(1),
         }
     });
 
@@ -2062,6 +2190,7 @@ async fn enroll_participants(
     plateau_index: usize,
     target_size: usize,
     runner_events: &RunnerEventLog,
+    profile_only_singletons: bool,
 ) -> Result<()> {
     if batch_size == 0 {
         return Err(anyhow!("Cannot enroll zero participants"));
@@ -2132,21 +2261,196 @@ async fn enroll_participants(
     // will be active after this enrollment batch. This includes peers enrolled in the
     // same batch; otherwise the first plateau in a batched ascent lacks new-new sessions.
     let existing_ids: Vec<WorkerSpec> = active.clone();
-    for (idx, participant) in prepared.iter().enumerate() {
-        let mut peers = existing_ids.clone();
-        peers.extend(
-            prepared
-                .iter()
-                .enumerate()
-                .filter(|(peer_idx, _)| *peer_idx != idx)
-                .map(|(_, peer)| peer.clone()),
-        );
-        establish_sessions(http, participant, &peers, fanout).await?;
-    }
+    if profile_only_singletons {
+        // When only singletons carry profiling, prioritise profile-enabled
+        // initiators so every (singleton→peer) session establishment runs
+        // PQXDH while no responder-side session exists yet. Without this
+        // ordering the bidirectional handshake creates a session on the
+        // singleton in loop 1 (via DecryptMessage), and loop 2's
+        // EstablishSessions hits has_session_with=true → skips all PQXDH
+        // crypto → no profiled initiator data.
 
-    // Also establish sessions from existing participants to the new ones.
-    for existing in &existing_ids {
-        establish_sessions(http, existing, &prepared, fanout).await?;
+        // Phase A: existing profile-enabled → new non-profiled
+        //          decrypt_on_peer = true (packed workers need the session)
+        let profile_enabled_existing: Vec<_> = existing_ids
+            .iter()
+            .filter(|w| w.profile_enabled)
+            .cloned()
+            .collect();
+        let non_profile_prepared: Vec<_> = prepared
+            .iter()
+            .filter(|w| !w.profile_enabled)
+            .cloned()
+            .collect();
+        for existing in &profile_enabled_existing {
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_existing_profiled",
+            );
+            if !non_profile_prepared.is_empty() {
+                establish_sessions(
+                    http,
+                    existing,
+                    &non_profile_prepared,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                )
+                .await?;
+            }
+        }
+
+        // Phase B: existing profile-enabled → new profile-enabled
+        //          decrypt_on_peer = false (the other singleton gets its
+        //          own profiled initiator turn in Phase C)
+        let profile_prepared: Vec<_> = prepared
+            .iter()
+            .filter(|w| w.profile_enabled)
+            .cloned()
+            .collect();
+        for existing in &profile_enabled_existing {
+            if profile_prepared.is_empty() {
+                break;
+            }
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_existing_to_new_profiled",
+            );
+            establish_sessions(
+                http,
+                existing,
+                &profile_prepared,
+                fanout,
+                target_size,
+                &est_cursor,
+                false,
+            )
+            .await?;
+        }
+
+        // Phase C: new profile-enabled → existing + peer-new
+        for p in &profile_prepared {
+            let mut peers: Vec<WorkerSpec> = existing_ids.clone();
+            peers.extend(prepared.iter().filter(|peer| peer.id != p.id).cloned());
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_new_profiled",
+            );
+            establish_sessions(http, p, &peers, fanout, target_size, &est_cursor, true).await?;
+        }
+
+        // Phase D: existing non-profiled → prepared
+        let non_profile_existing: Vec<_> = existing_ids
+            .iter()
+            .filter(|w| !w.profile_enabled)
+            .cloned()
+            .collect();
+        for existing in &non_profile_existing {
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_existing_nonprofiled",
+            );
+            establish_sessions(
+                http,
+                existing,
+                &prepared,
+                fanout,
+                target_size,
+                &est_cursor,
+                true,
+            )
+            .await?;
+        }
+
+        // Phase E: new non-profiled → existing + peer-new
+        for participant in &non_profile_prepared {
+            let mut peers = existing_ids.clone();
+            peers.extend(
+                prepared
+                    .iter()
+                    .filter(|peer| peer.id != participant.id)
+                    .cloned(),
+            );
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_new_nonprofiled",
+            );
+            establish_sessions(
+                http,
+                participant,
+                &peers,
+                fanout,
+                target_size,
+                &est_cursor,
+                true,
+            )
+            .await?;
+        }
+    } else {
+        for (idx, participant) in prepared.iter().enumerate() {
+            let mut peers = existing_ids.clone();
+            peers.extend(
+                prepared
+                    .iter()
+                    .enumerate()
+                    .filter(|(peer_idx, _)| *peer_idx != idx)
+                    .map(|(_, peer)| peer.clone()),
+            );
+            let est_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session",
+            );
+            establish_sessions(
+                http,
+                participant,
+                &peers,
+                fanout,
+                target_size,
+                &est_cursor,
+                true,
+            )
+            .await?;
+        }
+
+        // Also establish sessions from existing participants to the new ones.
+        for existing in &existing_ids {
+            let enroll_cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_reverse",
+            );
+            establish_sessions(
+                http,
+                existing,
+                &prepared,
+                fanout,
+                target_size,
+                &enroll_cursor,
+                true,
+            )
+            .await?;
+        }
     }
 
     let enrolled_count = prepared.len();
@@ -2226,6 +2530,7 @@ async fn transition_to_size(
     progress: &mut Progress,
     plateau_index: usize,
     runner_events: &RunnerEventLog,
+    profile_only_singletons: bool,
 ) -> Result<()> {
     while active.len() < target_size {
         if idle.is_empty() {
@@ -2250,6 +2555,7 @@ async fn transition_to_size(
             plateau_index,
             target_size,
             runner_events,
+            profile_only_singletons,
         )
         .await?;
     }
@@ -2368,6 +2674,7 @@ async fn run_application_phase(
                 &payload,
                 fanout,
                 profiling_recipient_id.as_deref(),
+                &cursor,
             )
             .await;
 
@@ -2525,12 +2832,33 @@ fn building_plateau_sequence(
     max_size: usize,
     step_size: usize,
     _roundtrips: usize,
+    piecewise: Option<(usize, usize)>,
+) -> Vec<usize> {
+    building_plateau_sequence_with_piecewise(min_size, max_size, step_size, piecewise)
+}
+
+fn building_plateau_sequence_with_piecewise(
+    min_size: usize,
+    max_size: usize,
+    step_size: usize,
+    piecewise: Option<(usize, usize)>,
 ) -> Vec<usize> {
     let mut sizes = Vec::new();
     let mut current = min_size;
     sizes.push(current);
     while current < max_size {
-        let next = current.saturating_add(step_size).min(max_size);
+        let next = if let Some((switch_at, after_switch)) = piecewise {
+            if current < switch_at {
+                current
+                    .saturating_add(step_size)
+                    .min(switch_at)
+                    .min(max_size)
+            } else {
+                current.saturating_add(after_switch).min(max_size)
+            }
+        } else {
+            current.saturating_add(step_size).min(max_size)
+        };
         if sizes.last().copied() != Some(next) {
             sizes.push(next);
         }
@@ -2545,7 +2873,7 @@ pub fn build_plateau_sequence(
     step_size: usize,
     roundtrips: usize,
 ) -> Vec<usize> {
-    let ascent = building_plateau_sequence(min_size, max_size, step_size, roundtrips);
+    let ascent = building_plateau_sequence(min_size, max_size, step_size, roundtrips, None);
     let mut sequence = Vec::new();
     for _ in 0..roundtrips {
         for &size in &ascent {
@@ -2567,10 +2895,26 @@ fn build_plateau_sequence_for_step_size<R: Rng + ?Sized>(
     max_size: usize,
     step_size: &StepSize,
     roundtrips: usize,
+    piecewise: Option<(usize, usize)>,
     rng: &mut R,
 ) -> Vec<usize> {
     if let StepSize::Fixed(step_size) = step_size {
-        return build_plateau_sequence(min_size, max_size, *step_size, roundtrips);
+        let ascent =
+            building_plateau_sequence(min_size, max_size, *step_size, roundtrips, piecewise);
+        let mut sequence = Vec::new();
+        for _ in 0..roundtrips {
+            for &size in &ascent {
+                if sequence.last().copied() != Some(size) {
+                    sequence.push(size);
+                }
+            }
+            for &size in ascent.iter().rev().skip(1) {
+                if sequence.last().copied() != Some(size) {
+                    sequence.push(size);
+                }
+            }
+        }
+        return sequence;
     }
 
     let mut sequence = Vec::new();
@@ -2600,10 +2944,11 @@ fn build_ascending_plateau_sequence_for_step_size<R: Rng + ?Sized>(
     min_size: usize,
     max_size: usize,
     step_size: &StepSize,
+    piecewise: Option<(usize, usize)>,
     rng: &mut R,
 ) -> Vec<usize> {
     if let StepSize::Fixed(step_size) = step_size {
-        return building_plateau_sequence(min_size, max_size, *step_size, 0);
+        return building_plateau_sequence(min_size, max_size, *step_size, 0, piecewise);
     }
 
     let mut sequence = Vec::new();
@@ -2626,16 +2971,17 @@ fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
     step_size: &StepSize,
     roundtrips: usize,
     plateau_order: PlateauOrder,
+    piecewise: Option<(usize, usize)>,
     rng: &mut R,
 ) -> Vec<usize> {
     if plateau_order == PlateauOrder::Staircase {
         return build_plateau_sequence_for_step_size(
-            min_size, max_size, step_size, roundtrips, rng,
+            min_size, max_size, step_size, roundtrips, piecewise, rng,
         );
     }
     if plateau_order == PlateauOrder::Ascending {
         return build_ascending_plateau_sequence_for_step_size(
-            min_size, max_size, step_size, rng,
+            min_size, max_size, step_size, piecewise, rng,
         );
     }
 
@@ -2707,8 +3053,8 @@ mod random_input_tests {
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::{
-        build_plateau_sequence, build_plateau_sequence_for_step_size, PayloadSizeSource,
-        PayloadSizes, StepSize,
+        build_plateau_sequence, build_plateau_sequence_for_step_size,
+        building_plateau_sequence_with_piecewise, PayloadSizeSource, PayloadSizes, StepSize,
     };
 
     #[test]
@@ -2741,10 +3087,10 @@ mod random_input_tests {
         assert!(step_samples.iter().collect::<HashSet<_>>().len() > 1);
 
         let fixed_sequence =
-            build_plateau_sequence_for_step_size(2, 32, &StepSize::Fixed(8), 1, &mut rng);
+            build_plateau_sequence_for_step_size(2, 32, &StepSize::Fixed(8), 1, None, &mut rng);
         assert_eq!(fixed_sequence, build_plateau_sequence(2, 32, 8, 1));
 
-        let sequence = build_plateau_sequence_for_step_size(2, 32, &step_size, 2, &mut rng);
+        let sequence = build_plateau_sequence_for_step_size(2, 32, &step_size, 2, None, &mut rng);
         assert_eq!(sequence.first(), Some(&2));
         assert_eq!(sequence.last(), Some(&2));
         assert!(sequence.contains(&32));
@@ -2761,6 +3107,22 @@ mod random_input_tests {
             .iter()
             .all(|sample| (32..=4096).contains(sample)));
         assert!(payload_samples.iter().collect::<HashSet<_>>().len() > 1);
+    }
+
+    #[test]
+    fn piecewise_fixed_step_snaps_to_switch_point() {
+        assert_eq!(
+            building_plateau_sequence_with_piecewise(2, 1024, 64, Some((256, 128))),
+            vec![2, 66, 130, 194, 256, 384, 512, 640, 768, 896, 1024]
+        );
+        assert_eq!(
+            building_plateau_sequence_with_piecewise(2, 1024, 64, Some((256, 196))),
+            vec![2, 66, 130, 194, 256, 452, 648, 844, 1024]
+        );
+        assert_eq!(
+            building_plateau_sequence_with_piecewise(2, 194, 64, Some((256, 128))),
+            vec![2, 66, 130, 194]
+        );
     }
 }
 
@@ -2820,6 +3182,16 @@ pub struct BatchFanoutCommand {
     pub command: Command,
     pub phase: Option<String>,
     pub profile: Option<bool>,
+    pub benchmark_plateau_index: Option<usize>,
+    pub benchmark_target_size: Option<usize>,
+    pub benchmark_active_size: Option<usize>,
+    pub benchmark_phase: Option<String>,
+    pub benchmark_operation: Option<String>,
+    pub benchmark_operation_seq: Option<usize>,
+    pub benchmark_payload_size: Option<usize>,
+    pub benchmark_workflow_id: Option<u64>,
+    pub workflow_pair_index: Option<u32>,
+    pub workflow_pair_count: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -3002,6 +3374,16 @@ async fn batch_physical_request(
             command: c.command.clone(),
             phase: c.phase.clone(),
             profile: c.profile,
+            benchmark_plateau_index: c.benchmark_plateau_index,
+            benchmark_target_size: c.benchmark_target_size,
+            benchmark_active_size: c.benchmark_active_size,
+            benchmark_phase: c.benchmark_phase.clone(),
+            benchmark_operation: c.benchmark_operation.clone(),
+            benchmark_operation_seq: c.benchmark_operation_seq,
+            benchmark_payload_size: c.benchmark_payload_size,
+            benchmark_workflow_id: c.benchmark_workflow_id,
+            workflow_pair_index: c.workflow_pair_index,
+            workflow_pair_count: c.workflow_pair_count,
         })
         .collect();
 
@@ -3306,6 +3688,20 @@ pub fn aggregate_csv(
                 benchmark_operation: Option<String>,
                 benchmark_operation_seq: Option<usize>,
                 benchmark_payload_size: Option<usize>,
+                benchmark_workflow_id: Option<u64>,
+                workflow_pair_index: Option<u32>,
+                workflow_pair_count: Option<u32>,
+                new_session_established: Option<bool>,
+                span_id: Option<u64>,
+                parent_span_id: Option<u64>,
+                parent_operation: Option<String>,
+                span_kind: Option<String>,
+                measurement_plane: Option<String>,
+                span_inclusive: Option<bool>,
+                global_span_id: Option<String>,
+                parent_global_span_id: Option<String>,
+                profiling_worker_id: Option<String>,
+                request_id: Option<String>,
                 participant_device_id: Option<u32>,
                 role: Option<String>,
                 peer_id: Option<String>,
@@ -3317,6 +3713,7 @@ pub fn aggregate_csv(
                 phase: Option<String>,
                 wall_ns: u128,
                 cpu_thread_ns: Option<u128>,
+                cpu_process_ns: Option<u128>,
                 cpu_envelope_utilization: Option<f64>,
                 cpu_throttled_time_ratio: Option<f64>,
                 alloc_bytes: Option<u64>,
@@ -3470,6 +3867,20 @@ pub fn aggregate_csv(
                 benchmark_operation: event.benchmark_operation,
                 benchmark_operation_seq: event.benchmark_operation_seq,
                 benchmark_payload_size: event.benchmark_payload_size,
+                benchmark_workflow_id: event.benchmark_workflow_id,
+                workflow_pair_index: event.workflow_pair_index,
+                workflow_pair_count: event.workflow_pair_count,
+                new_session_established: event.new_session_established,
+                span_id: event.span_id,
+                parent_span_id: event.parent_span_id,
+                parent_operation: event.parent_operation,
+                span_kind: event.span_kind,
+                measurement_plane: event.measurement_plane,
+                span_inclusive: event.span_inclusive,
+                global_span_id: event.global_span_id,
+                parent_global_span_id: event.parent_global_span_id,
+                profiling_worker_id: event.worker_id,
+                request_id: event.request_id,
                 participant_device_id: event.participant_device_id,
                 role: event.role,
                 peer_id: event.peer_id,
@@ -3481,6 +3892,7 @@ pub fn aggregate_csv(
                 phase: event.phase,
                 wall_ns: event.wall_ns,
                 cpu_thread_ns: event.cpu_thread_ns,
+                cpu_process_ns: event.cpu_process_ns,
                 cpu_envelope_utilization: event.cpu_envelope_utilization,
                 cpu_throttled_time_ratio: event.cpu_throttled_time_ratio,
                 alloc_bytes: event.alloc_bytes,
@@ -3601,11 +4013,21 @@ pub fn write_worker_failures_csv(run_dir: &Path, run_id: &str) -> Result<()> {
     let path = run_dir.join("worker_failures.csv");
     let mut wtr = csv::Writer::from_path(&path)?;
     wtr.write_record(&[
-        "run_id", "worker_id", "physical_worker_id", "participant_id",
-        "resource_profile_id", "failure_class", "failure_detail",
-        "failure_operation", "failure_span", "failure_phase",
-        "benchmark_target_size", "benchmark_active_size",
-        "container_exit_code", "oom_killed", "action_taken",
+        "run_id",
+        "worker_id",
+        "physical_worker_id",
+        "participant_id",
+        "resource_profile_id",
+        "failure_class",
+        "failure_detail",
+        "failure_operation",
+        "failure_span",
+        "failure_phase",
+        "benchmark_target_size",
+        "benchmark_active_size",
+        "container_exit_code",
+        "oom_killed",
+        "action_taken",
     ])?;
 
     let events_path = run_dir.join("runner-events.jsonl");
@@ -3648,13 +4070,26 @@ pub fn write_run_status_csv(run_dir: &Path, run_id: &str, events_csv_exists: boo
     let path = run_dir.join("run_status.csv");
     let mut wtr = csv::Writer::from_path(&path)?;
     wtr.write_record(&["run_id", "run_status", "events_csv_generated"])?;
-    let status = if events_csv_exists { "completed" } else { "failed" };
-    wtr.write_record(&[run_id, status, if events_csv_exists { "true" } else { "false" }])?;
+    let status = if events_csv_exists {
+        "completed"
+    } else {
+        "failed"
+    };
+    wtr.write_record(&[
+        run_id,
+        status,
+        if events_csv_exists { "true" } else { "false" },
+    ])?;
     wtr.flush()?;
     Ok(())
 }
 
-pub fn write_benchmark_outcome_json(run_dir: &Path, run_id: &str, events_csv_exists: bool, has_failures: bool) -> Result<()> {
+pub fn write_benchmark_outcome_json(
+    run_dir: &Path,
+    run_id: &str,
+    events_csv_exists: bool,
+    has_failures: bool,
+) -> Result<()> {
     let path = run_dir.join("benchmark_outcome.json");
     let outcome = serde_json::json!({
         "run_id": run_id,
@@ -3667,7 +4102,12 @@ pub fn write_benchmark_outcome_json(run_dir: &Path, run_id: &str, events_csv_exi
     Ok(())
 }
 
-pub fn write_validation_report_json(run_dir: &Path, run_id: &str, events_csv_exists: bool, events_csv_non_empty: bool) -> Result<()> {
+pub fn write_validation_report_json(
+    run_dir: &Path,
+    run_id: &str,
+    events_csv_exists: bool,
+    events_csv_non_empty: bool,
+) -> Result<()> {
     let path = run_dir.join("validation_report.json");
     let csv_path = run_dir.join("events.csv");
     let mut has_protocol_core = false;
@@ -3683,7 +4123,11 @@ pub fn write_validation_report_json(run_dir: &Path, run_id: &str, events_csv_exi
                 .and_then(|h| h.iter().position(|s| s == "measurement_class"));
             for record in reader.records().flatten() {
                 if let Some(idx) = span_layer_idx {
-                    if record.get(idx).map(|s| s == "protocol_core" || s == "libsignal_main").unwrap_or(false) {
+                    if record
+                        .get(idx)
+                        .map(|s| s == "protocol_core" || s == "libsignal_main")
+                        .unwrap_or(false)
+                    {
                         has_protocol_core = true;
                         break;
                     }
@@ -3723,7 +4167,9 @@ pub fn write_post_benchmark_sidecars(run_dir: &Path, run_id: &str) -> Result<()>
 
     let events_csv_exists = events_csv_path.exists();
     let events_csv_non_empty = if events_csv_exists {
-        fs::metadata(&events_csv_path).map(|m| m.len() > 0).unwrap_or(false)
+        fs::metadata(&events_csv_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
     } else {
         false
     };
@@ -3732,25 +4178,45 @@ pub fn write_post_benchmark_sidecars(run_dir: &Path, run_id: &str) -> Result<()>
     if !events_csv_exists {
         let mut wtr = csv::Writer::from_path(&events_csv_path)?;
         wtr.write_record(&[
-            "run_id", "scenario", "protocol_stack", "implementation",
-            "profile_schema_version", "client_id", "participant_id",
-            "worker_id", "physical_worker_id", "op", "span_name",
-            "span_layer", "measurement_class", "event_family", "event_subtype",
-            "success", "error_class", "failure_class", "failure_detail",
-            "wall_ns", "cpu_thread_ns",
+            "run_id",
+            "scenario",
+            "protocol_stack",
+            "implementation",
+            "profile_schema_version",
+            "client_id",
+            "participant_id",
+            "worker_id",
+            "physical_worker_id",
+            "op",
+            "span_name",
+            "span_layer",
+            "measurement_class",
+            "event_family",
+            "event_subtype",
+            "success",
+            "error_class",
+            "failure_class",
+            "failure_detail",
+            "wall_ns",
+            "cpu_thread_ns",
         ])?;
         wtr.flush()?;
     }
 
     let events_csv_exists = events_csv_path.exists();
     let events_csv_non_empty = if events_csv_exists {
-        fs::metadata(&events_csv_path).map(|m| m.len() > 0).unwrap_or(false)
+        fs::metadata(&events_csv_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false)
     } else {
         false
     };
 
     let runner_events_path = run_dir.join("runner-events.jsonl");
-    let has_failures = runner_events_path.exists() && fs::metadata(&runner_events_path).map(|m| m.len() > 0).unwrap_or(false);
+    let has_failures = runner_events_path.exists()
+        && fs::metadata(&runner_events_path)
+            .map(|m| m.len() > 0)
+            .unwrap_or(false);
 
     write_run_status_csv(run_dir, run_id, events_csv_non_empty)?;
     write_benchmark_outcome_json(run_dir, run_id, events_csv_non_empty, has_failures)?;

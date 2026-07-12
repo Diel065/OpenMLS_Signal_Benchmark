@@ -44,6 +44,12 @@ struct Args {
     #[arg(long, default_value = "1")]
     step_size: StepSize,
 
+    #[arg(long)]
+    step_size_switch_at: Option<usize>,
+
+    #[arg(long)]
+    step_size_after_switch: Option<usize>,
+
     #[arg(long, default_value = "staircase")]
     plateau_order: PlateauOrder,
 
@@ -185,6 +191,8 @@ fn main() -> Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         step_size: args.step_size,
+        step_size_switch_at: args.step_size_switch_at,
+        step_size_after_switch: args.step_size_after_switch,
         plateau_order: args.plateau_order,
         roundtrips: args.roundtrips,
         app_rounds: args.app_rounds,

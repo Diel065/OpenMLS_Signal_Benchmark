@@ -232,6 +232,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Safe Docker memory limit used while Rust enforces app heap budget",
     )
     p.add_argument(
+        "--ram-app-heap-sweep-values",
+        default="",
+        help="Comma-separated list of 10 application heap budgets for ram-app-heap-sweep",
+    )
+    p.add_argument(
         "--resource-experiment-output-dir",
         default=None,
         help="Directory to write resource experiment sidecar files",
@@ -1206,7 +1211,7 @@ def generate_compose_text(
         if heap_env.get("memory_model"):
             lines.append(f'      OPENMLS_MEMORY_MODEL: "{heap_env["memory_model"]}"')
         elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
-            lines.append('      OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-}')
+            lines.append('      OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-app-heap-budget}')
         if heap_env.get("docker_memory_limit"):
             lines.append(f'      OPENMLS_DOCKER_MEMORY_LIMIT: "{heap_env["docker_memory_limit"]}"')
         elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
@@ -1214,11 +1219,11 @@ def generate_compose_text(
         if heap_env.get("app_heap_budget"):
             lines.append(f'      OPENMLS_APP_HEAP_BUDGET: "{heap_env["app_heap_budget"]}"')
         elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
-            lines.append('      OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-}')
+            lines.append('      OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-1024g}')
         if heap_env.get("app_heap_budget_bytes"):
             lines.append(f'      OPENMLS_APP_HEAP_BUDGET_BYTES: "{heap_env["app_heap_budget_bytes"]}"')
         elif pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
-            lines.append('      OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-}')
+            lines.append('      OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-1099511627776}')
         if heap_env.get("resource_profile_id"):
             lines.append(f'      OPENMLS_RESOURCE_PROFILE_ID: "{heap_env["resource_profile_id"]}"')
         resource_profile_index = heap_env.get("resource_profile_index")

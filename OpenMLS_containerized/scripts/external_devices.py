@@ -665,6 +665,15 @@ class SshDeviceBackend(DeviceBackend):
     def pull(self, remote: str, local: Path) -> None:
         self._ensure_selected()
         local.parent.mkdir(parents=True, exist_ok=True)
+        # Remove a stale local destination file first. The in-docker runner
+        # runs as root and may leave a root-owned placeholder here; scp runs as
+        # the calling user and cannot truncate/overwrite it in place, which
+        # would fail the transfer (the parent dir is user-owned so unlink works).
+        if local.is_file():
+            try:
+                local.unlink()
+            except OSError:
+                pass
         remote_scp = f"{self.user}@{self.host}:{remote}"
         self._run_command(
             self._scp_cmd(remote_scp, str(local), recursive=True),
