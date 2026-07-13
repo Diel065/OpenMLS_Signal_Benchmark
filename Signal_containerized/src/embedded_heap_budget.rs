@@ -188,6 +188,7 @@ pub fn operation_family_for_command(command_name: &str) -> String {
         "GeneratePrekeyBundle" | "PublishPrekeyBundle" => "SignalPreKeyBundleCreate",
         "UpdateOneTimePrekeys" => "SignalPreKeyMaintenance",
         "EstablishSessions" => "SignalSessionEstablish",
+        "ResetSessions" => "SignalSessionReset",
         "EncryptMessage" => "SignalApplicationMessageCreate",
         "DecryptMessage" => "SignalApplicationMessageReceive",
         "ProcessPending" => "SignalProcessPending",

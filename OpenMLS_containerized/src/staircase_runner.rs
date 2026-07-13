@@ -66,12 +66,14 @@ pub struct StaircaseConfig {
     pub min_size: usize,
     pub max_size: Option<usize>,
     pub step_size: StepSize,
+    pub plateau_sizes: Vec<usize>,
     pub plateau_order: PlateauOrder,
     pub roundtrips: usize,
     pub update_rounds: usize,
     pub app_rounds: usize,
     pub max_update_samples_per_plateau: usize,
     pub max_app_samples_per_payload: usize,
+    pub min_profiled_samples_per_operation: usize,
     pub max_commit_receive_samples_per_plateau: usize,
     pub commit_receive_sampling_seed: u64,
     pub payload_sizes: PayloadSizes,
@@ -1908,14 +1910,29 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         );
     }
 
-    let plateau_sequence = build_plateau_sequence_for_order(
-        effective_min_size,
-        max_size,
-        &config.step_size,
-        config.roundtrips,
-        config.plateau_order,
-        &mut plateau_rng,
-    );
+    if config
+        .plateau_sizes
+        .first()
+        .is_some_and(|first| *first < effective_min_size)
+    {
+        return Err(anyhow!(
+            "explicit --plateau-sizes starts below protected minimum {}; got {:?}",
+            effective_min_size,
+            config.plateau_sizes
+        ));
+    }
+    let plateau_sequence = if config.plateau_sizes.is_empty() {
+        build_plateau_sequence_for_order(
+            effective_min_size,
+            max_size,
+            &config.step_size,
+            config.roundtrips,
+            config.plateau_order,
+            &mut plateau_rng,
+        )
+    } else {
+        config.plateau_sizes.clone()
+    };
 
     #[derive(Serialize)]
     struct ScenarioPlan<'a> {
@@ -1926,8 +1943,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         min_size: usize,
         max_size: usize,
         step_size: String,
+        plateau_sizes: Option<&'a [usize]>,
         roundtrips: usize,
         payload_sizes: String,
+        min_external_samples_per_operation: usize,
         randomized_membership_batches: bool,
         randomized_actor_selection: bool,
         randomized_payload_order: bool,
@@ -1941,8 +1960,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         min_size: effective_min_size,
         max_size,
         step_size: config.step_size.to_string(),
+        plateau_sizes: (!config.plateau_sizes.is_empty()).then_some(&config.plateau_sizes),
         roundtrips: config.roundtrips,
         payload_sizes: config.payload_sizes.to_string(),
+        min_external_samples_per_operation: config.min_profiled_samples_per_operation,
         randomized_membership_batches: true,
         randomized_actor_selection: true,
         randomized_payload_order: true,
@@ -1965,10 +1986,11 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             .filter(|worker| is_external_device(worker))
             .count(),
         config.external_coverage_lane,
+        config.min_profiled_samples_per_operation,
     );
 
     eprintln!(
-        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, scenario_seed={}, update_cap={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, scenario_seed={}, update_cap={}, app_cap={}, min_external_samples={}, total_units≈{}",
         config.plateau_order,
         plateau_sequence,
         config.step_size,
@@ -1976,6 +1998,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         config.scenario_seed,
         config.max_update_samples_per_plateau,
         config.max_app_samples_per_payload,
+        config.min_profiled_samples_per_operation,
         total_units
     );
 
@@ -2064,7 +2087,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &mut active,
                 &mut idle,
                 &mut fanout,
+                &mut progress,
                 config.process_pending_fanout,
+                config.external_coverage_lane,
+                config.min_profiled_samples_per_operation,
                 target_size,
                 config.max_commit_receive_samples_per_plateau,
                 config.commit_receive_sampling_seed,
@@ -2076,6 +2102,24 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         }
 
         if !config.remove_rejoin {
+            run_external_add_density_phase(
+                &http,
+                &mut active,
+                &mut idle,
+                &mut fanout,
+                &mut progress,
+                config.process_pending_fanout,
+                config.external_coverage_lane,
+                config.min_profiled_samples_per_operation,
+                target_size,
+                config.max_commit_receive_samples_per_plateau,
+                config.commit_receive_sampling_seed,
+                &mut scenario_rng,
+                plateau_idx + 1,
+                &runner_events,
+            )
+            .await?;
+
             run_update_phase(
                 &http,
                 &mut active,
@@ -2088,6 +2132,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &mut progress,
                 config.process_pending_fanout,
                 config.external_coverage_lane,
+                config.min_profiled_samples_per_operation,
                 &mut scenario_rng,
                 plateau_idx + 1,
                 &runner_events,
@@ -2124,6 +2169,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &mut fanout,
                 &mut progress,
                 config.external_coverage_lane,
+                config.min_profiled_samples_per_operation,
                 &mut scenario_rng,
                 plateau_idx + 1,
                 &runner_events,
@@ -4029,6 +4075,16 @@ pub struct BatchFanoutCommand {
     pub benchmark_operation_seq: Option<usize>,
     #[serde(default)]
     pub benchmark_payload_size: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_requested: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_effective: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_group_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_transition_cap: Option<usize>,
+    #[serde(default)]
+    pub membership_batch_source: Option<String>,
 }
 
 impl BatchFanoutCommand {
@@ -4040,6 +4096,11 @@ impl BatchFanoutCommand {
         self.benchmark_operation = Some(cursor.operation.clone());
         self.benchmark_operation_seq = cursor.operation_seq;
         self.benchmark_payload_size = cursor.payload_size;
+        self.membership_batch_requested = cursor.membership_batch_requested;
+        self.membership_batch_effective = cursor.membership_batch_effective;
+        self.membership_batch_group_cap = cursor.membership_batch_group_cap;
+        self.membership_batch_transition_cap = cursor.membership_batch_transition_cap;
+        self.membership_batch_source = cursor.membership_batch_source.clone();
         self
     }
 }
@@ -4382,32 +4443,7 @@ async fn batch_fanout_collect_physical(
     let batch_url = format!("{}/batch-command", physical_url.trim_end_matches('/'));
     let logical_count = cmds.len();
 
-    let batch_items: Vec<BatchCommandItem> = cmds
-        .iter()
-        .map(|c| BatchCommandItem {
-            client_id: c.client_id.clone(),
-            request_id: c.request_id.clone(),
-            command: c.command.clone(),
-            expected_epoch: c.expected_epoch,
-            phase: c.phase.clone(),
-            profile: c.profile,
-            benchmark_plateau_index: c.benchmark_plateau_index,
-            benchmark_target_size: c.benchmark_target_size,
-            benchmark_active_size: c.benchmark_active_size,
-            benchmark_phase: c.benchmark_phase.clone(),
-            benchmark_operation: c.benchmark_operation.clone(),
-            benchmark_operation_seq: c.benchmark_operation_seq,
-            benchmark_payload_size: c.benchmark_payload_size,
-            membership_batch_requested: None,
-            membership_batch_effective: None,
-            membership_batch_group_cap: None,
-            membership_batch_transition_cap: None,
-            membership_batch_source: None,
-            device_kind: None,
-            execution_backend: None,
-            ciphersuite: None,
-        })
-        .collect();
+    let batch_items: Vec<BatchCommandItem> = cmds.iter().map(batch_command_item).collect();
 
     let batch_req = BatchCommandRequest { items: batch_items };
     let attempt_start = Instant::now();
@@ -4499,6 +4535,32 @@ async fn batch_fanout_collect_physical(
         request_count: 1,
         timeout_count,
         connect_error_count,
+    }
+}
+
+fn batch_command_item(command: &BatchFanoutCommand) -> BatchCommandItem {
+    BatchCommandItem {
+        client_id: command.client_id.clone(),
+        request_id: command.request_id.clone(),
+        command: command.command.clone(),
+        expected_epoch: command.expected_epoch,
+        phase: command.phase.clone(),
+        profile: command.profile,
+        benchmark_plateau_index: command.benchmark_plateau_index,
+        benchmark_target_size: command.benchmark_target_size,
+        benchmark_active_size: command.benchmark_active_size,
+        benchmark_phase: command.benchmark_phase.clone(),
+        benchmark_operation: command.benchmark_operation.clone(),
+        benchmark_operation_seq: command.benchmark_operation_seq,
+        benchmark_payload_size: command.benchmark_payload_size,
+        membership_batch_requested: command.membership_batch_requested,
+        membership_batch_effective: command.membership_batch_effective,
+        membership_batch_group_cap: command.membership_batch_group_cap,
+        membership_batch_transition_cap: command.membership_batch_transition_cap,
+        membership_batch_source: command.membership_batch_source.clone(),
+        device_kind: None,
+        execution_backend: None,
+        ciphersuite: None,
     }
 }
 
@@ -4788,7 +4850,7 @@ fn active_external_indices(active: &[WorkerSpec]) -> Vec<usize> {
     active
         .iter()
         .enumerate()
-        .filter(|(_, worker)| is_external_device(worker))
+        .filter(|(_, worker)| worker.profile_enabled && is_external_device(worker))
         .map(|(idx, _)| idx)
         .collect()
 }
@@ -4808,6 +4870,70 @@ fn active_profiled_non_external_indices(active: &[WorkerSpec]) -> Vec<usize> {
         .filter(|(_, worker)| worker.profile_enabled && !is_external_device(worker))
         .map(|(idx, _)| idx)
         .collect()
+}
+
+fn external_remove_rejoin_pairs(active: &[WorkerSpec]) -> Vec<(String, String)> {
+    let mut external_ids = active
+        .iter()
+        .filter(|worker| worker.profile_enabled && is_external_device(worker))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+    external_ids.sort();
+
+    if external_ids.len() < 2 {
+        return Vec::new();
+    }
+
+    external_ids
+        .iter()
+        .enumerate()
+        .map(|(idx, victim_id)| {
+            (
+                victim_id.clone(),
+                external_ids[(idx + 1) % external_ids.len()].clone(),
+            )
+        })
+        .collect()
+}
+
+fn least_used_external_actor_id(
+    active: &[WorkerSpec],
+    actor_use_counts: &HashMap<String, usize>,
+    rng: &mut StdRng,
+) -> Option<String> {
+    let minimum = active
+        .iter()
+        .filter(|worker| is_external_device(worker))
+        .map(|worker| actor_use_counts.get(&worker.id).copied().unwrap_or(0))
+        .min()?;
+    let mut candidates = active
+        .iter()
+        .filter(|worker| {
+            is_external_device(worker)
+                && actor_use_counts.get(&worker.id).copied().unwrap_or(0) == minimum
+        })
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+    candidates.shuffle(rng);
+    candidates.pop()
+}
+
+fn least_sampled_active_external_id(
+    active: &[WorkerSpec],
+    success_counts: &HashMap<String, usize>,
+    required: usize,
+) -> Option<String> {
+    active
+        .iter()
+        .filter(|worker| worker.profile_enabled && is_external_device(worker))
+        .filter(|worker| success_counts.get(&worker.id).copied().unwrap_or(0) < required)
+        .min_by_key(|worker| {
+            (
+                success_counts.get(&worker.id).copied().unwrap_or(0),
+                worker.id.clone(),
+            )
+        })
+        .map(|worker| worker.id.clone())
 }
 
 fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize) -> usize {
@@ -4875,7 +5001,7 @@ fn build_commit_receive_sampling_map(
     epoch: u64,
     seq_no: usize,
 ) -> (HashSet<String>, HashMap<String, usize>, usize) {
-    let sample_indices = deterministic_commit_receive_sample_indices(
+    let mut sample_indices = deterministic_commit_receive_sample_indices(
         recipients.len(),
         max_samples,
         seed,
@@ -4883,6 +5009,17 @@ fn build_commit_receive_sampling_map(
         epoch,
         seq_no,
     );
+
+    // External devices are the scarce observations in hybrid campaigns. They
+    // remain part of the deterministic sample even when the ordinary cap would
+    // select different recipients. This can exceed max_samples by the number
+    // of external devices, and the recorded sample count/index reflects that.
+    for (idx, worker) in recipients.iter().enumerate() {
+        if worker.profile_enabled && is_external_device(worker) && !sample_indices.contains(&idx) {
+            sample_indices.push(idx);
+        }
+    }
+    sample_indices.sort_unstable();
     let sampled_ids: HashSet<String> = sample_indices
         .iter()
         .filter_map(|idx| recipients.get(*idx))
@@ -4910,6 +5047,7 @@ fn estimate_total_units(
     payload_count: usize,
     external_device_count: usize,
     external_coverage_lane: bool,
+    min_profiled_samples_per_operation: usize,
 ) -> usize {
     let mut total = 1usize;
     let mut current_size = 1usize;
@@ -4930,7 +5068,10 @@ fn estimate_total_units(
             let has_non_external = target > estimated_active_external;
 
             if external_coverage_lane {
-                let required_update_ops = estimated_active_external + usize::from(has_non_external);
+                let profiled_actor_count =
+                    estimated_active_external + usize::from(has_non_external);
+                let required_update_ops =
+                    profiled_actor_count.saturating_mul(min_profiled_samples_per_operation.max(1));
                 update_ops = update_ops.max(required_update_ops);
 
                 let base_app_per_payload = app_sends_per_payload_for_plateau(
@@ -4939,9 +5080,16 @@ fn estimate_total_units(
                     max_app_samples_per_payload,
                 );
                 let required_app_per_payload =
-                    estimated_active_external + usize::from(has_non_external);
+                    profiled_actor_count.saturating_mul(min_profiled_samples_per_operation.max(1));
                 app_ops =
                     app_ops.max(base_app_per_payload.max(required_app_per_payload) * payload_count);
+
+                if min_profiled_samples_per_operation > 0 {
+                    let density_units = estimated_active_external
+                        .saturating_mul(min_profiled_samples_per_operation)
+                        .saturating_mul(18);
+                    total = total.saturating_add(density_units);
+                }
             } else if app_sends_per_payload_for_plateau(
                 target,
                 app_rounds,
@@ -5307,6 +5455,11 @@ async fn add_n_members(
             benchmark_operation: None,
             benchmark_operation_seq: None,
             benchmark_payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         }
         .with_benchmark_cursor(&cursor)
     });
@@ -5597,6 +5750,11 @@ async fn remove_n_members(
             benchmark_operation: None,
             benchmark_operation_seq: None,
             benchmark_payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         }
         .with_benchmark_cursor(&cursor)
     });
@@ -5859,9 +6017,10 @@ async fn publish_remove_members_with_epoch_race_recovery(
                     "[oom-eviction] remove_members queued after epoch race; actor={} attempt={} message={}",
                     actor.id, attempt, response.message
                 );
-                if let Some(message) =
-                    best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
-                        .await
+                if let Some(message) = best_effort_process_pending_commits_after_epoch_race(
+                    http, actor, cursor, attempt,
+                )
+                .await
                 {
                     if queued_remove_members_republished(&message) {
                         let actor_after = show_group_state(http, actor).await?;
@@ -5871,7 +6030,8 @@ async fn publish_remove_members_with_epoch_race_recovery(
                             .filter(|member| !dead_ids.contains(*member))
                             .cloned()
                             .collect::<Vec<_>>();
-                        let expected_epoch = if expected_members.len() == actor_after.members.len() {
+                        let expected_epoch = if expected_members.len() == actor_after.members.len()
+                        {
                             actor_after.epoch
                         } else {
                             actor_after.epoch + 1
@@ -6105,6 +6265,11 @@ async fn evict_oom_group_members(
                 benchmark_operation: None,
                 benchmark_operation_seq: None,
                 benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
             }
             .with_benchmark_cursor(&cursor)
         });
@@ -6169,16 +6334,7 @@ async fn transition_to_size(
     plateau_index: usize,
     runner_events: &RunnerEventLog,
 ) -> Result<()> {
-    let mut external_add_actor_ids = if external_coverage_lane {
-        active
-            .iter()
-            .filter(|worker| is_external_device(worker))
-            .map(|worker| worker.id.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    external_add_actor_ids.shuffle(rng);
+    let mut external_add_actor_use_counts = HashMap::<String, usize>::new();
 
     while active.len() < target_size {
         let remaining = target_size - active.len();
@@ -6191,10 +6347,9 @@ async fn transition_to_size(
             );
             break;
         }
-        let external_actor_id = external_add_actor_ids
-            .iter()
-            .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
-            .map(|pos| external_add_actor_ids.remove(pos));
+        let external_actor_id = external_coverage_lane
+            .then(|| least_used_external_actor_id(active, &external_add_actor_use_counts, rng))
+            .flatten();
         let profiled_actor_id = if protect_profile_enabled_members {
             let mut unseen_profiled = active
                 .iter()
@@ -6215,6 +6370,11 @@ async fn transition_to_size(
         };
         let forced_actor_id = external_actor_id.clone().or(profiled_actor_id);
         if let Some(actor_id) = forced_actor_id.as_ref() {
+            if external_actor_id.as_ref() == Some(actor_id) {
+                *external_add_actor_use_counts
+                    .entry(actor_id.clone())
+                    .or_default() += 1;
+            }
             if active
                 .iter()
                 .any(|worker| worker.id == *actor_id && worker.profile_enabled)
@@ -6222,9 +6382,23 @@ async fn transition_to_size(
                 profiled_add_actor_seen.insert(actor_id.clone());
             }
         }
-        let reserved_for_external = external_add_actor_ids
-            .len()
-            .min(max_allowed.saturating_sub(1));
+        let reserved_for_external = if external_coverage_lane {
+            active
+                .iter()
+                .filter(|worker| {
+                    is_external_device(worker)
+                        && external_actor_id.as_deref() != Some(worker.id.as_str())
+                        && external_add_actor_use_counts
+                            .get(&worker.id)
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                })
+                .count()
+                .min(max_allowed.saturating_sub(1))
+        } else {
+            0
+        };
         let decision_cap = max_allowed.saturating_sub(reserved_for_external).max(1);
         let batch_decision = add_membership_batches.next_batch(
             active.len(),
@@ -6250,16 +6424,7 @@ async fn transition_to_size(
         .await?;
     }
 
-    let mut external_remove_actor_ids = if external_coverage_lane {
-        active
-            .iter()
-            .filter(|worker| is_external_device(worker))
-            .map(|worker| worker.id.clone())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-    external_remove_actor_ids.shuffle(rng);
+    let mut external_remove_actor_use_counts = HashMap::<String, usize>::new();
 
     while active.len() > target_size {
         let remaining = active.len() - target_size;
@@ -6267,13 +6432,31 @@ async fn transition_to_size(
         if max_allowed == 0 {
             return Err(anyhow!("Cannot remove the last remaining member"));
         }
-        let forced_actor_id = external_remove_actor_ids
-            .iter()
-            .position(|actor_id| active.iter().any(|worker| worker.id == *actor_id))
-            .map(|pos| external_remove_actor_ids.remove(pos));
-        let reserved_for_external = external_remove_actor_ids
-            .len()
-            .min(max_allowed.saturating_sub(1));
+        let forced_actor_id = external_coverage_lane
+            .then(|| least_used_external_actor_id(active, &external_remove_actor_use_counts, rng))
+            .flatten();
+        if let Some(actor_id) = forced_actor_id.as_ref() {
+            *external_remove_actor_use_counts
+                .entry(actor_id.clone())
+                .or_default() += 1;
+        }
+        let reserved_for_external = if external_coverage_lane {
+            active
+                .iter()
+                .filter(|worker| {
+                    is_external_device(worker)
+                        && forced_actor_id.as_deref() != Some(worker.id.as_str())
+                        && external_remove_actor_use_counts
+                            .get(&worker.id)
+                            .copied()
+                            .unwrap_or(0)
+                            == 0
+                })
+                .count()
+                .min(max_allowed.saturating_sub(1))
+        } else {
+            0
+        };
         let decision_cap = max_allowed.saturating_sub(reserved_for_external).max(1);
         let batch_decision = remove_membership_batches.next_batch(
             active.len(),
@@ -6303,18 +6486,351 @@ async fn transition_to_size(
     Ok(())
 }
 
-async fn run_remove_rejoin_phase(
+async fn restore_density_plateau(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
     fanout: &mut FanoutController,
+    progress: &mut Progress,
     process_pending_fanout: bool,
     plateau_size: usize,
     max_commit_receive_samples_per_plateau: usize,
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
     plateau_index: usize,
-    _runner_events: &RunnerEventLog,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    let mut requeued_external = idle
+        .iter()
+        .filter(|worker| worker.profile_enabled && is_external_device(worker))
+        .map(|worker| worker.id.clone())
+        .collect::<Vec<_>>();
+    requeued_external.sort();
+    for worker_id in requeued_external.into_iter().rev() {
+        if let Some(position) = idle.iter().position(|worker| worker.id == worker_id) {
+            let worker = idle
+                .remove(position)
+                .expect("worker position came from the same idle queue");
+            idle.push_front(worker);
+        }
+    }
+
+    while active.len() < plateau_size {
+        let batch_size = plateau_size
+            .saturating_sub(active.len())
+            .min(idle.len())
+            .min(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
+        if batch_size == 0 {
+            break;
+        }
+        let actor_id = active
+            .iter()
+            .find(|worker| worker.profile_enabled && is_external_device(worker))
+            .map(|worker| worker.id.clone());
+        let before = active.len();
+        add_n_members(
+            http,
+            active,
+            idle,
+            MembershipBatchDecision {
+                requested: batch_size,
+                effective: batch_size,
+                group_cap: membership_batch_group_cap(active.len()),
+                transition_cap: batch_size,
+                source: "external_density_recovery",
+            },
+            fanout,
+            progress,
+            process_pending_fanout,
+            actor_id.as_deref(),
+            rng,
+            plateau_index,
+            plateau_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            runner_events,
+        )
+        .await?;
+        if active.len() <= before {
+            return Err(anyhow!(
+                "external density recovery made no progress at plateau {} (active={}, idle={})",
+                plateau_size,
+                active.len(),
+                idle.len(),
+            ));
+        }
+    }
+    if active.len() != plateau_size {
+        return Err(anyhow!(
+            "external density recovery could not restore plateau {} (active={}, idle={})",
+            plateau_size,
+            active.len(),
+            idle.len(),
+        ));
+    }
+    Ok(())
+}
+
+fn external_density_source(batch_size: usize, reset: bool) -> &'static str {
+    match (batch_size, reset) {
+        (1, false) => "external_density_k1",
+        (8, false) => "external_density_k8",
+        (1, true) => "external_density_reset_k1",
+        (8, true) => "external_density_reset_k8",
+        _ => "external_density_other",
+    }
+}
+
+async fn run_external_add_density_phase(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+    external_coverage_lane: bool,
+    min_profiled_samples_per_operation: usize,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    rng: &mut StdRng,
+    plateau_index: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    if !external_coverage_lane || min_profiled_samples_per_operation == 0 {
+        return Ok(());
+    }
+
+    let protected_count = active
+        .iter()
+        .filter(|worker| worker.profile_enabled || is_external_device(worker))
+        .count();
+    let removable_count = active.len().saturating_sub(protected_count);
+    let mut batch_sizes = vec![1usize];
+    if removable_count >= MAX_RANDOM_MEMBERSHIP_BATCH_SIZE {
+        batch_sizes.push(MAX_RANDOM_MEMBERSHIP_BATCH_SIZE);
+    } else {
+        eprintln!(
+            "[add-density] plateau {}: k=8 is infeasible with {} non-profiled removable member(s); k=1 remains enabled",
+            plateau_size,
+            removable_count,
+        );
+    }
+
+    let mut success_counts = HashMap::<(usize, String), usize>::new();
+    eprintln!(
+        "[add-density] plateau {} completing {} successful AddCommit samples per active external device for k={:?}",
+        plateau_size,
+        min_profiled_samples_per_operation,
+        batch_sizes,
+    );
+
+    loop {
+        let mut external_ids = active
+            .iter()
+            .filter(|worker| worker.profile_enabled && is_external_device(worker))
+            .map(|worker| worker.id.clone())
+            .collect::<Vec<_>>();
+        external_ids.sort();
+        if external_ids.is_empty() {
+            eprintln!(
+                "[add-density] plateau {} stopped: no active external devices remain",
+                plateau_size,
+            );
+            return Ok(());
+        }
+
+        let next = batch_sizes
+            .iter()
+            .flat_map(|batch_size| {
+                external_ids
+                    .iter()
+                    .map(move |worker_id| (*batch_size, worker_id.clone()))
+            })
+            .filter(|key| {
+                success_counts.get(key).copied().unwrap_or(0) < min_profiled_samples_per_operation
+            })
+            .min_by_key(|key| (success_counts.get(key).copied().unwrap_or(0), key.clone()));
+        let Some((batch_size, actor_id)) = next else {
+            break;
+        };
+
+        if active.len() != plateau_size {
+            restore_density_plateau(
+                http,
+                active,
+                idle,
+                fanout,
+                progress,
+                process_pending_fanout,
+                plateau_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+                rng,
+                plateau_index,
+                runner_events,
+            )
+            .await?;
+        }
+
+        remove_n_members(
+            http,
+            active,
+            idle,
+            MembershipBatchDecision {
+                requested: batch_size,
+                effective: batch_size,
+                group_cap: membership_batch_group_cap(active.len()),
+                transition_cap: batch_size,
+                source: external_density_source(batch_size, true),
+            },
+            fanout,
+            progress,
+            process_pending_fanout,
+            Some(&actor_id),
+            true,
+            true,
+            plateau_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            rng,
+            runner_events,
+        )
+        .await?;
+
+        if !active.iter().any(|worker| worker.id == actor_id)
+            || active.len() != plateau_size.saturating_sub(batch_size)
+        {
+            restore_density_plateau(
+                http,
+                active,
+                idle,
+                fanout,
+                progress,
+                process_pending_fanout,
+                plateau_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+                rng,
+                plateau_index,
+                runner_events,
+            )
+            .await?;
+            continue;
+        }
+
+        add_n_members(
+            http,
+            active,
+            idle,
+            MembershipBatchDecision {
+                requested: batch_size,
+                effective: batch_size,
+                group_cap: membership_batch_group_cap(active.len()),
+                transition_cap: batch_size,
+                source: external_density_source(batch_size, false),
+            },
+            fanout,
+            progress,
+            process_pending_fanout,
+            Some(&actor_id),
+            rng,
+            plateau_index,
+            plateau_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            runner_events,
+        )
+        .await?;
+
+        if active.iter().any(|worker| worker.id == actor_id) && active.len() == plateau_size {
+            let completed = success_counts
+                .entry((batch_size, actor_id.clone()))
+                .or_default();
+            *completed += 1;
+            eprintln!(
+                "[add-density] plateau={} k={} actor={} samples={}/{}",
+                plateau_size, batch_size, actor_id, *completed, min_profiled_samples_per_operation,
+            );
+        } else {
+            restore_density_plateau(
+                http,
+                active,
+                idle,
+                fanout,
+                progress,
+                process_pending_fanout,
+                plateau_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+                rng,
+                plateau_index,
+                runner_events,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
+}
+
+fn select_supplemental_remove_receiver_roles(
+    active: &[WorkerSpec],
+    external_ids: &[String],
+    actor_counts: &HashMap<String, usize>,
+    receiver_counts: &HashMap<String, usize>,
+    required: usize,
+    plateau_size: usize,
+) -> Result<Option<(String, String, String)>> {
+    let Some(receiver_id) = external_ids
+        .iter()
+        .filter(|id| receiver_counts.get(*id).copied().unwrap_or(0) < required)
+        .min_by_key(|id| {
+            (
+                receiver_counts.get(*id).copied().unwrap_or(0),
+                (*id).clone(),
+            )
+        })
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let actor_id = external_ids
+        .iter()
+        .filter(|id| **id != receiver_id)
+        .min_by_key(|id| (actor_counts.get(*id).copied().unwrap_or(0), (*id).clone()))
+        .cloned()
+        .expect("at least two external devices are active");
+    let victim_id = active
+        .iter()
+        .filter(|worker| !is_external_device(worker))
+        .filter(|worker| worker.id != actor_id && worker.id != receiver_id)
+        .min_by_key(|worker| (worker.profile_enabled, worker.id.clone()))
+        .map(|worker| worker.id.clone())
+        .ok_or_else(|| {
+            anyhow!(
+                "remove/rejoin receiver density at plateau {} needs a non-external victim after external attrition",
+                plateau_size
+            )
+        })?;
+    Ok(Some((actor_id, victim_id, receiver_id)))
+}
+
+async fn run_remove_rejoin_phase(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    fanout: &mut FanoutController,
+    progress: &mut Progress,
+    process_pending_fanout: bool,
+    external_coverage_lane: bool,
+    min_profiled_samples_per_operation: usize,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    rng: &mut StdRng,
+    plateau_index: usize,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     let profiled = active_profiled_indices(active);
     if profiled.len() < 2 {
@@ -6323,6 +6839,186 @@ async fn run_remove_rejoin_phase(
             plateau_size,
             profiled.len()
         );
+        return Ok(());
+    }
+
+    if external_coverage_lane && !external_remove_rejoin_pairs(active).is_empty() {
+        let required = min_profiled_samples_per_operation.max(1);
+        let mut welcome_counts = HashMap::<String, usize>::new();
+        let mut actor_counts = HashMap::<String, usize>::new();
+        let mut receiver_counts = HashMap::<String, usize>::new();
+        eprintln!(
+            "[remove-rejoin] plateau {} completing {} successful welcome, remove-actor, and remove-receiver samples per active external device",
+            plateau_size,
+            required,
+        );
+        loop {
+            let mut external_ids = active
+                .iter()
+                .filter(|worker| worker.profile_enabled && is_external_device(worker))
+                .map(|worker| worker.id.clone())
+                .collect::<Vec<_>>();
+            external_ids.sort();
+            if external_ids.len() < 2 {
+                eprintln!(
+                    "[remove-rejoin] plateau {} stopped after external attrition: {} active external device(s) remain",
+                    plateau_size,
+                    external_ids.len(),
+                );
+                return Ok(());
+            }
+
+            let actor_id = external_ids
+                .iter()
+                .filter(|id| actor_counts.get(*id).copied().unwrap_or(0) < required)
+                .min_by_key(|id| (actor_counts.get(*id).copied().unwrap_or(0), (*id).clone()))
+                .cloned();
+            let victim_id = external_ids
+                .iter()
+                .filter(|id| actor_id.as_ref() != Some(*id))
+                .filter(|id| welcome_counts.get(*id).copied().unwrap_or(0) < required)
+                .min_by_key(|id| (welcome_counts.get(*id).copied().unwrap_or(0), (*id).clone()))
+                .cloned()
+                .or_else(|| {
+                    external_ids
+                        .iter()
+                        .filter(|id| actor_id.as_ref() != Some(*id))
+                        .min_by_key(|id| {
+                            (welcome_counts.get(*id).copied().unwrap_or(0), (*id).clone())
+                        })
+                        .cloned()
+                });
+
+            let (actor_id, victim_id, supplemental_receiver_id) = match (actor_id, victim_id) {
+                (Some(actor_id), Some(victim_id)) => (actor_id, victim_id, None),
+                (None, _) => {
+                    if let Some(victim_id) = external_ids
+                        .iter()
+                        .filter(|id| welcome_counts.get(*id).copied().unwrap_or(0) < required)
+                        .min_by_key(|id| {
+                            (welcome_counts.get(*id).copied().unwrap_or(0), (*id).clone())
+                        })
+                        .cloned()
+                    {
+                        let actor_id = external_ids
+                            .iter()
+                            .filter(|id| **id != victim_id)
+                            .min_by_key(|id| {
+                                (actor_counts.get(*id).copied().unwrap_or(0), (*id).clone())
+                            })
+                            .cloned()
+                            .expect("at least two external devices are active");
+                        (actor_id, victim_id, None)
+                    } else {
+                        let Some((actor_id, victim_id, receiver_id)) =
+                            select_supplemental_remove_receiver_roles(
+                                active,
+                                &external_ids,
+                                &actor_counts,
+                                &receiver_counts,
+                                required,
+                                plateau_size,
+                            )?
+                        else {
+                            break;
+                        };
+                        (actor_id, victim_id, Some(receiver_id))
+                    }
+                }
+                _ => unreachable!("two active external devices always provide a victim"),
+            };
+
+            let victim = active
+                .iter()
+                .find(|worker| worker.id == victim_id)
+                .cloned()
+                .expect("selected remove/rejoin victim remains active");
+            let actor = active
+                .iter()
+                .find(|worker| worker.id == actor_id)
+                .cloned()
+                .expect("selected external actor remains active");
+            let receiver_ids = external_ids
+                .iter()
+                .filter(|id| **id != actor_id && **id != victim_id)
+                .cloned()
+                .collect::<Vec<_>>();
+            if let Some(required_receiver_id) = supplemental_receiver_id.as_ref() {
+                debug_assert!(receiver_ids.contains(required_receiver_id));
+            }
+            let cycle_result = run_single_remove_rejoin_cycle(
+                http,
+                active,
+                idle,
+                fanout,
+                process_pending_fanout,
+                plateau_size,
+                max_commit_receive_samples_per_plateau,
+                commit_receive_sampling_seed,
+                plateau_index,
+                &victim,
+                &actor,
+            )
+            .await;
+            if let Err(error) = cycle_result {
+                if recover_remove_rejoin_cycle_failure(
+                    http,
+                    active,
+                    idle,
+                    fanout,
+                    process_pending_fanout,
+                    plateau_size,
+                    max_commit_receive_samples_per_plateau,
+                    commit_receive_sampling_seed,
+                    plateau_index,
+                    &victim,
+                    &actor,
+                    runner_events,
+                    &error,
+                )
+                .await?
+                {
+                    restore_density_plateau(
+                        http,
+                        active,
+                        idle,
+                        fanout,
+                        progress,
+                        process_pending_fanout,
+                        plateau_size,
+                        max_commit_receive_samples_per_plateau,
+                        commit_receive_sampling_seed,
+                        rng,
+                        plateau_index,
+                        runner_events,
+                    )
+                    .await?;
+                    continue;
+                }
+                return Err(error);
+            }
+            if is_external_device(&victim) {
+                *welcome_counts.entry(victim.id.clone()).or_default() += 1;
+            }
+            *actor_counts.entry(actor.id.clone()).or_default() += 1;
+            for receiver_id in &receiver_ids {
+                *receiver_counts.entry(receiver_id.clone()).or_default() += 1;
+            }
+            eprintln!(
+                "[remove-rejoin] plateau={} victim={} welcome_samples={}/{} actor={} remove_samples={}/{} receivers={:?}",
+                plateau_size,
+                victim.id,
+                welcome_counts.get(&victim.id).copied().unwrap_or(0),
+                required,
+                actor.id,
+                actor_counts[&actor.id],
+                required,
+                receiver_ids
+                    .iter()
+                    .map(|id| format!("{}:{}/{}", id, receiver_counts[id], required))
+                    .collect::<Vec<_>>(),
+            );
+        }
         return Ok(());
     }
 
@@ -6335,6 +7031,207 @@ async fn run_remove_rejoin_phase(
     let actor_idx = others[rng.gen_range(0..others.len())];
     let victim = active[victim_idx].clone();
     let actor = active[actor_idx].clone();
+    let cycle_result = run_single_remove_rejoin_cycle(
+        http,
+        active,
+        idle,
+        fanout,
+        process_pending_fanout,
+        plateau_size,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
+        plateau_index,
+        &victim,
+        &actor,
+    )
+    .await;
+    if let Err(error) = cycle_result {
+        if recover_remove_rejoin_cycle_failure(
+            http,
+            active,
+            idle,
+            fanout,
+            process_pending_fanout,
+            plateau_size,
+            max_commit_receive_samples_per_plateau,
+            commit_receive_sampling_seed,
+            plateau_index,
+            &victim,
+            &actor,
+            runner_events,
+            &error,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+fn remove_rejoin_failure_operation(error: &anyhow::Error) -> String {
+    if let Some(batch_error) = error.downcast_ref::<BatchFanoutError>() {
+        if batch_error.phase.contains("remove") {
+            return "remove_commit".to_string();
+        }
+        if batch_error.phase.contains("add") {
+            return "add_commit".to_string();
+        }
+        return batch_error.operation.clone();
+    }
+
+    if let Some(command_error) = error.downcast_ref::<WorkerCommandError>() {
+        return match command_error.command {
+            "GenerateKeyPackage" => "generate_key_package",
+            "RemoveMembers" => "remove_commit",
+            "AddMembers" => "add_commit",
+            "JoinFromWelcome" => "welcome_receive",
+            "ReceiveCommit" | "ProcessPending" => "receive_commit",
+            "ShowGroupState" => "show_group_state",
+            other => other,
+        }
+        .to_string();
+    }
+
+    "remove_rejoin_cycle".to_string()
+}
+
+async fn recover_remove_rejoin_cycle_failure(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    fanout: &mut FanoutController,
+    process_pending_fanout: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    plateau_index: usize,
+    victim: &WorkerSpec,
+    actor: &WorkerSpec,
+    runner_events: &RunnerEventLog,
+    error: &anyhow::Error,
+) -> Result<bool> {
+    let operation = remove_rejoin_failure_operation(error);
+    let cursor = BenchmarkCursor::new(
+        plateau_index,
+        plateau_size,
+        active.len(),
+        "remove_rejoin",
+        &operation,
+    );
+
+    let failed_workers = if error.downcast_ref::<BatchFanoutError>().is_some() {
+        let Some(dead_workers) = record_batch_oom_failures(
+            runner_events,
+            &cursor,
+            error,
+            "quarantine_remove_rejoin_cycle_and_continue",
+            active
+                .iter()
+                .find(|worker| worker.id != actor.id && worker.id != victim.id),
+        )
+        .await?
+        else {
+            return Ok(false);
+        };
+        dead_workers
+    } else if let Some(command_error) = error.downcast_ref::<WorkerCommandError>() {
+        let Some(failed_worker) = active
+            .iter()
+            .chain(idle.iter())
+            .chain([victim, actor])
+            .find(|worker| worker.id == command_error.worker_id)
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !record_profiled_worker_failure(
+            runner_events,
+            &cursor,
+            &failed_worker,
+            error,
+            "quarantine_remove_rejoin_cycle_and_continue",
+            active
+                .iter()
+                .find(|worker| worker.id != failed_worker.id && worker.id != victim.id),
+        )
+        .await?
+        {
+            return Ok(false);
+        }
+        vec![failed_worker]
+    } else {
+        return Ok(false);
+    };
+
+    let failed_ids = failed_workers
+        .iter()
+        .map(|worker| worker.id.clone())
+        .collect::<HashSet<_>>();
+    let mut quarantined = failed_workers;
+    for participant in [victim, actor] {
+        if !quarantined.iter().any(|worker| worker.id == participant.id) {
+            quarantined.push(participant.clone());
+        }
+    }
+
+    // A failure can occur while either the remove or re-add commit is in
+    // flight. Removing both cycle participants gives the surviving members a
+    // single unambiguous state; healthy participants can rejoin later.
+    evict_oom_group_members(
+        http,
+        active,
+        &quarantined,
+        fanout,
+        process_pending_fanout,
+        plateau_size,
+        max_commit_receive_samples_per_plateau,
+        commit_receive_sampling_seed,
+        runner_events,
+    )
+    .await?;
+
+    let quarantined_ids = quarantined
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<HashSet<_>>();
+    idle.retain(|worker| !quarantined_ids.contains(worker.id.as_str()));
+    for participant in [victim, actor] {
+        if !failed_ids.contains(&participant.id) {
+            idle.push_back(participant.clone());
+        }
+    }
+
+    eprintln!(
+        "[remove-rejoin] plateau={} recovered from failure; failed={:?} healthy_cycle_participants_requeued={:?} active={} idle={}",
+        plateau_size,
+        failed_ids,
+        [victim, actor]
+            .iter()
+            .filter(|worker| !failed_ids.contains(&worker.id))
+            .map(|worker| worker.id.as_str())
+            .collect::<Vec<_>>(),
+        active.len(),
+        idle.len()
+    );
+    Ok(true)
+}
+
+async fn run_single_remove_rejoin_cycle(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    fanout: &mut FanoutController,
+    process_pending_fanout: bool,
+    plateau_size: usize,
+    max_commit_receive_samples_per_plateau: usize,
+    commit_receive_sampling_seed: u64,
+    plateau_index: usize,
+    victim: &WorkerSpec,
+    actor: &WorkerSpec,
+) -> Result<()> {
     let remove_victim_active = active.len();
 
     eprintln!(
@@ -6351,15 +7248,14 @@ async fn run_remove_rejoin_phase(
         "generate_key_package",
     );
     let kp_context = WorkerCommandContext::with_metadata(
-        &victim,
+        victim,
         &Command::GenerateKeyPackage,
         None,
         Some("remove_rejoin.generate_key_package"),
         Some(&kp_cursor),
     );
     let _ =
-        send_command_with_context(http, &victim, &Command::GenerateKeyPackage, &kp_context)
-            .await?;
+        send_command_with_context(http, victim, &Command::GenerateKeyPackage, &kp_context).await?;
     // KeyPackage is now stored on DS at /keypackage/{victim.id}; AddMembers will fetch it.
 
     // ── Remove victim ──
@@ -6374,13 +7270,13 @@ async fn run_remove_rejoin_phase(
         members: vec![victim.id.clone()],
     };
     let remove_ctx = WorkerCommandContext::with_metadata(
-        &actor,
+        actor,
         &remove_cmd,
         None,
         Some("remove_rejoin.remove"),
         Some(&remove_cursor),
     );
-    let actor_before = show_group_state(http, &actor).await?;
+    let actor_before = show_group_state(http, actor).await?;
     let expected_after_remove = expected_group_state(
         &actor_before,
         actor_before.epoch + 1,
@@ -6393,7 +7289,7 @@ async fn run_remove_rejoin_phase(
     );
     send_cmd_expect_ok_fragment_with_context(
         http,
-        &actor,
+        actor,
         &remove_cmd,
         "removed locally; group commit published",
         &remove_ctx,
@@ -6402,7 +7298,7 @@ async fn run_remove_rejoin_phase(
     if process_pending_fanout {
         process_pending_commit_expect(
             http,
-            &actor,
+            actor,
             ExpectedReceiveCommitState::Group(expected_after_remove.clone()),
             "remove_rejoin.actor_process_pending",
             Some(&remove_cursor),
@@ -6411,7 +7307,7 @@ async fn run_remove_rejoin_phase(
     } else {
         receive_commit_expect(
             http,
-            &actor,
+            actor,
             "own commit accepted from DS",
             ExpectedReceiveCommitState::Group(expected_after_remove.clone()),
             "remove_rejoin.actor_receive_commit",
@@ -6454,13 +7350,9 @@ async fn run_remove_rejoin_phase(
                         expected_epoch: expected_ep,
                         profile: sampled,
                         commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6468,13 +7360,9 @@ async fn run_remove_rejoin_phase(
                     Command::ReceiveCommit {
                         profile: sampled,
                         commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6489,6 +7377,11 @@ async fn run_remove_rejoin_phase(
                 benchmark_operation: None,
                 benchmark_operation_seq: None,
                 benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
             }
             .with_benchmark_cursor(&remove_cursor)
         });
@@ -6498,7 +7391,7 @@ async fn run_remove_rejoin_phase(
             .collect::<HashMap<_, _>>();
         batch_fanout_workers(
             http,
-            "remove_rejoin",
+            fanout_phase,
             plateau_size,
             "receive_commit",
             &recipients,
@@ -6506,8 +7399,7 @@ async fn run_remove_rejoin_phase(
             &commands_by_physical,
             Some(&expected_by_client),
         )
-        .await
-        .map_err(|e| anyhow!("remove fanout: {:#}", e))?;
+        .await?;
     }
 
     // Move victim to idle
@@ -6534,24 +7426,21 @@ async fn run_remove_rejoin_phase(
         members: vec![victim.id.clone()],
     };
     let add_ctx = WorkerCommandContext::with_metadata(
-        &actor,
+        actor,
         &add_cmd,
         None,
         Some("remove_rejoin.add"),
         Some(&add_cursor),
     );
-    let actor_before = show_group_state(http, &actor).await?;
+    let actor_before = show_group_state(http, actor).await?;
     let mut expected_members = actor_before.members.clone();
     expected_members.push(victim.id.clone());
     expected_members.sort();
-    let expected_after_add = expected_group_state(
-        &actor_before,
-        actor_before.epoch + 1,
-        expected_members,
-    );
+    let expected_after_add =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
     send_cmd_expect_ok_fragment_with_context(
         http,
-        &actor,
+        actor,
         &add_cmd,
         "added locally in one commit",
         &add_ctx,
@@ -6560,7 +7449,7 @@ async fn run_remove_rejoin_phase(
     if process_pending_fanout {
         process_pending_commit_expect(
             http,
-            &actor,
+            actor,
             ExpectedReceiveCommitState::Group(expected_after_add.clone()),
             "remove_rejoin.actor_process_pending_add",
             Some(&add_cursor),
@@ -6569,7 +7458,7 @@ async fn run_remove_rejoin_phase(
     } else {
         receive_commit_expect(
             http,
-            &actor,
+            actor,
             "own commit accepted from DS",
             ExpectedReceiveCommitState::Group(expected_after_add.clone()),
             "remove_rejoin.actor_receive_commit_add",
@@ -6612,13 +7501,9 @@ async fn run_remove_rejoin_phase(
                         expected_epoch: expected_ep,
                         profile: sampled,
                         commit_create_op: Some("add".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6626,13 +7511,9 @@ async fn run_remove_rejoin_phase(
                     Command::ReceiveCommit {
                         profile: sampled,
                         commit_create_op: Some("add".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6647,6 +7528,11 @@ async fn run_remove_rejoin_phase(
                 benchmark_operation: None,
                 benchmark_operation_seq: None,
                 benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
             }
             .with_benchmark_cursor(&add_cursor)
         });
@@ -6656,7 +7542,7 @@ async fn run_remove_rejoin_phase(
             .collect::<HashMap<_, _>>();
         batch_fanout_workers(
             http,
-            "remove_rejoin",
+            fanout_phase,
             plateau_size,
             "receive_commit",
             &recipients,
@@ -6664,8 +7550,7 @@ async fn run_remove_rejoin_phase(
             &commands_by_physical,
             Some(&expected_by_client),
         )
-        .await
-        .map_err(|e| anyhow!("add fanout: {:#}", e))?;
+        .await?;
     }
 
     // ── Victim processes Welcome via JoinFromWelcome (fetches from DS) ──
@@ -6678,34 +7563,22 @@ async fn run_remove_rejoin_phase(
     );
     let welcome_cmd = Command::JoinFromWelcome;
     let welcome_ctx = WorkerCommandContext::with_metadata(
-        &victim,
+        victim,
         &welcome_cmd,
         None,
         Some("remove_rejoin.process_welcome"),
         Some(&welcome_cursor),
     );
-    match send_cmd_expect_ok_fragment_with_context(
+    send_cmd_expect_ok_fragment_with_context(
         http,
-        &victim,
+        victim,
         &welcome_cmd,
         "joined from welcome",
         &welcome_ctx,
     )
-    .await
-    {
-        Ok(_) => {
-            // Victim back into active only on success
-            idle.retain(|w| w.id != victim.id);
-            active.push(victim.clone());
-        }
-        Err(e) => {
-            eprintln!(
-                "[remove-rejoin] process_welcome for {} failed, leaving in idle: {:#}",
-                victim.id, e
-            );
-            // victim stays in idle; will be re-added by a future transition
-        }
-    }
+    .await?;
+    idle.retain(|w| w.id != victim.id);
+    active.push(victim.clone());
 
     eprintln!(
         "[remove-rejoin] plateau={} done: victim={} active={} idle={}",
@@ -6729,6 +7602,7 @@ async fn run_update_phase(
     progress: &mut Progress,
     process_pending_fanout: bool,
     external_coverage_lane: bool,
+    min_profiled_samples_per_operation: usize,
     rng: &mut StdRng,
     plateau_index: usize,
     runner_events: &RunnerEventLog,
@@ -6746,10 +7620,12 @@ async fn run_update_phase(
 
     let required_actor_ids = if external_coverage_lane {
         let mut required = active_external_indices(active);
-        let non_external_profiled_indices = active_profiled_non_external_indices(active);
-        if !non_external_profiled_indices.is_empty() {
-            let sampled_pos = rng.gen_range(0..non_external_profiled_indices.len());
-            required.push(non_external_profiled_indices[sampled_pos]);
+        if min_profiled_samples_per_operation == 0 {
+            let non_external_profiled_indices = active_profiled_non_external_indices(active);
+            if !non_external_profiled_indices.is_empty() {
+                let sampled_pos = rng.gen_range(0..non_external_profiled_indices.len());
+                required.push(non_external_profiled_indices[sampled_pos]);
+            }
         }
         required
             .into_iter()
@@ -6759,7 +7635,10 @@ async fn run_update_phase(
         Vec::new()
     };
 
-    let total_updates = base_updates.max(required_actor_ids.len());
+    let required_density_updates = required_actor_ids
+        .len()
+        .saturating_mul(min_profiled_samples_per_operation.max(1));
+    let total_updates = base_updates.max(required_density_updates);
     if total_updates == 0 {
         return Ok(());
     }
@@ -6781,8 +7660,25 @@ async fn run_update_phase(
         .as_ref()
         .map(|_| rng.gen_range(0..total_updates));
 
+    let density_enabled = external_coverage_lane && min_profiled_samples_per_operation > 0;
+    let mut density_successes = HashMap::<String, usize>::new();
     let mut seq_no = 0usize;
-    while seq_no < total_updates {
+    loop {
+        let density_actor_id = density_enabled
+            .then(|| {
+                least_sampled_active_external_id(
+                    active,
+                    &density_successes,
+                    min_profiled_samples_per_operation,
+                )
+            })
+            .flatten();
+        if density_enabled && density_actor_id.is_none() {
+            break;
+        }
+        if !density_enabled && seq_no >= total_updates {
+            break;
+        }
         let profiled_indices = active_profiled_indices(active);
         if profiled_indices.is_empty() {
             eprintln!(
@@ -6791,8 +7687,9 @@ async fn run_update_phase(
             );
             return Ok(());
         }
-        let actor_idx = required_actor_ids
-            .get(seq_no)
+        let actor_idx = density_actor_id
+            .as_ref()
+            .or_else(|| required_actor_ids.get(seq_no))
             .and_then(|actor_id| active.iter().position(|worker| worker.id == *actor_id))
             .or_else(|| {
                 if external_actor_seq == Some(seq_no) {
@@ -6960,25 +7857,17 @@ async fn run_update_phase(
         } else {
             "update.fanout_receive_commit"
         };
-        let sample_indices = deterministic_commit_receive_sample_indices(
-            recipients.len(),
+        let (sampled_ids, sample_index_map, sample_count) = build_commit_receive_sampling_map(
+            &recipients,
             max_commit_receive_samples_per_plateau,
             commit_receive_sampling_seed,
             plateau_size,
             expected_after_commit.epoch,
             seq_no,
         );
-        let sampled_ids: HashSet<String> = sample_indices
-            .iter()
-            .filter_map(|idx| recipients.get(*idx))
-            .map(|w| w.id.clone())
-            .collect();
-        let sample_count = sampled_ids.len();
         let commands_by_physical = build_batch_commands(&recipients, |worker| {
             let sampled = sampled_ids.contains(&worker.id);
-            let sample_index = sample_indices
-                .iter()
-                .position(|idx| recipients.get(*idx).map(|w| &w.id) == Some(&worker.id));
+            let sample_index = sample_index_map.get(&worker.id).copied();
             BatchFanoutCommand {
                 client_id: worker.id.clone(),
                 request_id: None,
@@ -7016,6 +7905,11 @@ async fn run_update_phase(
                 benchmark_operation: None,
                 benchmark_operation_seq: None,
                 benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
             }
             .with_benchmark_cursor(&cursor)
         });
@@ -7068,6 +7962,9 @@ async fn run_update_phase(
             total_updates,
             actor.id
         ));
+        if density_enabled {
+            *density_successes.entry(actor.id.clone()).or_default() += 1;
+        }
         seq_no += 1;
     }
 
@@ -7086,6 +7983,7 @@ async fn run_application_phase(
     fanout: &mut FanoutController,
     progress: &mut Progress,
     external_coverage_lane: bool,
+    min_profiled_samples_per_operation: usize,
     rng: &mut StdRng,
     plateau_index: usize,
     runner_events: &RunnerEventLog,
@@ -7117,7 +8015,8 @@ async fn run_application_phase(
         let non_external_at_payload_start = active_profiled_non_external_indices(active);
         let required_actor_ids = if external_coverage_lane {
             let mut required = active_external_indices(active);
-            if !non_external_at_payload_start.is_empty() {
+            if min_profiled_samples_per_operation == 0 && !non_external_at_payload_start.is_empty()
+            {
                 let sampled_pos = rng.gen_range(0..non_external_at_payload_start.len());
                 required.push(non_external_at_payload_start[sampled_pos]);
             }
@@ -7136,7 +8035,11 @@ async fn run_application_phase(
             && external_actor_id.is_some()
             && !non_external_at_payload_start.is_empty();
         let planned_per_payload_count = if external_coverage_lane {
-            per_payload_count.max(required_actor_ids.len())
+            per_payload_count.max(
+                required_actor_ids
+                    .len()
+                    .saturating_mul(min_profiled_samples_per_operation.max(1)),
+            )
         } else {
             per_payload_count + usize::from(force_external_receive_sample && per_payload_count == 1)
         };
@@ -7161,8 +8064,25 @@ async fn run_application_phase(
                 None
             };
 
+        let density_enabled = external_coverage_lane && min_profiled_samples_per_operation > 0;
+        let mut density_successes = HashMap::<String, usize>::new();
         let mut seq_no = 0usize;
-        while seq_no < planned_per_payload_count {
+        loop {
+            let density_actor_id = density_enabled
+                .then(|| {
+                    least_sampled_active_external_id(
+                        active,
+                        &density_successes,
+                        min_profiled_samples_per_operation,
+                    )
+                })
+                .flatten();
+            if density_enabled && density_actor_id.is_none() {
+                break;
+            }
+            if !density_enabled && seq_no >= planned_per_payload_count {
+                break;
+            }
             if active.len() < 2 {
                 eprintln!(
                     "\n[plateau {}] application phase stopped after OOM attrition: fewer than 2 active members",
@@ -7175,8 +8095,9 @@ async fn run_application_phase(
                 return Ok(());
             }
             let non_external_profiled_indices = active_profiled_non_external_indices(active);
-            let actor_idx = required_actor_ids
-                .get(seq_no)
+            let actor_idx = density_actor_id
+                .as_ref()
+                .or_else(|| required_actor_ids.get(seq_no))
                 .and_then(|actor_id| active.iter().position(|worker| worker.id == *actor_id))
                 .or_else(|| {
                     if external_actor_seq == Some(seq_no) {
@@ -7306,6 +8227,11 @@ async fn run_application_phase(
                     benchmark_operation: None,
                     benchmark_operation_seq: None,
                     benchmark_payload_size: None,
+                    membership_batch_requested: None,
+                    membership_batch_effective: None,
+                    membership_batch_group_cap: None,
+                    membership_batch_transition_cap: None,
+                    membership_batch_source: None,
                 }
                 .with_benchmark_cursor(&cursor)
             });
@@ -7355,6 +8281,9 @@ async fn run_application_phase(
                 planned_per_payload_count,
                 actor.id
             ));
+            if density_enabled {
+                *density_successes.entry(actor.id.clone()).or_default() += 1;
+            }
             seq_no += 1;
         }
     }
@@ -8666,6 +9595,17 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
     if config.payload_sizes.is_empty() {
         return Err(anyhow!("At least one payload size is required"));
     }
+    if config.min_profiled_samples_per_operation > 0
+        && (!config.external_coverage_lane
+            || !config
+                .workers
+                .iter()
+                .any(|worker| worker.profile_enabled && is_external_device(worker)))
+    {
+        return Err(anyhow!(
+            "--min-external-samples-per-operation requires --external-coverage-lane and at least one profile-enabled external device"
+        ));
+    }
 
     let max_size = config.max_size.unwrap_or(worker_count);
 
@@ -8685,6 +9625,40 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
             config.min_size,
             max_size
         ));
+    }
+
+    if !config.plateau_sizes.is_empty() {
+        if config.plateau_order != PlateauOrder::Ascending {
+            return Err(anyhow!(
+                "--plateau-sizes requires --plateau-order ascending"
+            ));
+        }
+        if config.plateau_sizes.iter().any(|size| *size == 0) {
+            return Err(anyhow!("--plateau-sizes values must be at least 1"));
+        }
+        if config
+            .plateau_sizes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(anyhow!(
+                "--plateau-sizes must be strictly increasing; got {:?}",
+                config.plateau_sizes
+            ));
+        }
+        let first = config.plateau_sizes[0];
+        let last = *config
+            .plateau_sizes
+            .last()
+            .expect("non-empty plateau sizes");
+        if first < config.min_size || last > max_size {
+            return Err(anyhow!(
+                "--plateau-sizes {:?} must stay within --min-size {} and --max-size {}",
+                config.plateau_sizes,
+                config.min_size,
+                max_size
+            ));
+        }
     }
 
     Ok(max_size)
@@ -8816,10 +9790,15 @@ mod tests {
     use crate::worker_api::Command;
 
     use super::{
-        batch_physical_base_url, build_batch_commands, choose_remove_actor_and_removable_indices,
-        fanout_workers, partition_batch_failures_by_reconciled_state, protected_member_floor,
-        removable_member_indices, retry_batch_commands_for_failures, sampled_member_index,
-        BatchFanoutCommand, FanoutController, FanoutFailure, WorkerSpec,
+        batch_command_item, batch_physical_base_url, build_batch_commands,
+        build_commit_receive_sampling_map, choose_remove_actor_and_removable_indices,
+        external_remove_rejoin_pairs, fanout_workers, least_sampled_active_external_id,
+        least_used_external_actor_id, partition_batch_failures_by_reconciled_state,
+        protected_member_floor, removable_member_indices, remove_rejoin_failure_operation,
+        retry_batch_commands_for_failures, sampled_member_index,
+        select_supplemental_remove_receiver_roles, BatchFanoutCommand, BatchFanoutError,
+        BenchmarkCursor, FanoutController, FanoutFailure, MembershipBatchDecision,
+        WorkerCommandError, WorkerCommandErrorClass, WorkerSpec,
         DEFAULT_FANOUT_ERROR_RATE_THRESHOLD, FANOUT_LATENCY_SPIKE_P95_MS,
     };
 
@@ -8874,6 +9853,88 @@ mod tests {
     }
 
     #[test]
+    fn density_actor_selection_reaches_the_floor_for_each_external_only() {
+        let mut external_a = WorkerSpec::legacy("ext-a".into(), "http://a".into());
+        external_a.profile_enabled = true;
+        external_a.device_kind = "raspberry_pi".into();
+        let mut external_b = WorkerSpec::legacy("ext-b".into(), "http://b".into());
+        external_b.profile_enabled = true;
+        external_b.device_kind = "luckfox".into();
+        let mut docker = WorkerSpec::legacy("docker".into(), "http://docker".into());
+        docker.profile_enabled = true;
+        docker.device_kind = "scratch_container".into();
+        let active = vec![external_a, external_b, docker];
+        let mut counts = HashMap::new();
+
+        while let Some(actor_id) = least_sampled_active_external_id(&active, &counts, 20) {
+            *counts.entry(actor_id).or_default() += 1;
+        }
+
+        assert_eq!(counts.get("ext-a"), Some(&20));
+        assert_eq!(counts.get("ext-b"), Some(&20));
+        assert_eq!(counts.get("docker"), None);
+    }
+
+    #[test]
+    fn two_external_remove_rejoin_uses_non_external_victim_for_receiver_density() {
+        let mut external_a = WorkerSpec::legacy("ext-a".into(), "http://a".into());
+        external_a.profile_enabled = true;
+        external_a.device_kind = "raspberry_pi_5".into();
+        let mut external_b = WorkerSpec::legacy("ext-b".into(), "http://b".into());
+        external_b.profile_enabled = true;
+        external_b.device_kind = "raspberry_pi_3".into();
+        let mut profiled_docker = WorkerSpec::legacy("docker".into(), "http://docker".into());
+        profiled_docker.profile_enabled = true;
+        profiled_docker.device_kind = "scratch_container".into();
+        let mut ordinary = WorkerSpec::legacy("ordinary".into(), "http://ordinary".into());
+        ordinary.profile_enabled = false;
+        let active = vec![external_a, external_b, profiled_docker, ordinary];
+        let external_ids = vec!["ext-a".to_string(), "ext-b".to_string()];
+        let actor_counts = HashMap::from([
+            ("ext-a".to_string(), 20usize),
+            ("ext-b".to_string(), 20usize),
+        ]);
+        let mut receiver_counts = HashMap::new();
+
+        let first = select_supplemental_remove_receiver_roles(
+            &active,
+            &external_ids,
+            &actor_counts,
+            &receiver_counts,
+            20,
+            128,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first, ("ext-b".into(), "ordinary".into(), "ext-a".into()));
+
+        receiver_counts.insert("ext-a".to_string(), 20);
+        let second = select_supplemental_remove_receiver_roles(
+            &active,
+            &external_ids,
+            &actor_counts,
+            &receiver_counts,
+            20,
+            128,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(second, ("ext-a".into(), "ordinary".into(), "ext-b".into()));
+
+        receiver_counts.insert("ext-b".to_string(), 20);
+        assert!(select_supplemental_remove_receiver_roles(
+            &active,
+            &external_ids,
+            &actor_counts,
+            &receiver_counts,
+            20,
+            128,
+        )
+        .unwrap()
+        .is_none());
+    }
+
+    #[test]
     fn removal_actor_prefers_actor_that_can_remove_full_batch() {
         let mut protected = WorkerSpec::legacy("00001".into(), "http://worker-1:8080".into());
         protected.profile_enabled = true;
@@ -8918,35 +9979,161 @@ mod tests {
     }
 
     #[test]
+    fn commit_receive_sampling_always_includes_profiled_external_devices() {
+        let mut recipients = (0..10)
+            .map(|idx| {
+                WorkerSpec::legacy(format!("worker-{idx}"), format!("http://worker-{idx}:8080"))
+            })
+            .collect::<Vec<_>>();
+        recipients[2].profile_enabled = true;
+        recipients[2].device_kind = "raspberry_pi_5".to_string();
+        recipients[7].profile_enabled = true;
+        recipients[7].device_kind = "luckfox_pico_plus".to_string();
+
+        let (ids, index_map, count) =
+            build_commit_receive_sampling_map(&recipients, 1, 42, 10, 3, 0);
+
+        assert!(ids.contains("worker-2"));
+        assert!(ids.contains("worker-7"));
+        assert_eq!(ids.len(), count);
+        assert_eq!(index_map.len(), count);
+        assert!(count >= 3, "ordinary capped sample plus two externals");
+    }
+
+    #[test]
+    fn external_actor_selection_balances_use_counts() {
+        let mut workers = (0..3)
+            .map(|idx| {
+                let mut worker = WorkerSpec::legacy(
+                    format!("external-{idx}"),
+                    format!("http://external-{idx}:8080"),
+                );
+                worker.device_kind = "external_device".to_string();
+                worker
+            })
+            .collect::<Vec<_>>();
+        workers.push(WorkerSpec::legacy(
+            "container".to_string(),
+            "http://container:8080".to_string(),
+        ));
+        let mut counts = HashMap::new();
+        let mut rng = StdRng::seed_from_u64(17);
+
+        for _ in 0..12 {
+            let actor = least_used_external_actor_id(&workers, &counts, &mut rng).unwrap();
+            *counts.entry(actor).or_insert(0usize) += 1;
+        }
+
+        assert_eq!(counts.len(), 3);
+        assert!(counts.values().all(|count| *count == 4));
+        assert!(!counts.contains_key("container"));
+    }
+
+    #[test]
+    fn external_remove_rejoin_pairs_cover_each_device_in_both_roles() {
+        let mut workers = ["external-c", "external-a", "external-b"]
+            .into_iter()
+            .map(|id| {
+                let mut worker = WorkerSpec::legacy(id.to_string(), format!("http://{id}:8080"));
+                worker.device_kind = "external_device".to_string();
+                worker.profile_enabled = true;
+                worker
+            })
+            .collect::<Vec<_>>();
+        let mut local = WorkerSpec::legacy(
+            "profiled-local".to_string(),
+            "http://profiled-local:8080".to_string(),
+        );
+        local.profile_enabled = true;
+        workers.push(local);
+
+        assert_eq!(
+            external_remove_rejoin_pairs(&workers),
+            vec![
+                ("external-a".to_string(), "external-b".to_string()),
+                ("external-b".to_string(), "external-c".to_string()),
+                ("external-c".to_string(), "external-a".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn remove_rejoin_failures_preserve_attempted_operation() {
+        let worker_error: anyhow::Error = WorkerCommandError {
+            worker_id: "external-a".to_string(),
+            command: "JoinFromWelcome",
+            url: "http://external-a:8080/command".to_string(),
+            request_id: "request-1".to_string(),
+            attempts: 3,
+            classification: WorkerCommandErrorClass::TransportRetryable,
+            last_error: "connection refused".to_string(),
+            diagnostic: None,
+        }
+        .into();
+        assert_eq!(
+            remove_rejoin_failure_operation(&worker_error),
+            "welcome_receive"
+        );
+
+        let fanout_error: anyhow::Error = BatchFanoutError {
+            phase: "remove_rejoin.fanout_receive_commit_remove".to_string(),
+            operation: "receive_commit".to_string(),
+            failures: Vec::new(),
+        }
+        .into();
+        assert_eq!(
+            remove_rejoin_failure_operation(&fanout_error),
+            "remove_commit"
+        );
+    }
+
+    #[test]
     fn build_batch_commands_assigns_request_ids() {
         let workers = (1..=2)
             .map(|idx| {
                 WorkerSpec::legacy(format!("{idx:05}"), format!("http://worker-{idx:05}:8080"))
             })
             .collect::<Vec<_>>();
+        let decision = MembershipBatchDecision {
+            requested: 8,
+            effective: 8,
+            group_cap: 8,
+            transition_cap: 8,
+            source: "external_density_k8",
+        };
+        let cursor = BenchmarkCursor::new(3, 40, 32, "membership_add", "add_commit")
+            .with_membership_batch(&decision);
 
-        let commands_by_physical = build_batch_commands(&workers, |worker| BatchFanoutCommand {
-            client_id: worker.id.clone(),
-            request_id: None,
-            command: Command::ReceiveCommit {
-                profile: false,
-                commit_create_op: None,
-                commit_receive_sampling_policy: None,
-                commit_receive_sampling_seed: None,
-                commit_receive_sample_index: None,
-                commit_receive_sample_count: None,
-                commit_receive_population_size: None,
-            },
-            expected_epoch: Some(3),
-            phase: Some("test.phase".to_string()),
-            profile: None,
-            benchmark_plateau_index: None,
-            benchmark_target_size: None,
-            benchmark_active_size: None,
-            benchmark_phase: None,
-            benchmark_operation: None,
-            benchmark_operation_seq: None,
-            benchmark_payload_size: None,
+        let commands_by_physical = build_batch_commands(&workers, |worker| {
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: Command::ReceiveCommit {
+                    profile: false,
+                    commit_create_op: None,
+                    commit_receive_sampling_policy: None,
+                    commit_receive_sampling_seed: None,
+                    commit_receive_sample_index: None,
+                    commit_receive_sample_count: None,
+                    commit_receive_population_size: None,
+                },
+                expected_epoch: Some(3),
+                phase: Some("test.phase".to_string()),
+                profile: None,
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
+            }
+            .with_benchmark_cursor(&cursor)
         });
 
         let request_ids = commands_by_physical
@@ -8958,6 +10145,18 @@ mod tests {
 
         assert_eq!(request_ids.len(), workers.len());
         assert_eq!(unique_request_ids.len(), workers.len());
+        let command = &commands_by_physical[0].1[0];
+        let item = batch_command_item(command);
+        assert_eq!(
+            command.membership_batch_source.as_deref(),
+            Some("external_density_k8")
+        );
+        assert_eq!(item.membership_batch_requested, Some(8));
+        assert_eq!(item.membership_batch_effective, Some(8));
+        assert_eq!(
+            item.membership_batch_source.as_deref(),
+            Some("external_density_k8")
+        );
     }
 
     #[test]
@@ -8988,6 +10187,11 @@ mod tests {
                     benchmark_operation: None,
                     benchmark_operation_seq: None,
                     benchmark_payload_size: None,
+                    membership_batch_requested: None,
+                    membership_batch_effective: None,
+                    membership_batch_group_cap: None,
+                    membership_batch_transition_cap: None,
+                    membership_batch_source: None,
                 },
                 BatchFanoutCommand {
                     client_id: "00002".to_string(),
@@ -9011,6 +10215,11 @@ mod tests {
                     benchmark_operation: None,
                     benchmark_operation_seq: None,
                     benchmark_payload_size: None,
+                    membership_batch_requested: None,
+                    membership_batch_effective: None,
+                    membership_batch_group_cap: None,
+                    membership_batch_transition_cap: None,
+                    membership_batch_source: None,
                 },
             ],
         )];
@@ -9084,6 +10293,11 @@ mod tests {
             benchmark_operation: None,
             benchmark_operation_seq: None,
             benchmark_payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         };
         let layout_cmd = BatchFanoutCommand {
             client_id: "00002".to_string(),
@@ -9107,6 +10321,11 @@ mod tests {
             benchmark_operation: None,
             benchmark_operation_seq: None,
             benchmark_payload_size: None,
+            membership_batch_requested: None,
+            membership_batch_effective: None,
+            membership_batch_group_cap: None,
+            membership_batch_transition_cap: None,
+            membership_batch_source: None,
         };
 
         assert_eq!(

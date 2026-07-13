@@ -44,6 +44,10 @@ struct Args {
     #[arg(long, default_value = "1")]
     step_size: StepSize,
 
+    /// Exact ascending participant-count plateaus. Overrides step generation.
+    #[arg(long, value_delimiter = ',')]
+    plateau_sizes: Vec<usize>,
+
     #[arg(long)]
     step_size_switch_at: Option<usize>,
 
@@ -63,6 +67,15 @@ struct Args {
     /// Hard cap on successful application sends per payload at each plateau
     #[arg(long, default_value_t = 16)]
     max_app_samples_per_payload: usize,
+
+    /// Minimum successful create and receive samples per external device.
+    /// Zero preserves the ordinary cap-only workload.
+    #[arg(
+        long = "min-external-samples-per-operation",
+        alias = "min-profiled-samples-per-operation",
+        default_value_t = 0
+    )]
+    min_profiled_samples_per_operation: usize,
 
     #[arg(long, default_value = "32,256,1024,4096")]
     payload_sizes: PayloadSizes,
@@ -191,12 +204,14 @@ fn main() -> Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         step_size: args.step_size,
+        plateau_sizes: args.plateau_sizes,
         step_size_switch_at: args.step_size_switch_at,
         step_size_after_switch: args.step_size_after_switch,
         plateau_order: args.plateau_order,
         roundtrips: args.roundtrips,
         app_rounds: args.app_rounds,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
+        min_profiled_samples_per_operation: args.min_profiled_samples_per_operation,
         payload_sizes: args.payload_sizes,
         run_id: args.run_id,
         scenario: args.scenario,

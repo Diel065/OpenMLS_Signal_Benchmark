@@ -568,7 +568,15 @@ impl Client {
             member_count_before,
             member_count_before,
         ));
-        let total_scope = ProfileScope::start("commit_receive_total_local", "openmls");
+        // A worker may have profiling enabled globally while this recipient was
+        // not selected for CommitReceive profiling. Do not emit a partial total
+        // row in that case: it lacks the parsed commit metadata (including k)
+        // and would be indistinguishable from a complete observation downstream.
+        let total_scope = if profile.enabled {
+            ProfileScope::start("commit_receive_total_local", "openmls")
+        } else {
+            None
+        };
 
         let process_result = (|| -> Result<(), anyhow::Error> {
             let group = self

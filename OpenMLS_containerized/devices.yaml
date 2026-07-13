@@ -45,7 +45,7 @@ devices:
       type: ssh
       host: "192.168.178.33"
       user: "diel"
-      password: "diel"
+      identity_file: "/home/diel/.ssh/id_ed25519"
       host_candidates:
         - host: "100.71.112.120"
           port: 10022
@@ -84,7 +84,7 @@ devices:
       type: ssh
       host: "192.168.178.35"
       user: "diel"
-      password: "diel"
+      identity_file: "/home/diel/.ssh/id_ed25519"
       host_candidates:
         - host: "100.71.112.120"
           port: 10023

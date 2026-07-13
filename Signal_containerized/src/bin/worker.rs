@@ -1,5 +1,7 @@
 use std::{
     collections::HashMap,
+    fs::OpenOptions,
+    io::Write,
     net::SocketAddr,
     path::PathBuf,
     sync::Arc,
@@ -25,12 +27,109 @@ use signal_benchmark::embedded_heap_budget::{
 use signal_benchmark::signal_metrics::SignalProfileEvent;
 use signal_benchmark::signal_participant::SignalParticipant;
 use signal_benchmark::worker_api::{
-    handle_command, Command, CommandResponse, CompletedCommandCache, IncomingCommandRequest,
-    RequestEnvelopeParts,
+    handle_command, valid_persisted_signal_canonical_total_count, Command, CommandResponse,
+    CompletedCommandCache, IncomingCommandRequest, RequestEnvelopeParts,
 };
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_PACKED_INTERNAL_PARALLELISM: usize = 4;
+
+fn persist_signal_profile_event(path: &PathBuf, event: &SignalProfileEvent) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    serde_json::to_writer(&mut file, event)?;
+    file.write_all(b"\n")?;
+    file.flush()?;
+    Ok(())
+}
+
+fn is_plot_canonical_total(op: &str) -> bool {
+    matches!(
+        op,
+        "signal_session_establish.total"
+            | "signal_application_message_create.total"
+            | "signal_application_message_receive.total"
+    )
+}
+
+fn has_positive_plot_metrics(event: &SignalProfileEvent) -> bool {
+    event.cpu_process_ns.is_some_and(|value| value > 0)
+        && event.alloc_bytes.is_some_and(|value| value > 0)
+}
+
+fn expected_canonical_profile_total(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::EstablishSessions { profile: true, .. } => Some("signal_session_establish.total"),
+        Command::EncryptMessage { .. } => Some("signal_application_message_create.total"),
+        Command::DecryptMessage { profile: true, .. } => {
+            Some("signal_application_message_receive.total")
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod profile_persistence_tests {
+    use super::*;
+
+    #[test]
+    fn canonical_profile_row_is_flushed_as_complete_jsonl() {
+        let path = std::env::temp_dir().join(format!(
+            "signal-profile-persist-{}-{}.jsonl",
+            std::process::id(),
+            unix_ms_now(),
+        ));
+        let event = SignalProfileEvent {
+            op: "signal_application_message_receive.total".to_string(),
+            cpu_process_ns: Some(17),
+            alloc_bytes: Some(19),
+            ..SignalProfileEvent::default()
+        };
+
+        persist_signal_profile_event(&path, &event).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(bytes.ends_with(b"\n"));
+        let decoded: SignalProfileEvent =
+            serde_json::from_slice(bytes.strip_suffix(b"\n").unwrap()).unwrap();
+        assert_eq!(decoded.op, event.op);
+        assert!(has_positive_plot_metrics(&decoded));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn persistence_error_is_reported() {
+        let directory = std::env::temp_dir();
+        assert!(persist_signal_profile_event(&directory, &SignalProfileEvent::default()).is_err());
+    }
+
+    #[test]
+    fn maps_only_profiled_commands_to_canonical_totals() {
+        assert_eq!(
+            expected_canonical_profile_total(&Command::EstablishSessions {
+                participants: vec!["peer".to_string()],
+                conversation_size: Some(4),
+                profile: true,
+            }),
+            Some("signal_session_establish.total")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::EstablishSessions {
+                participants: vec!["peer".to_string()],
+                conversation_size: Some(4),
+                profile: false,
+            }),
+            None
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::ResetSessions {
+                participants: vec!["peer".to_string()],
+            }),
+            None
+        );
+    }
+}
 
 struct ParticipantSlot {
     participant: SignalParticipant,
@@ -481,6 +580,18 @@ fn signal_event_context(
             peer_count: Some(participants.len()),
             phase: None,
         },
+        Command::ResetSessions { participants } => SignalEventContext {
+            measurement_class: "control_lifecycle",
+            event_family: "session_lifecycle",
+            event_subtype: "signal_session_reset_local",
+            event_side: Some("local"),
+            direction: None,
+            role: Some("self"),
+            peer_id: (participants.len() == 1).then(|| participants[0].clone()),
+            peer_device_id: (participants.len() == 1).then_some(1),
+            peer_count: Some(participants.len()),
+            phase: None,
+        },
         Command::EncryptMessage { recipient, .. } => SignalEventContext {
             measurement_class: "wrapper",
             event_family: "message_protection",
@@ -610,7 +721,21 @@ async fn participant_command_actor(
             &participant_id,
             envelope.phase.as_deref(),
         );
-        let heap_budget_guard = if slot.profile_enabled {
+        let command_profile_enabled = match &envelope.command {
+            Command::EstablishSessions { profile, .. } => *profile,
+            Command::ResetSessions { .. } => false,
+            _ => true,
+        };
+        let profile_this_command = slot.profile_enabled && command_profile_enabled;
+        let expected_profile_total = profile_this_command
+            .then(|| expected_canonical_profile_total(&envelope.command))
+            .flatten();
+        let persisted_profile_count_before = expected_profile_total
+            .map(|op| valid_persisted_signal_canonical_total_count(&participant_id, op));
+        let effective_profile_path = profile_this_command
+            .then_some(slot.profile_path.as_ref())
+            .flatten();
+        let heap_budget_guard = if profile_this_command {
             let operation_family = operation_family_for_command(command_name);
             Some(begin_heap_budget_operation(OperationAttribution {
                 operation_family: operation_family.clone(),
@@ -632,31 +757,32 @@ async fn participant_command_actor(
             mark_worker_command_execution();
         }
 
+        let has_benchmark = envelope.benchmark_phase.is_some()
+            || envelope.benchmark_operation.is_some()
+            || envelope.benchmark_plateau_index.is_some();
+        let benchmark_context = (profile_this_command && has_benchmark).then(|| {
+            libsignal_protocol::profiling::BenchmarkContext {
+                benchmark_plateau_index: envelope.benchmark_plateau_index,
+                benchmark_target_size: envelope.benchmark_target_size,
+                benchmark_active_size: envelope.benchmark_active_size,
+                benchmark_phase: envelope.benchmark_phase.clone(),
+                benchmark_operation: envelope.benchmark_operation.clone(),
+                benchmark_operation_seq: envelope.benchmark_operation_seq,
+                benchmark_payload_size: envelope.benchmark_payload_size,
+                benchmark_workflow_id: envelope.benchmark_workflow_id,
+                workflow_pair_index: envelope.workflow_pair_index,
+                workflow_pair_count: envelope.workflow_pair_count,
+                request_id: envelope.request_id.clone(),
+            }
+        });
         if slot.profile_enabled {
             libsignal_protocol::profiling::clear_benchmark_context();
             libsignal_protocol::profiling::set_worker_id(participant_id.clone());
-            let has_benchmark = envelope.benchmark_phase.is_some()
-                || envelope.benchmark_operation.is_some()
-                || envelope.benchmark_plateau_index.is_some();
-            if has_benchmark {
-                libsignal_protocol::profiling::set_benchmark_context(
-                    libsignal_protocol::profiling::BenchmarkContext {
-                        benchmark_plateau_index: envelope.benchmark_plateau_index,
-                        benchmark_target_size: envelope.benchmark_target_size,
-                        benchmark_active_size: envelope.benchmark_active_size,
-                        benchmark_phase: envelope.benchmark_phase.clone(),
-                        benchmark_operation: envelope.benchmark_operation.clone(),
-                        benchmark_operation_seq: envelope.benchmark_operation_seq,
-                        benchmark_payload_size: envelope.benchmark_payload_size,
-                        benchmark_workflow_id: envelope.benchmark_workflow_id,
-                        workflow_pair_index: envelope.workflow_pair_index,
-                        workflow_pair_count: envelope.workflow_pair_count,
-                        request_id: envelope.request_id.clone(),
-                    },
-                );
+            if let Some(context) = benchmark_context.as_ref() {
+                libsignal_protocol::profiling::set_benchmark_context(context.clone());
             }
         }
-        let wrapper_span_id = if slot.profile_enabled {
+        let wrapper_span_id = if profile_this_command {
             let sid = libsignal_protocol::profiling::next_span_id();
             let op_name = format!("benchmark_wrapper.{}", event_context.event_subtype);
             libsignal_protocol::profiling::push_span_id(sid, op_name);
@@ -672,7 +798,8 @@ async fn participant_command_actor(
             &relay_url,
             envelope.command,
             envelope.phase.as_deref(),
-            slot.profile_path.as_ref(),
+            effective_profile_path,
+            benchmark_context.as_ref(),
         )
         .await;
 
@@ -691,7 +818,7 @@ async fn participant_command_actor(
             None
         };
         let mut metrics = None;
-        let response = match result {
+        let mut response = match result {
             Ok(mut outcome) => {
                 outcome.metrics.cpu_process_ns = Some(process_start.elapsed().as_nanos());
                 metrics = Some(outcome.metrics);
@@ -700,15 +827,19 @@ async fn participant_command_actor(
             Err(err) => CommandResponse::error(err.to_string()),
         };
 
-        if let Some(ref profile_path) = slot.profile_path {
-            if let Some(parent) = profile_path.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(profile_path)
+        if let (Some(op), Some(before)) = (expected_profile_total, persisted_profile_count_before) {
+            if response.status == "ok"
+                && valid_persisted_signal_canonical_total_count(&participant_id, op) <= before
             {
+                response = CommandResponse::error(format!(
+                    "PROFILE_MEASUREMENT_NOT_PERSISTED: canonical_op={} requires a flushed row with positive cpu_process_ns and alloc_bytes",
+                    op
+                ));
+            }
+        }
+
+        if let Some(profile_path) = effective_profile_path {
+            let profile_result = (|| -> Result<(String, bool)> {
                 let metrics = metrics.unwrap_or_default();
                 let failure_class = if response.message.contains("APP_HEAP_BUDGET_EXCEEDED") {
                     Some("app_heap_budget_exceeded".to_string())
@@ -876,10 +1007,27 @@ async fn participant_command_actor(
                     failure_phase: (response.status != "ok").then(|| phase.to_string()),
                     ..SignalProfileEvent::default()
                 };
-                if let Ok(json_line) = serde_json::to_string(&event) {
-                    let _ = std::io::Write::write(&mut file, json_line.as_bytes());
-                    let _ = std::io::Write::write(&mut file, b"\n");
+                persist_signal_profile_event(profile_path, &event)?;
+                Ok((event.op.clone(), has_positive_plot_metrics(&event)))
+            })();
+            match profile_result {
+                Err(error) => {
+                    response = CommandResponse::error(format!(
+                        "PROFILE_MEASUREMENT_NOT_PERSISTED: error={:#}",
+                        error
+                    ));
                 }
+                Ok((op, valid_metrics))
+                    if response.status == "ok"
+                        && is_plot_canonical_total(&op)
+                        && !valid_metrics =>
+                {
+                    response = CommandResponse::error(format!(
+                        "PROFILE_MEASUREMENT_INVALID: canonical_op={} requires positive cpu_process_ns and alloc_bytes",
+                        op
+                    ));
+                }
+                Ok(_) => {}
             }
         }
 

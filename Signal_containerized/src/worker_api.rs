@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     error::Error as StdError,
     path::PathBuf,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
@@ -9,6 +10,7 @@ use anyhow::{anyhow, Context, Result};
 use cpu_time::{ProcessTime, ThreadTime};
 use libsignal_core::DeviceId;
 use libsignal_protocol::kem;
+use libsignal_protocol::profiling::BenchmarkContext;
 use libsignal_protocol::{
     KyberPreKeyId, PreKeyBundle, PreKeyId, PreKeySignalMessage, SignalMessage, SignedPreKeyId,
 };
@@ -26,6 +28,31 @@ use crate::l1d_cache::{L1DCacheCounterScope, L1DCacheCounts};
 use crate::signal_metrics::SignalProfileEvent;
 use crate::signal_participant::SignalParticipant;
 
+static PERSISTED_CANONICAL_TOTALS: OnceLock<Mutex<HashMap<(String, String), u64>>> =
+    OnceLock::new();
+
+fn canonical_total_counts() -> &'static Mutex<HashMap<(String, String), u64>> {
+    PERSISTED_CANONICAL_TOTALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn is_signal_plot_canonical_total(op: &str) -> bool {
+    matches!(
+        op,
+        "signal_session_establish.total"
+            | "signal_application_message_create.total"
+            | "signal_application_message_receive.total"
+    )
+}
+
+pub fn valid_persisted_signal_canonical_total_count(participant_id: &str, op: &str) -> u64 {
+    canonical_total_counts()
+        .lock()
+        .expect("canonical total counter lock")
+        .get(&(participant_id.to_string(), op.to_string()))
+        .copied()
+        .unwrap_or_default()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
@@ -37,6 +64,11 @@ pub enum Command {
         participants: Vec<String>,
         #[serde(default)]
         conversation_size: Option<usize>,
+        #[serde(default = "default_profile_true")]
+        profile: bool,
+    },
+    ResetSessions {
+        participants: Vec<String>,
     },
     EncryptMessage {
         recipient: String,
@@ -59,6 +91,10 @@ pub enum Command {
     },
 }
 
+fn default_profile_true() -> bool {
+    true
+}
+
 impl Command {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -67,6 +103,7 @@ impl Command {
             Command::PublishPrekeyBundle => "PublishPrekeyBundle",
             Command::UpdateOneTimePrekeys => "UpdateOneTimePrekeys",
             Command::EstablishSessions { .. } => "EstablishSessions",
+            Command::ResetSessions { .. } => "ResetSessions",
             Command::EncryptMessage { .. } => "EncryptMessage",
             Command::DecryptMessage { .. } => "DecryptMessage",
             Command::ProcessPending { .. } => "ProcessPending",
@@ -83,6 +120,7 @@ impl Command {
                 | Command::PublishPrekeyBundle
                 | Command::UpdateOneTimePrekeys
                 | Command::EstablishSessions { .. }
+                | Command::ResetSessions { .. }
                 | Command::EncryptMessage { .. }
                 | Command::DecryptMessage { .. }
                 | Command::ProcessPending { .. }
@@ -328,10 +366,27 @@ fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
     )
 }
 
+fn install_profile_context(
+    profile_path: Option<&PathBuf>,
+    participant_id: &str,
+    benchmark_context: Option<&BenchmarkContext>,
+) {
+    if profile_path.is_none() {
+        return;
+    }
+    libsignal_protocol::profiling::clear_benchmark_context();
+    libsignal_protocol::profiling::set_worker_id(participant_id.to_string());
+    if let Some(context) = benchmark_context {
+        libsignal_protocol::profiling::set_benchmark_context(context.clone());
+    }
+}
+
 pub fn write_subspan_event(profile_path: Option<&PathBuf>, event: &SignalProfileEvent) {
     if let Some(path) = profile_path {
         if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
+            if std::fs::create_dir_all(parent).is_err() {
+                return;
+            }
         }
         if let Ok(mut file) = std::fs::OpenOptions::new()
             .create(true)
@@ -339,8 +394,21 @@ pub fn write_subspan_event(profile_path: Option<&PathBuf>, event: &SignalProfile
             .open(path)
         {
             if let Ok(json_line) = serde_json::to_string(event) {
-                let _ = std::io::Write::write(&mut file, json_line.as_bytes());
-                let _ = std::io::Write::write(&mut file, b"\n");
+                let persisted = std::io::Write::write_all(&mut file, json_line.as_bytes())
+                    .and_then(|_| std::io::Write::write_all(&mut file, b"\n"))
+                    .and_then(|_| std::io::Write::flush(&mut file))
+                    .is_ok();
+                let valid_metrics = event.cpu_process_ns.is_some_and(|value| value > 0)
+                    && event.alloc_bytes.is_some_and(|value| value > 0);
+                if persisted && valid_metrics && is_signal_plot_canonical_total(&event.op) {
+                    if let Some(participant_id) = event.participant_id.as_deref() {
+                        *canonical_total_counts()
+                            .lock()
+                            .expect("canonical total counter lock")
+                            .entry((participant_id.to_string(), event.op.clone()))
+                            .or_default() += 1;
+                    }
+                }
             }
         }
     }
@@ -355,9 +423,11 @@ pub fn make_subspan_event(
     participant_id: &str,
     wall_ns: u128,
     cpu_thread_ns: Option<u128>,
+    cpu_process_ns: Option<u128>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     success: bool,
+    benchmark_context: Option<&BenchmarkContext>,
 ) -> SignalProfileEvent {
     make_subspan_event_with_span(
         op,
@@ -368,12 +438,14 @@ pub fn make_subspan_event(
         participant_id,
         wall_ns,
         cpu_thread_ns,
+        cpu_process_ns,
         alloc_bytes,
         alloc_count,
         success,
         None,
         None,
         None,
+        benchmark_context,
     )
 }
 
@@ -386,15 +458,17 @@ pub fn make_subspan_event_with_span(
     participant_id: &str,
     wall_ns: u128,
     cpu_thread_ns: Option<u128>,
+    cpu_process_ns: Option<u128>,
     alloc_bytes: Option<u64>,
     alloc_count: Option<u64>,
     success: bool,
     span_id: Option<u64>,
     parent_span_id: Option<u64>,
     parent_operation: Option<String>,
+    benchmark_context: Option<&BenchmarkContext>,
 ) -> SignalProfileEvent {
     let heap_snapshot = allocation_counter::embedded_heap_budget::snapshot();
-    let worker_id = libsignal_protocol::profiling::current_worker_id();
+    let worker_id = Some(participant_id.to_string());
     let global_span_id = worker_id
         .as_ref()
         .zip(span_id)
@@ -403,7 +477,7 @@ pub fn make_subspan_event_with_span(
         .as_ref()
         .zip(parent_span_id)
         .map(|(w, s)| format!("{}:{}", w, s));
-    let bench_ctx = libsignal_protocol::profiling::current_benchmark_context();
+    let bench_ctx = benchmark_context.cloned();
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
         profile_schema_version: 5,
@@ -453,6 +527,7 @@ pub fn make_subspan_event_with_span(
         success,
         wall_ns,
         cpu_thread_ns,
+        cpu_process_ns,
         alloc_bytes,
         alloc_count,
         cpu_model: env_nonempty("SIGNAL_RESOURCE_CPU_MODEL"),
@@ -1118,6 +1193,7 @@ async fn receive_message_delivery(
     conversation_size: usize,
     phase: Option<&str>,
     profile_path: Option<&PathBuf>,
+    benchmark_context: Option<&BenchmarkContext>,
 ) -> Result<CommandOutcome> {
     let total_start = Instant::now();
     let io_start = Instant::now();
@@ -1136,7 +1212,9 @@ async fn receive_message_delivery(
             None,
             None,
             None,
+            None,
             true,
+            benchmark_context,
         ),
     );
 
@@ -1170,7 +1248,9 @@ async fn receive_message_delivery(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
             return Ok(CommandOutcome::new(
@@ -1190,6 +1270,7 @@ async fn receive_message_delivery(
 
     let decrypt_start = Instant::now();
     let (decrypt_result, mut profile_metrics) = if profile {
+        install_profile_context(profile_path, &participant.name, benchmark_context);
         measure_profile(|| {
             participant.decrypt_message(
                 &sender_address,
@@ -1222,9 +1303,11 @@ async fn receive_message_delivery(
                     &participant.name,
                     decrypt_wall,
                     profile_metrics.cpu_thread_ns,
+                    profile_metrics.cpu_process_ns,
                     profile_metrics.alloc_bytes,
                     profile_metrics.alloc_count,
                     true,
+                    benchmark_context,
                 ),
             );
             let io_start = Instant::now();
@@ -1243,7 +1326,9 @@ async fn receive_message_delivery(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
             let text = String::from_utf8_lossy(&plaintext).to_string();
@@ -1264,9 +1349,11 @@ async fn receive_message_delivery(
                     &participant.name,
                     total_start.elapsed().as_nanos(),
                     profile_metrics.cpu_thread_ns,
+                    profile_metrics.cpu_process_ns,
                     profile_metrics.alloc_bytes,
                     profile_metrics.alloc_count,
                     true,
+                    benchmark_context,
                 ),
             );
             Ok(CommandOutcome::new(
@@ -1296,7 +1383,9 @@ async fn receive_message_delivery(
                         None,
                         None,
                         None,
+                        None,
                         true,
+                        benchmark_context,
                     ),
                 );
                 profile_metrics.artifact_size_bytes = Some(message_bytes.len());
@@ -1330,7 +1419,9 @@ async fn process_pending(
     let mut errors = Vec::new();
 
     while remaining > 0 {
-        match receive_message_delivery(participant, relay_url, true, 2, None, profile_path).await {
+        match receive_message_delivery(participant, relay_url, true, 2, None, profile_path, None)
+            .await
+        {
             Ok(outcome) => {
                 messages_processed += 1;
                 metrics.merge_message(&outcome.metrics);
@@ -1438,6 +1529,7 @@ pub async fn handle_command(
     command: Command,
     phase: Option<&str>,
     profile_path: Option<&std::path::PathBuf>,
+    benchmark_context: Option<&BenchmarkContext>,
 ) -> Result<CommandOutcome> {
     match command {
         Command::RegisterParticipant => Ok(CommandOutcome::new(
@@ -1449,6 +1541,7 @@ pub async fn handle_command(
         )),
 
         Command::GeneratePrekeyBundle => {
+            install_profile_context(profile_path, &participant.name, benchmark_context);
             let (bundles, mut profile_metrics) =
                 measure_profile(|| participant.generate_prekey_bundles());
             let bundles = bundles?;
@@ -1474,7 +1567,9 @@ pub async fn handle_command(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
 
@@ -1502,7 +1597,9 @@ pub async fn handle_command(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
 
@@ -1522,7 +1619,9 @@ pub async fn handle_command(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
 
@@ -1546,6 +1645,7 @@ pub async fn handle_command(
         }
 
         Command::PublishPrekeyBundle => {
+            install_profile_context(profile_path, &participant.name, benchmark_context);
             let (result, mut profile_metrics) = measure_profile(|| participant.store_own_prekeys());
             result?;
             profile_metrics.prekey_bundle_count = Some(participant.remaining_prekeys() + 1);
@@ -1576,6 +1676,7 @@ pub async fn handle_command(
                 ));
             }
 
+            install_profile_context(profile_path, &participant.name, benchmark_context);
             let (bundles, mut profile_metrics) =
                 measure_profile(|| participant.generate_replenishment_prekey_bundles());
             let bundles = bundles?;
@@ -1614,6 +1715,7 @@ pub async fn handle_command(
         Command::EstablishSessions {
             participants,
             conversation_size,
+            profile: _,
         } => {
             let conversation_size =
                 conversation_size.unwrap_or(participants.len().saturating_add(1));
@@ -1629,6 +1731,7 @@ pub async fn handle_command(
                     DeviceId::new(1).expect("valid device id"),
                 );
 
+                install_profile_context(profile_path, &participant.name, benchmark_context);
                 let (has_session, has_session_metrics) =
                     measure_profile(|| participant.has_session_with(&peer_address));
                 profile_metrics.merge_profile(&has_session_metrics);
@@ -1655,7 +1758,9 @@ pub async fn handle_command(
                         None,
                         None,
                         None,
+                        None,
                         true,
+                        benchmark_context,
                     ),
                 );
                 artifact_size_bytes = artifact_size_bytes.saturating_add(bundle_bytes.len());
@@ -1724,6 +1829,7 @@ pub async fn handle_command(
 
                 let total_start = Instant::now();
                 let core_start = Instant::now();
+                install_profile_context(profile_path, &participant.name, benchmark_context);
                 let (result, establish_metrics) = measure_profile(|| {
                     participant.establish_session_from_bundle(
                         &peer_address,
@@ -1745,9 +1851,11 @@ pub async fn handle_command(
                         &participant.name,
                         core_wall,
                         establish_metrics.cpu_thread_ns,
+                        establish_metrics.cpu_process_ns,
                         establish_metrics.alloc_bytes,
                         establish_metrics.alloc_count,
                         true,
+                        benchmark_context,
                     ),
                 );
                 profile_metrics.merge_profile(&establish_metrics);
@@ -1766,9 +1874,11 @@ pub async fn handle_command(
                         &participant.name,
                         total_start.elapsed().as_nanos(),
                         establish_metrics.cpu_thread_ns,
+                        establish_metrics.cpu_process_ns,
                         establish_metrics.alloc_bytes,
                         establish_metrics.alloc_count,
                         true,
+                        benchmark_context,
                     ),
                 );
                 established += 1;
@@ -1795,6 +1905,21 @@ pub async fn handle_command(
             ))
         }
 
+        Command::ResetSessions { participants } => {
+            let removed = participant.reset_sessions_with(&participants);
+            Ok(CommandOutcome::new(
+                format!(
+                    "sessions reset: removed={} requested={}",
+                    removed,
+                    participants.len()
+                ),
+                CommandMetrics {
+                    participant_count: Some(participants.len()),
+                    ..Default::default()
+                },
+            ))
+        }
+
         Command::EncryptMessage {
             recipient,
             message,
@@ -1810,6 +1935,7 @@ pub async fn handle_command(
             );
 
             let core_start = Instant::now();
+            install_profile_context(profile_path, &participant.name, benchmark_context);
             let (ciphertext, mut profile_metrics) = measure_profile(|| {
                 participant.encrypt_message(
                     &recipient_address,
@@ -1833,9 +1959,11 @@ pub async fn handle_command(
                     &participant.name,
                     core_wall,
                     profile_metrics.cpu_thread_ns,
+                    profile_metrics.cpu_process_ns,
                     profile_metrics.alloc_bytes,
                     profile_metrics.alloc_count,
                     true,
+                    benchmark_context,
                 ),
             );
 
@@ -1863,7 +1991,9 @@ pub async fn handle_command(
                     None,
                     None,
                     None,
+                    None,
                     true,
+                    benchmark_context,
                 ),
             );
 
@@ -1886,9 +2016,11 @@ pub async fn handle_command(
                             &participant.name,
                             total_start.elapsed().as_nanos(),
                             profile_metrics.cpu_thread_ns,
+                            profile_metrics.cpu_process_ns,
                             profile_metrics.alloc_bytes,
                             profile_metrics.alloc_count,
                             true,
+                            benchmark_context,
                         ),
                     );
                     profile_metrics
@@ -1908,6 +2040,7 @@ pub async fn handle_command(
                 conversation_size.unwrap_or(2),
                 phase,
                 profile_path,
+                benchmark_context,
             )
             .await
         }
@@ -1933,5 +2066,86 @@ pub async fn handle_command(
                 ..Default::default()
             },
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        make_subspan_event, valid_persisted_signal_canonical_total_count, write_subspan_event,
+    };
+    use libsignal_protocol::profiling::BenchmarkContext;
+
+    #[test]
+    fn profiled_subspan_preserves_process_cpu_time() {
+        let benchmark_context = BenchmarkContext {
+            benchmark_target_size: Some(104),
+            benchmark_payload_size: Some(512),
+            request_id: Some("request-7".to_string()),
+            ..BenchmarkContext::default()
+        };
+        let event = make_subspan_event(
+            "signal_application_message_create.total",
+            "message_protection",
+            "signal_application_message_create.total",
+            "benchmark_wrapper",
+            "protocol_operation",
+            "participant-1",
+            101,
+            Some(23),
+            Some(29),
+            Some(31),
+            Some(37),
+            true,
+            Some(&benchmark_context),
+        );
+
+        assert_eq!(event.cpu_thread_ns, Some(23));
+        assert_eq!(event.cpu_process_ns, Some(29));
+        assert_eq!(event.alloc_bytes, Some(31));
+        assert_eq!(event.alloc_count, Some(37));
+        assert_eq!(event.benchmark_target_size, Some(104));
+        assert_eq!(event.benchmark_payload_size, Some(512));
+        assert_eq!(event.request_id.as_deref(), Some("request-7"));
+
+        let json = serde_json::to_value(event).expect("serialize profile event");
+        assert_eq!(json["cpu_process_ns"], 29);
+    }
+
+    #[test]
+    fn canonical_subspan_is_counted_only_after_complete_persistence() {
+        let participant_id = format!("persist-test-{}", std::process::id());
+        let path = std::env::temp_dir().join(format!("{participant_id}.jsonl"));
+        let event = make_subspan_event(
+            "signal_session_establish.total",
+            "session_establishment",
+            "signal_session_establish.total",
+            "benchmark_wrapper",
+            "protocol_operation",
+            &participant_id,
+            101,
+            Some(23),
+            Some(29),
+            Some(31),
+            Some(37),
+            true,
+            None,
+        );
+        let before = valid_persisted_signal_canonical_total_count(
+            &participant_id,
+            "signal_session_establish.total",
+        );
+
+        write_subspan_event(Some(&path), &event);
+
+        assert_eq!(
+            valid_persisted_signal_canonical_total_count(
+                &participant_id,
+                "signal_session_establish.total"
+            ),
+            before + 1
+        );
+        assert!(std::fs::read(&path).unwrap().ends_with(b"\n"));
+        std::fs::remove_file(path).unwrap();
     }
 }

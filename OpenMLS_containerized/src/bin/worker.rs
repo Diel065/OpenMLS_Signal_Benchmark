@@ -27,11 +27,95 @@ use mls_playground::worker_api::{
 };
 use openmls::profiling::{
     l1d_cache_counters_available, l1d_cache_profiling_enabled, profiling_enabled,
-    set_benchmark_context, set_worker_id, BenchmarkContext,
+    set_benchmark_context, set_worker_id, valid_persisted_canonical_total_count, BenchmarkContext,
 };
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
 const DEFAULT_PACKED_INTERNAL_PARALLELISM: usize = 4;
+
+fn expected_canonical_profile_total(command: &Command) -> Option<&'static str> {
+    match command {
+        Command::AddMembers { .. } => Some("add_commit_total_local"),
+        Command::JoinFromWelcome => Some("welcome_receive_total_local"),
+        Command::SendApplicationMessage { .. } => Some("application_message_create_total_local"),
+        Command::ReceiveApplicationMessage { profile: true } => {
+            Some("application_message_receive_total_local")
+        }
+        Command::SelfUpdate => Some("update_commit_create_total_local"),
+        Command::RemoveMembers { .. } => Some("remove_commit_create_total_local"),
+        Command::ReceiveCommit { profile: true, .. } => Some("commit_receive_total_local"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod profile_ack_tests {
+    use super::*;
+
+    #[test]
+    fn maps_only_profiled_canonical_commands_to_v11_totals() {
+        assert_eq!(
+            expected_canonical_profile_total(&Command::AddMembers { members: vec![] }),
+            Some("add_commit_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::JoinFromWelcome),
+            Some("welcome_receive_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::SendApplicationMessage {
+                message: String::new(),
+            }),
+            Some("application_message_create_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::SelfUpdate),
+            Some("update_commit_create_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::RemoveMembers { members: vec![] }),
+            Some("remove_commit_create_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::ReceiveApplicationMessage { profile: true }),
+            Some("application_message_receive_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::ReceiveApplicationMessage {
+                profile: false,
+            }),
+            None
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::ReceiveCommit {
+                profile: true,
+                commit_create_op: None,
+                commit_receive_sampling_policy: None,
+                commit_receive_sampling_seed: None,
+                commit_receive_sample_index: None,
+                commit_receive_sample_count: None,
+                commit_receive_population_size: None,
+            }),
+            Some("commit_receive_total_local")
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::ReceiveCommit {
+                profile: false,
+                commit_create_op: None,
+                commit_receive_sampling_policy: None,
+                commit_receive_sampling_seed: None,
+                commit_receive_sample_index: None,
+                commit_receive_sample_count: None,
+                commit_receive_population_size: None,
+            }),
+            None
+        );
+        assert_eq!(
+            expected_canonical_profile_total(&Command::CreateGroup),
+            None
+        );
+    }
+}
 
 struct ClientSlot {
     client: Client,
@@ -534,6 +618,15 @@ async fn client_command_actor(
         let command_name = envelope.command.kind();
         let is_mutating = envelope.command.is_mls_mutating();
         let phase = envelope.phase.as_deref().unwrap_or("-");
+        let has_benchmark_context = envelope.benchmark_phase.is_some()
+            || envelope.benchmark_operation.is_some()
+            || envelope.benchmark_plateau_index.is_some();
+        let expected_profile_total =
+            (slot.profile_enabled && profiling_enabled() && has_benchmark_context)
+                .then(|| expected_canonical_profile_total(&envelope.command))
+                .flatten();
+        let persisted_profile_count_before =
+            expected_profile_total.map(valid_persisted_canonical_total_count);
 
         if let Some(request_id) = envelope.request_id.as_deref() {
             if let Some(response) = slot.response_cache.get(request_id) {
@@ -585,9 +678,6 @@ async fn client_command_actor(
         // Clear stale benchmark context and worker ID, then set current command's context.
         set_benchmark_context(BenchmarkContext::default());
         set_worker_id(client_id.clone());
-        let has_benchmark_context = envelope.benchmark_phase.is_some()
-            || envelope.benchmark_operation.is_some()
-            || envelope.benchmark_plateau_index.is_some();
         let benchmark_context = BenchmarkContext {
             benchmark_plateau_index: envelope.benchmark_plateau_index,
             benchmark_target_size: envelope.benchmark_target_size,
@@ -656,6 +746,21 @@ async fn client_command_actor(
             }
         }
         drop(heap_budget_guard);
+
+        if let (Ok(message), Some(op), Some(before)) = (
+            &result,
+            expected_profile_total,
+            persisted_profile_count_before,
+        ) {
+            if !message.contains("queued for retry")
+                && valid_persisted_canonical_total_count(op) <= before
+            {
+                result = Err(anyhow!(
+                    "PROFILE_MEASUREMENT_NOT_PERSISTED: canonical_op={} requires positive cpu_process_ns and alloc_bytes",
+                    op
+                ));
+            }
+        }
 
         let response = match result {
             Ok(message) => CommandResponse::ok(message),
