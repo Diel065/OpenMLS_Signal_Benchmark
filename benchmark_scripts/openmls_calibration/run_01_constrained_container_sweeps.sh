@@ -25,6 +25,7 @@ NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 
 WORKERS="${WORKERS:-1024}"
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
+PROFILED_FAILURE_STOP_AFTER="${PROFILED_FAILURE_STOP_AFTER:-0}"
 SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
 SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
 PACKED_PER_CONTAINER="${PACKED_PER_CONTAINER:-256}"
@@ -50,10 +51,14 @@ FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 CPU_SWEEP_FRACTIONS="${CPU_SWEEP_FRACTIONS:-1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01}"
 OPENMLS_RAM_SWEEP_VALUES="${OPENMLS_RAM_SWEEP_VALUES:-32k,64k,128k,512k,1m,2m,8m,32m,256m,1g}"
-SIGNAL_RAM_SWEEP_VALUES="${SIGNAL_RAM_SWEEP_VALUES:-8m,16m,32m,64m,128m,256m,512m,1g,2g,3g}"
+SIGNAL_RAM_SWEEP_VALUES="${SIGNAL_RAM_SWEEP_VALUES:-10k,50k,100k,500k,1m,5m,10m,50m,100m,500m}"
+REMOVE_REJOIN="${REMOVE_REJOIN:-0}"
+STEP_SIZE_SWITCH_AT="${STEP_SIZE_SWITCH_AT:-}"
+STEP_SIZE_AFTER_SWITCH="${STEP_SIZE_AFTER_SWITCH:-}"
 CPU_THROTTLED_PERIOD_THRESHOLD="${CPU_THROTTLED_PERIOD_THRESHOLD:-0.05}"
 
 # Signal-specific defaults (smaller sizes, pairwise semantics)
+SIGNAL_MIN_CONVERSATION_SIZE="${SIGNAL_MIN_CONVERSATION_SIZE:-2}"
 SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-256}"
 SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
 SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
@@ -183,6 +188,10 @@ run_sweep() {
   if [ "$RESOURCE_OUTPUT_VALIDATION" != "1" ]; then
     validation_args=(--no-resource-output-validation)
   fi
+  local -a remove_rejoin_args=()
+  if [ "$REMOVE_REJOIN" = "1" ]; then
+    remove_rejoin_args=(--remove-rejoin)
+  fi
 
   echo "===== [01/$label] iteration $iter/$N run_id=$run_id ====="
   cd "$OPENMLS_DIR"
@@ -200,6 +209,7 @@ run_sweep() {
     --bridge-count "$BRIDGE_COUNT" \
     --resource-experiment "$sweep_type" \
     --profiled-singleton-count "$PROFILED_SINGLETON_COUNT" \
+    --profiled-failure-stop-after "$PROFILED_FAILURE_STOP_AFTER" \
     --resource-failure-policy remove-and-continue \
     --cpu-affinity-mode "$mode" \
     --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
@@ -228,6 +238,7 @@ run_sweep() {
     --force-cleanup-mls-ports \
     --runner-in-docker \
     --no-aggregate \
+    "${remove_rejoin_args[@]}" \
     "${validation_args[@]}" \
     "${image_args[@]}"
   require_events_csv "$run_dir"
@@ -256,6 +267,11 @@ run_signal_sweep() {
   echo "===== [01/Signal-$label] iteration $iter/$N run_id=$run_id ====="
   cd "$SIGNAL_DIR"
 
+  local piecewise_step_args=()
+  if [ -n "$STEP_SIZE_SWITCH_AT" ] || [ -n "$STEP_SIZE_AFTER_SWITCH" ]; then
+    piecewise_step_args=(--step-size-switch-at "$STEP_SIZE_SWITCH_AT" --step-size-after-switch "$STEP_SIZE_AFTER_SWITCH")
+  fi
+
   case "$sweep_type" in
     cpu-quota-sweep)
       "$py" scripts/run_compose_benchmark.py \
@@ -271,6 +287,7 @@ run_signal_sweep() {
         --bridge-count "$BRIDGE_COUNT" \
         --resource-experiment cpu-quota-sweep \
         --profiled-singleton-count "$PROFILED_SINGLETON_COUNT" \
+        --profiled-failure-stop-after "$PROFILED_FAILURE_STOP_AFTER" \
         --resource-failure-policy stop-on-profiled-failure \
         --strict-cpuset \
         --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
@@ -280,9 +297,11 @@ run_signal_sweep() {
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
         --health-poll-seconds 0.5 \
         --worker-health-poll-ms 250 \
-        --min-size 2 \
+        --min-size "$SIGNAL_MIN_CONVERSATION_SIZE" \
         --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
         --step-size "$SIGNAL_STEP_SIZE" \
+        "${piecewise_step_args[@]}" \
+        --plateau-order "$PLATEAU_ORDER" \
         --roundtrips "$SIGNAL_ROUNDTRIPS" \
         --app-rounds "$SIGNAL_APP_ROUNDS" \
         --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
@@ -292,11 +311,12 @@ run_signal_sweep() {
         --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
         --max-fanout-parallelism "$FANOUT_PARALLELISM" \
         --min-fanout-parallelism "$FANOUT_MIN" \
+        --profile-only-singletons \
         --force-cleanup-signal-ports \
         --runner-in-docker \
         "${image_args[@]}"
       ;;
-    ram-docker-cgroup-sweep)
+    ram-app-heap-sweep)
       "$py" scripts/run_compose_benchmark.py \
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
@@ -308,20 +328,23 @@ run_signal_sweep() {
         --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
         --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
         --bridge-count "$BRIDGE_COUNT" \
-        --resource-experiment ram-docker-cgroup-sweep \
+        --resource-experiment ram-app-heap-sweep \
         --profiled-singleton-count "$PROFILED_SINGLETON_COUNT" \
-        --resource-failure-policy stop-on-profiled-failure \
+        --profiled-failure-stop-after "$PROFILED_FAILURE_STOP_AFTER" \
+        --resource-failure-policy remove-and-continue \
         --strict-cpuset \
         --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
         --embedded-docker-memory 4g \
-        --ram-sweep-values "$SIGNAL_RAM_SWEEP_VALUES" \
+        --ram-app-heap-sweep-values "$SIGNAL_RAM_SWEEP_VALUES" \
         --health-timeout-seconds "$HEALTH_TIMEOUT" \
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \
         --health-poll-seconds 0.5 \
         --worker-health-poll-ms 250 \
-        --min-size 2 \
+        --min-size "$SIGNAL_MIN_CONVERSATION_SIZE" \
         --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
         --step-size "$SIGNAL_STEP_SIZE" \
+        "${piecewise_step_args[@]}" \
+        --plateau-order "$PLATEAU_ORDER" \
         --roundtrips "$SIGNAL_ROUNDTRIPS" \
         --app-rounds "$SIGNAL_APP_ROUNDS" \
         --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
@@ -331,6 +354,7 @@ run_signal_sweep() {
         --worker-outbound-http-permits "$WORKER_OUTBOUND_PERMITS" \
         --max-fanout-parallelism "$FANOUT_PARALLELISM" \
         --min-fanout-parallelism "$FANOUT_MIN" \
+        --profile-only-singletons \
         --force-cleanup-signal-ports \
         --runner-in-docker \
         "${image_args[@]}"
@@ -371,11 +395,11 @@ if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
   cleanup_docker_signal
   for iter in $(seq 1 "$N"); do
     case "$SWEEP" in
-      ram) run_signal_sweep "$iter" "ram-docker-cgroup-sweep" "RAM cgroup sweep" ;;
+      ram) run_signal_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep" ;;
       cpu) run_signal_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep" ;;
       both)
+        run_signal_sweep "$iter" "ram-app-heap-sweep" "RAM app-heap sweep"
         run_signal_sweep "$iter" "cpu-quota-sweep" "CPU quota sweep"
-        run_signal_sweep "$iter" "ram-docker-cgroup-sweep" "RAM cgroup sweep"
         ;;
       *) echo "ERROR: SWEEP must be ram, cpu, or both" >&2; exit 1 ;;
     esac

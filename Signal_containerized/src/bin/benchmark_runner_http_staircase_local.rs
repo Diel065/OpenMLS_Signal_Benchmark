@@ -139,6 +139,7 @@ fn main() -> Result<()> {
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         profile_only_singletons: false,
         no_aggregate: false,
+        profiled_failure_stop_after: 0,
         worker_layout: None,
         run_id: args.run_id,
         scenario: args.scenario,

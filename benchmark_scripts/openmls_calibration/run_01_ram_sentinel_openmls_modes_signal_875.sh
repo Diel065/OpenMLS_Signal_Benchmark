@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# RAM-only sentinel sweep: OpenMLS normal, then Signal.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+COMMON_ENV=(
+  OUTPUT_ROOT="${OUTPUT_ROOT:-/dev/shm}"
+  SWEEP=ram
+  N="${N:-1}"
+  BUILD_IMAGES="${BUILD_IMAGES:-1}"
+  WORKERS="${WORKERS:-875}"
+  MAX_GROUP_SIZE="${MAX_GROUP_SIZE:-875}"
+  STEP_SIZE="${STEP_SIZE:-16}"
+  PLATEAU_ORDER=ascending
+  PROFILED_SINGLETON_COUNT=5
+  PROFILED_FAILURE_STOP_AFTER=4
+  SINGLETON_MIN_COUNT=5
+  SIGNAL_WORKERS="${SIGNAL_WORKERS:-875}"
+  SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-875}"
+  SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
+  OPENMLS_RAM_SWEEP_VALUES="${OPENMLS_RAM_SWEEP_VALUES:-750k,2m,3m,4m,100m}"
+  SIGNAL_RAM_SWEEP_VALUES="${SIGNAL_RAM_SWEEP_VALUES:-750k,2m,3m,4m,100m}"
+  PAYLOAD_SIZES="${PAYLOAD_SIZES:-512}"
+)
+
+env "${COMMON_ENV[@]}" PROTOCOL=openmls REMOVE_REJOIN=0 \
+  "$SCRIPT_DIR/run_01_constrained_container_sweeps.sh"
+
+env "${COMMON_ENV[@]}" PROTOCOL=signal REMOVE_REJOIN=0 \
+  "$SCRIPT_DIR/run_01_constrained_container_sweeps.sh"

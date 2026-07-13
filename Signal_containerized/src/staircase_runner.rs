@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -114,6 +114,7 @@ pub struct StaircaseConfig {
     pub profile_only_singletons: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
+    pub profiled_failure_stop_after: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,15 +500,51 @@ struct RunnerEventLog {
     path: PathBuf,
     oom_evidence_path: PathBuf,
     run_dir: PathBuf,
+    profiled_budget_failures: Mutex<HashSet<String>>,
+    profiled_failure_stop_after: usize,
 }
 
 impl RunnerEventLog {
-    fn new(run_dir: &Path) -> Self {
+    fn new(run_dir: &Path, profiled_failure_stop_after: usize) -> Self {
         Self {
             path: run_dir.join("runner-events.jsonl"),
             oom_evidence_path: run_dir.join("oom_events.jsonl"),
             run_dir: run_dir.to_path_buf(),
+            profiled_budget_failures: Mutex::new(HashSet::new()),
+            profiled_failure_stop_after,
         }
+    }
+
+    fn count_profiled_budget_failure(
+        &self,
+        worker: &WorkerSpec,
+        failure_class: &str,
+    ) -> Result<()> {
+        if self.profiled_failure_stop_after == 0
+            || !worker.profile_enabled
+            || worker.container_mode != ContainerMode::Singleton
+            || !matches!(
+                failure_class,
+                "app_heap_budget_exceeded"
+                    | "app_heap_budget_allocator_abort"
+                    | "embedded_budget_timeout"
+                    | "cpu_starvation_timeout"
+                    | "oom_kill"
+            )
+        {
+            return Ok(());
+        }
+        let mut failures = self.profiled_budget_failures.lock().unwrap();
+        failures.insert(worker.id.clone());
+        let count = failures.len();
+        if count >= self.profiled_failure_stop_after {
+            return Err(ExpectedProfiledFailureStop {
+                count,
+                limit: self.profiled_failure_stop_after,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn find_oom_evidence(&self, worker: &WorkerSpec) -> Option<OomEvidence> {
@@ -523,12 +560,13 @@ impl RunnerEventLog {
         None
     }
 
-    fn record_oom_failure(
+    fn record_worker_failure(
         &self,
         cursor: &BenchmarkCursor,
         worker: &WorkerSpec,
         error: &anyhow::Error,
-        evidence: &OomEvidence,
+        failure_class: &str,
+        evidence: Option<&OomEvidence>,
         action: &str,
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
@@ -538,10 +576,10 @@ impl RunnerEventLog {
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
             failed_physical_worker_id: worker.physical_worker_id.clone(),
-            failure_class: "oom_kill".to_string(),
+            failure_class: failure_class.to_string(),
             failure_detail: format!("{:#}", error),
-            failure_evidence_source: non_empty_string(&evidence.source),
-            failure_evidence_detail: evidence.detail.clone(),
+            failure_evidence_source: evidence.and_then(|e| non_empty_string(&e.source)),
+            failure_evidence_detail: evidence.and_then(|e| e.detail.clone()),
             failure_action: action.to_string(),
             reassigned_to_worker_id: reassigned_to.map(|candidate| candidate.id.clone()),
             benchmark_plateau_index: cursor.plateau_index,
@@ -569,19 +607,58 @@ impl RunnerEventLog {
             append_signal_profile_event(&profile_path, &event.to_profile_event())
         {
             eprintln!(
-                "[oom-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
+                "[resource-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
                 worker.id,
                 profile_error,
                 self.path.display()
             );
         }
         eprintln!(
-            "[oom-attrition] worker={} physical_worker={} phase={} operation={} action={}",
-            worker.id, worker.physical_worker_id, cursor.phase, cursor.operation, action
+            "[resource-attrition] worker={} physical_worker={} class={} phase={} operation={} action={}",
+            worker.id, worker.physical_worker_id, failure_class, cursor.phase, cursor.operation, action
         );
+        self.count_profiled_budget_failure(worker, failure_class)?;
         Ok(())
     }
+
+    fn record_oom_failure(
+        &self,
+        cursor: &BenchmarkCursor,
+        worker: &WorkerSpec,
+        error: &anyhow::Error,
+        evidence: &OomEvidence,
+        action: &str,
+        reassigned_to: Option<&WorkerSpec>,
+    ) -> Result<()> {
+        self.record_worker_failure(
+            cursor,
+            worker,
+            error,
+            "oom_kill",
+            Some(evidence),
+            action,
+            reassigned_to,
+        )
+    }
 }
+
+#[derive(Debug)]
+struct ExpectedProfiledFailureStop {
+    count: usize,
+    limit: usize,
+}
+
+impl fmt::Display for ExpectedProfiledFailureStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "expected profiled resource-failure stop after {}/{} workers",
+            self.count, self.limit
+        )
+    }
+}
+
+impl StdError for ExpectedProfiledFailureStop {}
 
 impl RunnerEvent {
     fn to_profile_event(&self) -> SignalProfileEvent {
@@ -835,6 +912,13 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
 
 pub fn measured_active_participants(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+fn any_profile_enabled_remaining(active: &[WorkerSpec], idle: &VecDeque<WorkerSpec>) -> bool {
+    active
+        .iter()
+        .chain(idle.iter())
+        .any(|worker| worker.profile_enabled)
 }
 
 fn frontload_profile_enabled_singletons_in_idle(
@@ -1142,7 +1226,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
-    let runner_events = RunnerEventLog::new(&run_dir);
+    let runner_events = RunnerEventLog::new(&run_dir, config.profiled_failure_stop_after);
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
     let min_fanout_parallelism =
@@ -1306,6 +1390,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                     .saturating_div(2),
             );
 
+            if config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+                eprintln!(
+                    "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                    target_size
+                );
+                break;
+            }
+
             if let Err(e) = run_application_phase(
                 &http,
                 &kr_url,
@@ -1323,6 +1415,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             .await
             {
                 plateau_result = Err(e);
+                break;
+            }
+
+            if config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+                eprintln!(
+                    "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                    target_size
+                );
                 break;
             }
 
@@ -1352,6 +1452,20 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             "[sidecars] failed to write post-benchmark sidecars: {:#}",
             e
         );
+    }
+
+    if let Err(ref error) = run_result {
+        if error
+            .downcast_ref::<ExpectedProfiledFailureStop>()
+            .is_some()
+        {
+            eprintln!("[resource-sweep] {:#}; exiting successfully", error);
+            println!(
+                "Signal staircase benchmark finished early. Output in {}",
+                run_dir.display()
+            );
+            return Ok(());
+        }
     }
 
     if run_result.is_ok() {
@@ -1719,6 +1833,24 @@ async fn record_worker_oom_if_evidenced(
     reassigned_to: Option<&WorkerSpec>,
 ) -> Result<bool> {
     let Some(evidence) = runner_events.find_oom_evidence(worker).await else {
+        let failure_class = classify_worker_error(error);
+        if matches!(
+            failure_class,
+            "app_heap_budget_exceeded"
+                | "app_heap_budget_allocator_abort"
+                | "embedded_budget_timeout"
+        ) {
+            runner_events.record_worker_failure(
+                cursor,
+                worker,
+                error,
+                failure_class,
+                None,
+                action,
+                reassigned_to,
+            )?;
+            return Ok(true);
+        }
         return Ok(false);
     };
     runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
@@ -2008,14 +2140,16 @@ async fn establish_sessions(
     conversation_size: usize,
     cursor: &BenchmarkCursor,
     decrypt_on_peer: bool,
-) -> Result<()> {
+    runner_events: &RunnerEventLog,
+) -> Result<HashSet<String>> {
+    let mut failed_ids = HashSet::new();
     if existing_participants.is_empty() {
-        return Ok(());
+        return Ok(failed_ids);
     }
 
     let workflow_id = next_workflow_id();
     let pair_count = existing_participants.len();
-    for (pair_index, peer) in existing_participants.iter().enumerate() {
+    'pairs: for (pair_index, peer) in existing_participants.iter().enumerate() {
         let establish_command = Command::EstablishSessions {
             participants: vec![peer.id.clone()],
             conversation_size: Some(conversation_size),
@@ -2027,14 +2161,30 @@ async fn establish_sessions(
             Some(cursor),
         )
         .with_workflow(workflow_id, pair_index, pair_count);
-        send_cmd_expect_ok_fragment_with_context(
+        if let Err(error) = send_cmd_expect_ok_fragment_with_context(
             http,
             actor,
             &establish_command,
             "session establishment",
             &establish_context,
         )
-        .await?;
+        .await
+        {
+            if record_worker_oom_if_evidenced(
+                runner_events,
+                cursor,
+                actor,
+                &error,
+                "remove_active_participant",
+                None,
+            )
+            .await?
+            {
+                failed_ids.insert(actor.id.clone());
+                return Ok(failed_ids);
+            }
+            return Err(error);
+        }
 
         let initial_message = format!("signal-initial-handshake:{}->{}", actor.id, peer.id);
         let encrypt_command = Command::EncryptMessage {
@@ -2047,34 +2197,67 @@ async fn establish_sessions(
             &encrypt_command,
             Some("handshake.initial_message_encrypt"),
         );
-        send_cmd_expect_ok_fragment_with_context(
+        if let Err(error) = send_cmd_expect_ok_fragment_with_context(
             http,
             actor,
             &encrypt_command,
             "encrypted and sent",
             &encrypt_context,
         )
-        .await?;
+        .await
+        {
+            if record_worker_oom_if_evidenced(
+                runner_events,
+                cursor,
+                actor,
+                &error,
+                "remove_active_participant",
+                None,
+            )
+            .await?
+            {
+                failed_ids.insert(actor.id.clone());
+                return Ok(failed_ids);
+            }
+            return Err(error);
+        }
 
         if decrypt_on_peer {
             let decrypt_command = Command::DecryptMessage {
                 sender: actor.id.clone(),
                 profile: true,
                 conversation_size: Some(2),
+                expected_plaintext_bytes: None,
             };
             let decrypt_context = WorkerCommandContext::with_metadata(
                 peer,
                 &decrypt_command,
                 Some("handshake.initial_message_decrypt"),
             );
-            send_cmd_expect_ok_fragment_with_context(
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
                 http,
                 peer,
                 &decrypt_command,
                 "pairwise message received",
                 &decrypt_context,
             )
-            .await?;
+            .await
+            {
+                if record_worker_oom_if_evidenced(
+                    runner_events,
+                    cursor,
+                    peer,
+                    &error,
+                    "remove_active_participant",
+                    None,
+                )
+                .await?
+                {
+                    failed_ids.insert(peer.id.clone());
+                    continue 'pairs;
+                }
+                return Err(error);
+            }
 
             let update_opks_command = Command::UpdateOneTimePrekeys;
             let update_opks_context = WorkerCommandContext::with_metadata(
@@ -2082,18 +2265,34 @@ async fn establish_sessions(
                 &update_opks_command,
                 Some("prekey.maintenance_after_handshake"),
             );
-            send_cmd_expect_ok_fragment_with_context(
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
                 http,
                 peer,
                 &update_opks_command,
                 "one-time prekey stock",
                 &update_opks_context,
             )
-            .await?;
+            .await
+            {
+                if record_worker_oom_if_evidenced(
+                    runner_events,
+                    cursor,
+                    peer,
+                    &error,
+                    "remove_active_participant",
+                    None,
+                )
+                .await?
+                {
+                    failed_ids.insert(peer.id.clone());
+                    continue 'pairs;
+                }
+                return Err(error);
+            }
         }
     }
 
-    Ok(())
+    Ok(failed_ids)
 }
 
 async fn broadcast_message(
@@ -2146,6 +2345,7 @@ async fn broadcast_message(
                 sender: sender.id.clone(),
                 profile: is_profiled,
                 conversation_size: Some(conversation_size),
+                expected_plaintext_bytes: cursor.payload_size,
             },
             phase: Some("application.fanout_receive_message".to_string()),
             profile: is_profiled.then_some(true),
@@ -2260,7 +2460,8 @@ async fn enroll_participants(
     // Establish pairwise sessions from each new participant to every participant that
     // will be active after this enrollment batch. This includes peers enrolled in the
     // same batch; otherwise the first plateau in a batched ascent lacks new-new sessions.
-    let existing_ids: Vec<WorkerSpec> = active.clone();
+    let mut existing_ids: Vec<WorkerSpec> = active.clone();
+    let mut failed_ids = HashSet::new();
     if profile_only_singletons {
         // When only singletons carry profiling, prioritise profile-enabled
         // initiators so every (singleton→peer) session establishment runs
@@ -2272,7 +2473,7 @@ async fn enroll_participants(
 
         // Phase A: existing profile-enabled → new non-profiled
         //          decrypt_on_peer = true (packed workers need the session)
-        let profile_enabled_existing: Vec<_> = existing_ids
+        let mut profile_enabled_existing: Vec<_> = existing_ids
             .iter()
             .filter(|w| w.profile_enabled)
             .cloned()
@@ -2283,6 +2484,9 @@ async fn enroll_participants(
             .cloned()
             .collect();
         for existing in &profile_enabled_existing {
+            if failed_ids.contains(&existing.id) {
+                continue;
+            }
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2291,29 +2495,39 @@ async fn enroll_participants(
                 "establish_session_existing_profiled",
             );
             if !non_profile_prepared.is_empty() {
-                establish_sessions(
-                    http,
-                    existing,
-                    &non_profile_prepared,
-                    fanout,
-                    target_size,
-                    &est_cursor,
-                    true,
-                )
-                .await?;
+                failed_ids.extend(
+                    establish_sessions(
+                        http,
+                        existing,
+                        &non_profile_prepared,
+                        fanout,
+                        target_size,
+                        &est_cursor,
+                        true,
+                        runner_events,
+                    )
+                    .await?,
+                );
             }
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        profile_enabled_existing.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase B: existing profile-enabled → new profile-enabled
-        //          decrypt_on_peer = false (the other singleton gets its
-        //          own profiled initiator turn in Phase C)
+        // Phase B: existing profile-enabled → new profile-enabled.
+        // Decrypt now so application receives do not consume stale handshakes.
         let profile_prepared: Vec<_> = prepared
             .iter()
             .filter(|w| w.profile_enabled)
             .cloned()
             .collect();
         for existing in &profile_enabled_existing {
-            if profile_prepared.is_empty() {
+            let peers: Vec<_> = profile_prepared
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
+            if peers.is_empty() {
                 break;
             }
             let est_cursor = BenchmarkCursor::new(
@@ -2323,22 +2537,39 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_existing_to_new_profiled",
             );
-            establish_sessions(
-                http,
-                existing,
-                &profile_prepared,
-                fanout,
-                target_size,
-                &est_cursor,
-                false,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase C: new profile-enabled → existing + peer-new
         for p in &profile_prepared {
-            let mut peers: Vec<WorkerSpec> = existing_ids.clone();
-            peers.extend(prepared.iter().filter(|peer| peer.id != p.id).cloned());
+            if failed_ids.contains(&p.id) {
+                continue;
+            }
+            let mut peers: Vec<WorkerSpec> = existing_ids
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
+            peers.extend(
+                prepared
+                    .iter()
+                    .filter(|peer| peer.id != p.id && !failed_ids.contains(&peer.id))
+                    .cloned(),
+            );
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2346,8 +2577,23 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_new_profiled",
             );
-            establish_sessions(http, p, &peers, fanout, target_size, &est_cursor, true).await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    p,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase D: existing non-profiled → prepared
         let non_profile_existing: Vec<_> = existing_ids
@@ -2356,6 +2602,14 @@ async fn enroll_participants(
             .cloned()
             .collect();
         for existing in &non_profile_existing {
+            if failed_ids.contains(&existing.id) {
+                continue;
+            }
+            let peers: Vec<_> = prepared
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2363,25 +2617,38 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_existing_nonprofiled",
             );
-            establish_sessions(
-                http,
-                existing,
-                &prepared,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase E: new non-profiled → existing + peer-new
         for participant in &non_profile_prepared {
-            let mut peers = existing_ids.clone();
+            if failed_ids.contains(&participant.id) {
+                continue;
+            }
+            let mut peers: Vec<_> = existing_ids
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
             peers.extend(
                 prepared
                     .iter()
-                    .filter(|peer| peer.id != participant.id)
+                    .filter(|peer| peer.id != participant.id && !failed_ids.contains(&peer.id))
                     .cloned(),
             );
             let est_cursor = BenchmarkCursor::new(
@@ -2391,16 +2658,19 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_new_nonprofiled",
             );
-            establish_sessions(
-                http,
-                participant,
-                &peers,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    participant,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
     } else {
         for (idx, participant) in prepared.iter().enumerate() {
@@ -2419,16 +2689,19 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session",
             );
-            establish_sessions(
-                http,
-                participant,
-                &peers,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    participant,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
 
         // Also establish sessions from existing participants to the new ones.
@@ -2440,19 +2713,24 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_reverse",
             );
-            establish_sessions(
-                http,
-                existing,
-                &prepared,
-                fanout,
-                target_size,
-                &enroll_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &prepared,
+                    fanout,
+                    target_size,
+                    &enroll_cursor,
+                    true,
+                    runner_events,
+                )
+                .await?,
+            );
         }
     }
 
+    active.retain(|worker| !failed_ids.contains(&worker.id));
+    prepared.retain(|worker| !failed_ids.contains(&worker.id));
     let enrolled_count = prepared.len();
     active.extend(prepared);
     let new_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();

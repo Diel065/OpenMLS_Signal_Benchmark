@@ -36,7 +36,7 @@ APP_ROUNDS="${APP_ROUNDS:-4}"
 PLATEAU_ORDER="${PLATEAU_ORDER:-staircase}"
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
-PAYLOAD_SIZES="${PAYLOAD_SIZES:-32,256,2048}"
+PAYLOAD_SIZES="${PAYLOAD_SIZES:-32,256,512,2048}"
 
 CPU_AFFINITY_SAMPLE="${CPU_AFFINITY_SAMPLE:-20}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
@@ -155,6 +155,7 @@ run_baseline() {
     --update-rounds "$UPDATE_ROUNDS" \
     --app-rounds "$APP_ROUNDS" \
     --max-update-samples-per-plateau "$MAX_UPDATE_SAMPLES_PER_PLATEAU" \
+    --add-batch-extremes-only \
     --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
     --payload-sizes "$PAYLOAD_SIZES" \
     --http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \

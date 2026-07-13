@@ -53,6 +53,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--update-rounds", type=int, default=2)
     p.add_argument("--max-update-samples-per-plateau", type=int, default=16)
+    p.add_argument(
+        "--add-batch-extremes-only",
+        action="store_true",
+        help="Use only k=1 and k=max AddCommit batches, except transition remainders.",
+    )
 
     p.add_argument("--app-rounds", type=int, default=2)
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
@@ -559,6 +564,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="stop-on-profiled-failure",
         choices=["stop-on-profiled-failure", "remove-and-continue"],
         help="Policy for handling profiled worker failures (default: stop-on-profiled-failure)",
+    )
+    p.add_argument(
+        "--profiled-failure-stop-after",
+        type=int,
+        default=0,
+        help="Exit successfully after this many unique profiled singleton resource failures (0 disables).",
     )
     p.add_argument(
         "--remove-rejoin",
@@ -4546,6 +4557,7 @@ def main() -> int:
                 str(args.update_rounds),
                 "--max-update-samples-per-plateau",
                 str(args.max_update_samples_per_plateau),
+                *(["--add-batch-extremes-only"] if args.add_batch_extremes_only else []),
                 "--app-rounds",
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
@@ -4577,6 +4589,8 @@ def main() -> int:
                 *(["--remove-rejoin"] if args.remove_rejoin else []),
                 "--profiled-failure-policy",
                 args.resource_failure_policy,
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4613,6 +4627,7 @@ def main() -> int:
                 str(args.update_rounds),
                 "--max-update-samples-per-plateau",
                 str(args.max_update_samples_per_plateau),
+                *(["--add-batch-extremes-only"] if args.add_batch_extremes_only else []),
                 "--app-rounds",
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
@@ -4644,6 +4659,8 @@ def main() -> int:
                 *(["--remove-rejoin"] if args.remove_rejoin else []),
                 "--profiled-failure-policy",
                 args.resource_failure_policy,
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4850,19 +4867,26 @@ def main() -> int:
             if agg_exit != 0:
                 print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
 
+        if exit_code == 0 and use_no_aggregate and not args.preflight_only:
+            layout_file = run_dir / "worker_layout.json"
+            workers_file = run_dir / "workers.combined.txt"
+            agg_exit = run_standalone_aggregation(
+                run_dir,
+                layout_file if layout_file.exists() else None,
+                workers_file if workers_file.exists() else None,
+                allow_partial=True,
+                manifest_path=run_dir / "aggregation_manifest.json",
+            )
+            if agg_exit != 0:
+                raise RuntimeError(f"standalone aggregation failed with exit={agg_exit}")
+
         if not args.preflight_only:
             validate_artifacts(
                 run_dir,
                 args.worker_layout_mode,
-                require_aggregate=not use_no_aggregate,
+                require_aggregate=True,
             )
-            if use_no_aggregate:
-                print(
-                    "[aggregate] --no-aggregate used; skipping integrated aggregation manifest",
-                    flush=True,
-                )
-            else:
-                write_integrated_aggregation_manifest(run_dir, run_id)
+            write_integrated_aggregation_manifest(run_dir, run_id)
 
         # Stop external device workers
         if external_device_stop_required:

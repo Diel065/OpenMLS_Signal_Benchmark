@@ -610,7 +610,7 @@ async fn participant_command_actor(
             &participant_id,
             envelope.phase.as_deref(),
         );
-        let heap_budget_guard = if slot.profile_enabled {
+        let heap_budget_guard = if slot.profile_enabled && embedded_heap_budget.enabled {
             let operation_family = operation_family_for_command(command_name);
             Some(begin_heap_budget_operation(OperationAttribution {
                 operation_family: operation_family.clone(),

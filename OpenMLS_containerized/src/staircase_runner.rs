@@ -74,6 +74,7 @@ pub struct StaircaseConfig {
     pub max_app_samples_per_payload: usize,
     pub max_commit_receive_samples_per_plateau: usize,
     pub commit_receive_sampling_seed: u64,
+    pub add_batch_extremes_only: bool,
     pub payload_sizes: PayloadSizes,
     pub scenario_seed: u64,
     pub run_id: String,
@@ -94,6 +95,7 @@ pub struct StaircaseConfig {
     pub no_aggregate: bool,
     pub failure_experiment: bool,
     pub profiled_failure_policy: ProfiledFailurePolicy,
+    pub profiled_failure_stop_after: usize,
     pub remove_rejoin: bool,
 }
 
@@ -633,15 +635,51 @@ struct RunnerEventLog {
     path: PathBuf,
     oom_evidence_path: PathBuf,
     run_dir: PathBuf,
+    profiled_budget_failures: Mutex<HashSet<String>>,
+    profiled_failure_stop_after: usize,
 }
 
 impl RunnerEventLog {
-    fn new(run_dir: &Path) -> Self {
+    fn new(run_dir: &Path, profiled_failure_stop_after: usize) -> Self {
         Self {
             path: run_dir.join("runner-events.jsonl"),
             oom_evidence_path: run_dir.join("oom_events.jsonl"),
             run_dir: run_dir.to_path_buf(),
+            profiled_budget_failures: Mutex::new(HashSet::new()),
+            profiled_failure_stop_after,
         }
+    }
+
+    fn count_profiled_budget_failure(
+        &self,
+        worker: &WorkerSpec,
+        failure_class: &str,
+    ) -> Result<()> {
+        if self.profiled_failure_stop_after == 0
+            || !worker.profile_enabled
+            || worker.container_mode != ContainerMode::Singleton
+            || !matches!(
+                failure_class,
+                "app_heap_budget_exceeded"
+                    | "app_heap_budget_allocator_abort"
+                    | "embedded_budget_timeout"
+                    | "cpu_starvation_timeout"
+                    | "oom_kill"
+            )
+        {
+            return Ok(());
+        }
+        let mut failures = self.profiled_budget_failures.lock().unwrap();
+        failures.insert(worker.id.clone());
+        let count = failures.len();
+        if count >= self.profiled_failure_stop_after {
+            return Err(ExpectedProfiledFailureStop {
+                count,
+                limit: self.profiled_failure_stop_after,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn find_oom_evidence(&self, worker: &WorkerSpec) -> Option<OomEvidence> {
@@ -711,6 +749,7 @@ impl RunnerEventLog {
             "[oom-attrition] worker={} physical_worker={} phase={} operation={} action={}",
             worker.id, worker.physical_worker_id, cursor.phase, cursor.operation, action
         );
+        self.count_profiled_budget_failure(worker, "oom_kill")?;
         Ok(())
     }
 
@@ -771,9 +810,28 @@ impl RunnerEventLog {
             "[failure-attrition] worker={} physical_worker={} class={} phase={} operation={} action={}",
             worker.id, worker.physical_worker_id, failure_class, cursor.phase, cursor.operation, action
         );
+        self.count_profiled_budget_failure(worker, failure_class)?;
         Ok(())
     }
 }
+
+#[derive(Debug)]
+struct ExpectedProfiledFailureStop {
+    count: usize,
+    limit: usize,
+}
+
+impl fmt::Display for ExpectedProfiledFailureStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "expected profiled resource-failure stop after {}/{} workers",
+            self.count, self.limit
+        )
+    }
+}
+
+impl StdError for ExpectedProfiledFailureStop {}
 
 impl RunnerEvent {
     fn to_profile_event(&self) -> ProfileEvent {
@@ -988,6 +1046,13 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
 
 pub fn measured_active_clients(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+fn any_profile_enabled_remaining(active: &[WorkerSpec], idle: &VecDeque<WorkerSpec>) -> bool {
+    active
+        .iter()
+        .chain(idle.iter())
+        .any(|worker| worker.profile_enabled)
 }
 
 fn frontload_profile_enabled_singletons_in_idle(
@@ -1594,14 +1659,16 @@ struct MembershipBatchPlanner {
     rng: StdRng,
     cycle: VecDeque<usize>,
     cycle_cap: usize,
+    extremes_only: bool,
 }
 
 impl MembershipBatchPlanner {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, extremes_only: bool) -> Self {
         Self {
             rng: StdRng::seed_from_u64(seed),
             cycle: VecDeque::new(),
             cycle_cap: 0,
+            extremes_only,
         }
     }
 
@@ -1624,9 +1691,15 @@ impl MembershipBatchPlanner {
         let group_cap = membership_batch_group_cap(current_group_size);
         let feasible_cap = group_cap.min(max_allowed);
         if self.cycle.is_empty() || self.cycle_cap != feasible_cap {
-            let mut values = (1..=feasible_cap).collect::<Vec<_>>();
-            values.shuffle(&mut self.rng);
-            if feasible_cap > 1 {
+            let mut values = if self.extremes_only && feasible_cap > 1 {
+                vec![feasible_cap, 1]
+            } else {
+                (1..=feasible_cap).collect::<Vec<_>>()
+            };
+            if !self.extremes_only {
+                values.shuffle(&mut self.rng);
+            }
+            if feasible_cap > 1 && !self.extremes_only {
                 let max_pos = values
                     .iter()
                     .position(|value| *value == feasible_cap)
@@ -1654,14 +1727,16 @@ struct MembershipBatchPlans {
     regular: MembershipBatchPlanner,
     external: HashMap<String, MembershipBatchPlanner>,
     external_seed: u64,
+    extremes_only: bool,
 }
 
 impl MembershipBatchPlans {
-    fn new(seed: u64) -> Self {
+    fn new(seed: u64, extremes_only: bool) -> Self {
         Self {
-            regular: MembershipBatchPlanner::new(seed),
+            regular: MembershipBatchPlanner::new(seed, extremes_only),
             external: HashMap::new(),
             external_seed: seed ^ EXTERNAL_BATCH_SEED_DOMAIN,
+            extremes_only,
         }
     }
 
@@ -1675,11 +1750,26 @@ impl MembershipBatchPlans {
             let actor_seed = self.external_seed ^ stable_string_seed(actor_id);
             self.external
                 .entry(actor_id.to_string())
-                .or_insert_with(|| MembershipBatchPlanner::new(actor_seed))
-                .next_batch(current_group_size, max_allowed, "balanced_seeded_external")
+                .or_insert_with(|| MembershipBatchPlanner::new(actor_seed, self.extremes_only))
+                .next_batch(
+                    current_group_size,
+                    max_allowed,
+                    if self.extremes_only {
+                        "extremes_external"
+                    } else {
+                        "balanced_seeded_external"
+                    },
+                )
         } else {
-            self.regular
-                .next_batch(current_group_size, max_allowed, "balanced_seeded_regular")
+            self.regular.next_batch(
+                current_group_size,
+                max_allowed,
+                if self.extremes_only {
+                    "extremes_regular"
+                } else {
+                    "balanced_seeded_regular"
+                },
+            )
         }
     }
 }
@@ -1782,6 +1872,17 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
         .build()
         .context("Failed to build benchmark runner Tokio runtime")?
         .block_on(run_staircase_benchmark_async(config))
+        .or_else(|error| {
+            if error
+                .downcast_ref::<ExpectedProfiledFailureStop>()
+                .is_some()
+            {
+                eprintln!("[resource-sweep] {:#}; exiting successfully", error);
+                Ok(())
+            } else {
+                Err(error)
+            }
+        })
 }
 
 async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
@@ -1802,7 +1903,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
     configure_profiled_operation_journal(&run_dir);
-    let runner_events = RunnerEventLog::new(&run_dir);
+    let runner_events = RunnerEventLog::new(&run_dir, config.profiled_failure_stop_after);
 
     for worker in &config.workers {
         if worker.profile_enabled {
@@ -1929,6 +2030,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         roundtrips: usize,
         payload_sizes: String,
         randomized_membership_batches: bool,
+        add_batch_extremes_only: bool,
         randomized_actor_selection: bool,
         randomized_payload_order: bool,
     }
@@ -1944,6 +2046,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         roundtrips: config.roundtrips,
         payload_sizes: config.payload_sizes.to_string(),
         randomized_membership_batches: true,
+        add_batch_extremes_only: config.add_batch_extremes_only,
         randomized_actor_selection: true,
         randomized_payload_order: true,
     };
@@ -1997,10 +2100,12 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             "[sampling] external coverage lane enabled; active external devices are protected from random removal and scheduled as app/update/add/remove actors"
         );
     }
-    let mut add_membership_batches =
-        MembershipBatchPlans::new(config.scenario_seed ^ ADD_BATCH_SEED_DOMAIN);
+    let mut add_membership_batches = MembershipBatchPlans::new(
+        config.scenario_seed ^ ADD_BATCH_SEED_DOMAIN,
+        config.add_batch_extremes_only,
+    );
     let mut remove_membership_batches =
-        MembershipBatchPlans::new(config.scenario_seed ^ REMOVE_BATCH_SEED_DOMAIN);
+        MembershipBatchPlans::new(config.scenario_seed ^ REMOVE_BATCH_SEED_DOMAIN, false);
     let mut profiled_add_actor_seen = HashSet::new();
 
     create_group(&http, &leader, &mut progress).await?;
@@ -2057,6 +2162,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             "\n[plateau {}] converged at epoch {} with members {:?}",
             target_size, state.epoch, state.members
         );
+
+        if config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+            eprintln!(
+                "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                target_size
+            );
+            break;
+        }
 
         if config.remove_rejoin {
             run_remove_rejoin_phase(
@@ -2129,6 +2242,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &runner_events,
             )
             .await?;
+        }
+
+        if config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+            eprintln!(
+                "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                target_size
+            );
+            break;
         }
 
         eprintln!("\n=== Plateau {} complete ===", target_size);
@@ -3829,6 +3950,10 @@ fn is_profiled_resource_budget_failure(worker: &WorkerSpec, error: &anyhow::Erro
         && is_resource_budget_failure(error)
 }
 
+fn is_not_in_group_error(error: &anyhow::Error) -> bool {
+    format!("{:#}", error).contains("Client is not in a group")
+}
+
 #[derive(Debug)]
 struct FanoutAttempt<T> {
     worker: WorkerSpec,
@@ -5338,6 +5463,23 @@ async fn add_n_members(
         .await?
         {
             failed_recipients = dead_workers;
+        } else if let Some(batch_error) = error.downcast_ref::<BatchFanoutError>() {
+            let not_in_group = batch_error
+                .failures
+                .iter()
+                .filter(|failure| is_not_in_group_error(&failure.error))
+                .map(|failure| failure.worker.id.clone())
+                .collect::<HashSet<_>>();
+            if not_in_group.is_empty() || not_in_group.len() != batch_error.failures.len() {
+                return Err(error);
+            }
+            eprintln!(
+                "[membership-add] dropping {} active client(s) that never joined after add retry: {:?}",
+                not_in_group.len(),
+                not_in_group
+            );
+            active.retain(|worker| !not_in_group.contains(&worker.id));
+            return Ok(());
         } else {
             return Err(error);
         }
@@ -5859,9 +6001,10 @@ async fn publish_remove_members_with_epoch_race_recovery(
                     "[oom-eviction] remove_members queued after epoch race; actor={} attempt={} message={}",
                     actor.id, attempt, response.message
                 );
-                if let Some(message) =
-                    best_effort_process_pending_commits_after_epoch_race(http, actor, cursor, attempt)
-                        .await
+                if let Some(message) = best_effort_process_pending_commits_after_epoch_race(
+                    http, actor, cursor, attempt,
+                )
+                .await
                 {
                     if queued_remove_members_republished(&message) {
                         let actor_after = show_group_state(http, actor).await?;
@@ -5871,7 +6014,8 @@ async fn publish_remove_members_with_epoch_race_recovery(
                             .filter(|member| !dead_ids.contains(*member))
                             .cloned()
                             .collect::<Vec<_>>();
-                        let expected_epoch = if expected_members.len() == actor_after.members.len() {
+                        let expected_epoch = if expected_members.len() == actor_after.members.len()
+                        {
                             actor_after.epoch
                         } else {
                             actor_after.epoch + 1
@@ -6142,6 +6286,25 @@ async fn evict_oom_group_members(
                 }
                 continue;
             }
+            if let Some(batch_error) = error.downcast_ref::<BatchFanoutError>() {
+                let not_in_group = batch_error
+                    .failures
+                    .iter()
+                    .filter(|failure| is_not_in_group_error(&failure.error))
+                    .map(|failure| failure.worker.id.clone())
+                    .collect::<HashSet<_>>();
+                if !not_in_group.is_empty() && not_in_group.len() == batch_error.failures.len() {
+                    eprintln!(
+                        "[oom-eviction] dropping {} active client(s) that are not in the group: {:?}",
+                        not_in_group.len(),
+                        not_in_group
+                    );
+                    active.retain(|worker| {
+                        !dead_ids.contains(&worker.id) && !not_in_group.contains(&worker.id)
+                    });
+                    return Ok(());
+                }
+            }
             return Err(error);
         }
 
@@ -6248,6 +6411,13 @@ async fn transition_to_size(
             runner_events,
         )
         .await?;
+        if protect_profile_enabled_members && !any_profile_enabled_remaining(active, idle) {
+            eprintln!(
+                "[resource-sweep] plateau target {} cannot be reached; no profile-enabled workers remain",
+                target_size
+            );
+            break;
+        }
     }
 
     let mut external_remove_actor_ids = if external_coverage_lane {
@@ -6314,7 +6484,7 @@ async fn run_remove_rejoin_phase(
     commit_receive_sampling_seed: u64,
     rng: &mut StdRng,
     plateau_index: usize,
-    _runner_events: &RunnerEventLog,
+    runner_events: &RunnerEventLog,
 ) -> Result<()> {
     let profiled = active_profiled_indices(active);
     if profiled.len() < 2 {
@@ -6358,8 +6528,7 @@ async fn run_remove_rejoin_phase(
         Some(&kp_cursor),
     );
     let _ =
-        send_command_with_context(http, &victim, &Command::GenerateKeyPackage, &kp_context)
-            .await?;
+        send_command_with_context(http, &victim, &Command::GenerateKeyPackage, &kp_context).await?;
     // KeyPackage is now stored on DS at /keypackage/{victim.id}; AddMembers will fetch it.
 
     // ── Remove victim ──
@@ -6409,7 +6578,7 @@ async fn run_remove_rejoin_phase(
         )
         .await?;
     } else {
-        receive_commit_expect(
+        if let Err(error) = receive_commit_expect(
             http,
             &actor,
             "own commit accepted from DS",
@@ -6417,7 +6586,22 @@ async fn run_remove_rejoin_phase(
             "remove_rejoin.actor_receive_commit",
             Some(&remove_cursor),
         )
-        .await?;
+        .await
+        {
+            if record_profiled_worker_failure(
+                runner_events,
+                &remove_cursor,
+                &actor,
+                &error,
+                "stop_after_remove_rejoin_actor_failure",
+                None,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            return Err(error);
+        }
     }
 
     // Fanout RemoveCommit receivers
@@ -6454,13 +6638,9 @@ async fn run_remove_rejoin_phase(
                         expected_epoch: expected_ep,
                         profile: sampled,
                         commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6468,13 +6648,9 @@ async fn run_remove_rejoin_phase(
                     Command::ReceiveCommit {
                         profile: sampled,
                         commit_create_op: Some("remove".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6544,11 +6720,8 @@ async fn run_remove_rejoin_phase(
     let mut expected_members = actor_before.members.clone();
     expected_members.push(victim.id.clone());
     expected_members.sort();
-    let expected_after_add = expected_group_state(
-        &actor_before,
-        actor_before.epoch + 1,
-        expected_members,
-    );
+    let expected_after_add =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
     send_cmd_expect_ok_fragment_with_context(
         http,
         &actor,
@@ -6612,13 +6785,9 @@ async fn run_remove_rejoin_phase(
                         expected_epoch: expected_ep,
                         profile: sampled,
                         commit_create_op: Some("add".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -6626,13 +6795,9 @@ async fn run_remove_rejoin_phase(
                     Command::ReceiveCommit {
                         profile: sampled,
                         commit_create_op: Some("add".to_string()),
-                        commit_receive_sampling_policy: Some(
-                            "edge_middle_seeded_v1".to_string(),
-                        ),
+                        commit_receive_sampling_policy: Some("edge_middle_seeded_v1".to_string()),
                         commit_receive_sampling_seed: Some(commit_receive_sampling_seed),
-                        commit_receive_sample_index: sample_index_map
-                            .get(&worker.id)
-                            .copied(),
+                        commit_receive_sample_index: sample_index_map.get(&worker.id).copied(),
                         commit_receive_sample_count: Some(sample_count),
                         commit_receive_population_size: Some(recipients.len()),
                     }
@@ -7994,7 +8159,7 @@ mod membership_batch_tests {
 
     #[test]
     fn membership_batch_planner_covers_every_k_once_per_cycle() {
-        let mut planner = MembershipBatchPlanner::new(0x1234);
+        let mut planner = MembershipBatchPlanner::new(0x1234, false);
         let mut observed = (0..8)
             .map(|_| planner.next_batch(32, 8, "test").requested)
             .collect::<Vec<_>>();
@@ -8004,7 +8169,7 @@ mod membership_batch_tests {
 
     #[test]
     fn membership_batch_planner_uses_largest_feasible_batch_first() {
-        let mut planner = MembershipBatchPlanner::new(0x1234);
+        let mut planner = MembershipBatchPlanner::new(0x1234, false);
         let decision = planner.next_batch(32, 4, "test");
         assert_eq!(decision.requested, 4);
         assert_eq!(decision.effective, 4);
@@ -8013,7 +8178,7 @@ mod membership_batch_tests {
     #[test]
     fn membership_batch_planner_is_seed_reproducible() {
         let sequence = |seed| {
-            let mut planner = MembershipBatchPlanner::new(seed);
+            let mut planner = MembershipBatchPlanner::new(seed, false);
             (0..24)
                 .map(|_| planner.next_batch(32, 8, "test").requested)
                 .collect::<Vec<_>>()
@@ -8024,7 +8189,7 @@ mod membership_batch_tests {
 
     #[test]
     fn membership_batch_planner_respects_transition_cap() {
-        let mut planner = MembershipBatchPlanner::new(7);
+        let mut planner = MembershipBatchPlanner::new(7, false);
         for _ in 0..128 {
             let decision = planner.next_batch(256, 3, "test");
             assert!((1..=3).contains(&decision.requested));
@@ -8033,6 +8198,15 @@ mod membership_batch_tests {
             assert_eq!(decision.group_cap, 8);
             assert_eq!(decision.transition_cap, 3);
         }
+    }
+
+    #[test]
+    fn membership_batch_extremes_cover_plot_variants() {
+        let mut planner = MembershipBatchPlanner::new(7, true);
+        let observed = (0..4)
+            .map(|_| planner.next_batch(256, 8, "test").requested)
+            .collect::<Vec<_>>();
+        assert_eq!(observed, vec![8, 1, 8, 1]);
     }
 }
 
@@ -9277,7 +9451,7 @@ mod failure_experiment_tests {
     #[tokio::test]
     async fn record_failure_writes_runner_event_and_profile() {
         let run_dir = temp_dir();
-        let events = RunnerEventLog::new(&run_dir);
+        let events = RunnerEventLog::new(&run_dir, 0);
 
         let worker =
             WorkerSpec::legacy("test-001".to_string(), "http://127.0.0.1:9999".to_string());
@@ -9322,7 +9496,7 @@ mod failure_experiment_tests {
     #[tokio::test]
     async fn profiled_failure_policy_controls_continuation() {
         let run_dir = temp_dir();
-        let events = RunnerEventLog::new(&run_dir);
+        let events = RunnerEventLog::new(&run_dir, 0);
         let worker = WorkerSpec::legacy("00001".to_string(), "http://127.0.0.1:9999".to_string());
         let cursor = BenchmarkCursor::new(1, 2, 1, "membership_add", "generate_key_package");
         let err = anyhow!("APP_HEAP_BUDGET_EXCEEDED failure_class=app_heap_budget_exceeded");
@@ -9371,7 +9545,7 @@ mod failure_experiment_tests {
     #[tokio::test]
     async fn batch_app_heap_failures_become_dead_workers_for_attrition() {
         let run_dir = temp_dir();
-        let events = RunnerEventLog::new(&run_dir);
+        let events = RunnerEventLog::new(&run_dir, 0);
         let cursor = BenchmarkCursor::new(4, 50, 50, "oom_eviction", "receive_commit");
         let worker = WorkerSpec::legacy("00042".to_string(), "http://127.0.0.1:9999".to_string());
         let reassigned_to =
@@ -9612,7 +9786,7 @@ mod failure_experiment_tests {
         let layout_path = run_dir.join("worker_layout.json");
         fs::write(&layout_path, &layout_json).unwrap();
 
-        let events = RunnerEventLog::new(&run_dir);
+        let events = RunnerEventLog::new(&run_dir, 0);
         let worker =
             WorkerSpec::legacy("00001".to_string(), "http://worker-00001:8080".to_string());
         let cursor = BenchmarkCursor::new(1, 8, 8, "update", "self_update");

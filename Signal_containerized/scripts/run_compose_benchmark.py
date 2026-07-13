@@ -34,6 +34,7 @@ try:
     from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
     from resource_profiles import (
         generate_parallel_cpu_sweep_profiles,
+        generate_parallel_ram_app_heap_sweep_profiles,
         generate_parallel_ram_sweep_profiles,
     )
 except ModuleNotFoundError:
@@ -47,6 +48,7 @@ except ModuleNotFoundError:
     from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
     from resource_profiles import (
         generate_parallel_cpu_sweep_profiles,
+        generate_parallel_ram_app_heap_sweep_profiles,
         generate_parallel_ram_sweep_profiles,
     )
 
@@ -458,7 +460,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--resource-experiment",
-        choices=["none", "ram-docker-cgroup-sweep", "cpu-quota-sweep"],
+        choices=["none", "ram-docker-cgroup-sweep", "ram-app-heap-sweep", "cpu-quota-sweep"],
         default="none",
         help="Signal resource sweep mode for profiled singleton workers.",
     )
@@ -472,6 +474,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--ram-sweep-values",
         default="8m,16m,32m,64m,128m,256m,512m,1g,2g,3g",
         help="Comma-separated Docker memory limits for Signal RAM cgroup sweep.",
+    )
+    p.add_argument(
+        "--ram-app-heap-sweep-values",
+        default="10k,50k,100k,500k,1m,5m,10m,50m,100m,500m",
+        help="Comma-separated application heap budgets for Signal RAM app-heap sweep.",
     )
     p.add_argument(
         "--cpu-sweep-fractions",
@@ -488,6 +495,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["stop-on-profiled-failure", "remove-and-continue", "stop-on-failure"],
         default="stop-on-profiled-failure",
         help="Recorded policy for resource failure sidecars; Signal currently stops on runner failure.",
+    )
+    p.add_argument(
+        "--profiled-failure-stop-after",
+        type=int,
+        default=0,
+        help="Exit successfully after this many unique profiled singleton resource failures (0 disables).",
     )
 
     # External device flags
@@ -734,6 +747,13 @@ def build_resource_profiles_for_run(args: argparse.Namespace, run_id: str) -> li
     if args.resource_experiment == "ram-docker-cgroup-sweep":
         profiles = generate_parallel_ram_sweep_profiles(
             heap_budgets=comma_values(args.ram_sweep_values),
+            docker_memory_limit=args.embedded_docker_memory,
+            assigned_cpu_count=1,
+            run_id=run_id,
+        )
+    elif args.resource_experiment == "ram-app-heap-sweep":
+        profiles = generate_parallel_ram_app_heap_sweep_profiles(
+            heap_budgets=comma_values(args.ram_app_heap_sweep_values),
             docker_memory_limit=args.embedded_docker_memory,
             assigned_cpu_count=1,
             run_id=run_id,
@@ -2506,7 +2526,12 @@ def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
     return "infrastructure_failure", evidence
 
 
-def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_success: bool) -> None:
+def write_failure_sidecars_from_artifacts(
+    run_dir: Path,
+    run_id: str,
+    run_success: bool,
+    resource_failure_policy: str = "stop-on-failure",
+) -> None:
     summary_path = run_dir / "resource_summary.csv"
     resource_summaries = []
     if summary_path.exists():
@@ -2561,7 +2586,7 @@ def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_succes
             resource_experiment=(
                 "singleton-resource-envelope" if summary_path.exists() else "none"
             ),
-            resource_failure_policy="stop-on-failure",
+            resource_failure_policy=resource_failure_policy,
             preflight_passed=preflight_passed,
             output_validation_passed=run_success,
             notes="generated from resource_summary.csv/oom_events.jsonl after runner exit",
@@ -2569,6 +2594,7 @@ def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_succes
             docker_memory_limit=selected_profile.get("docker_memory_limit", ""),
             app_heap_budget=selected_profile.get("app_heap_budget", ""),
             app_heap_budget_bytes=int_or_zero(selected_profile.get("app_heap_budget_bytes")),
+            sweep_kind=selected_profile.get("sweep_kind", ""),
             resource_profile_id=selected_profile.get("resource_profile_id", ""),
             resource_profile_index=int_or_zero(selected_profile.get("resource_profile_index")),
             strict_cpuset_satisfied=str(selected_profile.get("strict_cpuset_satisfied", "")).lower() in ("true", "1", "yes"),
@@ -4076,6 +4102,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4139,6 +4167,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4169,7 +4199,10 @@ def main() -> int:
             outcome_class, evidence = classify_failure_from_resource_summary(run_dir)
             evidence["runner_exit_code"] = exit_code
             write_run_outcome(run_dir, outcome_class, evidence)
-            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=False)
+            write_failure_sidecars_from_artifacts(
+                run_dir, run_id, run_success=False,
+                resource_failure_policy=args.resource_failure_policy,
+            )
             collect_failure_diagnostics(
                 root=root,
                 compose_file=compose_tmp,
@@ -4189,17 +4222,23 @@ def main() -> int:
             print("[device] pulling external device profiles...", flush=True)
             pull_external_device_profiles(args, root, run_id, run_dir)
 
-            # Run standalone aggregation if --no-aggregate was used
-            if use_no_aggregate and not args.preflight_only:
-                layout_file = run_dir / "worker_layout.json"
-                workers_file = run_dir / "workers.combined.txt"
-                agg_exit = run_standalone_aggregation(run_dir, layout_file if layout_file.exists() else None, workers_file if workers_file.exists() else None)
-                if agg_exit != 0:
-                    print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
+        if use_no_aggregate and not args.preflight_only:
+            layout_file = run_dir / "worker_layout.json"
+            workers_file = run_dir / "workers.combined.txt"
+            agg_exit = run_standalone_aggregation(
+                run_dir,
+                layout_file if layout_file.exists() else None,
+                workers_file if workers_file.exists() else None,
+            )
+            if agg_exit != 0:
+                raise RuntimeError(f"standalone aggregation failed with exit={agg_exit}")
 
         if not args.preflight_only:
             validate_artifacts(run_dir, args.worker_layout_mode)
-            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=True)
+            write_failure_sidecars_from_artifacts(
+                run_dir, run_id, run_success=True,
+                resource_failure_policy=args.resource_failure_policy,
+            )
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 

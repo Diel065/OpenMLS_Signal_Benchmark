@@ -52,6 +52,10 @@ async fn main() -> Result<()> {
         )
         .route("/message/{recipient}", get(fetch_message))
         .route("/message/{recipient}/pending", get(fetch_pending_message))
+        .route(
+            "/message/{recipient}/pending/{sender}",
+            get(fetch_pending_message_from),
+        )
         .route("/message/{recipient}/ack/{message_id}", post(ack_message))
         .with_state(state);
 
@@ -136,6 +140,19 @@ async fn fetch_pending_message(
 ) -> Response {
     let metrics = state.metrics().start("fetch_pending_message");
     let response = match state.fetch_pending_message(&recipient) {
+        Some(message) => axum::Json(message).into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    };
+    metrics.finish_http_status(response.status().as_u16());
+    response
+}
+
+async fn fetch_pending_message_from(
+    State(state): State<SharedRelay>,
+    Path((recipient, sender)): Path<(String, String)>,
+) -> Response {
+    let metrics = state.metrics().start("fetch_pending_message_from");
+    let response = match state.fetch_pending_message_from(&recipient, &sender) {
         Some(message) => axum::Json(message).into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     };

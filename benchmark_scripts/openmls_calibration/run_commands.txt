@@ -14,5 +14,40 @@ PROTOCOL=openmls SWEEP=both N=4 OUTPUT_ROOT=/tmp \
 N=10 OUTPUT_ROOT=/tmp \
   bash benchmark_scripts/openmls_calibration/run_04_constrained_remove_rejoin_openmls.sh
 
+# Signal constrained RAM then CPU sweeps; RAM feeds the failure/group-size plot.
+# Plateaus: 10,42,...,234,256,384,512,...,1024. Ten heap budgets run in parallel.
+SIGNAL_RAM_SWEEP_VALUES="10k,50k,100k,500k,1m,5m,10m,50m,100m,500m" \
+PROTOCOL=signal SWEEP=both N=1 OUTPUT_ROOT=/dev/shm \
+  SIGNAL_WORKERS=1024 SIGNAL_MIN_CONVERSATION_SIZE=10 SIGNAL_MAX_CONVERSATION_SIZE=1024 \
+  SIGNAL_STEP_SIZE=32 STEP_SIZE_SWITCH_AT=256 STEP_SIZE_AFTER_SWITCH=128 \
+  PLATEAU_ORDER=ascending PROFILED_SINGLETON_COUNT=10 SINGLETON_MIN_COUNT=10 \
+  SIGNAL_APP_ROUNDS=1 SIGNAL_ROUNDTRIPS=1 MAX_APP_SAMPLES_PER_PAYLOAD=1 \
+  PAYLOAD_SIZES=512 BUILD_IMAGES=1 RESOURCE_OUTPUT_VALIDATION=1 \
+  bash benchmark_scripts/openmls_calibration/run_01_constrained_container_sweeps.sh
+
+# Signal constrained sweeps — baseline-style /dev/shm wrapper with piecewise steps (9 plateaus, STEP_SIZE_AFTER_SWITCH=196)
+WORKERS=1024 MAX_SIZE=1024 STEP_SIZE=64 STEP_SIZE_SWITCH_AT=256 \
+STEP_SIZE_AFTER_SWITCH=196 PLATEAU_ORDER=ascending \
+PROFILED_SINGLETON_COUNT=10 SINGLETON_MIN_COUNT=10 \
+MAX_APP_SAMPLES_PER_PAYLOAD=2 \
+  benchmark_scripts/openmls_calibration/run_01_devshm_signal_constrained.sh
+
+# Signal constrained smoke — small enough to check instrumentation quickly
+SIGNAL_RAM_SWEEP_VALUES="10k,50k,100k,500k,1m,5m,10m,50m,100m,500m" \
+PROTOCOL=signal SWEEP=both N=1 OUTPUT_ROOT=/tmp \
+  SIGNAL_WORKERS=10 SIGNAL_MAX_CONVERSATION_SIZE=10 SIGNAL_STEP_SIZE=8 \
+  SIGNAL_APP_ROUNDS=1 SIGNAL_ROUNDTRIPS=1 PROFILED_SINGLETON_COUNT=10 \
+  SINGLETON_MIN_COUNT=10 SINGLETON_FRACTION=1 SIGNAL_PACKED_PER_CONTAINER=1 \
+  PACKED_INTERNAL_PARALLELISM=1 MAX_APP_SAMPLES_PER_PAYLOAD=1 \
+  PAYLOAD_SIZES=512 BUILD_IMAGES=1 RESOURCE_OUTPUT_VALIDATION=0 \
+  bash benchmark_scripts/openmls_calibration/run_01_constrained_container_sweeps.sh
+
+# Signal constrained sweeps — baseline-style /dev/shm wrapper with piecewise steps, ascending order
+WORKERS=1024 MAX_SIZE=1024 STEP_SIZE=64 STEP_SIZE_SWITCH_AT=256 \
+STEP_SIZE_AFTER_SWITCH=256 PLATEAU_ORDER=ascending \
+PROFILED_SINGLETON_COUNT=10 SINGLETON_MIN_COUNT=10 \
+MAX_APP_SAMPLES_PER_PAYLOAD=2 BUILD_IMAGES=1 \
+  benchmark_scripts/openmls_calibration/run_01_devshm_signal_constrained.sh
+
 # These must be run from the repository root:
 #  cd /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark

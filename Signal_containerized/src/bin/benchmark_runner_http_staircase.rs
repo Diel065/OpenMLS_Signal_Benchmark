@@ -108,6 +108,9 @@ struct Args {
 
     #[arg(long, action = ArgAction::SetTrue)]
     no_aggregate: bool,
+
+    #[arg(long, default_value_t = 0)]
+    profiled_failure_stop_after: usize,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -211,6 +214,7 @@ fn main() -> Result<()> {
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         profile_only_singletons: args.profile_only_singletons,
         no_aggregate: args.no_aggregate,
+        profiled_failure_stop_after: args.profiled_failure_stop_after,
         worker_layout,
     })
 }

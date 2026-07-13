@@ -25,6 +25,7 @@ case "$PROTOCOL" in
 esac
 
 WORKERS="${WORKERS:-1024}"
+MIN_SIZE="${MIN_SIZE:-2}"
 MAX_SIZE="${MAX_SIZE:-1024}"
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
 SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
@@ -42,7 +43,7 @@ UPDATE_ROUNDS="${UPDATE_ROUNDS:-4}"
 ROUNDTRIPS="${ROUNDTRIPS:-1}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
-PAYLOAD_SIZES="${PAYLOAD_SIZES:-[32,4096]}"
+PAYLOAD_SIZES="${PAYLOAD_SIZES:-512}"
 CPU_AFFINITY_SAMPLE="${CPU_AFFINITY_SAMPLE:-20}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
 WORKER_HEALTH_TIMEOUT="${WORKER_HEALTH_TIMEOUT:-600}"
@@ -208,7 +209,7 @@ run_openmls() {
     --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT"
     --health-poll-seconds 0.5
     --worker-health-poll-ms 250
-    --min-size 2
+    --min-size "$MIN_SIZE"
     --max-size "$MAX_SIZE"
     --step-size "$STEP_SIZE"
     --plateau-order "$PLATEAU_ORDER"
@@ -216,6 +217,7 @@ run_openmls() {
     --update-rounds "$UPDATE_ROUNDS"
     --app-rounds "$APP_ROUNDS"
     --max-update-samples-per-plateau "$MAX_UPDATE_SAMPLES_PER_PLATEAU"
+    --add-batch-extremes-only
     --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD"
     --payload-sizes "$PAYLOAD_SIZES"
     --http-pool-max-idle-per-host "$WORKER_HTTP_POOL"
@@ -277,7 +279,7 @@ run_signal() {
     --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT"
     --health-poll-seconds 0.5
     --worker-health-poll-ms 250
-    --min-size 2
+    --min-size "$MIN_SIZE"
     --max-size "$MAX_SIZE"
     --step-size "$STEP_SIZE"
     "${piecewise_step_args[@]}"

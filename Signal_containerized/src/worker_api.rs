@@ -49,6 +49,8 @@ pub enum Command {
         profile: bool,
         #[serde(default)]
         conversation_size: Option<usize>,
+        #[serde(default)]
+        expected_plaintext_bytes: Option<usize>,
     },
     ProcessPending {
         max_messages: Option<usize>,
@@ -1008,12 +1010,21 @@ struct PendingMessageResponse {
 async fn relay_get_pending_message(
     relay_url: &str,
     recipient: &str,
+    sender: Option<&str>,
 ) -> Result<PendingMessageResponse> {
-    let url = format!(
-        "{}/message/{}/pending",
-        relay_url.trim_end_matches('/'),
-        recipient
-    );
+    let url = match sender {
+        Some(sender) => format!(
+            "{}/message/{}/pending/{}",
+            relay_url.trim_end_matches('/'),
+            recipient,
+            sender
+        ),
+        None => format!(
+            "{}/message/{}/pending",
+            relay_url.trim_end_matches('/'),
+            recipient
+        ),
+    };
     let http = control_http_client();
 
     retry_transient_http_async(
@@ -1114,14 +1125,25 @@ fn ciphertext_from_bytes(bytes: &[u8]) -> Result<libsignal_protocol::CiphertextM
 async fn receive_message_delivery(
     participant: &mut SignalParticipant,
     relay_url: &str,
+    sender: Option<&str>,
     profile: bool,
     conversation_size: usize,
+    expected_plaintext_bytes: Option<usize>,
     phase: Option<&str>,
     profile_path: Option<&PathBuf>,
 ) -> Result<CommandOutcome> {
     let total_start = Instant::now();
     let io_start = Instant::now();
-    let delivery = relay_get_pending_message(relay_url, &participant.name).await?;
+    let delivery = relay_get_pending_message(relay_url, &participant.name, sender).await?;
+    if let Some(expected_sender) = sender {
+        if delivery.sender != expected_sender {
+            return Err(anyhow!(
+                "Relay returned sender {} while {} was requested",
+                delivery.sender,
+                expected_sender
+            ));
+        }
+    }
     let io_wall = io_start.elapsed().as_nanos();
     write_subspan_event(
         profile_path,
@@ -1211,6 +1233,16 @@ async fn receive_message_delivery(
 
     match decrypt_result {
         Ok(plaintext) => {
+            if let Some(expected) = expected_plaintext_bytes {
+                if plaintext.len() != expected {
+                    return Err(anyhow!(
+                        "Decrypted {} plaintext bytes from {}, expected {}",
+                        plaintext.len(),
+                        delivery.sender,
+                        expected
+                    ));
+                }
+            }
             write_subspan_event(
                 profile_path,
                 &make_subspan_event(
@@ -1330,7 +1362,18 @@ async fn process_pending(
     let mut errors = Vec::new();
 
     while remaining > 0 {
-        match receive_message_delivery(participant, relay_url, true, 2, None, profile_path).await {
+        match receive_message_delivery(
+            participant,
+            relay_url,
+            None,
+            true,
+            2,
+            None,
+            Some("process_pending"),
+            profile_path,
+        )
+        .await
+        {
             Ok(outcome) => {
                 messages_processed += 1;
                 metrics.merge_message(&outcome.metrics);
@@ -1897,15 +1940,18 @@ pub async fn handle_command(
         }
 
         Command::DecryptMessage {
-            sender: _,
+            sender,
             profile,
             conversation_size,
+            expected_plaintext_bytes,
         } => {
             receive_message_delivery(
                 participant,
                 relay_url,
+                Some(&sender),
                 profile,
                 conversation_size.unwrap_or(2),
+                expected_plaintext_bytes,
                 phase,
                 profile_path,
             )

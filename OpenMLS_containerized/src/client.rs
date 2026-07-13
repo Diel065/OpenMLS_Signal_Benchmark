@@ -495,7 +495,9 @@ impl Client {
             .count();
 
         set_app_message_receive_context(AppMessageReceiveContext::new(member_count));
-        let total_scope = ProfileScope::start("application_message_receive_total_local", "openmls");
+        let total_scope = profile
+            .then(|| ProfileScope::start("application_message_receive_total_local", "openmls"))
+            .flatten();
 
         let result = (|| -> Result<Vec<u8>, anyhow::Error> {
             let group = self
