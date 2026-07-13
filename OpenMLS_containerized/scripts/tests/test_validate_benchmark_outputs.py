@@ -147,6 +147,30 @@ class TestValidator(unittest.TestCase):
         self.assertEqual(result.add_total_count, 1)
         self.assertEqual(result.add_k_counts, {2: 1})
 
+    def test_accepts_remove_rejoin_batch_source(self):
+        rows = valid_add_rows(k=1)
+        total = next(row for row in rows if row["op"] == CANONICAL_TOTAL)
+        total["membership_batch_transition_cap"] = "1"
+        total["membership_batch_source"] = "remove_rejoin"
+
+        result = validate_run(str(write_run(self.temp_dir, rows)))
+
+        self.assertTrue(result.success, result.errors)
+
+    def test_accepts_external_density_batch_sources(self):
+        for source, k in (("external_density_k1", 1), ("external_density_k8", 8)):
+            with self.subTest(source=source):
+                rows = valid_add_rows(k=k)
+                total = next(row for row in rows if row["op"] == CANONICAL_TOTAL)
+                total["membership_batch_source"] = source
+                if k == 1:
+                    total["membership_batch_transition_cap"] = "1"
+
+                run_root = Path(self.temp_dir) / source
+                result = validate_run(str(write_run(run_root, rows)))
+
+                self.assertTrue(result.success, result.errors)
+
     def test_rejects_stale_schema(self):
         rows = valid_add_rows()
         rows[0]["profile_schema_version"] = "9"

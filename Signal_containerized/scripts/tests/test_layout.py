@@ -65,8 +65,11 @@ class FakeArgs:
         self.singleton_memory_swap_bytes = None
         self.singleton_memory_swap_defaulted = False
         self.singleton_pids_limit = None
+        self.singleton_app_heap_budget = None
+        self.singleton_app_heap_budget_bytes = None
         self.resource_experiment = "none"
         self.profiled_singleton_count = 1
+        self.disable_container_profiling = False
         self.cpu_affinity_mode = "none"
         self.strict_cpuset = False
 
@@ -213,6 +216,98 @@ def test_legacy_layout_build():
     print("PASS: legacy layout build produces correct structure")
 
 
+def test_disable_container_profiling_keeps_all_docker_clients_unprofiled():
+    args = FakeArgs(32)
+    args.disable_container_profiling = True
+    layout = compute_hybrid_layout(
+        args.workers,
+        args.singleton_min_count,
+        args.singleton_fraction,
+        args.packed_clients_per_container,
+    )
+    singleton_ids = select_singleton_ids(
+        args.workers,
+        layout["singleton_count"],
+        args.singleton_selection_seed,
+        args.singleton_selection_strategy,
+    )
+    singleton_set = set(singleton_ids)
+    packed_ids = [
+        worker_id(index)
+        for index in range(1, args.workers + 1)
+        if worker_id(index) not in singleton_set
+    ]
+
+    clients, physical_workers = build_hybrid_layout(
+        args, singleton_ids, packed_ids, layout
+    )
+    assert all(not client.profile_enabled for client in clients)
+    assert all(not worker.profile_enabled_client_ids for worker in physical_workers)
+    assert "--profile-path-template" not in generate_compose.generate_compose_text(
+        args, physical_workers
+    )
+    worker_layout = generate_compose.generate_worker_layout_json(
+        args, clients, physical_workers
+    )
+    assert worker_layout["profile_policy"] == "external_devices_only"
+
+    args.worker_layout_mode = "one-container-per-client"
+    clients, physical_workers = build_legacy_layout(args)
+    assert all(not client.profile_enabled for client in clients)
+    assert all(not worker.profile_enabled_client_ids for worker in physical_workers)
+
+
+def test_empty_singleton_resource_envelope_is_disabled():
+    args = FakeArgs(32)
+    envelope = run_compose_benchmark.singleton_resource_envelope(args)
+    assert envelope["enabled"] is False
+
+    args.cpu_affinity_mode = "profiled-nor-background"
+    envelope = run_compose_benchmark.singleton_resource_envelope(args)
+    assert envelope["enabled"] is True
+
+
+def test_profile_enabled_ids_are_explicit_for_every_worker():
+    args = FakeArgs(32)
+    layout = compute_hybrid_layout(
+        args.workers,
+        args.singleton_min_count,
+        args.singleton_fraction,
+        args.packed_clients_per_container,
+    )
+    singleton_ids = select_singleton_ids(
+        args.workers,
+        layout["singleton_count"],
+        args.singleton_selection_seed,
+        args.singleton_selection_strategy,
+    )
+    singleton_set = set(singleton_ids)
+    packed_ids = [
+        worker_id(index)
+        for index in range(1, args.workers + 1)
+        if worker_id(index) not in singleton_set
+    ]
+    _, physical_workers = build_hybrid_layout(args, singleton_ids, packed_ids, layout)
+    compose = generate_compose.generate_compose_text(args, physical_workers)
+    profile_flag = '      - "--profile-enabled-participant-ids"'
+    empty_profile_flag = f'{profile_flag}\n      - ""'
+    packed_workers = [
+        physical_worker
+        for physical_worker in physical_workers
+        if physical_worker.container_mode == "packed"
+    ]
+    expected_empty_profiles = sum(
+        not physical_worker.profile_enabled_client_ids
+        for physical_worker in physical_workers
+    )
+
+    assert packed_workers
+    assert all(not physical_worker.profile_enabled_client_ids for physical_worker in packed_workers)
+    assert compose.count(profile_flag) == len(physical_workers)
+    assert compose.count(empty_profile_flag) == expected_empty_profiles
+    print("PASS: every worker receives an explicit profile-enabled participant list")
+
+
 
 
 def test_resource_limits_apply_to_singletons_only():
@@ -310,6 +405,9 @@ def main() -> int:
         test_all_clients_covered,
         test_hybrid_layout_build,
         test_legacy_layout_build,
+        test_disable_container_profiling_keeps_all_docker_clients_unprofiled,
+        test_empty_singleton_resource_envelope_is_disabled,
+        test_profile_enabled_ids_are_explicit_for_every_worker,
         test_resource_limits_apply_to_singletons_only,
         test_signal_resource_sweeps_build_affinity_inputs_from_profiles,
     ]

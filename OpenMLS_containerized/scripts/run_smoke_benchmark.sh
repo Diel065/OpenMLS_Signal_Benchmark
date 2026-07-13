@@ -9,11 +9,12 @@ echo "[smoke] Repo root: $REPO_ROOT"
 echo "[smoke] Output dir: $OUTPUT_DIR"
 echo "[smoke] Run ID: $RUN_ID"
 
-# Build the benchmark runner binary if not already built
-if [ ! -f "$REPO_ROOT/target/debug/benchmark_runner_http_staircase_local" ]; then
-    echo "[smoke] Building benchmark runner binary..."
-    cargo build --manifest-path "$REPO_ROOT/Cargo.toml" --bin benchmark_runner_http_staircase_local
-fi
+# The local runner spawns target/debug/worker directly. Rebuild both so a
+# profiling change cannot be smoke-tested against a stale worker executable.
+echo "[smoke] Building benchmark runner and worker binaries..."
+cargo build --manifest-path "$REPO_ROOT/Cargo.toml" \
+    --bin benchmark_runner_http_staircase_local \
+    --bin worker
 
 # Exercise multiple N and k values while remaining small enough for local validation.
 echo "[smoke] Running smoke benchmark..."

@@ -16,6 +16,7 @@ SCRIPTS_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(SCRIPTS_DIR))
 
 import external_devices
+import run_compose_benchmark
 from external_devices import (
     validate_run_id,
     load_devices_config,
@@ -191,6 +192,31 @@ def test_config_defaults():
     print("PASS: config defaults work correctly")
 
 
+def test_trim_incomplete_jsonl_tail_preserves_flushed_rows(tmp_path: Path):
+    profile = tmp_path / "participant-device.jsonl"
+    complete = b'{"op":"complete"}\n'
+    fragment = b'{"op":"partial"'
+    profile.write_bytes(complete + fragment)
+
+    dropped = run_compose_benchmark.trim_incomplete_jsonl_tail(profile)
+
+    assert dropped == len(fragment)
+    assert profile.read_bytes() == complete
+    assert run_compose_benchmark.trim_incomplete_jsonl_tail(profile) == 0
+
+
+def test_parse_discrete_plateau_sizes():
+    assert run_compose_benchmark.parse_plateau_sizes(
+        "4,8,16,32,64,128,256,512,1024"
+    ) == [4, 8, 16, 32, 64, 128, 256, 512, 1024]
+    try:
+        run_compose_benchmark.parse_plateau_sizes("4,16,8")
+    except Exception:
+        pass
+    else:
+        raise AssertionError("non-increasing plateau sizes must be rejected")
+
+
 def main() -> int:
     import shutil
 
@@ -204,6 +230,8 @@ def main() -> int:
             ("load_devices_config", lambda: test_load_devices_config(tmp_dir)),
             ("build_external_device_layout_entry", lambda: test_build_external_device_layout_entry()),
             ("config defaults", lambda: test_config_defaults()),
+            ("trim incomplete JSONL tail", lambda: test_trim_incomplete_jsonl_tail_preserves_flushed_rows(tmp_dir)),
+            ("parse discrete plateau sizes", test_parse_discrete_plateau_sizes),
         ]
 
         passed = 0

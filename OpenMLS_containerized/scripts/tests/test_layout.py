@@ -229,6 +229,14 @@ def test_disable_container_profiling_marks_container_workers_unprofiled():
     assert physical_workers
     assert all(not c.profile_enabled for c in clients)
     assert all(not pw.profile_enabled_client_ids for pw in physical_workers)
+    compose = generate_compose.generate_compose_text(args, physical_workers)
+    worker_sections = compose.split("\n  worker-")[1:]
+    assert worker_sections
+    assert all('      - "--profile-enabled-client-ids"' in section for section in worker_sections)
+    assert all(
+        '      - "--profile-enabled-client-ids"\n      - ""' in section
+        for section in worker_sections
+    )
     print("PASS: disabled container profiling marks Docker workers unprofiled")
 
 
@@ -318,9 +326,12 @@ def test_profiled_workers_pass_through_heap_tracking_env():
     clients, physical_workers = build_legacy_layout(args)
     compose = generate_compose.generate_compose_text(args, physical_workers)
     worker_section = compose.split("  worker-00001:", 1)[1].split("\n  worker-", 1)[0]
-    assert "OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-}" in worker_section
-    assert "OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-}" in worker_section
-    assert "OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-}" in worker_section
+    assert "OPENMLS_MEMORY_MODEL: ${OPENMLS_MEMORY_MODEL:-app-heap-budget}" in worker_section
+    assert "OPENMLS_APP_HEAP_BUDGET: ${OPENMLS_APP_HEAP_BUDGET:-1024g}" in worker_section
+    assert (
+        "OPENMLS_APP_HEAP_BUDGET_BYTES: ${OPENMLS_APP_HEAP_BUDGET_BYTES:-1099511627776}"
+        in worker_section
+    )
     print("PASS: profiled workers can opt into heap peak tracking via existing env vars")
 
 
