@@ -862,7 +862,7 @@ async fn participant_command_actor(
                     .zip(wrapper_span_id)
                     .map(|(w, s)| format!("{}:{}", w, s));
                 let event = SignalProfileEvent {
-                    profile_schema_version: 6,
+                    profile_schema_version: 7,
                     span_id: wrapper_span_id,
                     parent_span_id: None,
                     parent_operation: None,
@@ -913,8 +913,6 @@ async fn participant_command_actor(
                     alloc_bytes: metrics.alloc_bytes,
                     alloc_count: metrics.alloc_count,
                     alloc_measurement_scope: Some("current_thread".to_string()),
-                    ram_rss_delta_bytes: None,
-                    ram_rss_utilization: None,
                     artifact_size_bytes: metrics.artifact_size_bytes,
                     participant_count: metrics.participant_count,
                     conversation_size: metrics.conversation_size,

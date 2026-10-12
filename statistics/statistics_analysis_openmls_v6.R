@@ -270,8 +270,7 @@ openmls_v6_span_metric_base <- function(df) {
       span_role = factor(span_role, levels = c("total", "suboperation")),
       component_label = openmls_v6_component_label(operation, operation_family_label, is_protocol_parent),
       component_label = if_else(component_label == "total NA", "total", component_label),
-      alloc_mib = alloc_bytes / (1024 * 1024),
-      rss_delta_kib = ram_rss_delta_bytes / 1024
+      alloc_mib = alloc_bytes / (1024 * 1024)
     )
 }
 
@@ -289,8 +288,6 @@ openmls_v6_span_by_size_stats <- function(df) {
       p95_alloc_mib = openmls_v6_q(alloc_mib, 0.95),
       median_alloc_count = openmls_v6_q(alloc_count, 0.50),
       p95_alloc_count = openmls_v6_q(alloc_count, 0.95),
-      median_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.50),
-      p95_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.95),
       .groups = "drop"
     ) |>
     arrange(operation_family_label, device_publication_label, span_role, component_label, size_n)
@@ -311,8 +308,6 @@ openmls_v6_span_overall_stats <- function(df) {
       p95_alloc_mib = openmls_v6_q(alloc_mib, 0.95),
       median_alloc_count = openmls_v6_q(alloc_count, 0.50),
       p95_alloc_count = openmls_v6_q(alloc_count, 0.95),
-      median_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.50),
-      p95_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.95),
       .groups = "drop"
     ) |>
     arrange(operation_family_label, device_publication_label, span_role, desc(median_cpu_thread_ms))
@@ -389,8 +384,7 @@ openmls_v6_rfc9420_component_base <- function(df) {
   spec <- openmls_v6_rfc9420_component_spec()
   df |>
     mutate(
-      alloc_mib = alloc_bytes / (1024 * 1024),
-      rss_delta_kib = ram_rss_delta_bytes / 1024
+      alloc_mib = alloc_bytes / (1024 * 1024)
     ) |>
     inner_join(spec, by = "operation") |>
     mutate(
@@ -592,8 +586,6 @@ openmls_v6_device_operation_stats <- function(df) {
       p95_cpu_thread_ms = openmls_v6_q(cpu_thread_ms, 0.95),
       median_alloc_bytes = openmls_v6_q(alloc_bytes, 0.50),
       p95_alloc_bytes = openmls_v6_q(alloc_bytes, 0.95),
-      p95_rss_delta_bytes = openmls_v6_q(ram_rss_delta_bytes, 0.95),
-      max_rss_utilization = openmls_v6_max(ram_rss_utilization),
       max_cpu_throttle_ratio = openmls_v6_max(cpu_throttled_time_ratio),
       .groups = "drop"
     ) |>
@@ -857,7 +849,7 @@ openmls_v6_threshold_crossings <- function(df, thresholds_ms = openmls_v6_thresh
 openmls_v6_missingness_table <- function(df) {
   fields <- c(
     "member_count", "tree_size", "tree_size_effective", "wall_ms", "cpu_thread_ms",
-    "alloc_bytes", "alloc_count", "ram_rss_delta_bytes", "ram_rss_utilization",
+    "alloc_bytes", "alloc_count",
     "filtered_direct_path_len", "update_path_nodes_count", "encrypted_path_secret_count",
     "hpke_encrypt_count", "sum_copath_resolution_sizes", "welcome_bytes_norm",
     "ratchet_tree_bytes_norm", "commit_size_bytes", "commit_id", "commit_create_op",
@@ -1426,21 +1418,18 @@ plot_openmls_v6_resource_pressure <- function(df) {
     group_by(device_publication_label, operation_family_label, size_n) |>
     summarise(
       p95_alloc_mib = openmls_v6_q(alloc_bytes, 0.95) / (1024 * 1024),
-      p95_rss_kib = openmls_v6_q(ram_rss_delta_bytes, 0.95) / 1024,
-      max_rss_utilization = openmls_v6_max(ram_rss_utilization),
       rows = n(),
       .groups = "drop"
     ) |>
     pivot_longer(
-      cols = c(p95_alloc_mib, p95_rss_kib),
+      cols = c(p95_alloc_mib),
       names_to = "metric",
       values_to = "value"
     ) |>
     mutate(
       metric = recode(
         metric,
-        p95_alloc_mib = "p95 allocated MiB",
-        p95_rss_kib = "p95 RSS delta KiB"
+        p95_alloc_mib = "p95 allocated MiB"
       )
     )
 
@@ -1451,7 +1440,7 @@ plot_openmls_v6_resource_pressure <- function(df) {
     openmls_v6_scale_color_device(name = "device") +
     labs(
       title = "Resource pressure by operation and device",
-      subtitle = "RSS deltas are noisy systems diagnostics; allocation pressure is more stable for OpenMLS operation comparisons.",
+      subtitle = "Allocation pressure for OpenMLS operation comparisons.",
       x = "group size",
       y = NULL
     ) +

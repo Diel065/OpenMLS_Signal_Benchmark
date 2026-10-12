@@ -473,7 +473,7 @@ pub fn make_subspan_event_with_span(
         .or_else(libsignal_protocol::profiling::current_benchmark_context);
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
-        profile_schema_version: 6,
+        profile_schema_version: 7,
         span_id,
         parent_span_id,
         parent_operation,

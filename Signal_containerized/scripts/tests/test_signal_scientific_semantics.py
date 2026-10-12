@@ -60,8 +60,6 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "cpu_throttled_time_ratio",
         "alloc_bytes",
         "alloc_count",
-        "ram_rss_delta_bytes",
-        "ram_rss_utilization",
         "artifact_size_bytes",
         "prekey_stock_before",
         "prekey_stock_after",
@@ -103,8 +101,8 @@ def test_csv_schema_contains_scientific_columns() -> None:
         "pod_name",
     ]
     assert_contains_all(csv, required, "SignalCsvRow")
-    assert "profile_schema_version: 5" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
-    assert "profile_schema_version: 6" in read("Signal_containerized/src/bin/worker.rs")
+    assert "profile_schema_version: 6" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
+    assert "profile_schema_version: 7" in read("Signal_containerized/src/bin/worker.rs")
 
 
 def test_event_taxonomy_separates_wrapper_and_protocol_rows() -> None:

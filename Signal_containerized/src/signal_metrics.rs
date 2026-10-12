@@ -113,10 +113,6 @@ pub struct SignalProfileEvent {
     pub alloc_count: Option<u64>,
     #[serde(default)]
     pub alloc_measurement_scope: Option<String>,
-    #[serde(default)]
-    pub ram_rss_delta_bytes: Option<i64>,
-    #[serde(default)]
-    pub ram_rss_utilization: Option<f64>,
     pub artifact_size_bytes: Option<usize>,
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
@@ -340,8 +336,6 @@ pub struct SignalCsvRow<'a> {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     pub alloc_measurement_scope: Option<String>,
-    pub ram_rss_delta_bytes: Option<i64>,
-    pub ram_rss_utilization: Option<f64>,
     pub artifact_size_bytes: Option<usize>,
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,

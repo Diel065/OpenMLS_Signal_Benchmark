@@ -18,8 +18,6 @@ use serde::Serialize;
 static PROFILE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
 static CPU_STAT_PATH: OnceLock<Option<PathBuf>> = OnceLock::new();
 static CPU_LIMIT_CORES: OnceLock<Option<f64>> = OnceLock::new();
-static MEMORY_LIMIT_BYTES: OnceLock<Option<u64>> = OnceLock::new();
-static PAGE_SIZE_BYTES: OnceLock<u64> = OnceLock::new();
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
 
 thread_local! {
@@ -243,10 +241,6 @@ fn env_i32_or_none(key: &str) -> Option<i32> {
     std::env::var(key).ok()?.parse().ok()
 }
 
-fn env_positive_u64_or_none(key: &str) -> Option<u64> {
-    env_u64_or_none(key).filter(|value| *value > 0)
-}
-
 fn env_positive_f64_or_none(key: &str) -> Option<f64> {
     std::env::var(key)
         .ok()?
@@ -366,82 +360,9 @@ fn effective_cpu_limit_cores() -> Option<f64> {
     })
 }
 
-fn read_memory_limit(path: &Path) -> Option<u64> {
-    let contents = fs::read_to_string(path).ok()?;
-    let token = contents.split_whitespace().next()?;
-    if token == "max" {
-        return None;
-    }
-    let value = token.parse::<u64>().ok()?;
-    if value > 0 && value < (1u64 << 60) {
-        Some(value)
-    } else {
-        None
-    }
-}
-
-fn mem_total_bytes() -> Option<u64> {
-    let contents = fs::read_to_string("/proc/meminfo").ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("MemTotal:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
-fn page_size_bytes() -> u64 {
-    *PAGE_SIZE_BYTES
-        .get_or_init(|| env_positive_u64_or_none("SIGNAL_PAGE_SIZE_BYTES").unwrap_or(4096))
-}
-
-fn effective_memory_limit_bytes() -> Option<u64> {
-    *MEMORY_LIMIT_BYTES.get_or_init(|| {
-        if let Some(value) = env_positive_u64_or_none("SIGNAL_EFFECTIVE_MEMORY_LIMIT_BYTES") {
-            return Some(value);
-        }
-        if let Some(path) = first_existing_cgroup_file("memory", "memory.max") {
-            if let Some(value) = read_memory_limit(&path) {
-                return Some(value);
-            }
-        }
-        if let Some(path) = first_existing_cgroup_file("memory", "memory.limit_in_bytes") {
-            if let Some(value) = read_memory_limit(&path) {
-                return Some(value);
-            }
-        }
-        mem_total_bytes()
-    })
-}
-
-fn current_rss_bytes() -> Option<u64> {
-    if let Ok(contents) = fs::read_to_string("/proc/self/statm") {
-        if let Some(pages) = contents
-            .split_whitespace()
-            .nth(1)
-            .and_then(|value| value.parse::<u64>().ok())
-        {
-            if let Some(bytes) = pages.checked_mul(page_size_bytes()) {
-                return Some(bytes);
-            }
-        }
-    }
-
-    let contents = fs::read_to_string("/proc/self/status").ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("VmRSS:") {
-            let kb = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-            return kb.checked_mul(1024);
-        }
-    }
-    None
-}
-
 struct ResourceSnapshot {
     process_cpu_start: Option<ProcessTime>,
     throttled_ns: Option<u128>,
-    rss_bytes: Option<u64>,
 }
 
 impl ResourceSnapshot {
@@ -449,7 +370,6 @@ impl ResourceSnapshot {
         Self {
             process_cpu_start: Some(ProcessTime::now()),
             throttled_ns: current_cpu_throttled_ns(),
-            rss_bytes: current_rss_bytes(),
         }
     }
 
@@ -457,14 +377,8 @@ impl ResourceSnapshot {
         Self {
             process_cpu_start: None,
             throttled_ns: current_cpu_throttled_ns(),
-            rss_bytes: current_rss_bytes(),
         }
     }
-}
-
-fn bounded_i64_delta(start: u64, end: u64) -> i64 {
-    let delta = end as i128 - start as i128;
-    delta.clamp(i64::MIN as i128, i64::MAX as i128) as i64
 }
 
 fn measurement_class_for_op(op: &str) -> &'static str {
@@ -551,8 +465,6 @@ pub(crate) struct ProfileEvent {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     pub alloc_measurement_scope: Option<String>,
-    pub ram_rss_delta_bytes: Option<i64>,
-    pub ram_rss_utilization: Option<f64>,
     pub success: bool,
     pub error_class: Option<String>,
     pub participant_id: Option<String>,
@@ -708,20 +620,6 @@ impl ProfileScope {
                 }
                 _ => None,
             };
-        let ram_rss_delta_bytes = match (self.resource_start.rss_bytes, resource_end.rss_bytes) {
-            (Some(start), Some(end)) => Some(bounded_i64_delta(start, end)),
-            _ => None,
-        };
-        let ram_rss_utilization = match (
-            self.resource_start.rss_bytes,
-            resource_end.rss_bytes,
-            effective_memory_limit_bytes(),
-        ) {
-            (Some(start), Some(end), Some(limit)) if limit > 0 => {
-                Some(start.max(end) as f64 / limit as f64)
-            }
-            _ => None,
-        };
         let metadata = self.metadata.clone();
         let context = self.context.clone();
         let heap_snapshot = embedded_heap_budget::snapshot();
@@ -738,7 +636,7 @@ impl ProfileScope {
         let op_clone = self.op.clone();
 
         ProfileEvent {
-            profile_schema_version: 5,
+            profile_schema_version: 6,
             ts_unix_ns: unix_timestamp_ns(),
             op: op_clone.clone(),
             span_name: Some(self.op.clone()),
@@ -772,8 +670,6 @@ impl ProfileScope {
             alloc_bytes: Some(allocation_info.bytes_total),
             alloc_count: Some(allocation_info.count_total),
             alloc_measurement_scope: Some("current_thread".to_string()),
-            ram_rss_delta_bytes,
-            ram_rss_utilization,
             success,
             error_class,
             participant_id: context.participant_id,

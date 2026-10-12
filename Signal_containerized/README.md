@@ -157,7 +157,7 @@ The generator writes the envelope into `worker_layout.json` and applies it to ev
 
 Packed workers and real devices remain unconstrained and are marked with empty Docker resource-limit fields.
 
-Operation-local protocol rows include thread CPU time, allocation bytes/count, process CPU envelope utilization, throttling ratio, RSS delta, and RSS utilization where the local platform exposes those counters. Run-level resource artifacts are separate:
+Operation-local protocol rows include thread CPU time, allocation bytes/count, process CPU envelope utilization, throttling ratio where the local platform exposes those counters. Run-level resource artifacts are separate:
 
 - `benchmark_run_metadata.json`: run configuration, host CPU/platform data, Git provenance for this benchmark and libsignal, Docker version/info, and external-device binary hashes when available.
 - `resource_limits_verified.json`: Docker inspect verification that requested singleton caps were applied.

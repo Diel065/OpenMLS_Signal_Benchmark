@@ -77,8 +77,6 @@ openmls_v5_required_fields <- c(
   "cpu_thread_ns",
   "cpu_envelope_utilization",
   "cpu_throttled_time_ratio",
-  "ram_rss_delta_bytes",
-  "ram_rss_utilization",
   "resource_limit_cpus",
   "resource_limit_memory_bytes",
   "resource_profile"
@@ -103,8 +101,6 @@ openmls_v5_numeric_cols <- c(
   "cpu_throttled_time_ratio",
   "alloc_bytes",
   "alloc_count",
-  "ram_rss_delta_bytes",
-  "ram_rss_utilization",
   "artifact_size_bytes",
   "welcome_bytes",
   "welcome_size_bytes",
@@ -296,9 +292,7 @@ openmls_v5_metric_labels <- c(
   sender_generation = "sender generation",
   generation_gap = "generation gap",
   cpu_envelope_utilization = "CPU envelope utilization",
-  cpu_throttled_time_ratio = "CPU throttled time ratio",
-  ram_rss_delta_bytes = "RSS delta bytes",
-  ram_rss_utilization = "RSS utilization"
+  cpu_throttled_time_ratio = "CPU throttled time ratio"
 )
 
 `%||%` <- function(x, y) {
@@ -722,7 +716,7 @@ classify_operation_family <- function(df) {
     op == "application_message_create_protocol" | str_starts(op, "application_message_create") ~ "app_create",
     op == "application_message_receive_protocol" | str_starts(op, "application_message_receive") ~ "app_receive",
     op == "commit_receive_protocol" | str_starts(op, "commit_receive") ~ "commit_receive",
-    str_detect(op, "resource|rss|cpu|throttl") | str_detect(measurement, "resource|rss|cpu") ~ "resources",
+    str_detect(op, "resource|cpu|throttl") | str_detect(measurement, "resource|cpu") ~ "resources",
     TRUE ~ "other_child_span"
   )
 }
@@ -860,7 +854,6 @@ summarize_runs <- function(df) {
       has_container_rows = any(device_class == "container", na.rm = TRUE),
       has_resource_fields = any(!is.na(cpu_envelope_utilization) |
         !is.na(cpu_throttled_time_ratio) |
-        !is.na(ram_rss_delta_bytes) |
         !is.na(alloc_bytes)),
       run_looks_complete = all(openmls_v5_key_operations %in% operation),
       .groups = "drop"
@@ -2084,27 +2077,6 @@ plot_resource_alloc_by_operation_device <- function(df) {
     theme_openmls_v5()
 }
 
-plot_resource_rss_by_operation_device <- function(df) {
-  metric <- c("ram_rss_delta_bytes", "ram_rss_utilization")[vapply(c("ram_rss_delta_bytes", "ram_rss_utilization"), function(col) col %in% names(df) && has_values(df[[col]]), logical(1))][1]
-  if (is.na(metric)) {
-    return(openmls_v5_skip("no populated RSS metric found"))
-  }
-  d <- df |>
-    filter(is_protocol_parent, is.finite(size_n), is.finite(.data[[metric]]))
-  if (nrow(d) < 10) {
-    return(openmls_v5_skip("not enough parent rows with RSS metric"))
-  }
-  sampled <- thin_plot_rows(d)
-  p <- base_scatter(
-    sampled, "size_n", metric, "device_label",
-    "RSS diagnostic by operation and device",
-    "RSS deltas/utilization can be noisy and should be interpreted as systems diagnostics.",
-    ylab = metric_label(metric)
-  ) +
-    facet_wrap(~operation_family, scales = "free_y")
-  add_loess_if_possible(p, sampled, "size_n", metric, color_col = "device_label", group_cols = c("operation_family", "device_label"))
-}
-
 plot_resource_cpu_by_operation_device <- function(df) {
   metric <- "cpu_envelope_utilization"
   if (!(metric %in% names(df)) || !has_values(df[[metric]])) {
@@ -2303,7 +2275,6 @@ openmls_v5_plot_requirements <- function() {
     list(name = "plot_commit_receive_parent_child_consistency", required = c("global_span_id", "parent_global_span_id", "wall_ms")),
     list(name = "plot_commit_receive_gam_surface", required = c("size_n", "commit_size_bytes", "wall_ms")),
     list(name = "plot_resource_alloc_by_operation_device", required = c("alloc_bytes", "operation_family", "device_label")),
-    list(name = "plot_resource_rss_by_operation_device", required = c("ram_rss_delta_bytes", "ram_rss_utilization")),
     list(name = "plot_resource_cpu_by_operation_device", required = c("cpu_envelope_utilization")),
     list(name = "plot_resource_throttling", required = c("cpu_throttled_time_ratio")),
     list(name = "plot_iot_feasibility_frontier", required = c("size_n", "device_class", "device_label")),
@@ -2359,7 +2330,6 @@ openmls_v5_plot_registry <- function() {
       "plot_commit_receive_parent_child_consistency",
       "plot_commit_receive_gam_surface",
       "plot_resource_alloc_by_operation_device",
-      "plot_resource_rss_by_operation_device",
       "plot_resource_cpu_by_operation_device",
       "plot_resource_throttling",
       "plot_iot_feasibility_frontier",
@@ -2378,7 +2348,7 @@ openmls_v5_plot_registry <- function() {
       10, 11, 10, 10, 9,
       10, 8, 8, 10, 9,
       11, 11, 11, 11, 11, 8, 9,
-      10, 10, 10, 10, 11, 11, 10, 12
+      10, 10, 10, 11, 11, 10, 12
     ),
     height = c(
       7, 7, 7,
@@ -2390,7 +2360,7 @@ openmls_v5_plot_registry <- function() {
       6, 7, 6, 6, 6,
       6, 6, 6, 6, 6,
       7, 7, 7, 7, 7, 6, 6,
-      6, 7, 7, 6, 7, 7, 6, 7
+      6, 7, 6, 7, 7, 6, 7
     ),
     fun = purrr::map(name, ~ get(.x, mode = "function"))
   )

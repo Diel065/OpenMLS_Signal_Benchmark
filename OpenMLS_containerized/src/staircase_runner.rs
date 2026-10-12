@@ -700,7 +700,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 12,
+            profile_schema_version: 13,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -761,7 +761,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 12,
+            profile_schema_version: 13,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -1253,10 +1253,6 @@ struct ProfileEvent {
     alloc_count: Option<u64>,
     #[serde(default)]
     alloc_measurement_scope: Option<String>,
-    #[serde(default)]
-    ram_rss_delta_bytes: Option<i64>,
-    #[serde(default)]
-    ram_rss_utilization: Option<f64>,
     artifact_size_bytes: Option<usize>,
     #[serde(default)]
     welcome_bytes: Option<usize>,
@@ -8577,8 +8573,6 @@ pub fn aggregate_csv(
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
         alloc_measurement_scope: Option<String>,
-        ram_rss_delta_bytes: Option<i64>,
-        ram_rss_utilization: Option<f64>,
         artifact_size_bytes: Option<usize>,
         welcome_bytes: Option<usize>,
         ratchet_tree_bytes: Option<usize>,
@@ -8850,8 +8844,6 @@ pub fn aggregate_csv(
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
                 alloc_measurement_scope: event.alloc_measurement_scope,
-                ram_rss_delta_bytes: event.ram_rss_delta_bytes,
-                ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
                 welcome_bytes: event.welcome_bytes,
                 ratchet_tree_bytes: event.ratchet_tree_bytes,
@@ -9252,8 +9244,6 @@ mod aggregate_csv_resource_tests {
             "cpu_throttled_time_ratio": 0.1,
             "alloc_bytes": 42u64,
             "alloc_count": 3u64,
-            "ram_rss_delta_bytes": 4096i64,
-            "ram_rss_utilization": 0.25,
             "tree_height": 3u32,
             "tree_leaf_count": 8u32,
             "tree_node_count": 15u32,
@@ -9385,8 +9375,6 @@ mod aggregate_csv_resource_tests {
         assert_eq!(value("cpu_throttled_period_fraction_cumulative"), "0.05");
         assert_eq!(value("cpu_throttled_period_threshold"), "0.05");
         assert_eq!(value("cpu_throttled_period_threshold_crossing"), "true");
-        assert_eq!(value("ram_rss_delta_bytes"), "4096");
-        assert_eq!(value("ram_rss_utilization"), "0.25");
         assert_eq!(value("span_name"), "create_group");
         assert_eq!(value("span_id"), "44");
         assert_eq!(value("parent_span_id"), "43");
