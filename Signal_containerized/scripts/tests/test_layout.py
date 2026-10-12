@@ -52,7 +52,6 @@ class FakeArgs:
         self.project_name = "signal-layout-test"
         self.include_runner = False
         self.runner_in_docker = False
-        self.include_netcheck = False
         self.run_id = "test-run"
         self.scenario = "test-scenario"
         self.scenario_seed = 1

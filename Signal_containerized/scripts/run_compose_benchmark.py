@@ -327,14 +327,6 @@ def build_parser() -> argparse.ArgumentParser:
             "This allows workers to avoid publishing host ports."
         ),
     )
-    p.add_argument(
-        "--include-netcheck",
-        action="store_true",
-        help=(
-            "Include the continuous diagnostic netcheck service in the generated "
-            "Compose stack. Default: disabled."
-        ),
-    )
 
     p.add_argument(
         "--build-images",
@@ -862,8 +854,6 @@ def affinity_inputs_for_run(
     ]
     if args.runner_in_docker:
         bg_specs.append({"container_name": "runner", "container_role": "runner_or_helper"})
-    if args.include_netcheck:
-        bg_specs.append({"container_name": "netcheck", "container_role": "runner_or_helper"})
     profiled_id_set = set(profiled_singleton_ids)
     for cid in singleton_ids:
         if cid not in profiled_id_set:
@@ -1349,14 +1339,6 @@ def project_network_names(root: Path, project_name: str) -> list[str]:
     ]
 
 
-def write_netcheck_targets(run_dir: Path, worker_ids: list[str]) -> None:
-    if not worker_ids:
-        return
-
-    target_path = run_dir / "netcheck_targets.txt"
-    target_path.write_text("\n".join(worker_ids) + "\n", encoding="utf-8")
-
-
 def read_int_file(path: Path) -> int | None:
     try:
         return int(path.read_text(encoding="utf-8").strip())
@@ -1401,7 +1383,6 @@ def collect_failure_diagnostics(
     diag_dir.mkdir(parents=True, exist_ok=True)
 
     failed_worker_ids = extract_failed_worker_ids(terminal_output_path)
-    write_netcheck_targets(run_dir, failed_worker_ids)
 
     print(
         f"[diagnostics] collecting failure evidence in {diag_dir} "
@@ -1469,8 +1450,6 @@ def collect_failure_diagnostics(
     )
 
     services = ["runner", "kr", "relay"]
-    if args.include_netcheck:
-        services.append("netcheck")
     services.extend(f"worker-{worker_id}" for worker_id in failed_worker_ids)
     services.extend(f"worker-pack-{i:03d}" for i in range(100))
     compose_service_logs(
@@ -1518,25 +1497,6 @@ def collect_failure_diagnostics(
             probe_lines.append("")
         probe_script = "\n".join(probe_lines)
 
-        if args.include_netcheck:
-            run_capture(
-                root,
-                diag_dir / "runner-network-health-probes.txt",
-                [
-                    "docker",
-                    "compose",
-                    "-f",
-                    str(compose_file),
-                    "run",
-                    "--rm",
-                    "--no-deps",
-                    "netcheck",
-                    "sh",
-                    "-lc",
-                    probe_script,
-                ],
-                env=compose_env,
-            )
 
         for worker_id in failed_worker_ids[:10]:
             worker_index = int(worker_id)
@@ -1581,11 +1541,6 @@ def collect_failure_diagnostics(
                 ],
                 env=compose_env,
             )
-
-    if args.include_netcheck:
-        netcheck_log = run_dir / "netcheck.log"
-        if netcheck_log.exists():
-            shutil.copy2(netcheck_log, diag_dir / "netcheck.log")
 
 
 def physical_worker_services(
@@ -3975,8 +3930,6 @@ def main() -> int:
         else:
             generator_cmd.append("--publish-workers")
 
-        if args.include_netcheck:
-            generator_cmd.append("--include-netcheck")
 
         run_cmd(generator_cmd, cwd=root)
 
@@ -4126,14 +4079,6 @@ def main() -> int:
         )
         print("[health] relay ok", flush=True)
 
-        if args.include_netcheck:
-            print("[netcheck] starting continuous network monitor", flush=True)
-            run_cmd(
-                ["docker", "compose", "-f", str(compose_tmp), "up", "-d", "netcheck"],
-                cwd=root,
-                env=compose_env,
-            )
-            print(f"[netcheck] writing continuous log to {run_dir / 'netcheck.log'}", flush=True)
 
         if args.runner_in_docker:
             print("[health] skipping host worker health checks; runner will check workers inside Docker network")

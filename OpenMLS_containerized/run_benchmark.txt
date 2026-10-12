@@ -3,7 +3,6 @@ python3 scripts/run_compose_benchmark.py \
   --bridge-count 10 \
   --runner-in-docker \
   --build-images \
-  --include-netcheck \
   --worker-layout-mode hybrid \
   --singleton-min-count 32 \
   --singleton-fraction 0.125 \
