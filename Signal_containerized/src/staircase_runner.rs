@@ -8,7 +8,7 @@ use std::{
     str::FromStr,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -93,12 +93,14 @@ pub struct StaircaseConfig {
     pub min_size: usize,
     pub max_size: Option<usize>,
     pub step_size: StepSize,
+    pub plateau_sizes: Vec<usize>,
     pub step_size_switch_at: Option<usize>,
     pub step_size_after_switch: Option<usize>,
     pub plateau_order: PlateauOrder,
     pub roundtrips: usize,
     pub app_rounds: usize,
     pub max_app_samples_per_payload: usize,
+    pub min_profiled_samples_per_operation: usize,
     pub payload_sizes: PayloadSizes,
     pub run_id: String,
     pub scenario: String,
@@ -114,6 +116,7 @@ pub struct StaircaseConfig {
     pub profile_only_singletons: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
+    pub profiled_failure_stop_after: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -499,15 +502,55 @@ struct RunnerEventLog {
     path: PathBuf,
     oom_evidence_path: PathBuf,
     run_dir: PathBuf,
+    profiled_budget_failures: Mutex<HashSet<String>>,
+    profiled_failure_stop_after: usize,
+    resource_sweep: bool,
+    external_devices: bool,
 }
 
 impl RunnerEventLog {
-    fn new(run_dir: &Path) -> Self {
+    fn new(run_dir: &Path, profiled_failure_stop_after: usize) -> Self {
         Self {
             path: run_dir.join("runner-events.jsonl"),
             oom_evidence_path: run_dir.join("oom_events.jsonl"),
             run_dir: run_dir.to_path_buf(),
+            profiled_budget_failures: Mutex::new(HashSet::new()),
+            profiled_failure_stop_after,
+            resource_sweep: profiled_failure_stop_after > 0,
+            external_devices: false,
         }
+    }
+
+    fn count_profiled_budget_failure(
+        &self,
+        worker: &WorkerSpec,
+        failure_class: &str,
+    ) -> Result<()> {
+        if self.profiled_failure_stop_after == 0
+            || !worker.profile_enabled
+            || worker.container_mode != ContainerMode::Singleton
+            || !matches!(
+                failure_class,
+                "app_heap_budget_exceeded"
+                    | "app_heap_budget_allocator_abort"
+                    | "embedded_budget_timeout"
+                    | "cpu_starvation_timeout"
+                    | "oom_kill"
+            )
+        {
+            return Ok(());
+        }
+        let mut failures = self.profiled_budget_failures.lock().unwrap();
+        failures.insert(worker.id.clone());
+        let count = failures.len();
+        if count >= self.profiled_failure_stop_after {
+            return Err(ExpectedProfiledFailureStop {
+                count,
+                limit: self.profiled_failure_stop_after,
+            }
+            .into());
+        }
+        Ok(())
     }
 
     async fn find_oom_evidence(&self, worker: &WorkerSpec) -> Option<OomEvidence> {
@@ -523,12 +566,13 @@ impl RunnerEventLog {
         None
     }
 
-    fn record_oom_failure(
+    fn record_worker_failure(
         &self,
         cursor: &BenchmarkCursor,
         worker: &WorkerSpec,
         error: &anyhow::Error,
-        evidence: &OomEvidence,
+        failure_class: &str,
+        evidence: Option<&OomEvidence>,
         action: &str,
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
@@ -538,10 +582,10 @@ impl RunnerEventLog {
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
             failed_physical_worker_id: worker.physical_worker_id.clone(),
-            failure_class: "oom_kill".to_string(),
+            failure_class: failure_class.to_string(),
             failure_detail: format!("{:#}", error),
-            failure_evidence_source: non_empty_string(&evidence.source),
-            failure_evidence_detail: evidence.detail.clone(),
+            failure_evidence_source: evidence.and_then(|e| non_empty_string(&e.source)),
+            failure_evidence_detail: evidence.and_then(|e| e.detail.clone()),
             failure_action: action.to_string(),
             reassigned_to_worker_id: reassigned_to.map(|candidate| candidate.id.clone()),
             benchmark_plateau_index: cursor.plateau_index,
@@ -569,19 +613,58 @@ impl RunnerEventLog {
             append_signal_profile_event(&profile_path, &event.to_profile_event())
         {
             eprintln!(
-                "[oom-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
+                "[resource-attrition] WARNING: failed to append duplicate profile row for worker {}: {:#}; runner journal {} remains authoritative",
                 worker.id,
                 profile_error,
                 self.path.display()
             );
         }
         eprintln!(
-            "[oom-attrition] worker={} physical_worker={} phase={} operation={} action={}",
-            worker.id, worker.physical_worker_id, cursor.phase, cursor.operation, action
+            "[resource-attrition] worker={} physical_worker={} class={} phase={} operation={} action={}",
+            worker.id, worker.physical_worker_id, failure_class, cursor.phase, cursor.operation, action
         );
+        self.count_profiled_budget_failure(worker, failure_class)?;
         Ok(())
     }
+
+    fn record_oom_failure(
+        &self,
+        cursor: &BenchmarkCursor,
+        worker: &WorkerSpec,
+        error: &anyhow::Error,
+        evidence: &OomEvidence,
+        action: &str,
+        reassigned_to: Option<&WorkerSpec>,
+    ) -> Result<()> {
+        self.record_worker_failure(
+            cursor,
+            worker,
+            error,
+            "oom_kill",
+            Some(evidence),
+            action,
+            reassigned_to,
+        )
+    }
 }
+
+#[derive(Debug)]
+struct ExpectedProfiledFailureStop {
+    count: usize,
+    limit: usize,
+}
+
+impl fmt::Display for ExpectedProfiledFailureStop {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "expected profiled resource-failure stop after {}/{} workers",
+            self.count, self.limit
+        )
+    }
+}
+
+impl StdError for ExpectedProfiledFailureStop {}
 
 impl RunnerEvent {
     fn to_profile_event(&self) -> SignalProfileEvent {
@@ -835,6 +918,13 @@ pub fn workers_from_layout(layout: &WorkerLayout) -> Vec<WorkerSpec> {
 
 pub fn measured_active_participants(active: &[WorkerSpec]) -> Vec<&WorkerSpec> {
     active.iter().filter(|w| w.profile_enabled).collect()
+}
+
+fn any_profile_enabled_remaining(active: &[WorkerSpec], idle: &VecDeque<WorkerSpec>) -> bool {
+    active
+        .iter()
+        .chain(idle.iter())
+        .any(|worker| worker.profile_enabled)
 }
 
 fn frontload_profile_enabled_singletons_in_idle(
@@ -1142,7 +1232,18 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
-    let runner_events = RunnerEventLog::new(&run_dir);
+    let mut runner_events = RunnerEventLog::new(&run_dir, config.profiled_failure_stop_after);
+    if let Some(layout) = config.worker_layout.as_ref() {
+        runner_events.resource_sweep |= layout.physical_workers.iter().any(|worker| {
+            worker.execution_backend != "real_device"
+                && (worker.resource_limit_cpus.is_some()
+                    || worker.resource_limit_memory.is_some()
+                    || worker.resource_profile.contains("appheap-"))
+        });
+        runner_events.external_devices = layout.clients.iter().any(|client| {
+            client.execution_backend == "real_device"
+        });
+    }
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
     let min_fanout_parallelism =
@@ -1224,30 +1325,81 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     };
 
     let mut plateau_rng = rand::rng();
-    let plateau_sequence = build_plateau_sequence_for_order(
-        config.min_size,
-        max_size,
-        &config.step_size,
-        config.roundtrips,
-        config.plateau_order,
-        piecewise_step,
-        &mut plateau_rng,
-    );
+    let plateau_sequence = if config.plateau_sizes.is_empty() {
+        build_plateau_sequence_for_order(
+            config.min_size,
+            max_size,
+            &config.step_size,
+            config.roundtrips,
+            config.plateau_order,
+            piecewise_step,
+            &mut plateau_rng,
+        )
+    } else {
+        config.plateau_sizes.clone()
+    };
+    let external_density_ids = external_profiled_client_ids(config.worker_layout.as_ref());
+    if config.min_profiled_samples_per_operation > 0 {
+        if config.plateau_order != PlateauOrder::Ascending {
+            return Err(anyhow!(
+                "external density mode requires --plateau-order ascending"
+            ));
+        }
+        let minimum_initial_size = external_density_ids.len().saturating_add(1);
+        if plateau_sequence.first().copied().unwrap_or(0) < minimum_initial_size {
+            return Err(anyhow!(
+                "external density plan requires initial size >= {} so every external device and one active peer are present; got {}",
+                minimum_initial_size,
+                plateau_sequence.first().copied().unwrap_or(0),
+            ));
+        }
+    }
+
+    #[derive(Serialize)]
+    struct ScenarioPlan<'a> {
+        run_id: &'a str,
+        plateau_order: PlateauOrder,
+        plateau_sequence: &'a [usize],
+        min_size: usize,
+        max_size: usize,
+        step_size: String,
+        plateau_sizes: Option<&'a [usize]>,
+        payload_sizes: String,
+        min_external_samples_per_operation: usize,
+    }
+    let scenario_plan = ScenarioPlan {
+        run_id: &config.run_id,
+        plateau_order: config.plateau_order,
+        plateau_sequence: &plateau_sequence,
+        min_size: *plateau_sequence.first().unwrap_or(&config.min_size),
+        max_size: *plateau_sequence.last().unwrap_or(&max_size),
+        step_size: config.step_size.to_string(),
+        plateau_sizes: (!config.plateau_sizes.is_empty()).then_some(&config.plateau_sizes),
+        payload_sizes: config.payload_sizes.to_string(),
+        min_external_samples_per_operation: config.min_profiled_samples_per_operation,
+    };
+    fs::write(
+        run_dir.join("scenario_plan.json"),
+        serde_json::to_vec_pretty(&scenario_plan)?,
+    )?;
 
     let total_units = estimate_total_units(
         &plateau_sequence,
         config.app_rounds,
         config.max_app_samples_per_payload,
         config.payload_sizes.source_count(),
+        external_density_ids.len(),
+        config.min_profiled_samples_per_operation,
     );
 
     eprintln!(
-        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, app_cap={}, total_units≈{}",
+        "Scenario plan: plateau_order={}, plateaus={:?}, step_size={}, payload_sizes={}, app_cap={}, min_external_samples={}, total_units≈{}",
         config.plateau_order,
         plateau_sequence,
         config.step_size,
         config.payload_sizes,
         config.max_app_samples_per_payload,
+        config.min_profiled_samples_per_operation,
         total_units
     );
 
@@ -1276,6 +1428,12 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 target_size
             );
 
+            let mut external_session_budget = external_density_ids
+                .iter()
+                .map(|worker_id| (worker_id.clone(), config.min_profiled_samples_per_operation))
+                .collect::<HashMap<_, _>>();
+            let external_session_budget_arg = (config.min_profiled_samples_per_operation > 0)
+                .then_some(&mut external_session_budget);
             if let Err(e) = transition_to_size(
                 &http,
                 &kr_url,
@@ -1288,10 +1446,49 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 plateau_idx + 1,
                 &runner_events,
                 config.profile_only_singletons,
+                external_session_budget_arg,
             )
             .await
             {
                 plateau_result = Err(e);
+                break;
+            }
+
+            if config.min_profiled_samples_per_operation > 0 {
+                if let Err(error) = top_up_external_session_density(
+                    &http,
+                    &active,
+                    &external_density_ids,
+                    &mut external_session_budget,
+                    &mut fanout,
+                    plateau_idx + 1,
+                    target_size,
+                    &runner_events,
+                )
+                .await
+                {
+                    plateau_result = Err(error);
+                    break;
+                }
+            }
+
+            let incomplete_session_devices = active
+                .iter()
+                .filter(|worker| external_density_ids.contains(&worker.id))
+                .filter_map(|worker| {
+                    let remaining = external_session_budget
+                        .get(&worker.id)
+                        .copied()
+                        .unwrap_or(config.min_profiled_samples_per_operation);
+                    (remaining > 0).then_some((worker.id.clone(), remaining))
+                })
+                .collect::<Vec<_>>();
+            if !incomplete_session_devices.is_empty() {
+                plateau_result = Err(anyhow!(
+                    "plateau {} failed to satisfy the external session profiling budget: {:?}",
+                    target_size,
+                    incomplete_session_devices,
+                ));
                 break;
             }
 
@@ -1306,6 +1503,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                     .saturating_div(2),
             );
 
+            if runner_events.resource_sweep && config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+                eprintln!(
+                    "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                    target_size
+                );
+                break;
+            }
+
             if let Err(e) = run_application_phase(
                 &http,
                 &kr_url,
@@ -1314,6 +1519,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 target_size,
                 config.app_rounds,
                 config.max_app_samples_per_payload,
+                config.min_profiled_samples_per_operation,
+                &external_density_ids,
                 &config.payload_sizes,
                 &mut fanout,
                 &mut progress,
@@ -1323,6 +1530,14 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             .await
             {
                 plateau_result = Err(e);
+                break;
+            }
+
+            if runner_events.resource_sweep && config.profile_only_singletons && !any_profile_enabled_remaining(&active, &idle) {
+                eprintln!(
+                    "\n[resource-sweep] stopping after plateau {}: no profile-enabled workers remain",
+                    target_size
+                );
                 break;
             }
 
@@ -1352,6 +1567,20 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             "[sidecars] failed to write post-benchmark sidecars: {:#}",
             e
         );
+    }
+
+    if let Err(ref error) = run_result {
+        if error
+            .downcast_ref::<ExpectedProfiledFailureStop>()
+            .is_some()
+        {
+            eprintln!("[resource-sweep] {:#}; exiting successfully", error);
+            println!(
+                "Signal staircase benchmark finished early. Output in {}",
+                run_dir.display()
+            );
+            return Ok(());
+        }
     }
 
     if run_result.is_ok() {
@@ -1719,6 +1948,24 @@ async fn record_worker_oom_if_evidenced(
     reassigned_to: Option<&WorkerSpec>,
 ) -> Result<bool> {
     let Some(evidence) = runner_events.find_oom_evidence(worker).await else {
+        let failure_class = classify_worker_error(error);
+        if matches!(
+            failure_class,
+            "app_heap_budget_exceeded"
+                | "app_heap_budget_allocator_abort"
+                | "embedded_budget_timeout"
+        ) {
+            runner_events.record_worker_failure(
+                cursor,
+                worker,
+                error,
+                failure_class,
+                None,
+                action,
+                reassigned_to,
+            )?;
+            return Ok(true);
+        }
         return Ok(false);
     };
     runner_events.record_oom_failure(cursor, worker, error, &evidence, action, reassigned_to)?;
@@ -2008,17 +2255,32 @@ async fn establish_sessions(
     conversation_size: usize,
     cursor: &BenchmarkCursor,
     decrypt_on_peer: bool,
-) -> Result<()> {
+    runner_events: &RunnerEventLog,
+    mut external_profile_budget: Option<&mut HashMap<String, usize>>,
+) -> Result<HashSet<String>> {
+    let mut failed_ids = HashSet::new();
     if existing_participants.is_empty() {
-        return Ok(());
+        return Ok(failed_ids);
     }
 
     let workflow_id = next_workflow_id();
     let pair_count = existing_participants.len();
-    for (pair_index, peer) in existing_participants.iter().enumerate() {
+    'pairs: for (pair_index, peer) in existing_participants.iter().enumerate() {
+        let requires_fresh_external_sample = external_profile_budget
+            .as_deref()
+            .and_then(|budget| budget.get(&actor.id))
+            .is_some_and(|remaining| *remaining > 0);
+        let profile = external_profile_budget
+            .as_deref()
+            .and_then(|budget| budget.get(&actor.id))
+            .map_or(true, |remaining| *remaining > 0);
+        if requires_fresh_external_sample {
+            reset_session_pair(http, actor, peer).await?;
+        }
         let establish_command = Command::EstablishSessions {
             participants: vec![peer.id.clone()],
             conversation_size: Some(conversation_size),
+            profile,
         };
         let establish_context = WorkerCommandContext::with_cursor(
             actor,
@@ -2027,54 +2289,121 @@ async fn establish_sessions(
             Some(cursor),
         )
         .with_workflow(workflow_id, pair_index, pair_count);
-        send_cmd_expect_ok_fragment_with_context(
+        let establishment_result = send_cmd_expect_ok_fragment_with_context(
             http,
             actor,
             &establish_command,
             "session establishment",
             &establish_context,
         )
-        .await?;
-
-        let initial_message = format!("signal-initial-handshake:{}->{}", actor.id, peer.id);
-        let encrypt_command = Command::EncryptMessage {
-            recipient: peer.id.clone(),
-            message: initial_message,
-            conversation_size: Some(2),
+        .await;
+        let establishment_message = match establishment_result {
+            Ok(message) => message,
+            Err(error) => {
+                if runner_events.resource_sweep
+                    && record_worker_oom_if_evidenced(
+                        runner_events,
+                        cursor,
+                        actor,
+                        &error,
+                        "remove_active_participant",
+                        None,
+                    )
+                    .await?
+                {
+                    failed_ids.insert(actor.id.clone());
+                    return Ok(failed_ids);
+                }
+                return Err(error);
+            }
         };
-        let encrypt_context = WorkerCommandContext::with_metadata(
-            actor,
-            &encrypt_command,
-            Some("handshake.initial_message_encrypt"),
-        );
-        send_cmd_expect_ok_fragment_with_context(
-            http,
-            actor,
-            &encrypt_command,
-            "encrypted and sent",
-            &encrypt_context,
-        )
-        .await?;
+        if profile && session_established_count(&establishment_message) > 0 {
+            if let Some(remaining) = external_profile_budget
+                .as_deref_mut()
+                .and_then(|budget| budget.get_mut(&actor.id))
+            {
+                *remaining = remaining.saturating_sub(1);
+            }
+        }
+
+        if decrypt_on_peer || !runner_events.external_devices {
+            let initial_message = format!("signal-initial-handshake:{}->{}", actor.id, peer.id);
+            let encrypt_command = Command::EncryptMessage {
+                recipient: peer.id.clone(),
+                message: initial_message,
+                conversation_size: Some(2),
+            };
+            let encrypt_context = WorkerCommandContext::with_metadata(
+                actor,
+                &encrypt_command,
+                Some("handshake.initial_message_encrypt"),
+            );
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
+                http,
+                actor,
+                &encrypt_command,
+                "encrypted and sent",
+                &encrypt_context,
+            )
+            .await
+            {
+                if runner_events.resource_sweep
+                    && record_worker_oom_if_evidenced(
+                        runner_events,
+                        cursor,
+                        actor,
+                        &error,
+                        "remove_active_participant",
+                        None,
+                    )
+                    .await?
+                {
+                    failed_ids.insert(actor.id.clone());
+                    return Ok(failed_ids);
+                }
+                return Err(error);
+            }
+        }
 
         if decrypt_on_peer {
             let decrypt_command = Command::DecryptMessage {
                 sender: actor.id.clone(),
                 profile: true,
                 conversation_size: Some(2),
+                expected_plaintext_bytes: (runner_events.resource_sweep
+                    || runner_events.external_devices)
+                    .then(|| format!("signal-initial-handshake:{}->{}", actor.id, peer.id).len()),
             };
             let decrypt_context = WorkerCommandContext::with_metadata(
                 peer,
                 &decrypt_command,
                 Some("handshake.initial_message_decrypt"),
             );
-            send_cmd_expect_ok_fragment_with_context(
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
                 http,
                 peer,
                 &decrypt_command,
                 "pairwise message received",
                 &decrypt_context,
             )
-            .await?;
+            .await
+            {
+                if runner_events.resource_sweep
+                    && record_worker_oom_if_evidenced(
+                        runner_events,
+                        cursor,
+                        peer,
+                        &error,
+                        "remove_active_participant",
+                        None,
+                    )
+                    .await?
+                {
+                    failed_ids.insert(peer.id.clone());
+                    continue 'pairs;
+                }
+                return Err(error);
+            }
 
             let update_opks_command = Command::UpdateOneTimePrekeys;
             let update_opks_context = WorkerCommandContext::with_metadata(
@@ -2082,17 +2411,161 @@ async fn establish_sessions(
                 &update_opks_command,
                 Some("prekey.maintenance_after_handshake"),
             );
-            send_cmd_expect_ok_fragment_with_context(
+            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
                 http,
                 peer,
                 &update_opks_command,
                 "one-time prekey stock",
                 &update_opks_context,
             )
-            .await?;
+            .await
+            {
+                if runner_events.resource_sweep
+                    && record_worker_oom_if_evidenced(
+                        runner_events,
+                        cursor,
+                        peer,
+                        &error,
+                        "remove_active_participant",
+                        None,
+                    )
+                    .await?
+                {
+                    failed_ids.insert(peer.id.clone());
+                    continue 'pairs;
+                }
+                return Err(error);
+            }
         }
     }
 
+    Ok(failed_ids)
+}
+
+fn session_established_count(message: &str) -> usize {
+    message
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("new="))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn session_density_peer(
+    actor: &WorkerSpec,
+    active: &[WorkerSpec],
+    external_density_ids: &HashSet<String>,
+) -> Option<WorkerSpec> {
+    active
+        .iter()
+        .filter(|peer| peer.id != actor.id)
+        .min_by_key(|peer| (external_density_ids.contains(&peer.id), peer.id.as_str()))
+        .cloned()
+}
+
+async fn reset_session_pair(
+    http: &reqwest::Client,
+    actor: &WorkerSpec,
+    peer: &WorkerSpec,
+) -> Result<()> {
+    for (worker, remote_id) in [(actor, &peer.id), (peer, &actor.id)] {
+        let reset_command = Command::ResetSessions {
+            participants: vec![remote_id.clone()],
+        };
+        let reset_context = WorkerCommandContext::with_metadata(
+            worker,
+            &reset_command,
+            Some("sampling.session_reset"),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            worker,
+            &reset_command,
+            "sessions reset",
+            &reset_context,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn top_up_external_session_density(
+    http: &reqwest::Client,
+    active: &[WorkerSpec],
+    external_density_ids: &HashSet<String>,
+    external_session_budget: &mut HashMap<String, usize>,
+    fanout: &mut FanoutController,
+    plateau_index: usize,
+    target_size: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    let mut actors = active
+        .iter()
+        .filter(|worker| external_density_ids.contains(&worker.id))
+        .cloned()
+        .collect::<Vec<_>>();
+    actors.sort_by(|left, right| left.id.cmp(&right.id));
+
+    for actor in actors {
+        let peer = session_density_peer(&actor, active, external_density_ids).ok_or_else(|| {
+            anyhow!(
+                "external session density requires an active peer for {} at plateau {}",
+                actor.id,
+                target_size
+            )
+        })?;
+        let mut density_seq = 0usize;
+        while external_session_budget
+            .get(&actor.id)
+            .copied()
+            .unwrap_or_default()
+            > 0
+        {
+            let before = external_session_budget
+                .get(&actor.id)
+                .copied()
+                .unwrap_or_default();
+            let cursor = BenchmarkCursor::new(
+                plateau_index,
+                target_size,
+                active.len(),
+                "enrollment",
+                "establish_session_external_density",
+            )
+            .at_operation(density_seq, None);
+            let failed_ids = establish_sessions(
+                http,
+                &actor,
+                std::slice::from_ref(&peer),
+                fanout,
+                target_size,
+                &cursor,
+                true,
+                runner_events,
+                Some(external_session_budget),
+            )
+            .await?;
+            if !failed_ids.is_empty() {
+                return Err(anyhow!(
+                    "external session density trial for {} at plateau {} failed for workers {:?}",
+                    actor.id,
+                    target_size,
+                    failed_ids,
+                ));
+            }
+            let after = external_session_budget
+                .get(&actor.id)
+                .copied()
+                .unwrap_or_default();
+            if after >= before {
+                return Err(anyhow!(
+                    "fresh session density trial for {} at plateau {} produced no persisted session measurement",
+                    actor.id,
+                    target_size
+                ));
+            }
+            density_seq = density_seq.saturating_add(1);
+        }
+    }
     Ok(())
 }
 
@@ -2104,6 +2577,7 @@ async fn broadcast_message(
     fanout: &mut FanoutController,
     profiling_recipient_id: Option<&str>,
     cursor: &BenchmarkCursor,
+    sender_specific_delivery: bool,
 ) -> Result<()> {
     let conversation_size = recipients.len() + 1;
 
@@ -2146,6 +2620,8 @@ async fn broadcast_message(
                 sender: sender.id.clone(),
                 profile: is_profiled,
                 conversation_size: Some(conversation_size),
+                expected_plaintext_bytes: sender_specific_delivery
+                    .then_some(cursor.payload_size).flatten(),
             },
             phase: Some("application.fanout_receive_message".to_string()),
             profile: is_profiled.then_some(true),
@@ -2191,6 +2667,7 @@ async fn enroll_participants(
     target_size: usize,
     runner_events: &RunnerEventLog,
     profile_only_singletons: bool,
+    mut external_profile_budget: Option<&mut HashMap<String, usize>>,
 ) -> Result<()> {
     if batch_size == 0 {
         return Err(anyhow!("Cannot enroll zero participants"));
@@ -2260,7 +2737,8 @@ async fn enroll_participants(
     // Establish pairwise sessions from each new participant to every participant that
     // will be active after this enrollment batch. This includes peers enrolled in the
     // same batch; otherwise the first plateau in a batched ascent lacks new-new sessions.
-    let existing_ids: Vec<WorkerSpec> = active.clone();
+    let mut existing_ids: Vec<WorkerSpec> = active.clone();
+    let mut failed_ids = HashSet::new();
     if profile_only_singletons {
         // When only singletons carry profiling, prioritise profile-enabled
         // initiators so every (singleton→peer) session establishment runs
@@ -2272,7 +2750,7 @@ async fn enroll_participants(
 
         // Phase A: existing profile-enabled → new non-profiled
         //          decrypt_on_peer = true (packed workers need the session)
-        let profile_enabled_existing: Vec<_> = existing_ids
+        let mut profile_enabled_existing: Vec<_> = existing_ids
             .iter()
             .filter(|w| w.profile_enabled)
             .cloned()
@@ -2283,6 +2761,9 @@ async fn enroll_participants(
             .cloned()
             .collect();
         for existing in &profile_enabled_existing {
+            if failed_ids.contains(&existing.id) {
+                continue;
+            }
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2291,29 +2772,40 @@ async fn enroll_participants(
                 "establish_session_existing_profiled",
             );
             if !non_profile_prepared.is_empty() {
-                establish_sessions(
-                    http,
-                    existing,
-                    &non_profile_prepared,
-                    fanout,
-                    target_size,
-                    &est_cursor,
-                    true,
-                )
-                .await?;
+                failed_ids.extend(
+                    establish_sessions(
+                        http,
+                        existing,
+                        &non_profile_prepared,
+                        fanout,
+                        target_size,
+                        &est_cursor,
+                        true,
+                        runner_events,
+                        external_profile_budget.as_deref_mut(),
+                    )
+                    .await?,
+                );
             }
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        profile_enabled_existing.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase B: existing profile-enabled → new profile-enabled
-        //          decrypt_on_peer = false (the other singleton gets its
-        //          own profiled initiator turn in Phase C)
+        // Phase B: existing profile-enabled → new profile-enabled.
+        // Decrypt now so application receives do not consume stale handshakes.
         let profile_prepared: Vec<_> = prepared
             .iter()
             .filter(|w| w.profile_enabled)
             .cloned()
             .collect();
         for existing in &profile_enabled_existing {
-            if profile_prepared.is_empty() {
+            let peers: Vec<_> = profile_prepared
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
+            if peers.is_empty() {
                 break;
             }
             let est_cursor = BenchmarkCursor::new(
@@ -2323,22 +2815,40 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_existing_to_new_profiled",
             );
-            establish_sessions(
-                http,
-                existing,
-                &profile_prepared,
-                fanout,
-                target_size,
-                &est_cursor,
-                false,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    runner_events.resource_sweep,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase C: new profile-enabled → existing + peer-new
         for p in &profile_prepared {
-            let mut peers: Vec<WorkerSpec> = existing_ids.clone();
-            peers.extend(prepared.iter().filter(|peer| peer.id != p.id).cloned());
+            if failed_ids.contains(&p.id) {
+                continue;
+            }
+            let mut peers: Vec<WorkerSpec> = existing_ids
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
+            peers.extend(
+                prepared
+                    .iter()
+                    .filter(|peer| peer.id != p.id && !failed_ids.contains(&peer.id))
+                    .cloned(),
+            );
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2346,8 +2856,24 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_new_profiled",
             );
-            establish_sessions(http, p, &peers, fanout, target_size, &est_cursor, true).await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    p,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase D: existing non-profiled → prepared
         let non_profile_existing: Vec<_> = existing_ids
@@ -2356,6 +2882,14 @@ async fn enroll_participants(
             .cloned()
             .collect();
         for existing in &non_profile_existing {
+            if failed_ids.contains(&existing.id) {
+                continue;
+            }
+            let peers: Vec<_> = prepared
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
             let est_cursor = BenchmarkCursor::new(
                 plateau_index,
                 target_size,
@@ -2363,25 +2897,39 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_existing_nonprofiled",
             );
-            establish_sessions(
-                http,
-                existing,
-                &prepared,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
+        active.retain(|worker| !failed_ids.contains(&worker.id));
+        existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
+        prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
         // Phase E: new non-profiled → existing + peer-new
         for participant in &non_profile_prepared {
-            let mut peers = existing_ids.clone();
+            if failed_ids.contains(&participant.id) {
+                continue;
+            }
+            let mut peers: Vec<_> = existing_ids
+                .iter()
+                .filter(|peer| !failed_ids.contains(&peer.id))
+                .cloned()
+                .collect();
             peers.extend(
                 prepared
                     .iter()
-                    .filter(|peer| peer.id != participant.id)
+                    .filter(|peer| peer.id != participant.id && !failed_ids.contains(&peer.id))
                     .cloned(),
             );
             let est_cursor = BenchmarkCursor::new(
@@ -2391,16 +2939,20 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_new_nonprofiled",
             );
-            establish_sessions(
-                http,
-                participant,
-                &peers,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    participant,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
     } else {
         for (idx, participant) in prepared.iter().enumerate() {
@@ -2419,16 +2971,20 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session",
             );
-            establish_sessions(
-                http,
-                participant,
-                &peers,
-                fanout,
-                target_size,
-                &est_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    participant,
+                    &peers,
+                    fanout,
+                    target_size,
+                    &est_cursor,
+                    true,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
 
         // Also establish sessions from existing participants to the new ones.
@@ -2440,19 +2996,25 @@ async fn enroll_participants(
                 "enrollment",
                 "establish_session_reverse",
             );
-            establish_sessions(
-                http,
-                existing,
-                &prepared,
-                fanout,
-                target_size,
-                &enroll_cursor,
-                true,
-            )
-            .await?;
+            failed_ids.extend(
+                establish_sessions(
+                    http,
+                    existing,
+                    &prepared,
+                    fanout,
+                    target_size,
+                    &enroll_cursor,
+                    true,
+                    runner_events,
+                    external_profile_budget.as_deref_mut(),
+                )
+                .await?,
+            );
         }
     }
 
+    active.retain(|worker| !failed_ids.contains(&worker.id));
+    prepared.retain(|worker| !failed_ids.contains(&worker.id));
     let enrolled_count = prepared.len();
     active.extend(prepared);
     let new_ids: Vec<String> = active.iter().map(|w| w.id.clone()).collect();
@@ -2531,6 +3093,7 @@ async fn transition_to_size(
     plateau_index: usize,
     runner_events: &RunnerEventLog,
     profile_only_singletons: bool,
+    mut external_profile_budget: Option<&mut HashMap<String, usize>>,
 ) -> Result<()> {
     while active.len() < target_size {
         if idle.is_empty() {
@@ -2556,6 +3119,7 @@ async fn transition_to_size(
             target_size,
             runner_events,
             profile_only_singletons,
+            external_profile_budget.as_deref_mut(),
         )
         .await?;
     }
@@ -2582,6 +3146,8 @@ async fn run_application_phase(
     plateau_size: usize,
     app_rounds: usize,
     max_app_samples_per_payload: usize,
+    min_profiled_samples_per_operation: usize,
+    external_density_ids: &HashSet<String>,
     payload_sizes: &PayloadSizes,
     fanout: &mut FanoutController,
     progress: &mut Progress,
@@ -2596,23 +3162,44 @@ async fn run_application_phase(
         return Ok(());
     }
 
-    let per_payload_count =
+    let base_per_payload_count =
         app_sends_per_plateau(plateau_size, app_rounds, max_app_samples_per_payload);
-    if per_payload_count == 0 {
+    if base_per_payload_count == 0 && min_profiled_samples_per_operation == 0 {
         return Ok(());
     }
 
     let mut payload_rng = rand::rng();
     for payload_source in payload_sizes.sources() {
+        let initial_external_count = active
+            .iter()
+            .filter(|worker| external_density_ids.contains(&worker.id))
+            .count();
+        let density_enabled = min_profiled_samples_per_operation > 0 && initial_external_count >= 2;
+        let samples_per_external = if density_enabled {
+            min_profiled_samples_per_operation.max(
+                base_per_payload_count
+                    .saturating_add(initial_external_count - 1)
+                    .saturating_div(initial_external_count),
+            )
+        } else {
+            0
+        };
+        let planned_count = if density_enabled {
+            initial_external_count.saturating_mul(samples_per_external)
+        } else {
+            base_per_payload_count
+        };
         eprintln!(
             "\n[plateau {}] application phase: {} sends at {}",
             plateau_size,
-            per_payload_count,
+            planned_count,
             payload_source.phase_label()
         );
 
+        let mut actor_successes = HashMap::<String, usize>::new();
+        let mut receiver_successes = HashMap::<String, usize>::new();
         let mut seq_no = 0usize;
-        while seq_no < per_payload_count {
+        loop {
             if active.len() < 2 {
                 eprintln!(
                     "\n[plateau {}] application phase stopped after OOM attrition: fewer than 2 active participants",
@@ -2623,13 +3210,42 @@ async fn run_application_phase(
             let mut profiled_indices: Vec<usize> = active
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, worker)| worker.profile_enabled.then_some(idx))
+                .filter_map(|(idx, worker)| {
+                    if density_enabled {
+                        external_density_ids.contains(&worker.id).then_some(idx)
+                    } else {
+                        worker.profile_enabled.then_some(idx)
+                    }
+                })
                 .collect();
             if profiled_indices.is_empty() {
                 profiled_indices = (0..active.len()).collect();
             }
-            let actor_selection_idx =
-                sampled_participant_index(profiled_indices.len(), per_payload_count, seq_no);
+            let density_pair = density_enabled
+                .then(|| {
+                    profiled_density_pair(
+                        active,
+                        &profiled_indices,
+                        &actor_successes,
+                        &receiver_successes,
+                        samples_per_external,
+                    )
+                })
+                .flatten();
+            if density_enabled && density_pair.is_none() {
+                break;
+            }
+            if !density_enabled && seq_no >= base_per_payload_count {
+                break;
+            }
+            let actor_selection_idx = if let Some((actor_idx, _)) = density_pair {
+                profiled_indices
+                    .iter()
+                    .position(|candidate| *candidate == actor_idx)
+                    .expect("density actor belongs to profiled indices")
+            } else {
+                sampled_participant_index(profiled_indices.len(), base_per_payload_count, seq_no)
+            };
             let actor_idx = profiled_indices[actor_selection_idx];
             let actor = active[actor_idx].clone();
             let payload_size = payload_source.sample(&mut payload_rng);
@@ -2643,18 +3259,18 @@ async fn run_application_phase(
                 .map(|&i| active[i].clone())
                 .collect();
 
-            let profiling_recipient_id = if profiled_indices.len() > 1 {
-                let profiled_recipient_indices: Vec<usize> = profiled_indices
-                    .iter()
-                    .copied()
-                    .filter(|&i| i != actor_idx)
-                    .collect();
-                let sampled_pos = sampled_participant_index(
-                    profiled_recipient_indices.len(),
-                    per_payload_count,
-                    seq_no,
-                );
-                Some(active[profiled_recipient_indices[sampled_pos]].id.clone())
+            let profiling_recipient_id = if let Some((_, recipient_idx)) = density_pair {
+                Some(active[recipient_idx].id.clone())
+            } else if runner_events.external_devices && profiled_indices.len() > 1 {
+                let recipient_idx =
+                    profiled_recipient_index(&profiled_indices, actor_selection_idx)
+                        .expect("multiple profiled participants have a recipient");
+                Some(active[recipient_idx].id.clone())
+            } else if profiled_indices.len() > 1 {
+                let indices = profiled_indices.iter().copied()
+                    .filter(|idx| *idx != actor_idx).collect::<Vec<_>>();
+                let sampled = sampled_participant_index(indices.len(), base_per_payload_count, seq_no);
+                Some(active[indices[sampled]].id.clone())
             } else {
                 None
             };
@@ -2675,6 +3291,7 @@ async fn run_application_phase(
                 fanout,
                 profiling_recipient_id.as_deref(),
                 &cursor,
+                runner_events.resource_sweep || runner_events.external_devices,
             )
             .await;
 
@@ -2731,12 +3348,19 @@ async fn run_application_phase(
                 return Err(error);
             }
 
+            if density_enabled {
+                *actor_successes.entry(actor.id.clone()).or_default() += 1;
+                if let Some(recipient_id) = profiling_recipient_id.as_ref() {
+                    *receiver_successes.entry(recipient_id.clone()).or_default() += 1;
+                }
+            }
+
             progress.tick(&format!(
                 "plateau {} app payload={} {}/{} actor={} recipients={}",
                 plateau_size,
                 payload_size,
                 seq_no + 1,
-                per_payload_count,
+                planned_count,
                 actor.id,
                 recipient_workers.len()
             ));
@@ -2757,6 +3381,56 @@ fn sampled_participant_index(member_count: usize, sample_count: usize, seq_no: u
     let one_based_index =
         ((sample_no + 1) as u128 * member_count as u128 / sample_count as u128) as usize;
     one_based_index.saturating_sub(1)
+}
+
+fn profiled_density_pair(
+    active: &[WorkerSpec],
+    profiled_indices: &[usize],
+    actor_successes: &HashMap<String, usize>,
+    receiver_successes: &HashMap<String, usize>,
+    required: usize,
+) -> Option<(usize, usize)> {
+    let mut candidates = Vec::new();
+    for &actor_idx in profiled_indices {
+        for &recipient_idx in profiled_indices {
+            if actor_idx == recipient_idx {
+                continue;
+            }
+            let actor = &active[actor_idx];
+            let recipient = &active[recipient_idx];
+            let actor_count = actor_successes.get(&actor.id).copied().unwrap_or(0);
+            let receiver_count = receiver_successes.get(&recipient.id).copied().unwrap_or(0);
+            let needs_actor = usize::from(actor_count < required);
+            let needs_receiver = usize::from(receiver_count < required);
+            let progress = needs_actor + needs_receiver;
+            if progress == 0 {
+                continue;
+            }
+            candidates.push((
+                2usize.saturating_sub(progress),
+                actor_count.saturating_add(receiver_count),
+                actor.id.clone(),
+                recipient.id.clone(),
+                actor_idx,
+                recipient_idx,
+            ));
+        }
+    }
+    candidates.sort();
+    candidates
+        .into_iter()
+        .next()
+        .map(|candidate| (candidate.4, candidate.5))
+}
+
+fn profiled_recipient_index(
+    profiled_indices: &[usize],
+    actor_selection_idx: usize,
+) -> Option<usize> {
+    if profiled_indices.len() < 2 {
+        return None;
+    }
+    Some(profiled_indices[(actor_selection_idx + 1) % profiled_indices.len()])
 }
 
 fn deterministic_payload(
@@ -2803,17 +3477,22 @@ fn estimate_total_units(
     app_rounds: usize,
     max_app_samples: usize,
     payload_count: usize,
+    external_participant_count: usize,
+    min_profiled_samples_per_operation: usize,
 ) -> usize {
     let mut total = 0usize;
     let mut current = 0usize;
     for &target in plateau_sequence {
         total = total.saturating_add(current.abs_diff(target));
-        total = total.saturating_add(app_ops_for_plateau(
-            target,
-            app_rounds,
-            max_app_samples,
-            payload_count,
-        ));
+        let base_app_ops = app_ops_for_plateau(target, app_rounds, max_app_samples, payload_count);
+        let density_app_ops = external_participant_count
+            .saturating_mul(min_profiled_samples_per_operation)
+            .saturating_mul(payload_count);
+        let density_session_ops =
+            external_participant_count.saturating_mul(min_profiled_samples_per_operation);
+        total = total
+            .saturating_add(density_session_ops)
+            .saturating_add(base_app_ops.max(density_app_ops));
         current = target;
     }
     total
@@ -3011,6 +3690,15 @@ fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
     sequence
 }
 
+fn external_profiled_client_ids(worker_layout: Option<&WorkerLayout>) -> HashSet<String> {
+    worker_layout
+        .into_iter()
+        .flat_map(|layout| layout.clients.iter())
+        .filter(|client| client.profile_enabled && client.execution_backend == "real_device")
+        .map(|client| client.client_id.clone())
+        .collect()
+}
+
 fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usize> {
     if config.min_size == 0 {
         return Err(anyhow!("--min-size must be at least 1"));
@@ -3023,6 +3711,13 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
     }
     if config.payload_sizes.is_empty() {
         return Err(anyhow!("At least one payload size is required"));
+    }
+    if config.min_profiled_samples_per_operation > 0
+        && external_profiled_client_ids(config.worker_layout.as_ref()).len() < 2
+    {
+        return Err(anyhow!(
+            "--min-external-samples-per-operation requires at least two profile-enabled real-device participants in worker_layout.json"
+        ));
     }
 
     let max_size = config.max_size.unwrap_or(worker_count);
@@ -3043,18 +3738,53 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
             max_size
         ));
     }
+    if !config.plateau_sizes.is_empty() {
+        if config.plateau_order != PlateauOrder::Ascending {
+            return Err(anyhow!(
+                "--plateau-sizes requires --plateau-order ascending"
+            ));
+        }
+        if config.plateau_sizes.iter().any(|size| *size == 0) {
+            return Err(anyhow!("--plateau-sizes values must be at least 1"));
+        }
+        if config
+            .plateau_sizes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(anyhow!(
+                "--plateau-sizes must be strictly increasing; got {:?}",
+                config.plateau_sizes
+            ));
+        }
+        let first = config.plateau_sizes[0];
+        let last = *config
+            .plateau_sizes
+            .last()
+            .expect("non-empty plateau sizes");
+        if first < config.min_size || last > max_size {
+            return Err(anyhow!(
+                "--plateau-sizes {:?} must stay within --min-size {} and --max-size {}",
+                config.plateau_sizes,
+                config.min_size,
+                max_size
+            ));
+        }
+    }
     Ok(max_size)
 }
 
 #[cfg(test)]
 mod random_input_tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::{
         build_plateau_sequence, build_plateau_sequence_for_step_size,
-        building_plateau_sequence_with_piecewise, PayloadSizeSource, PayloadSizes, StepSize,
+        building_plateau_sequence_with_piecewise, profiled_density_pair, profiled_recipient_index,
+        sampled_participant_index, session_density_peer, session_established_count, ContainerMode,
+        PayloadSizeSource, PayloadSizes, StepSize, WorkerSpec,
     };
 
     #[test]
@@ -3123,6 +3853,98 @@ mod random_input_tests {
             building_plateau_sequence_with_piecewise(2, 194, 64, Some((256, 128))),
             vec![2, 66, 130, 194]
         );
+    }
+
+    #[test]
+    fn capped_profiled_application_samples_cover_every_sender_and_receiver() {
+        let profiled = vec![3, 7, 11, 15];
+        let mut senders = Vec::new();
+        let mut receivers = Vec::new();
+
+        for seq_no in 0..profiled.len() {
+            let actor_pos = sampled_participant_index(profiled.len(), profiled.len(), seq_no);
+            senders.push(profiled[actor_pos]);
+            receivers.push(
+                profiled_recipient_index(&profiled, actor_pos)
+                    .expect("four profiled participants have a recipient"),
+            );
+        }
+
+        senders.sort_unstable();
+        receivers.sort_unstable();
+        assert_eq!(senders, profiled);
+        assert_eq!(receivers, profiled);
+    }
+
+    #[test]
+    fn external_density_pair_balances_both_roles_to_twenty() {
+        let worker = |id: &str| WorkerSpec {
+            id: id.to_string(),
+            url: format!("http://{id}"),
+            command_url: format!("http://{id}/command"),
+            health_url: format!("http://{id}/health"),
+            physical_worker_id: id.to_string(),
+            container_mode: ContainerMode::Singleton,
+            profile_enabled: true,
+        };
+        let active = vec![worker("ext-a"), worker("ext-b"), worker("ext-c")];
+        let profiled_indices = vec![0, 1, 2];
+        let mut actors = HashMap::new();
+        let mut receivers = HashMap::new();
+        let mut operations = 0;
+        while let Some((actor_idx, receiver_idx)) =
+            profiled_density_pair(&active, &profiled_indices, &actors, &receivers, 20)
+        {
+            *actors.entry(active[actor_idx].id.clone()).or_default() += 1;
+            *receivers
+                .entry(active[receiver_idx].id.clone())
+                .or_default() += 1;
+            operations += 1;
+        }
+
+        assert_eq!(operations, 60);
+        for worker in &active {
+            assert_eq!(actors.get(&worker.id), Some(&20));
+            assert_eq!(receivers.get(&worker.id), Some(&20));
+        }
+    }
+
+    #[test]
+    fn session_budget_counts_only_new_session_responses() {
+        assert_eq!(
+            session_established_count("session establishment: new=1 existing=0 total_target=1"),
+            1
+        );
+        assert_eq!(
+            session_established_count("session establishment: new=0 existing=1 total_target=1"),
+            0
+        );
+    }
+
+    #[test]
+    fn session_density_reuses_an_active_non_external_peer() {
+        let worker = |id: &str| WorkerSpec {
+            id: id.to_string(),
+            url: format!("http://{id}"),
+            command_url: format!("http://{id}/command"),
+            health_url: format!("http://{id}/health"),
+            physical_worker_id: id.to_string(),
+            container_mode: ContainerMode::Singleton,
+            profile_enabled: true,
+        };
+        let active = vec![
+            worker("external-a"),
+            worker("external-b"),
+            worker("external-c"),
+            worker("docker-peer"),
+        ];
+        let external_ids = ["external-a", "external-b", "external-c"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<HashSet<_>>();
+
+        let peer = session_density_peer(&active[0], &active, &external_ids).unwrap();
+        assert_eq!(peer.id, "docker-peer");
     }
 }
 
@@ -4223,6 +5045,101 @@ pub fn write_post_benchmark_sidecars(run_dir: &Path, run_id: &str) -> Result<()>
     write_validation_report_json(run_dir, run_id, events_csv_non_empty, events_csv_non_empty)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod external_density_failure_tests {
+    use super::*;
+    use axum::{extract::State, routing::post, Json, Router};
+
+    async fn respond(
+        State(failed_command): State<&'static str>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<CommandResponse> {
+        let command = request["command"]["cmd"].as_str().expect("command");
+        if command == failed_command {
+            return Json(CommandResponse::error("APP_HEAP_BUDGET_EXCEEDED"));
+        }
+        Json(CommandResponse::ok(match command {
+            "reset_sessions" => "sessions reset",
+            "establish_sessions" => "session establishment new=1",
+            "encrypt_message" => "encrypted and sent",
+            other => panic!("unexpected command {other}"),
+        }))
+    }
+
+    #[tokio::test]
+    async fn density_trials_propagate_actor_and_peer_failures() {
+        for resource_sweep in [false, true] {
+            for failed_command in ["establish_sessions", "decrypt_message"] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("local command server");
+                let address = listener.local_addr().expect("local address");
+                let server = tokio::spawn(async move {
+                    axum::serve(
+                        listener,
+                        Router::new()
+                            .route("/command", post(respond))
+                            .with_state(failed_command),
+                    )
+                    .await
+                    .expect("serve command responses");
+                });
+                let run_dir = std::env::temp_dir().join(format!(
+                    "signal-density-failure-{}-{}-{}-{}",
+                    std::process::id(),
+                    address.port(),
+                    resource_sweep,
+                    failed_command,
+                ));
+                fs::create_dir_all(&run_dir).expect("run directory");
+                let mut journal = RunnerEventLog::new(&run_dir, 0);
+                journal.resource_sweep = resource_sweep;
+                journal.external_devices = true;
+                let actor = WorkerSpec::legacy("actor".into(), format!("http://{address}"));
+                let peer = WorkerSpec::legacy("peer".into(), format!("http://{address}"));
+                let mut budget = HashMap::from([(actor.id.clone(), 1)]);
+                let error = top_up_external_session_density(
+                    &reqwest::Client::new(),
+                    &[actor.clone(), peer.clone()],
+                    &HashSet::from([actor.id.clone()]),
+                    &mut budget,
+                    &mut FanoutController::new(1, 1, false, 0.02, 5000),
+                    1,
+                    2,
+                    &journal,
+                )
+                .await
+                .expect_err("a failed density workflow must not succeed");
+                let failed_id = if failed_command == "establish_sessions" {
+                    "actor"
+                } else {
+                    "peer"
+                };
+                if resource_sweep {
+                    assert!(error.to_string().contains("failed for workers"));
+                    assert!(error.to_string().contains(failed_id));
+                    let event: serde_json::Value = serde_json::from_str(
+                        fs::read_to_string(&journal.path)
+                            .expect("failure journal")
+                            .trim(),
+                    )
+                    .expect("failure event");
+                    assert_eq!(event["failed_worker_id"], failed_id);
+                } else {
+                    assert!(error.to_string().contains("APP_HEAP_BUDGET_EXCEEDED"));
+                    assert!(!journal.path.exists());
+                }
+                assert_eq!(
+                    budget["actor"],
+                    usize::from(failed_command == "establish_sessions")
+                );
+                server.abort();
+                let _ = fs::remove_dir_all(run_dir);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

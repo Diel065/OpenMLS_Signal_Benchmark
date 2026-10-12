@@ -113,6 +113,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Internal parallelism for packed worker containers",
     )
     p.add_argument(
+        "--disable-container-profiling",
+        action="store_true",
+        help="Do not emit profiles from Docker container workers.",
+    )
+    p.add_argument(
         "--singleton-cpus",
         default=None,
         help=(
@@ -552,11 +557,12 @@ def build_hybrid_layout(
     for cid in singleton_ids:
         sid = f"worker-{cid}"
         base_url = f"http://{sid}:8080"
+        profile_enabled = not getattr(args, "disable_container_profiling", False)
         clients.append(ClientLayoutEntry(
             client_id=cid,
             physical_worker_id=sid,
             container_mode="singleton",
-            profile_enabled=True,
+            profile_enabled=profile_enabled,
             command_url=f"{base_url}/participant/{cid}",
             health_url=f"{base_url}/participant/{cid}/health",
         ))
@@ -565,7 +571,7 @@ def build_hybrid_layout(
             container_mode="singleton",
             client_ids=[cid],
             base_url=base_url,
-            profile_enabled_client_ids=[cid],
+            profile_enabled_client_ids=[cid] if profile_enabled else [],
             resource_limits=dict(configured_singleton_limits),
         ))
         singleton_counter += 1
@@ -611,11 +617,12 @@ def build_legacy_layout(
         cid = worker_id(i)
         sid = f"worker-{cid}"
         base_url = f"http://{sid}:8080"
+        profile_enabled = not getattr(args, "disable_container_profiling", False)
         clients.append(ClientLayoutEntry(
             client_id=cid,
             physical_worker_id=sid,
             container_mode="singleton",
-            profile_enabled=True,
+            profile_enabled=profile_enabled,
             command_url=f"{base_url}/participant/{cid}",
             health_url=f"{base_url}/participant/{cid}/health",
         ))
@@ -624,7 +631,7 @@ def build_legacy_layout(
             container_mode="singleton",
             client_ids=[cid],
             base_url=base_url,
-            profile_enabled_client_ids=[cid],
+            profile_enabled_client_ids=[cid] if profile_enabled else [],
             resource_limits=dict(configured_singleton_limits),
         ))
 
@@ -701,7 +708,11 @@ def generate_worker_layout_json(
         "singleton_fraction": args.singleton_fraction,
         "packed_clients_per_container": args.packed_clients_per_container,
         "singleton_selection_seed": args.singleton_selection_seed,
-        "profile_policy": "singletons_only" if args.worker_layout_mode == "hybrid" else "all",
+        "profile_policy": (
+            "external_devices_only"
+            if getattr(args, "disable_container_profiling", False)
+            else ("singletons_only" if args.worker_layout_mode == "hybrid" else "all")
+        ),
         "singleton_resource_envelope": {
             "enabled": envelope_enabled,
             "applies_to": "all_containerized_singletons",
@@ -1047,10 +1058,10 @@ def generate_compose_text(
         lines.append('      - "--participants"')
         lines.append(f'      - "{participant_ids_csv}"')
 
+        profile_csv = ",".join(pw.profile_enabled_client_ids)
+        lines.append('      - "--profile-enabled-participant-ids"')
+        lines.append(f'      - "{profile_csv}"')
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
-            profile_csv = ",".join(pw.profile_enabled_client_ids)
-            lines.append('      - "--profile-enabled-participant-ids"')
-            lines.append(f'      - "{profile_csv}"')
             lines.append('      - "--profile-path-template"')
             lines.append(f'      - "/results/{args.run_id}/participant-{{participant_id}}.jsonl"')
 

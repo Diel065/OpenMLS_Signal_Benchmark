@@ -35,6 +35,7 @@ UPDATE_ROUNDS="${UPDATE_ROUNDS:-4}"
 APP_ROUNDS="${APP_ROUNDS:-4}"
 PLATEAU_ORDER="${PLATEAU_ORDER:-staircase}"
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
+ADD_BATCH_EXTREMES_ONLY="${ADD_BATCH_EXTREMES_ONLY:-0}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
 PAYLOAD_SIZES="${PAYLOAD_SIZES:-32,256,2048}"
 
@@ -127,6 +128,10 @@ run_baseline() {
   fi
 
   echo "===== [02/baseline] iteration $iter/$N run_id=$run_id ====="
+  local -a batch_args=()
+  if [ "$ADD_BATCH_EXTREMES_ONLY" = "1" ]; then
+    batch_args=(--add-batch-extremes-only)
+  fi
   cd "$OPENMLS_DIR"
   "$py" scripts/run_compose_benchmark.py \
     --workers "$WORKERS" \
@@ -155,6 +160,7 @@ run_baseline() {
     --update-rounds "$UPDATE_ROUNDS" \
     --app-rounds "$APP_ROUNDS" \
     --max-update-samples-per-plateau "$MAX_UPDATE_SAMPLES_PER_PLATEAU" \
+    "${batch_args[@]}" \
     --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \
     --payload-sizes "$PAYLOAD_SIZES" \
     --http-pool-max-idle-per-host "$WORKER_HTTP_POOL" \

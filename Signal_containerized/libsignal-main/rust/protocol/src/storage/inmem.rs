@@ -279,6 +279,11 @@ impl InMemSessionStore {
         }
     }
 
+    /// Remove one local session so a benchmark can perform a fresh pre-key handshake.
+    pub fn remove_session(&mut self, address: &ProtocolAddress) -> bool {
+        self.sessions.remove(address).is_some()
+    }
+
     /// Bulk version of [`SessionStore::load_session`].
     ///
     /// Useful for [crate::sealed_sender_multi_recipient_encrypt].

@@ -35,6 +35,10 @@ struct Args {
     #[arg(long, default_value = "1")]
     step_size: StepSize,
 
+    /// Exact ascending group-size plateaus. Overrides step generation.
+    #[arg(long, value_delimiter = ',')]
+    plateau_sizes: Vec<usize>,
+
     #[arg(long, default_value = "staircase")]
     plateau_order: PlateauOrder,
 
@@ -56,6 +60,13 @@ struct Args {
     /// Hard cap on successful application sends per payload at each plateau
     #[arg(long, default_value_t = 16)]
     max_app_samples_per_payload: usize,
+
+    #[arg(
+        long = "min-external-samples-per-operation",
+        alias = "min-profiled-samples-per-operation",
+        default_value_t = 0
+    )]
+    min_profiled_samples_per_operation: usize,
 
     #[arg(long, default_value = "32,256,1024,4096")]
     payload_sizes: PayloadSizes,
@@ -101,6 +112,9 @@ struct Args {
 
     #[arg(long, default_value_t = 1)]
     commit_receive_sampling_seed: u64,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    add_batch_extremes_only: bool,
 }
 
 fn main() -> Result<()> {
@@ -137,6 +151,7 @@ fn main() -> Result<()> {
         min_size: args.min_size,
         max_size: args.max_size,
         step_size: args.step_size,
+        plateau_sizes: args.plateau_sizes,
         plateau_order: args.plateau_order,
         roundtrips: args.roundtrips,
         update_rounds: args.update_rounds,
@@ -144,7 +159,9 @@ fn main() -> Result<()> {
         max_update_samples_per_plateau: args.max_update_samples_per_plateau,
         max_commit_receive_samples_per_plateau: args.max_commit_receive_samples_per_plateau,
         commit_receive_sampling_seed: args.commit_receive_sampling_seed,
+        add_batch_extremes_only: args.add_batch_extremes_only,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
+        min_profiled_samples_per_operation: args.min_profiled_samples_per_operation,
         payload_sizes: args.payload_sizes,
         scenario_seed: args.scenario_seed,
         worker_health_timeout_seconds: 300,
@@ -161,6 +178,7 @@ fn main() -> Result<()> {
         no_aggregate: false,
         failure_experiment: false,
         profiled_failure_policy: ProfiledFailurePolicy::StopOnProfiledFailure,
+        profiled_failure_stop_after: 0,
         remove_rejoin: false,
         worker_layout: None,
         run_id: args.run_id,

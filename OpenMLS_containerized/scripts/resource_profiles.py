@@ -307,7 +307,7 @@ def generate_parallel_ram_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 10 parallel app-heap budget profiles for RAM sweep.
+    """Generate parallel app-heap budget profiles for RAM sweep.
 
     Each profile tests a single application heap budget.
     Docker memory is held high (4 GiB default) so Linux/container memory
@@ -318,18 +318,18 @@ def generate_parallel_ram_sweep_profiles(
     as the group creator.
 
     Args:
-        heap_budgets: List of 10 heap budget strings.
+        heap_budgets: List of heap budget strings.
         docker_memory_limit: Safe Docker memory limit for all containers.
         assigned_cpu_count: CPU cores assigned to each profiled worker.
         run_id: Benchmark run ID for profile labeling.
 
     Returns:
-        List of 10 ResourceProfile objects, ordered by increasing budget.
+        ResourceProfile objects, ordered by increasing budget.
     """
     if heap_budgets is None:
         heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
-    if len(heap_budgets) != 10:
-        raise ValueError(f"Parallel RAM sweep requires exactly 10 heap budgets, got {len(heap_budgets)}")
+    if not heap_budgets:
+        raise ValueError("Parallel RAM sweep requires at least one heap budget")
 
     if not validate_memory_string(docker_memory_limit):
         raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")

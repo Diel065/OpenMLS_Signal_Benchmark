@@ -11,6 +11,7 @@ import json
 import math
 import platform
 import re
+import signal
 import shutil
 import shlex
 import socket
@@ -34,6 +35,7 @@ try:
     from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
     from resource_profiles import (
         generate_parallel_cpu_sweep_profiles,
+        generate_parallel_ram_app_heap_sweep_profiles,
         generate_parallel_ram_sweep_profiles,
     )
 except ModuleNotFoundError:
@@ -47,11 +49,24 @@ except ModuleNotFoundError:
     from resource_experiment_sidecars import RESOURCE_SUMMARY_HEADER, SidecarWriter
     from resource_profiles import (
         generate_parallel_cpu_sweep_profiles,
+        generate_parallel_ram_app_heap_sweep_profiles,
         generate_parallel_ram_sweep_profiles,
     )
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
+
+
+def parse_plateau_sizes(value: str) -> list[int]:
+    try:
+        sizes = [int(part.strip()) for part in value.split(",") if part.strip()]
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("plateau sizes must be comma-separated integers") from error
+    if not sizes or any(size < 1 for size in sizes):
+        raise argparse.ArgumentTypeError("plateau sizes must contain positive integers")
+    if any(left >= right for left, right in zip(sizes, sizes[1:])):
+        raise argparse.ArgumentTypeError("plateau sizes must be strictly increasing")
+    return sizes
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -68,6 +83,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-size", type=int, default=2)
     p.add_argument("--max-size", type=int, default=None)
     p.add_argument("--step-size", default="1", help="Integer step size or uniform [min,max] range")
+    p.add_argument(
+        "--plateau-sizes",
+        type=parse_plateau_sizes,
+        default=None,
+        help="Exact comma-separated ascending plateau sizes; overrides step generation",
+    )
     p.add_argument("--step-size-switch-at", type=int, default=None)
     p.add_argument("--step-size-after-switch", type=int, default=None)
     p.add_argument(
@@ -83,6 +104,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--app-rounds", type=int, default=2)
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
+    p.add_argument(
+        "--min-external-samples-per-operation",
+        "--min-profiled-samples-per-operation",
+        dest="min_profiled_samples_per_operation",
+        type=int,
+        default=0,
+        help="Successful create/receive samples required per external device and plateau; 0 keeps cap-only scheduling",
+    )
 
     p.add_argument(
         "--payload-sizes",
@@ -382,6 +411,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only profile singleton measured clients (default: true)",
     )
     p.add_argument(
+        "--disable-container-profiling",
+        action="store_true",
+        help="Disable profiling for Docker workers; external devices remain profiled.",
+    )
+    p.add_argument(
         "--packed-worker-internal-parallelism",
         type=int,
         default=4,
@@ -458,7 +492,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument(
         "--resource-experiment",
-        choices=["none", "ram-docker-cgroup-sweep", "cpu-quota-sweep"],
+        choices=["none", "ram-docker-cgroup-sweep", "ram-app-heap-sweep", "cpu-quota-sweep"],
         default="none",
         help="Signal resource sweep mode for profiled singleton workers.",
     )
@@ -474,6 +508,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated Docker memory limits for Signal RAM cgroup sweep.",
     )
     p.add_argument(
+        "--ram-app-heap-sweep-values",
+        default="10k,50k,100k,500k,1m,5m,10m,50m,100m,500m",
+        help="Comma-separated application heap budgets for Signal RAM app-heap sweep.",
+    )
+    p.add_argument(
         "--cpu-sweep-fractions",
         default="1.00,0.75,0.50,0.25,0.10,0.05,0.04,0.03,0.02,0.01",
         help="Comma-separated Docker CPU fractions for Signal hard-quota sweep.",
@@ -487,7 +526,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--resource-failure-policy",
         choices=["stop-on-profiled-failure", "remove-and-continue", "stop-on-failure"],
         default="stop-on-profiled-failure",
-        help="Recorded policy for resource failure sidecars; Signal currently stops on runner failure.",
+        help="Resource failure policy recorded in sidecars; evidenced resource failures can be removed while the benchmark continues.",
+    )
+    p.add_argument(
+        "--profiled-failure-stop-after",
+        type=int,
+        default=0,
+        help="Exit successfully after this many unique profiled singleton resource failures (0 disables).",
     )
 
     # External device flags
@@ -654,9 +699,10 @@ def singleton_resource_envelope(args: argparse.Namespace) -> dict:
             args.singleton_memory_swap,
             args.singleton_pids_limit,
             args.singleton_app_heap_budget,
-            args.cpu_affinity_mode != "none",
         )
-    )
+    ) or args.cpu_affinity_mode != "none"
+    if not (getattr(args, "enable_external_devices", False) or getattr(args, "disable_container_profiling", False)):
+        enabled = True
     profile_parts = []
     if args.singleton_cpus is not None:
         profile_parts.append(f"cpus-{args.singleton_cpus}")
@@ -734,6 +780,13 @@ def build_resource_profiles_for_run(args: argparse.Namespace, run_id: str) -> li
     if args.resource_experiment == "ram-docker-cgroup-sweep":
         profiles = generate_parallel_ram_sweep_profiles(
             heap_budgets=comma_values(args.ram_sweep_values),
+            docker_memory_limit=args.embedded_docker_memory,
+            assigned_cpu_count=1,
+            run_id=run_id,
+        )
+    elif args.resource_experiment == "ram-app-heap-sweep":
+        profiles = generate_parallel_ram_app_heap_sweep_profiles(
+            heap_budgets=comma_values(args.ram_app_heap_sweep_values),
             docker_memory_limit=args.embedded_docker_memory,
             assigned_cpu_count=1,
             run_id=run_id,
@@ -870,6 +923,34 @@ def tee_subprocess_output(
         output_path: Path,
         env: dict[str, str] | None = None,
 ) -> int:
+    class _TerminationRequested(Exception):
+        def __init__(self, signum: int) -> None:
+            self.signum = signum
+
+    def stop_process_group(proc: subprocess.Popen[str], signum: int) -> None:
+        if proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signum)
+        except ProcessLookupError:
+            return
+
+        for fallback_signal, timeout in (
+            (None, 20.0),
+            (signal.SIGTERM, 10.0),
+            (signal.SIGKILL, 5.0),
+        ):
+            if fallback_signal is not None and proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, fallback_signal)
+                except ProcessLookupError:
+                    return
+            try:
+                proc.wait(timeout=timeout)
+                return
+            except subprocess.TimeoutExpired:
+                continue
+
     with output_path.open("w", encoding="utf-8") as out_file:
         proc = subprocess.Popen(
             cmd,
@@ -879,14 +960,54 @@ def tee_subprocess_output(
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            start_new_session=True,
         )
 
         assert proc.stdout is not None
-        for line in proc.stdout:
-            print(line, end="")
-            out_file.write(line)
+        def copy_output() -> None:
+            assert proc.stdout is not None
+            for line in proc.stdout:
+                print(line, end="")
+                out_file.write(line)
+                out_file.flush()
 
-        return proc.wait()
+        output_thread = threading.Thread(
+            target=copy_output,
+            name="benchmark-output-tee",
+            daemon=True,
+        )
+        output_thread.start()
+
+        previous_sigterm = signal.getsignal(signal.SIGTERM)
+
+        def request_termination(signum: int, _frame: object) -> None:
+            raise _TerminationRequested(signum)
+
+        signal.signal(signal.SIGTERM, request_termination)
+        requested_signal: int | None = None
+        exit_code: int | None = None
+        try:
+            exit_code = proc.wait()
+        except KeyboardInterrupt:
+            requested_signal = signal.SIGINT
+        except _TerminationRequested as request:
+            requested_signal = request.signum
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+
+        if requested_signal is None:
+            output_thread.join()
+            assert exit_code is not None
+            return exit_code
+
+        assert requested_signal is not None
+        print(
+            f"\n[runner] received signal {requested_signal}; stopping benchmark process group...",
+            flush=True,
+        )
+        stop_process_group(proc, requested_signal)
+        output_thread.join(timeout=5.0)
+        return 128 + requested_signal
 
 
 def wait_for_health(url: str, timeout_seconds: int, poll_seconds: float) -> None:
@@ -2506,7 +2627,12 @@ def classify_failure_from_resource_summary(run_dir: Path) -> tuple[str, dict]:
     return "infrastructure_failure", evidence
 
 
-def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_success: bool) -> None:
+def write_failure_sidecars_from_artifacts(
+    run_dir: Path,
+    run_id: str,
+    run_success: bool,
+    resource_failure_policy: str = "stop-on-failure",
+) -> None:
     summary_path = run_dir / "resource_summary.csv"
     resource_summaries = []
     if summary_path.exists():
@@ -2561,7 +2687,7 @@ def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_succes
             resource_experiment=(
                 "singleton-resource-envelope" if summary_path.exists() else "none"
             ),
-            resource_failure_policy="stop-on-failure",
+            resource_failure_policy=resource_failure_policy,
             preflight_passed=preflight_passed,
             output_validation_passed=run_success,
             notes="generated from resource_summary.csv/oom_events.jsonl after runner exit",
@@ -2569,6 +2695,7 @@ def write_failure_sidecars_from_artifacts(run_dir: Path, run_id: str, run_succes
             docker_memory_limit=selected_profile.get("docker_memory_limit", ""),
             app_heap_budget=selected_profile.get("app_heap_budget", ""),
             app_heap_budget_bytes=int_or_zero(selected_profile.get("app_heap_budget_bytes")),
+            sweep_kind=selected_profile.get("sweep_kind", ""),
             resource_profile_id=selected_profile.get("resource_profile_id", ""),
             resource_profile_index=int_or_zero(selected_profile.get("resource_profile_index")),
             strict_cpuset_satisfied=str(selected_profile.get("strict_cpuset_satisfied", "")).lower() in ("true", "1", "yes"),
@@ -3198,6 +3325,13 @@ def pull_external_device_profiles(
             try:
                 local_runner_profile = local_jsonl.read_bytes() if local_jsonl.exists() else b""
                 backend.pull(remote_jsonl, local_jsonl)
+                dropped_tail_bytes = trim_incomplete_jsonl_tail(local_jsonl)
+                if dropped_tail_bytes:
+                    print(
+                        f"[device] {dev_id}: discarded {dropped_tail_bytes} byte(s) "
+                        "from an unacknowledged trailing JSONL fragment",
+                        flush=True,
+                    )
                 if local_runner_profile:
                     pulled_profile = local_jsonl.read_bytes()
                     separator = b"" if not pulled_profile or pulled_profile.endswith(b"\n") else b"\n"
@@ -3222,6 +3356,34 @@ def pull_external_device_profiles(
                 print(f"[device] {dev_id}: remote {remote_path}/ contents:\n{ls_result.stdout.strip()}", flush=True)
             except Exception as ls_err:
                 print(f"[device] {dev_id}: could not list remote dir: {ls_err}", flush=True)
+
+
+def trim_incomplete_jsonl_tail(path: Path, block_size: int = 64 * 1024) -> int:
+    """Drop only a non-newline-terminated final record after device attrition."""
+    if not path.is_file():
+        return 0
+    with path.open("r+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        original_size = handle.tell()
+        if original_size == 0:
+            return 0
+        handle.seek(-1, os.SEEK_END)
+        if handle.read(1) == b"\n":
+            return 0
+
+        cursor = original_size
+        retained_size = 0
+        while cursor > 0:
+            start = max(0, cursor - block_size)
+            handle.seek(start)
+            chunk = handle.read(cursor - start)
+            newline = chunk.rfind(b"\n")
+            if newline >= 0:
+                retained_size = start + newline + 1
+                break
+            cursor = start
+        handle.truncate(retained_size)
+        return original_size - retained_size
 
 
 def run_standalone_aggregation(
@@ -3416,16 +3578,19 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "min_size": args.min_size,
             "max_size": args.max_size if args.max_size is not None else args.workers,
             "step_size": args.step_size,
+            "plateau_sizes": args.plateau_sizes,
             "step_size_switch_at": args.step_size_switch_at,
             "step_size_after_switch": args.step_size_after_switch,
             "plateau_order": args.plateau_order,
             "roundtrips": args.roundtrips,
             "app_rounds": args.app_rounds,
             "max_app_samples_per_payload": args.max_app_samples_per_payload,
+            "min_external_samples_per_operation": args.min_profiled_samples_per_operation,
             "payload_sizes": args.payload_sizes,
             "worker_layout_mode": args.worker_layout_mode,
             "singleton_resource_envelope": singleton_resource_envelope(args),
             "profile_only_singletons": args.profile_only_singletons,
+            "disable_container_profiling": args.disable_container_profiling,
         },
         "host": {
             "platform": platform.platform(),
@@ -3466,6 +3631,16 @@ def main() -> int:
 
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+
+    if args.plateau_sizes:
+        configured_max = args.max_size if args.max_size is not None else args.workers
+        if args.plateau_order != "ascending":
+            raise SystemExit("--plateau-sizes requires --plateau-order ascending")
+        if args.plateau_sizes[0] < args.min_size or args.plateau_sizes[-1] > configured_max:
+            raise SystemExit(
+                f"--plateau-sizes {args.plateau_sizes} must stay within "
+                f"--min-size {args.min_size} and --max-size {configured_max}"
+            )
 
     if args.bridge_count < 1:
         raise SystemExit("--bridge-count must be at least 1")
@@ -3548,7 +3723,16 @@ def main() -> int:
     if args.resource_monitor_interval_ms < 1:
         raise SystemExit("--resource-monitor-interval-ms must be >= 1")
 
-    if args.profiled_singleton_count < 1:
+    if args.disable_container_profiling:
+        if args.profiled_singleton_count != 0:
+            raise SystemExit(
+                "--disable-container-profiling requires --profiled-singleton-count 0"
+            )
+        if args.resource_experiment != "none":
+            raise SystemExit(
+                "--disable-container-profiling is incompatible with Signal resource sweeps"
+            )
+    elif args.profiled_singleton_count < 1:
         raise SystemExit("--profiled-singleton-count must be >= 1")
 
     apply_strict_cpuset_alias(args)
@@ -3596,12 +3780,27 @@ def main() -> int:
     compose_up = False
     failure_seen = False
     external_device_stop_required = False
+    external_devices_launched = False
+    external_profiles_pulled = False
+    recovery_aggregation_attempted = False
     resource_monitor: ResourceMonitor | None = None
     resource_monitor_stopped = False
     external_oom_monitor: ExternalOomMonitor | None = None
     external_oom_monitor_stopped = False
 
     compose_env = build_compose_env(args)
+
+    def flush_and_pull_external_profiles() -> None:
+        nonlocal external_device_stop_required, external_profiles_pulled
+        if not external_devices_launched or external_profiles_pulled:
+            return
+        if external_device_stop_required:
+            stop_external_device_workers(args, root)
+            external_device_stop_required = False
+            time.sleep(0.5)
+        print("[device] pulling flushed external device profiles...", flush=True)
+        pull_external_device_profiles(args, root, run_id, run_dir)
+        external_profiles_pulled = True
 
     try:
         if args.force_cleanup_signal_ports:
@@ -3709,6 +3908,8 @@ def main() -> int:
             "--packed-worker-internal-parallelism",
             str(args.packed_worker_internal_parallelism),
         ]
+        if args.disable_container_profiling:
+            generator_cmd.append("--disable-container-profiling")
 
         if resource_profiles:
             resource_profiles_input_path.write_text(
@@ -3951,6 +4152,7 @@ def main() -> int:
 
         if args.enable_external_devices and args.devices_file:
             external_device_stop_required = not args.no_device_stop_after_run
+            external_devices_launched = True
             ext_clients, ext_workers, ext_lines = launch_external_devices(
                 args, root, args.kr_port, args.relay_port, run_id,
             )
@@ -4041,6 +4243,7 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                *(["--plateau-sizes", ",".join(map(str, args.plateau_sizes))] if args.plateau_sizes else []),
                 *([
                     "--step-size-switch-at",
                     str(args.step_size_switch_at),
@@ -4055,6 +4258,8 @@ def main() -> int:
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
                 str(args.max_app_samples_per_payload),
+                "--min-external-samples-per-operation",
+                str(args.min_profiled_samples_per_operation),
                 "--payload-sizes",
                 args.payload_sizes,
                 "--worker-health-timeout-seconds",
@@ -4076,6 +4281,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4104,6 +4311,7 @@ def main() -> int:
                 str(args.max_size if args.max_size is not None else args.workers),
                 "--step-size",
                 str(args.step_size),
+                *(["--plateau-sizes", ",".join(map(str, args.plateau_sizes))] if args.plateau_sizes else []),
                 *([
                     "--step-size-switch-at",
                     str(args.step_size_switch_at),
@@ -4118,6 +4326,8 @@ def main() -> int:
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
                 str(args.max_app_samples_per_payload),
+                "--min-external-samples-per-operation",
+                str(args.min_profiled_samples_per_operation),
                 "--payload-sizes",
                 args.payload_sizes,
                 "--worker-health-timeout-seconds",
@@ -4139,6 +4349,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
+                "--profiled-failure-stop-after",
+                str(args.profiled_failure_stop_after),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -4168,8 +4380,26 @@ def main() -> int:
             failure_seen = True
             outcome_class, evidence = classify_failure_from_resource_summary(run_dir)
             evidence["runner_exit_code"] = exit_code
+            if exit_code in (128 + signal.SIGINT, 128 + signal.SIGTERM):
+                outcome_class = "interrupted"
+                evidence["termination_signal"] = exit_code - 128
+            flush_and_pull_external_profiles()
+            if not args.preflight_only:
+                layout_file = run_dir / "worker_layout.json"
+                workers_file = run_dir / "workers.combined.txt"
+                agg_exit = run_standalone_aggregation(
+                    run_dir,
+                    layout_file if layout_file.exists() else None,
+                    workers_file if workers_file.exists() else None,
+                )
+                recovery_aggregation_attempted = True
+                if agg_exit != 0:
+                    print(f"[aggregate] recovery aggregation exit={agg_exit}, continuing", flush=True)
             write_run_outcome(run_dir, outcome_class, evidence)
-            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=False)
+            write_failure_sidecars_from_artifacts(
+                run_dir, run_id, run_success=False,
+                resource_failure_policy=args.resource_failure_policy,
+            )
             collect_failure_diagnostics(
                 root=root,
                 compose_file=compose_tmp,
@@ -4183,23 +4413,25 @@ def main() -> int:
 
         # ---- Post-run: pull external device profiles -----------------------
         if args.enable_external_devices and args.devices_file:
-            settle = 3.0
-            print(f"[device] settling {settle}s for external device workers to finish writing profiles...", flush=True)
-            time.sleep(settle)
-            print("[device] pulling external device profiles...", flush=True)
-            pull_external_device_profiles(args, root, run_id, run_dir)
+            flush_and_pull_external_profiles()
 
-            # Run standalone aggregation if --no-aggregate was used
-            if use_no_aggregate and not args.preflight_only:
-                layout_file = run_dir / "worker_layout.json"
-                workers_file = run_dir / "workers.combined.txt"
-                agg_exit = run_standalone_aggregation(run_dir, layout_file if layout_file.exists() else None, workers_file if workers_file.exists() else None)
-                if agg_exit != 0:
-                    print(f"[aggregate] standalone aggregation had non-zero exit, but continuing", flush=True)
+        if use_no_aggregate and not args.preflight_only:
+            layout_file = run_dir / "worker_layout.json"
+            workers_file = run_dir / "workers.combined.txt"
+            agg_exit = run_standalone_aggregation(
+                run_dir,
+                layout_file if layout_file.exists() else None,
+                workers_file if workers_file.exists() else None,
+            )
+            if agg_exit != 0:
+                raise RuntimeError(f"standalone aggregation failed with exit={agg_exit}")
 
         if not args.preflight_only:
             validate_artifacts(run_dir, args.worker_layout_mode)
-            write_failure_sidecars_from_artifacts(run_dir, run_id, run_success=True)
+            write_failure_sidecars_from_artifacts(
+                run_dir, run_id, run_success=True,
+                resource_failure_policy=args.resource_failure_policy,
+            )
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 
@@ -4253,6 +4485,33 @@ def main() -> int:
                 external_oom_monitor_stopped = True
             except Exception as exc:
                 print(f"[resources] external OOM monitor stop failed (non-fatal): {exc}", flush=True)
+
+        if external_devices_launched and not external_profiles_pulled:
+            try:
+                flush_and_pull_external_profiles()
+            except Exception as exc:
+                print(f"[device] cleanup-time profile recovery failed (non-fatal): {exc}", flush=True)
+
+        if (
+            failure_seen
+            and external_profiles_pulled
+            and not recovery_aggregation_attempted
+            and any(run_dir.glob("participant-*.jsonl"))
+        ):
+            try:
+                layout_file = run_dir / "worker_layout.json"
+                workers_file = run_dir / "workers.combined.txt"
+                run_standalone_aggregation(
+                    run_dir,
+                    layout_file if layout_file.exists() else None,
+                    workers_file if workers_file.exists() else None,
+                )
+                recovery_aggregation_attempted = True
+            except Exception as exc:
+                print(
+                    f"[aggregate] external cleanup-time aggregation failed (non-fatal): {exc}",
+                    flush=True,
+                )
 
         if external_device_stop_required:
             stop_external_device_workers(args, root)

@@ -54,6 +54,11 @@ pub struct CommitReceiveProfileOptions {
     pub commit_receive_population_size: Option<usize>,
 }
 
+fn selective_receive_profiling() -> bool {
+    std::env::var("OPENMLS_PROFILE_EXECUTION_BACKEND").as_deref() == Ok("real_device")
+        || std::env::var("OPENMLS_RESOURCE_PROFILE_ID").is_ok_and(|id| !id.is_empty())
+}
+
 impl Client {
     fn fresh(name: &str) -> Result<Self> {
         let crypto = OpenMlsRustCrypto::default();
@@ -495,7 +500,9 @@ impl Client {
             .count();
 
         set_app_message_receive_context(AppMessageReceiveContext::new(member_count));
-        let total_scope = ProfileScope::start("application_message_receive_total_local", "openmls");
+        let total_scope = (profile || !selective_receive_profiling())
+            .then(|| ProfileScope::start("application_message_receive_total_local", "openmls"))
+            .flatten();
 
         let result = (|| -> Result<Vec<u8>, anyhow::Error> {
             let group = self
@@ -568,7 +575,12 @@ impl Client {
             member_count_before,
             member_count_before,
         ));
-        let total_scope = ProfileScope::start("commit_receive_total_local", "openmls");
+        // Feature lanes omit unsampled totals; ordinary runs retain main's rows.
+        let total_scope = if profile.enabled || !selective_receive_profiling() {
+            ProfileScope::start("commit_receive_total_local", "openmls")
+        } else {
+            None
+        };
 
         let process_result = (|| -> Result<(), anyhow::Error> {
             let group = self

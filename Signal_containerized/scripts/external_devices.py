@@ -344,6 +344,8 @@ class AdbDeviceBackend(DeviceBackend):
             profile_path = launch.profile_path_template.replace("{participant_id}", launch.worker_id)
             env = {
                 "SIGNAL_PROFILE_ENABLED": "true",
+                "SIGNAL_PROFILE_EXECUTION_BACKEND": "real_device",
+                "SIGNAL_PROFILE_DEVICE_KIND": self.config.metadata.get("device_kind", self.config.kind),
                 "SIGNAL_PROFILE_PARTICIPANT_IDS": launch.worker_id,
                 "SIGNAL_PROFILE_PATH": profile_path,
                 "SIGNAL_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
@@ -660,6 +662,8 @@ class SshDeviceBackend(DeviceBackend):
             profile_path = launch.profile_path_template.replace("{participant_id}", launch.worker_id)
             env = {
                 "SIGNAL_PROFILE_ENABLED": "true",
+                "SIGNAL_PROFILE_EXECUTION_BACKEND": "real_device",
+                "SIGNAL_PROFILE_DEVICE_KIND": self.config.metadata.get("device_kind", self.config.kind),
                 "SIGNAL_PROFILE_PARTICIPANT_IDS": launch.worker_id,
                 "SIGNAL_PROFILE_PATH": profile_path,
                 "SIGNAL_PROFILE_PATH_TEMPLATE": launch.profile_path_template,

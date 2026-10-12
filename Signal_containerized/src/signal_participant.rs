@@ -467,6 +467,19 @@ impl SignalParticipant {
         })
     }
 
+    pub fn reset_sessions_with(&mut self, remote_names: &[String]) -> usize {
+        remote_names
+            .iter()
+            .filter(|name| {
+                let address = ProtocolAddress::new(
+                    (*name).clone(),
+                    DeviceId::new(DEVICE_ID).expect("DEVICE_ID is valid"),
+                );
+                self.store.session_store.remove_session(&address)
+            })
+            .count()
+    }
+
     pub fn remaining_prekeys(&self) -> usize {
         let one_time_ec_count = self.store.all_pre_key_ids().count();
         let one_time_pq_count = self.store.all_kyber_pre_key_ids().count().saturating_sub(1);

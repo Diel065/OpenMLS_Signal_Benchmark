@@ -405,10 +405,10 @@ class Validator:
         status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
         sweep_kind = status_rows[0].get("sweep_kind", "").strip() if status_rows else ""
         is_parallel_sweep = sweep_kind in ("ram_sweep", "cpu_quota_sweep", "ram_app_heap_sweep")
-        expected_selected = 10 if is_parallel_sweep else 1
 
         selected = self._read_column_values(profiles_path, "selected_for_this_run")
         true_count = sum(1 for v in selected if v.lower() in ("true", "1"))
+        expected_selected = true_count if is_parallel_sweep else 1
 
         if true_count == 0:
             self.warn("No profile has selected_for_this_run=true (multiplexed mode?)")
@@ -422,7 +422,7 @@ class Validator:
         if os.path.exists(assignments_path):
             assign_selected = self._read_column_values(assignments_path, "selected_for_this_run")
             assign_true = sum(1 for v in assign_selected if v.lower() in ("true", "1"))
-            if assign_true != expected_selected:
+            if true_count != 0 and assign_true != expected_selected:
                 self.error(
                     f"{assign_true} workers marked selected_for_this_run=true "
                     f"(expected exactly {expected_selected})"
@@ -594,8 +594,8 @@ class Validator:
             and (row.get("profile_enabled") or "").lower() in ("true", "1")
         ]
 
-        if len(profiled_singletons) != 10:
-            self.error(f"Parallel {sweep_kind} must have exactly 10 profiled singleton workers, found {len(profiled_singletons)}")
+        if not profiled_singletons:
+            self.error(f"Parallel {sweep_kind} must have at least 1 profiled singleton worker")
 
         packed_profiled = [
             row for row in assignments
@@ -737,8 +737,8 @@ class Validator:
                 "memory_model",
                 "app_heap_budget",
                 "app_heap_budget_bytes",
-                "app_heap_current_live_bytes",
-                "app_heap_peak_live_bytes",
+                "heap_current_live_bytes",
+                "heap_peak_live_bytes",
             }
             missing = required - headers
             if missing:

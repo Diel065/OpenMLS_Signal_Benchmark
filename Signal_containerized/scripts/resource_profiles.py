@@ -6,12 +6,13 @@ Generates structured resource profiles for:
   - cpu_matrix_singleton: Matrix of (core_count, capacity_fraction) combinations
   - embedded_budget_singleton: Docker memory x Docker CPU combinations
   - ram_sweep: Parallel 10-profile sweep of Docker memory limits
+  - ram_app_heap_sweep: Parallel 10-profile sweep of application heap budgets
   - cpu_quota_sweep: Parallel 10-profile sweep of Docker CPU fractions
 
 Supports explicit profile selection via index or ID for single-profile
 scientific threshold experiments. Supports parallel 10-profile sweeps.
 
-Signal uses docker-cgroup memory model (no app-heap-budget allocator).
+Signal supports both docker-cgroup memory sweeps and app-heap-budget sweeps.
 """
 
 from dataclasses import dataclass, field
@@ -394,6 +395,84 @@ def generate_parallel_ram_sweep_profiles(
             ),
             profile_notes=(
                 f"Parallel RAM sweep: {mem_limit} docker-cgroup memory limit, "
+                f"CPU abundant at {assigned_cpu_count} cores"
+            ),
+        ))
+
+    return profiles
+
+
+def generate_parallel_ram_app_heap_sweep_profiles(
+    heap_budgets: Optional[List[str]] = None,
+    docker_memory_limit: str = "4g",
+    assigned_cpu_count: int = 1,
+    run_id: str = "",
+) -> List[ResourceProfile]:
+    """Generate parallel app-heap budget profiles for RAM sweep."""
+    if heap_budgets is None:
+        heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
+    if not heap_budgets:
+        raise ValueError("Parallel RAM app-heap sweep requires at least one heap budget")
+
+    if not validate_memory_string(docker_memory_limit):
+        raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")
+    docker_memory_bytes = parse_memory_to_bytes(docker_memory_limit)
+    if docker_memory_bytes < DOCKER_MIN_MEMORY_BYTES:
+        raise ValueError(
+            f"RAM app-heap sweep Docker memory limit '{docker_memory_limit}' is below "
+            f"the daemon minimum of 6 MiB"
+        )
+
+    budget_bytes_list = []
+    for hb in heap_budgets:
+        if not validate_memory_string(hb):
+            raise ValueError(f"Invalid heap budget '{hb}'")
+        bbytes = parse_memory_to_bytes(hb)
+        if bbytes <= 0:
+            raise ValueError(f"Invalid heap budget '{hb}'")
+        if bbytes >= docker_memory_bytes:
+            raise ValueError(
+                f"Heap budget '{hb}' must be below Docker memory limit '{docker_memory_limit}'"
+            )
+        budget_bytes_list.append((hb, bbytes))
+
+    max_idx = len(budget_bytes_list) - 1
+    profiles = []
+    for idx, (heap_budget, heap_budget_bytes) in enumerate(budget_bytes_list):
+        is_group_creator = idx == max_idx
+        profile_id = f"ram_app_heap_{heap_budget.lower()}"
+        label = f"AppHeap={heap_budget} DockerMem={docker_memory_limit} CPU=1c"
+
+        profiles.append(ResourceProfile(
+            resource_profile_id=profile_id,
+            experiment_kind="ram_app_heap_sweep",
+            resource_profile_index=idx,
+            profile_label=label,
+            cpu_limit_cpus=1.0,
+            capacity_fraction=1.0,
+            assigned_cpu_count=assigned_cpu_count,
+            memory_limit=docker_memory_limit,
+            memory_swap=docker_memory_limit,
+            rayon_num_threads=assigned_cpu_count,
+            cpuset_role="ram_app_heap_sweep",
+            memory_model="app-heap-budget",
+            docker_memory_limit=docker_memory_limit,
+            app_heap_budget=heap_budget,
+            app_heap_budget_bytes=heap_budget_bytes,
+            sweep_kind="ram_app_heap_sweep",
+            app_heap_interpretation=(
+                "app heap budget is the tested synthetic memory constraint; "
+                f"Docker memory ({docker_memory_limit}) is a non-limiting container envelope"
+            ),
+            cpu_interpretation="CPU is non-limiting (1 core at 100% capacity)",
+            group_creator=is_group_creator,
+            group_creator_reason=(
+                f"highest-valued profiled worker ({heap_budget} app heap budget)"
+                if is_group_creator else ""
+            ),
+            profile_notes=(
+                f"Parallel RAM app-heap sweep: {heap_budget} synthetic heap budget, "
+                f"Docker memory held at safe Linux/container limit {docker_memory_limit}; "
                 f"CPU abundant at {assigned_cpu_count} cores"
             ),
         ))

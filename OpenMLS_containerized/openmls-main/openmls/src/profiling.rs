@@ -32,6 +32,33 @@ static NODE_SECRET_DERIVATION_COUNT: AtomicU64 = AtomicU64::new(0);
 static HPKE_ENCRYPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static HPKE_DECRYPT_COUNT: AtomicU64 = AtomicU64::new(0);
 static NEXT_SPAN_ID: AtomicU64 = AtomicU64::new(1);
+static VALID_ADD_COMMIT_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_REMOVE_COMMIT_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_UPDATE_COMMIT_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_APPLICATION_CREATE_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_COMMIT_RECEIVE_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_APPLICATION_RECEIVE_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+static VALID_WELCOME_RECEIVE_TOTALS_PERSISTED: AtomicU64 = AtomicU64::new(0);
+
+fn canonical_total_counter(op: &str) -> Option<&'static AtomicU64> {
+    match op {
+        "add_commit_total_local" => Some(&VALID_ADD_COMMIT_TOTALS_PERSISTED),
+        "remove_commit_create_total_local" => Some(&VALID_REMOVE_COMMIT_TOTALS_PERSISTED),
+        "update_commit_create_total_local" => Some(&VALID_UPDATE_COMMIT_TOTALS_PERSISTED),
+        "application_message_create_total_local" => Some(&VALID_APPLICATION_CREATE_TOTALS_PERSISTED),
+        "commit_receive_total_local" => Some(&VALID_COMMIT_RECEIVE_TOTALS_PERSISTED),
+        "application_message_receive_total_local" => Some(&VALID_APPLICATION_RECEIVE_TOTALS_PERSISTED),
+        "welcome_receive_total_local" => Some(&VALID_WELCOME_RECEIVE_TOTALS_PERSISTED),
+        _ => None,
+    }
+}
+
+/// Number of canonical rows flushed with positive metrics used by the plots.
+pub fn valid_persisted_canonical_total_count(op: &str) -> u64 {
+    canonical_total_counter(op)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
 
 thread_local! {
     static SPAN_STACK: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
@@ -1629,9 +1656,17 @@ pub fn emit_event(event: &ProfileEvent) {
     }
 
     if let Ok(line) = serde_json::to_string(&event) {
-        let _ = guard.write_all(line.as_bytes());
-        let _ = guard.write_all(b"\n");
-        let _ = guard.flush();
+        let persisted = guard.write_all(line.as_bytes())
+            .and_then(|_| guard.write_all(b"\n"))
+            .and_then(|_| guard.flush())
+            .is_ok();
+        let valid_metrics = event.cpu_process_ns > 0
+            && event.alloc_bytes.is_some_and(|value| value > 0);
+        if persisted && valid_metrics {
+            if let Some(counter) = canonical_total_counter(&event.op) {
+                counter.fetch_add(1, Ordering::Relaxed);
+            }
+        }
     }
 }
 

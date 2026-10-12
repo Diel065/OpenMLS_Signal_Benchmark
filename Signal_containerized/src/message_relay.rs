@@ -86,12 +86,26 @@ impl MessageRelay {
     }
 
     pub fn fetch_message(&self, recipient: &str) -> Option<Vec<u8>> {
-        self.fetch_pending_message_record(recipient)
+        self.fetch_pending_message_record(recipient, None)
             .map(|envelope| envelope.message_bytes.as_ref().clone())
     }
 
     pub fn fetch_pending_message(&self, recipient: &str) -> Option<PendingMessage> {
-        self.fetch_pending_message_record(recipient)
+        self.fetch_pending_message_record(recipient, None)
+            .map(|envelope| PendingMessage {
+                id: envelope.id,
+                conversation_id: envelope.conversation_id,
+                sender: envelope.sender,
+                message_hex: hex::encode(envelope.message_bytes.as_ref()),
+            })
+    }
+
+    pub fn fetch_pending_message_from(
+        &self,
+        recipient: &str,
+        sender: &str,
+    ) -> Option<PendingMessage> {
+        self.fetch_pending_message_record(recipient, Some(sender))
             .map(|envelope| PendingMessage {
                 id: envelope.id,
                 conversation_id: envelope.conversation_id,
@@ -113,9 +127,18 @@ impl MessageRelay {
         before != queue.len()
     }
 
-    fn fetch_pending_message_record(&self, recipient: &str) -> Option<RelayEnvelope> {
+    fn fetch_pending_message_record(
+        &self,
+        recipient: &str,
+        sender: Option<&str>,
+    ) -> Option<RelayEnvelope> {
         let queue = self.inboxes.read().unwrap().get(recipient).cloned()?;
-        let envelope = queue.lock().unwrap().front().cloned();
+        let envelope = queue
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|envelope| sender.map_or(true, |sender| envelope.sender == sender))
+            .cloned();
 
         if let Some(envelope) = &envelope {
             if debug_logs_enabled() {
@@ -150,4 +173,27 @@ impl Default for MessageRelay {
 
 fn pairwise_message_id(conversation_id: &str, sender: &str, seq: u64, recipient: &str) -> String {
     format!("{conversation_id}:{sender}:{seq}:{recipient}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fetches_pending_message_from_requested_sender() {
+        let relay = MessageRelay::new();
+        let recipient = "recipient".to_string();
+        relay
+            .publish_pairwise_message("c", "first", &[recipient.clone()], vec![1])
+            .unwrap();
+        relay
+            .publish_pairwise_message("c", "second", &[recipient], vec![2])
+            .unwrap();
+
+        let message = relay
+            .fetch_pending_message_from("recipient", "second")
+            .unwrap();
+        assert_eq!(message.sender, "second");
+        assert_eq!(message.message_hex, "02");
+    }
 }

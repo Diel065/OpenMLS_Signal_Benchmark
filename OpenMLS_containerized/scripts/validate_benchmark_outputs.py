@@ -41,7 +41,16 @@ NONZERO_ALLOCATION_SPANS = {
     "commit_add.group_info.aead_encrypt",
     "commit_add.welcome_group_secrets_encrypt",
 }
-VALID_BATCH_SOURCES = {"balanced_seeded_regular", "balanced_seeded_external"}
+VALID_BATCH_SOURCES = {
+    "balanced_seeded_regular",
+    "balanced_seeded_external",
+    "extremes_regular",
+    "extremes_external",
+    "external_density_k1",
+    "external_density_k8",
+    "external_density_recovery",
+    "remove_rejoin",
+}
 
 REQUIRED_COLUMNS = {
     "profile_schema_version",

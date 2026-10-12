@@ -1183,10 +1183,10 @@ def generate_compose_text(
         lines.append('      - "--clients"')
         lines.append(f'      - "{client_ids_csv}"')
 
+        profile_csv = ",".join(pw.profile_enabled_client_ids)
+        lines.append('      - "--profile-enabled-client-ids"')
+        lines.append(f'      - "{profile_csv}"')
         if pw.container_mode == "singleton" and pw.profile_enabled_client_ids:
-            profile_csv = ",".join(pw.profile_enabled_client_ids)
-            lines.append('      - "--profile-enabled-client-ids"')
-            lines.append(f'      - "{profile_csv}"')
             lines.append('      - "--profile-path-template"')
             lines.append(f'      - "/results/{args.run_id}/client-{{client_id}}.jsonl"')
 

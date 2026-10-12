@@ -388,6 +388,8 @@ class AdbDeviceBackend(DeviceBackend):
             profile_path = launch.profile_path_template.replace("{client_id}", launch.worker_id)
             env = {
                 "OPENMLS_PROFILE_ENABLED": "true",
+                "OPENMLS_PROFILE_EXECUTION_BACKEND": "real_device",
+                "OPENMLS_PROFILE_DEVICE_KIND": self.config.metadata.get("device_kind", self.config.kind),
                 "OPENMLS_PROFILE_CLIENT_IDS": launch.worker_id,
                 "OPENMLS_PROFILE_PATH": profile_path,
                 "OPENMLS_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
@@ -714,6 +716,8 @@ class SshDeviceBackend(DeviceBackend):
             profile_path = launch.profile_path_template.replace("{client_id}", launch.worker_id)
             env = {
                 "OPENMLS_PROFILE_ENABLED": "true",
+                "OPENMLS_PROFILE_EXECUTION_BACKEND": "real_device",
+                "OPENMLS_PROFILE_DEVICE_KIND": self.config.metadata.get("device_kind", self.config.kind),
                 "OPENMLS_PROFILE_CLIENT_IDS": launch.worker_id,
                 "OPENMLS_PROFILE_PATH": profile_path,
                 "OPENMLS_PROFILE_PATH_TEMPLATE": launch.profile_path_template,
