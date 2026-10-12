@@ -381,14 +381,6 @@ struct ProfilingCapabilities {
     client_exists: Option<bool>,
     #[serde(default)]
     profiling_enabled: bool,
-    #[serde(default = "default_true")]
-    l1d_cache_profiling_enabled: bool,
-    #[serde(default)]
-    l1d_cache_counters_available: bool,
-}
-
-fn default_true() -> bool {
-    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -708,7 +700,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 11,
+            profile_schema_version: 12,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -769,7 +761,7 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 11,
+            profile_schema_version: 12,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -1261,20 +1253,6 @@ struct ProfileEvent {
     alloc_count: Option<u64>,
     #[serde(default)]
     alloc_measurement_scope: Option<String>,
-    #[serde(default)]
-    l1d_cache_accesses: Option<u64>,
-    #[serde(default)]
-    l1d_cache_misses: Option<u64>,
-    #[serde(default)]
-    l1d_measurement_scope: Option<String>,
-    #[serde(default)]
-    l1d_cache_status: Option<String>,
-    #[serde(default)]
-    l1d_measured_thread_count: Option<usize>,
-    #[serde(default)]
-    l1d_discovered_thread_count: Option<usize>,
-    #[serde(default)]
-    l1d_multiplexed_thread_count: Option<usize>,
     #[serde(default)]
     ram_rss_delta_bytes: Option<i64>,
     #[serde(default)]
@@ -2671,26 +2649,6 @@ async fn verify_publication_profiling_capabilities(
                     worker.id
                 ));
             }
-            if !capabilities.l1d_cache_profiling_enabled {
-                eprintln!(
-                    "[preflight] L1D profiling is disabled for publication worker {}; continuing without L1D metrics",
-                    worker.id
-                );
-            } else if !capabilities.l1d_cache_counters_available {
-                if worker.device_kind.to_lowercase().contains("luckfox") {
-                    eprintln!(
-                        "[preflight] WARNING: L1D hardware counters are unavailable for publication worker {} ({}); proceeding without L1D metrics for this device",
-                        worker.id,
-                        worker.device_kind
-                    );
-                } else {
-                    return Err(anyhow!(
-                        "L1D hardware counters are unavailable for publication worker {} ({})",
-                        worker.id,
-                        worker.device_kind
-                    ));
-                }
-            }
             Ok::<_, anyhow::Error>(worker.id.clone())
         })
         .buffer_unordered(max_parallelism.max(1));
@@ -2701,7 +2659,7 @@ async fn verify_publication_profiling_capabilities(
         verified += 1;
     }
     eprintln!(
-        "[preflight] verified profiling capabilities on {} publication workers; L1D counters were required only where enabled",
+        "[preflight] verified profiling capabilities on {} publication workers",
         verified
     );
     Ok(())
@@ -8619,13 +8577,6 @@ pub fn aggregate_csv(
         alloc_bytes: Option<u64>,
         alloc_count: Option<u64>,
         alloc_measurement_scope: Option<String>,
-        l1d_cache_accesses: Option<u64>,
-        l1d_cache_misses: Option<u64>,
-        l1d_measurement_scope: Option<String>,
-        l1d_cache_status: Option<String>,
-        l1d_measured_thread_count: Option<usize>,
-        l1d_discovered_thread_count: Option<usize>,
-        l1d_multiplexed_thread_count: Option<usize>,
         ram_rss_delta_bytes: Option<i64>,
         ram_rss_utilization: Option<f64>,
         artifact_size_bytes: Option<usize>,
@@ -8899,13 +8850,6 @@ pub fn aggregate_csv(
                 alloc_bytes: event.alloc_bytes,
                 alloc_count: event.alloc_count,
                 alloc_measurement_scope: event.alloc_measurement_scope,
-                l1d_cache_accesses: event.l1d_cache_accesses,
-                l1d_cache_misses: event.l1d_cache_misses,
-                l1d_measurement_scope: event.l1d_measurement_scope,
-                l1d_cache_status: event.l1d_cache_status,
-                l1d_measured_thread_count: event.l1d_measured_thread_count,
-                l1d_discovered_thread_count: event.l1d_discovered_thread_count,
-                l1d_multiplexed_thread_count: event.l1d_multiplexed_thread_count,
                 ram_rss_delta_bytes: event.ram_rss_delta_bytes,
                 ram_rss_utilization: event.ram_rss_utilization,
                 artifact_size_bytes: event.artifact_size_bytes,
@@ -9308,8 +9252,6 @@ mod aggregate_csv_resource_tests {
             "cpu_throttled_time_ratio": 0.1,
             "alloc_bytes": 42u64,
             "alloc_count": 3u64,
-            "l1d_cache_accesses": 1000u64,
-            "l1d_cache_misses": 25u64,
             "ram_rss_delta_bytes": 4096i64,
             "ram_rss_utilization": 0.25,
             "tree_height": 3u32,
@@ -9443,8 +9385,6 @@ mod aggregate_csv_resource_tests {
         assert_eq!(value("cpu_throttled_period_fraction_cumulative"), "0.05");
         assert_eq!(value("cpu_throttled_period_threshold"), "0.05");
         assert_eq!(value("cpu_throttled_period_threshold_crossing"), "true");
-        assert_eq!(value("l1d_cache_accesses"), "1000");
-        assert_eq!(value("l1d_cache_misses"), "25");
         assert_eq!(value("ram_rss_delta_bytes"), "4096");
         assert_eq!(value("ram_rss_utilization"), "0.25");
         assert_eq!(value("span_name"), "create_group");

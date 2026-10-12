@@ -90,8 +90,6 @@ openmls_v4_numeric_cols <- c(
   "update_path_size_bytes",
   "welcome_bytes",
   "ratchet_tree_bytes",
-  "l1d_cache_accesses",
-  "l1d_cache_misses",
   "tree_height",
   "tree_leaf_count",
   "tree_node_count",
@@ -157,9 +155,7 @@ metric_labels <- c(
   tree_hash_nodes_touched = "tree hash nodes touched",
   parent_hash_nodes_touched = "parent hash nodes touched",
   members_added = "members added",
-  members_removed = "members removed",
-  l1d_hit_ratio = "corrected L1D hit ratio",
-  l1d_miss_ratio = "L1D miss ratio"
+  members_removed = "members removed"
 )
 
 metric_label <- function(metric) {
@@ -244,19 +240,6 @@ read_openmls_v4_raw <- function(files = discover_openmls_v4_events(),
         (cpu_thread_ns / wall_ns) * 100,
         NA_real_
       ),
-      # Correct hit ratio from perf-style load/access and miss counters.
-      # The old v3 script used accesses / (accesses + misses), which is not a
-      # hit ratio if accesses already includes misses.
-      l1d_miss_ratio = if_else(
-        is.finite(l1d_cache_accesses) & l1d_cache_accesses > 0,
-        l1d_cache_misses / l1d_cache_accesses,
-        NA_real_
-      ),
-      l1d_hit_ratio = if_else(
-        is.finite(l1d_cache_accesses) & l1d_cache_accesses > 0,
-        (l1d_cache_accesses - l1d_cache_misses) / l1d_cache_accesses,
-        NA_real_
-      ),
       members_added = case_when(
         is.finite(added_members_count) ~ added_members_count,
         op %in% c("commit_create_protocol_add", "welcome_create_protocol", "welcome_create_serialize") &
@@ -303,7 +286,6 @@ summarise_openmls_v4_data <- function(df) {
       payload_max = suppressWarnings(max(app_msg_plaintext_bytes, na.rm = TRUE)),
       wall_ms_median = median(wall_ms, na.rm = TRUE),
       alloc_bytes_median = median(alloc_bytes, na.rm = TRUE),
-      finite_l1d_hit_ratio = finite_n(l1d_hit_ratio),
       .groups = "drop"
     ) |>
     mutate(across(
@@ -1099,8 +1081,8 @@ plot_openmls_resource_diagnostics <- function(df) {
   print(plot_2d_group(
     df,
     "update_path_compute_protocol_core",
-    c("cpu_usage_percent", "l1d_hit_ratio", "l1d_miss_ratio"),
-    "OpenMLS UpdatePath resource diagnostics: corrected L1D formula",
+    c("cpu_usage_percent"),
+    "OpenMLS UpdatePath resource diagnostics",
     x_col = "tree_height",
     x_label = "tree height",
     x_window = 2,
@@ -1265,12 +1247,12 @@ export_all_openmls_v4_plots <- function(df = NULL,
       "application plaintext bytes"
     ),
     save_openmls_v4_2d_png(
-      file.path(output_dir, "12_resource_diagnostics_corrected_l1d.png"),
+      file.path(output_dir, "12_resource_diagnostics.png"),
       plot_2d_group(
         df,
         "update_path_compute_protocol_core",
-        c("cpu_usage_percent", "l1d_hit_ratio", "l1d_miss_ratio"),
-        "OpenMLS UpdatePath resource diagnostics: corrected L1D formula",
+        c("cpu_usage_percent"),
+        "OpenMLS UpdatePath resource diagnostics",
         x_col = "tree_height",
         x_label = "tree height",
         x_window = 2,

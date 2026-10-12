@@ -489,7 +489,6 @@ openmls_v7_prepare <- function(raw_result) {
       group_info_plaintext_bytes_source = group_info_plaintext$source,
       cpu_thread_ms = as.numeric(cpu_thread_ns) / 1e6,
       wall_ms = as.numeric(wall_ns) / 1e6,
-      metric_l1d_cache_misses = as.numeric(l1d_cache_misses),
       metric_alloc_bytes = as.numeric(alloc_bytes),
       metric_alloc_count = as.numeric(alloc_count)
     )
@@ -500,7 +499,6 @@ openmls_v7_metric_spec <- function() {
     ~metric_key, ~value_col, ~raw_col, ~label, ~filename_key, ~accuracy,
     "cpu_thread_time", "cpu_thread_ms", "cpu_thread_ns", "CPU thread time (ms)", "cpu_thread_time", 0.01,
     "cpu_wall_time", "wall_ms", "wall_ns", "CPU wall time (ms)", "cpu_wall_time", 0.01,
-    "l1_cache_misses", "metric_l1d_cache_misses", "l1d_cache_misses", "L1D cache misses", "l1_cache_misses", 1,
     "ram_alloc_bytes", "metric_alloc_bytes", "alloc_bytes", "RAM allocated bytes", "ram_alloc_bytes", 1,
     "ram_alloc_count", "metric_alloc_count", "alloc_count", "RAM allocation count", "ram_alloc_count", 1
   )
@@ -588,7 +586,6 @@ openmls_v7_addcommit_create_span_inventory <- function(df) {
       rows = n(),
       finite_wall_rows = sum(is.finite(wall_ms)),
       finite_cpu_thread_rows = sum(is.finite(cpu_thread_ms)),
-      finite_l1d_miss_rows = sum(is.finite(metric_l1d_cache_misses)),
       finite_alloc_bytes_rows = sum(is.finite(metric_alloc_bytes)),
       finite_alloc_count_rows = sum(is.finite(metric_alloc_count)),
       min_group_size = openmls_v7_min(group_size_n),
@@ -964,12 +961,10 @@ openmls_v7_make_plotting_rows <- function(df) {
       update_path_present,
       wall_ns,
       cpu_thread_ns,
-      l1d_cache_misses,
       alloc_bytes,
       alloc_count,
       cpu_thread_ms,
       wall_ms,
-      metric_l1d_cache_misses,
       metric_alloc_bytes,
       metric_alloc_count
     )

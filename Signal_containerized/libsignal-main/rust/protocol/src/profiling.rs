@@ -13,7 +13,6 @@ use std::{
 
 use allocation_counter::{embedded_heap_budget, AllocationInfo};
 use cpu_time::{ProcessTime, ThreadTime};
-use l1d_cache_counter::L1DCacheCounterScope;
 use serde::Serialize;
 
 static PROFILE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
@@ -552,8 +551,6 @@ pub(crate) struct ProfileEvent {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     pub alloc_measurement_scope: Option<String>,
-    pub l1d_cache_accesses: Option<u64>,
-    pub l1d_cache_misses: Option<u64>,
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
     pub success: bool,
@@ -650,7 +647,6 @@ struct ProfileScope {
     wall_start: Instant,
     cpu_start: Option<ThreadTime>,
     resource_start: ResourceSnapshot,
-    l1d_cache_start: Option<L1DCacheCounterScope>,
     span_id: u64,
     parent_span_id: Option<u64>,
     parent_operation: Option<String>,
@@ -662,7 +658,6 @@ impl ProfileScope {
         if !profiling_enabled() {
             return None;
         }
-        let _ = L1DCacheCounterScope::counters_available();
         let span_id = next_span_id();
         let op_name: String = op.into();
         let parent_span_id = current_parent_span_id();
@@ -675,7 +670,6 @@ impl ProfileScope {
             wall_start: Instant::now(),
             cpu_start: Some(ThreadTime::now()),
             resource_start: ResourceSnapshot::capture_start(),
-            l1d_cache_start: L1DCacheCounterScope::start(),
             span_id,
             parent_span_id,
             parent_operation,
@@ -692,11 +686,6 @@ impl ProfileScope {
         self.finished = true;
         pop_span_id(self.span_id);
 
-        let l1d_cache_counts = self
-            .l1d_cache_start
-            .take()
-            .map(L1DCacheCounterScope::finish)
-            .unwrap_or_default();
         let wall_ns = self.wall_start.elapsed().as_nanos();
         let cpu_thread_ns = self.cpu_start.map(|start| start.elapsed().as_nanos());
         let resource_end = ResourceSnapshot::capture_end();
@@ -749,7 +738,7 @@ impl ProfileScope {
         let op_clone = self.op.clone();
 
         ProfileEvent {
-            profile_schema_version: 4,
+            profile_schema_version: 5,
             ts_unix_ns: unix_timestamp_ns(),
             op: op_clone.clone(),
             span_name: Some(self.op.clone()),
@@ -783,8 +772,6 @@ impl ProfileScope {
             alloc_bytes: Some(allocation_info.bytes_total),
             alloc_count: Some(allocation_info.count_total),
             alloc_measurement_scope: Some("current_thread".to_string()),
-            l1d_cache_accesses: l1d_cache_counts.accesses,
-            l1d_cache_misses: l1d_cache_counts.misses,
             ram_rss_delta_bytes,
             ram_rss_utilization,
             success,

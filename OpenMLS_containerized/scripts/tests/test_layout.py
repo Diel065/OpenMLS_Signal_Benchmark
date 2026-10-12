@@ -303,21 +303,6 @@ def test_resource_limits_apply_to_singletons_only():
     print("PASS: resource limits apply to singleton services and layout metadata only")
 
 
-def test_worker_compose_enables_perf_event_access():
-    args = generate_compose.build_parser().parse_args(["--workers", "2"])
-    generate_compose.validate_args(args)
-    clients, physical_workers = build_legacy_layout(args)
-    compose = generate_compose.generate_compose_text(args, physical_workers)
-    worker_common = compose.split("x-worker-common: &worker-common", 1)[1].split("services:", 1)[0]
-    assert "cap_add:" in worker_common
-    assert "- PERFMON" in worker_common
-    assert "security_opt:" in worker_common
-    assert "- seccomp=unconfined" in worker_common
-    assert (
-        "OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}"
-        in compose
-    )
-    print("PASS: worker containers retain perf access with reversible L1D profiling disabled")
 
 
 def test_profiled_workers_pass_through_heap_tracking_env():
@@ -351,7 +336,6 @@ def main() -> int:
         test_legacy_layout_build,
         test_disable_container_profiling_marks_container_workers_unprofiled,
         test_resource_limits_apply_to_singletons_only,
-        test_worker_compose_enables_perf_event_access,
         test_profiled_workers_pass_through_heap_tracking_env,
     ]
 

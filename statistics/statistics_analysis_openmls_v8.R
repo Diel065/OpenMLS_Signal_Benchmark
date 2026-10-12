@@ -55,9 +55,7 @@ openmls_v8_columns <- c(
   "benchmark_target_size", "benchmark_active_size", "worker_id", "device_kind",
   "execution_backend", "global_span_id", "parent_global_span_id", "wall_ns",
   "cpu_thread_ns", "cpu_process_ns", "alloc_bytes", "alloc_count",
-  "alloc_measurement_scope", "l1d_cache_accesses", "l1d_cache_misses",
-  "l1d_measurement_scope", "l1d_cache_status", "l1d_measured_thread_count",
-  "l1d_discovered_thread_count", "l1d_multiplexed_thread_count", "member_count",
+  "alloc_measurement_scope", "member_count",
   "member_count_before", "member_count_after", "added_members_count",
   "membership_batch_requested", "membership_batch_effective", "membership_batch_group_cap",
   "membership_batch_transition_cap", "membership_batch_source", "filtered_direct_path_len",
@@ -76,8 +74,7 @@ openmls_v8_required_columns <- setdiff(openmls_v8_columns, "source_file")
 openmls_v8_numeric_columns <- c(
   "profile_schema_version", "benchmark_plateau_index", "benchmark_target_size",
   "benchmark_active_size", "wall_ns", "cpu_thread_ns", "cpu_process_ns", "alloc_bytes",
-  "alloc_count", "l1d_cache_accesses", "l1d_cache_misses", "l1d_measured_thread_count",
-  "l1d_discovered_thread_count", "l1d_multiplexed_thread_count", "member_count",
+  "alloc_count", "member_count",
   "member_count_before", "member_count_after", "added_members_count",
   "membership_batch_requested", "membership_batch_effective", "membership_batch_group_cap",
   "membership_batch_transition_cap", "filtered_direct_path_len",
@@ -185,19 +182,6 @@ openmls_v8_validate_contract <- function(data) {
     if (any(as.integer(span_counts) != nrow(totals))) {
       errors <- c(errors, "incomplete_required_span_coverage")
     }
-  }
-
-  # L1D cache counters are optional: unavailable counters do not invalidate data.
-  # The metric-level filter in openmls_v8_metric_rows will exclude L1D rows
-  # whose l1d_cache_status does not start with "available_", so L1D plots
-  # simply show "No valid observations" on platforms without hardware counters.
-  # The l1d_status diagnostic table reports exact coverage per span and platform.
-  process_l1_scope <- data |> filter(.data$op %in% c(total_op, "commit_add.path_hpke_encrypt"))
-  if (nrow(process_l1_scope) > 0 && any(
-    process_l1_scope$l1d_measurement_scope != "process_threads_at_span_start",
-    na.rm = TRUE
-  )) {
-    errors <- c(errors, "invalid_process_L1D_scope")
   }
 
   process_alloc <- data |> filter(.data$op %in% c(total_op, "commit_add.path_hpke_encrypt"))
@@ -378,7 +362,6 @@ openmls_v8_metrics <- tribble(
   "wall_ms", "wall_ns", "wall time", "ms", "wall_time_ms", "final",
   "cpu_process_ms", "cpu_process_ns", "process CPU time", "ms", "cpu_process_ms", "final",
   "cpu_thread_ms", "cpu_thread_ns", "caller-thread CPU time", "ms", "cpu_thread_ms", "diagnostic",
-  "l1d_misses", "l1d_cache_misses", "L1D cache misses", "misses", "l1d_cache_misses", "final_where_available",
   "alloc_bytes", "alloc_bytes", "allocated bytes", "bytes", "allocated_bytes", "final",
   "alloc_count", "alloc_count", "allocation count", "allocations", "allocation_count", "final"
 )
@@ -398,22 +381,10 @@ openmls_v8_expected_alloc_scope <- function(span) {
          "process_all_threads", "current_thread")
 }
 
-openmls_v8_expected_l1_scope <- function(span) {
-  ifelse(span %in% c("add_commit_total_local", "commit_add.path_hpke_encrypt"),
-         "process_threads_at_span_start", "current_thread")
-}
-
 openmls_v8_metric_rows <- function(df, metric, span) {
   value <- suppressWarnings(as.numeric(df[[metric$column]]))
   if (metric$metric_key %in% c("wall_ms", "cpu_process_ms", "cpu_thread_ms")) value <- value / 1e6
   valid <- is.finite(value) & value >= 0
-  if (metric$metric_key == "l1d_misses") {
-    valid <- valid & stringr::str_starts(dplyr::coalesce(df$l1d_cache_status, ""), "available_") &
-      df$l1d_measurement_scope == openmls_v8_expected_l1_scope(span)
-    if (openmls_v8_expected_l1_scope(span) == "process_threads_at_span_start") {
-      valid <- valid & !stringr::str_detect(dplyr::coalesce(df$l1d_cache_status, ""), "partial")
-    }
-  }
   if (metric$metric_key %in% c("alloc_bytes", "alloc_count")) {
     valid <- valid & df$alloc_measurement_scope == openmls_v8_expected_alloc_scope(span)
   }
@@ -651,18 +622,6 @@ openmls_v8_diagnostics <- function(data, summaries, platform_levels) {
   welcome_n_k <- data |>
     filter(.data$op == "commit_add.welcome_group_secrets_encrypt") |>
     count(.data$platform_label, .data$N, .data$k, .data$n_band, name = "observations")
-  l1_status <- data |> count(.data$platform_label, .data$op, .data$l1d_measurement_scope, .data$l1d_cache_status, name = "observations")
-  l1d_coverage <- data |>
-    filter(.data$op %in% c("add_commit_total_local", openmls_v8_suboperations$span)) |>
-    mutate(l1d_available = stringr::str_starts(dplyr::coalesce(.data$l1d_cache_status, ""), "available_")) |>
-    group_by(.data$platform_label, .data$op) |>
-    summarise(
-      total_rows = n(),
-      available_rows = sum(.data$l1d_available),
-      missing_rows = total_rows - available_rows,
-      pct_available = round(100 * available_rows / total_rows, 1),
-      .groups = "drop"
-    )
   alloc_scope <- data |> count(.data$platform_label, .data$op, .data$alloc_measurement_scope, name = "observations")
 
   expected_grid <- tidyr::crossing(
@@ -695,8 +654,6 @@ openmls_v8_diagnostics <- function(data, summaries, platform_levels) {
     observations_by_n_k = n_k,
     sampling_balance_by_worker_k = sampling,
     welcome_n_k_coverage = welcome_n_k,
-    l1d_status = l1_status,
-    l1d_coverage = l1d_coverage,
     allocation_scope = alloc_scope,
     metric_missingness = missingness,
     path_hpke_cpu_sanity = cpu_sanity
@@ -721,8 +678,6 @@ openmls_v8_write_report <- function(out_dir, load_result, summaries, diagnostics
     "- Integer scaling variables k, C, and F are plotted as discrete observed levels. There is no LOESS.",
     "- Error bars are raw Q25-Q75 intervals, not confidence intervals.",
     "- Welcome HPKE is stratified by before-commit N band to expose N/k confounding.",
-    "- L1D cache counters are optional. Rows without available counters are excluded from L1D plots,",
-    "  producing 'No valid observations' facets. See `l1d_coverage.csv` for per-span availability.",
     "- Allocation rows are used only with the operation's expected thread/process scope.",
     "",
     "## Coverage",
@@ -732,13 +687,6 @@ openmls_v8_write_report <- function(out_dir, load_result, summaries, diagnostics
     paste0("- Expected platform levels: ", paste(load_result$platform_levels, collapse = ", ")),
     paste0("- Missing platform/suboperation/metric cells: ", missing_count),
     paste0("- Plots generated: ", nrow(plot_registry)),
-    {
-      l1d_totals <- diagnostics$l1d_coverage |>
-        filter(.data$op == "add_commit_total_local") |>
-        summarise(total = sum(.data$total_rows), available = sum(.data$available_rows), .groups = "drop")
-      paste0("- L1D AddCommit total coverage: ", l1d_totals$available, "/", l1d_totals$total,
-             " rows (", round(100 * l1d_totals$available / max(l1d_totals$total, 1), 1), "%)")
-    },
     "",
     "## Plot status",
     "",
@@ -747,7 +695,6 @@ openmls_v8_write_report <- function(out_dir, load_result, summaries, diagnostics
     "",
     "## Required companion checks",
     "",
-    "- Confirm L1D counter availability on benchmark hosts via `perf_event_paranoid` <= 1.",
     "- Run `OpenMLS_containerized/scripts/validate_benchmark_outputs.py` before treating any run as publication data."
   )
   writeLines(lines, report_path)
@@ -945,17 +892,6 @@ openmls_v8_cr_diagnostics <- function(data) {
     filter(.data$op == "commit_receive_total_local") |>
     count(.data$platform_label, .data$commit_kind, .data$N, name = "observations")
 
-  l1d_coverage <- data |>
-    filter(.data$op %in% openmls_v8_cr_required_spans) |>
-    mutate(l1d_available = stringr::str_starts(dplyr::coalesce(.data$l1d_cache_status, ""), "available_")) |>
-    group_by(.data$platform_label, .data$op) |>
-    summarise(
-      total_rows = n(), available_rows = sum(.data$l1d_available),
-      missing_rows = total_rows - available_rows,
-      pct_available = round(100 * available_rows / total_rows, 1),
-      .groups = "drop"
-    )
-
   metadata_coverage <- tibble(
     column = c("member_count_before", "member_count_after", "commit_kind",
                "commit_size_bytes", "receiver_leaf_index", "committer_leaf_index",
@@ -972,7 +908,6 @@ openmls_v8_cr_diagnostics <- function(data) {
     span_inventory = span_inventory,
     platform_inventory = platforms,
     commit_kind_counts = commit_kind_counts,
-    l1d_coverage = l1d_coverage,
     metadata_coverage = metadata_coverage
   )
 }
@@ -1102,7 +1037,6 @@ openmls_v8_cr_write_report <- function(out_dir, load_result, diagnostics, plot_c
     "- `commit_receive_total_local` is the canonical total span wrapping the full local receiver-side work.",
     "- Integer scaling variables are plotted as discrete observed levels with raw median + IQR. No LOESS.",
     "- Process CPU is the primary CPU metric. Caller-thread CPU is diagnostic.",
-    "- L1D cache counters are optional; missing L1D rows are excluded from L1D plots only.",
     "",
     "## Coverage",
     "",
@@ -1134,7 +1068,7 @@ openmls_v8_cr_write_report <- function(out_dir, load_result, diagnostics, plot_c
     "- Old pre-refactor data lacks `operation_family=commit_receive` and is skipped loudly.",
     "- `receiver_is_committer` is always false for profiled receives (committer uses unprofiled merge_pending_commit).",
     "- `filtered_direct_path_len` and `sum_copath_resolution_sizes` are not propagated to child spans in the current instrumentation.",
-    "- Only wall/CPU/allocation metrics are plotted; L1D plots appear only if counters are available."
+    "- Only wall/CPU/allocation metrics are plotted."
   )
   writeLines(lines, report_path)
   report_path
@@ -1317,14 +1251,7 @@ openmls_v8_am_diagnostics <- function(data) {
     summarise(observations = n(), workers = n_distinct(.data$worker_id),
               runs = n_distinct(.data$run_id), .groups = "drop")
 
-  l1d_coverage <- data |>
-    mutate(l1d_available = stringr::str_starts(dplyr::coalesce(.data$l1d_cache_status, ""), "available_")) |>
-    group_by(.data$platform_label, .data$op, .data$op_family) |>
-    summarise(total_rows = n(), available_rows = sum(.data$l1d_available),
-              missing_rows = total_rows - available_rows,
-              pct_available = round(100 * available_rows / total_rows, 1), .groups = "drop")
-
-  list(span_inventory = span_inventory, platform_inventory = platforms, l1d_coverage = l1d_coverage)
+  list(span_inventory = span_inventory, platform_inventory = platforms)
 }
 
 openmls_v8_am_summarise <- openmls_v8_summarise_values
@@ -1445,7 +1372,6 @@ run_openmls_v8_app_message_analysis <- function(
     "- Only schema >= 10 rows with operation_family=application_message_{create,receive} accepted.",
     "- member_count == member_count_before == member_count_after (no membership change).",
     "- Process CPU is primary; caller-thread CPU is diagnostic.",
-    "- L1D cache counters are optional.",
     "", "## Coverage",
     paste0("- Create rows: ", sum(loaded$data$op_family == "create")),
     paste0("- Receive rows: ", sum(loaded$data$op_family == "receive")),
@@ -1747,12 +1673,7 @@ run_openmls_v8_welcome_receive_analysis <- function(
   diag <- list(
     span_inventory = data |> count(.data$platform_label, .data$op, name = "observations"),
     platform_inventory = data |> group_by(.data$platform_label) |>
-      summarise(obs = n(), workers = n_distinct(.data$worker_id), .groups = "drop"),
-    l1d_coverage = data |>
-      mutate(l1d_avail = stringr::str_starts(dplyr::coalesce(.data$l1d_cache_status, ""), "available_")) |>
-      group_by(.data$platform_label, .data$op) |>
-      summarise(total = n(), available = sum(.data$l1d_avail), pct = round(100 * available / total, 1),
-                .groups = "drop")
+      summarise(obs = n(), workers = n_distinct(.data$worker_id), .groups = "drop")
   )
   purrr::iwalk(diag, ~ readr::write_csv(.x, file.path(table_dir, paste0(.y, ".csv")), na = ""))
 

@@ -31,7 +31,6 @@ GROUP_INFO_SPANS = {
     "commit_add.welcome.new",
     "welcome_create_protocol",
 }
-PROCESS_L1D_SPANS = {CANONICAL_TOTAL, "commit_add.path_hpke_encrypt"}
 PROCESS_ALLOCATION_SPANS = {CANONICAL_TOTAL, "commit_add.path_hpke_encrypt"}
 NONZERO_ALLOCATION_SPANS = {
     CANONICAL_TOTAL,
@@ -67,13 +66,6 @@ REQUIRED_COLUMNS = {
     "alloc_bytes",
     "alloc_count",
     "alloc_measurement_scope",
-    "l1d_cache_accesses",
-    "l1d_cache_misses",
-    "l1d_measurement_scope",
-    "l1d_cache_status",
-    "l1d_measured_thread_count",
-    "l1d_discovered_thread_count",
-    "l1d_multiplexed_thread_count",
     "operation_family",
     "benchmark_operation",
     "member_count",
@@ -256,39 +248,6 @@ def validate_run(
         else:
             global_ids.add(global_id)
 
-        l1_status = row.get("l1d_cache_status", "")
-        if not l1_status:
-            result.add_error(f"row {row_number} ({row.get('op')}): missing l1d_cache_status")
-        elif l1_status == "disabled":
-            pass
-        elif l1_status.startswith("available_"):
-            accesses = validate_numeric_nonnegative(
-                result, row, row_number, "l1d_cache_accesses"
-            )
-            misses = validate_numeric_nonnegative(result, row, row_number, "l1d_cache_misses")
-            if accesses is not None and misses is not None and misses > accesses:
-                result.add_error(
-                    f"row {row_number} ({row.get('op')}): L1D misses exceed accesses"
-                )
-            if not present(row.get("l1d_measurement_scope")):
-                result.add_error(f"row {row_number} ({row.get('op')}): missing L1D scope")
-        elif any(kind in row.get("device_kind", "").lower() for kind in ["luckfox", "local_process"]):
-            # Luckfox and local processes are exempt from L1D requirements if missing
-            pass
-
-        if row.get("op") in PROCESS_L1D_SPANS and l1_status != "disabled":
-            if any(kind in row.get("device_kind", "").lower() for kind in ["luckfox", "local_process"]):
-                pass
-            else:
-                if row.get("l1d_measurement_scope") != "process_threads_at_span_start":
-                    result.add_error(
-                        f"row {row_number} ({row.get('op')}): process-wide L1D scope required"
-                    )
-                if not l1_status.startswith("available_all_process_threads"):
-                    result.add_error(
-                        f"row {row_number} ({row.get('op')}): complete process-thread L1D "
-                        f"coverage required, got {l1_status!r}"
-                    )
         if row.get("op") in PROCESS_ALLOCATION_SPANS and row.get(
             "alloc_measurement_scope"
         ) != "process_all_threads":
@@ -363,24 +322,6 @@ def validate_run(
             result.add_error(
                 f"span {span!r} has {count} rows for {len(totals)} AddCommits"
             )
-
-    plotted_l1d_ops = REQUIRED_ADD_SPANS | {CANONICAL_TOTAL}
-    for row_number, row in enumerate(
-        [row for row in add_rows if row.get("op") in plotted_l1d_ops], start=1
-    ):
-        l1_status = row.get("l1d_cache_status", "")
-        if l1_status == "disabled":
-            continue
-        if not l1_status.startswith("available_"):
-            if any(kind in row.get("device_kind", "").lower() for kind in ["luckfox", "local_process"]):
-                result.add_warning(
-                    f"AddCommit L1D row {row_number} ({row.get('op')}): L1D missing for {row.get('device_kind')}, got {row.get('l1d_cache_status')!r}"
-                )
-            else:
-                result.add_error(
-                    f"AddCommit L1D row {row_number} ({row.get('op')}): complete measurement "
-                    f"required, got {row.get('l1d_cache_status')!r}"
-                )
 
     for critical_op in (CANONICAL_TOTAL, "commit_add.path_hpke_encrypt"):
         critical_rows = [row for row in add_rows if row.get("op") == critical_op]

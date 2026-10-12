@@ -39,11 +39,6 @@ def valid_add_rows(run_id="test-run", k=2):
                 "alloc_bytes": "128",
                 "alloc_count": "2",
                 "alloc_measurement_scope": "current_thread",
-                "l1d_measurement_scope": "current_thread",
-                "l1d_cache_status": "available_current_thread",
-                "l1d_cache_accesses": "100",
-                "l1d_cache_misses": "10",
-                "l1d_multiplexed_thread_count": "0",
                 "operation_family": "add_commit_create",
                 "benchmark_operation": "add_commit",
                 "member_count": "8",
@@ -56,12 +51,6 @@ def valid_add_rows(run_id="test-run", k=2):
             row.update(
                 {
                     "alloc_measurement_scope": "process_all_threads",
-                    "l1d_measurement_scope": "process_threads_at_span_start",
-                    "l1d_cache_status": "available_all_process_threads",
-                    "l1d_cache_accesses": "1000",
-                    "l1d_cache_misses": "100",
-                    "l1d_measured_thread_count": "4",
-                    "l1d_discovered_thread_count": "4",
                     "benchmark_plateau_index": "1",
                     "benchmark_target_size": str(8 + k),
                     "membership_batch_requested": str(k),
@@ -77,12 +66,6 @@ def valid_add_rows(run_id="test-run", k=2):
             row.update(
                 {
                     "alloc_measurement_scope": "process_all_threads",
-                    "l1d_measurement_scope": "process_threads_at_span_start",
-                    "l1d_cache_status": "available_all_process_threads",
-                    "l1d_cache_accesses": "500",
-                    "l1d_cache_misses": "50",
-                    "l1d_measured_thread_count": "4",
-                    "l1d_discovered_thread_count": "4",
                     "sum_copath_resolution_sizes": "3",
                     "hpke_encrypt_count": "3",
                 }
@@ -206,21 +189,6 @@ class TestValidator(unittest.TestCase):
             any("transitions permitting k > 1" in error for error in result.errors)
         )
 
-    def test_rejects_partial_process_l1d_coverage(self):
-        rows = valid_add_rows()
-        total = next(row for row in rows if row["op"] == CANONICAL_TOTAL)
-        total.update(
-            {
-                "l1d_cache_status": "available_partial_process_threads",
-                "l1d_cache_accesses": "100",
-                "l1d_cache_misses": "10",
-                "l1d_measured_thread_count": "2",
-                "l1d_discovered_thread_count": "3",
-            }
-        )
-        result = validate_run(str(write_run(self.temp_dir, rows)))
-        self.assertFalse(result.success)
-        self.assertTrue(any("complete process-thread" in error for error in result.errors))
 
     def test_rejects_missing_external_device_addcommit(self):
         layout = {
@@ -243,35 +211,7 @@ class TestValidator(unittest.TestCase):
         self.assertFalse(result.success)
         self.assertTrue(any("malformed JSONL" in error for error in result.errors))
 
-    def test_accepts_luckfox_missing_l1d(self):
-        rows = valid_add_rows()
-        for row in rows:
-            row.update({
-                "device_kind": "luckfox_pico_plus",
-                "l1d_cache_status": "unsupported_or_permission_denied",
-                "l1d_cache_accesses": "",
-                "l1d_cache_misses": "",
-                "l1d_measurement_scope": "",
-                "l1d_measured_thread_count": "",
-                "l1d_discovered_thread_count": "",
-            })
-        result = validate_run(str(write_run(self.temp_dir, rows)))
-        self.assertTrue(result.success, result.errors)
 
-    def test_accepts_explicitly_disabled_l1d(self):
-        rows = valid_add_rows()
-        for row in rows:
-            row.update({
-                "l1d_cache_status": "disabled",
-                "l1d_cache_accesses": "",
-                "l1d_cache_misses": "",
-                "l1d_measurement_scope": "",
-                "l1d_measured_thread_count": "",
-                "l1d_discovered_thread_count": "",
-                "l1d_multiplexed_thread_count": "",
-            })
-        result = validate_run(str(write_run(self.temp_dir, rows)))
-        self.assertTrue(result.success, result.errors)
 
 
 if __name__ == "__main__":

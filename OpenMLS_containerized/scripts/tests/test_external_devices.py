@@ -29,34 +29,8 @@ from external_devices import (
 )
 
 
-class FakePerfBackend(DeviceBackend):
-    def __init__(self, value: int | None):
-        self.value = value
-        self.set_values: list[int] = []
-
-    def shell(self, command: str, check: bool = True) -> subprocess.CompletedProcess:
-        output = f"{self.value}\n" if self.value is not None else "not available\n"
-        return subprocess.CompletedProcess(command, 0, output, "")
-
-    def _set_perf_event_paranoid(self, value: int) -> None:
-        self.set_values.append(value)
-        self.value = value
 
 
-def test_perf_event_access_is_enforced():
-    backend = FakePerfBackend(4)
-    backend.ensure_perf_event_access()
-    assert backend.value == 2
-    assert backend.set_values == [2]
-
-    already_allowed = FakePerfBackend(1)
-    already_allowed.ensure_perf_event_access()
-    assert already_allowed.set_values == []
-
-    no_sysctl = FakePerfBackend(None)
-    no_sysctl.ensure_perf_event_access()
-    assert no_sysctl.set_values == []
-    print("PASS: external perf-event access is enforced")
 
 
 def test_host_runner_layout_rewrites_only_execution_endpoints():
@@ -366,7 +340,6 @@ def main() -> int:
             ("ssh password config", lambda: test_ssh_password_config_defaults_to_password_backend(tmp_dir)),
             ("trim incomplete JSONL tail", lambda: test_trim_incomplete_jsonl_tail_preserves_flushed_rows(tmp_dir)),
             ("parse discrete plateau sizes", test_parse_discrete_plateau_sizes),
-            ("perf-event access", lambda: test_perf_event_access_is_enforced()),
             ("host-runner mixed layout", lambda: test_host_runner_layout_rewrites_only_execution_endpoints()),
         ]
 

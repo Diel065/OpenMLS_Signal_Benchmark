@@ -846,15 +846,10 @@ def generate_compose_text(
     lines.append("")
     lines.append("x-worker-common: &worker-common")
     lines.append("  image: mls-worker")
-    lines.append("  cap_add:")
-    lines.append("    - PERFMON")
-    lines.append("  security_opt:")
-    lines.append("    - seccomp=unconfined")
     lines.append("  environment:")
     lines.append(f"    OPENMLS_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO: {args.scenario}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
-    lines.append("    OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}")
     lines.append("    MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}")
     lines.append("    OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}")
     lines.append("    OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}")
@@ -1001,7 +996,6 @@ def generate_compose_text(
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
-        lines.append('      OPENMLS_L1D_PROFILING_ENABLED: ${OPENMLS_L1D_PROFILING_ENABLED:-false}')
         lines.append('      OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD: ${OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD:-0.05}')
 
         if affinity_result.get("rayon_num_threads"):

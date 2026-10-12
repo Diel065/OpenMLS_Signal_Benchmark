@@ -14,7 +14,6 @@ use std::{
 
 use allocation_counter::{process_snapshot, ProcessAllocationSnapshot};
 use cpu_time::{ProcessTime, ThreadTime};
-use l1d_cache_counter::L1DCacheCounterScope;
 use serde::Serialize;
 
 static PROFILE_WRITER: OnceLock<Option<Mutex<BufWriter<File>>>> = OnceLock::new();
@@ -1108,16 +1107,6 @@ pub fn profiling_enabled() -> bool {
     writer().is_some()
 }
 
-/// Returns whether L1D profiling is enabled by configuration.
-pub fn l1d_cache_profiling_enabled() -> bool {
-    L1DCacheCounterScope::profiling_enabled()
-}
-
-/// Returns whether this process can open and read L1D hardware counters.
-pub fn l1d_cache_counters_available() -> bool {
-    L1DCacheCounterScope::counters_available()
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 struct StructuralCounterSnapshot {
     tree_hash_nodes_touched: u64,
@@ -1224,13 +1213,6 @@ pub struct ProfileEvent {
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
     pub alloc_measurement_scope: Option<String>,
-    pub l1d_cache_accesses: Option<u64>,
-    pub l1d_cache_misses: Option<u64>,
-    pub l1d_measurement_scope: Option<String>,
-    pub l1d_cache_status: String,
-    pub l1d_measured_thread_count: Option<usize>,
-    pub l1d_discovered_thread_count: Option<usize>,
-    pub l1d_multiplexed_thread_count: Option<usize>,
     pub ram_rss_delta_bytes: Option<i64>,
     pub ram_rss_utilization: Option<f64>,
 
@@ -1678,10 +1660,6 @@ pub struct ProfileScope {
     process_cpu_start: Option<ProcessTime>,
     resource_start: ResourceSnapshot,
     structural_start: StructuralCounterSnapshot,
-    l1d_cache_start: Option<L1DCacheCounterScope>,
-    l1d_profiling_enabled: bool,
-    l1d_cache_available: bool,
-    l1d_measurement_scope: &'static str,
     process_allocation_start: ProcessAllocationSnapshot,
     span_id: u64,
     parent_span_id: Option<u64>,
@@ -1703,27 +1681,6 @@ impl ProfileScope {
         let parent_operation = current_parent_operation();
         push_span_id(span_id, op_name.clone());
 
-        let use_process_l1d_scope = op_name == "add_commit_total_local"
-            || op_name.ends_with(".path_hpke_encrypt");
-        let l1d_profiling_enabled = l1d_cache_profiling_enabled();
-        #[cfg(not(target_arch = "wasm32"))]
-        if l1d_profiling_enabled && use_process_l1d_scope {
-            // Ensure the global Rayon pool exists before process TIDs are enumerated.
-            let _ = rayon::current_num_threads();
-        }
-        let l1d_cache_available = L1DCacheCounterScope::counters_available();
-        let l1d_cache_start = if !l1d_profiling_enabled {
-            None
-        } else if use_process_l1d_scope {
-            L1DCacheCounterScope::start_process_threads()
-        } else {
-            L1DCacheCounterScope::start_current_thread()
-        };
-        let l1d_measurement_scope = if use_process_l1d_scope {
-            "process_threads_at_span_start"
-        } else {
-            "current_thread"
-        };
         let process_allocation_start = process_snapshot();
         let structural_start = StructuralCounterSnapshot::capture();
         let resource_start = ResourceSnapshot::capture_start();
@@ -1740,10 +1697,6 @@ impl ProfileScope {
             process_cpu_start,
             resource_start,
             structural_start,
-            l1d_cache_start,
-            l1d_profiling_enabled,
-            l1d_cache_available,
-            l1d_measurement_scope,
             process_allocation_start,
             span_id,
             parent_span_id,
@@ -1776,42 +1729,6 @@ impl ProfileScope {
         let process_allocation = process_snapshot().delta_since(self.process_allocation_start);
         let structural_counters =
             StructuralCounterSnapshot::capture().delta_since(self.structural_start);
-        let l1d_cache_counts = self
-            .l1d_cache_start
-            .take()
-            .map(L1DCacheCounterScope::finish)
-            .unwrap_or_default();
-        let l1d_cache_status = if !self.l1d_profiling_enabled {
-            "disabled"
-        } else if l1d_cache_counts.accesses.is_some()
-            && l1d_cache_counts.misses.is_some()
-        {
-            if self.l1d_measurement_scope == "current_thread" {
-                if l1d_cache_counts.multiplexed_thread_count > 0 {
-                    "available_current_thread_scaled_for_multiplexing"
-                } else {
-                    "available_current_thread"
-                }
-            } else if l1d_cache_counts.measured_thread_count
-                == l1d_cache_counts.discovered_thread_count
-            {
-                if l1d_cache_counts.multiplexed_thread_count > 0 {
-                    "available_all_process_threads_scaled_for_multiplexing"
-                } else {
-                    "available_all_process_threads"
-                }
-            } else {
-                if l1d_cache_counts.multiplexed_thread_count > 0 {
-                    "available_partial_process_threads_scaled_for_multiplexing"
-                } else {
-                    "available_partial_process_threads"
-                }
-            }
-        } else if self.l1d_cache_available {
-            "counter_start_or_read_failed"
-        } else {
-            "unsupported_or_permission_denied"
-        };
         let resource_end = ResourceSnapshot::capture_end();
         let effective_cpu_limit = effective_cpu_limit_cores().unwrap_or(1.0);
         let cpu_envelope_utilization = if wall_ns > 0 && effective_cpu_limit > 0.0 {
@@ -1887,7 +1804,7 @@ impl ProfileScope {
         pop_span_id(self.span_id);
 
         let mut event = ProfileEvent {
-            profile_schema_version: 11,
+            profile_schema_version: 12,
             ts_unix_ns: unix_timestamp_ns(),
             measurement_class: measurement_class_for_op(&op).to_string(),
             measurement_plane: measurement_plane_for_op(&op).to_string(),
@@ -1919,19 +1836,6 @@ impl ProfileScope {
             alloc_bytes: Some(process_allocation.bytes_total),
             alloc_count: Some(process_allocation.count_total),
             alloc_measurement_scope: Some("process_all_threads".to_string()),
-            l1d_cache_accesses: l1d_cache_counts.accesses,
-            l1d_cache_misses: l1d_cache_counts.misses,
-            l1d_measurement_scope: self
-                .l1d_profiling_enabled
-                .then(|| self.l1d_measurement_scope.to_string()),
-            l1d_cache_status: l1d_cache_status.to_string(),
-            l1d_measured_thread_count: (l1d_cache_counts.measured_thread_count > 0)
-                .then_some(l1d_cache_counts.measured_thread_count),
-            l1d_discovered_thread_count: (l1d_cache_counts.discovered_thread_count > 0)
-                .then_some(l1d_cache_counts.discovered_thread_count),
-            l1d_multiplexed_thread_count: self
-                .l1d_profiling_enabled
-                .then_some(l1d_cache_counts.multiplexed_thread_count),
             ram_rss_delta_bytes,
             ram_rss_utilization,
 

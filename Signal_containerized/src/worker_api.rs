@@ -24,7 +24,6 @@ use crate::http_retry::{
 use crate::key_repository::{
     OneTimePrekeyStorable, PrekeyBundleBatchStorable, PrekeyBundleStorable, PrekeyStock,
 };
-use crate::l1d_cache::{L1DCacheCounterScope, L1DCacheCounts};
 use crate::signal_metrics::SignalProfileEvent;
 use crate::signal_participant::SignalParticipant;
 
@@ -248,8 +247,6 @@ pub struct CommandMetrics {
     pub cpu_process_ns: Option<u128>,
     pub alloc_bytes: Option<u64>,
     pub alloc_count: Option<u64>,
-    pub l1d_cache_accesses: Option<u64>,
-    pub l1d_cache_misses: Option<u64>,
     pub artifact_size_bytes: Option<usize>,
     pub participant_count: Option<usize>,
     pub conversation_size: Option<usize>,
@@ -284,9 +281,6 @@ impl CommandMetrics {
         self.cpu_process_ns = add_u128_options(self.cpu_process_ns, other.cpu_process_ns);
         self.alloc_bytes = add_u64_options(self.alloc_bytes, other.alloc_bytes);
         self.alloc_count = add_u64_options(self.alloc_count, other.alloc_count);
-        self.l1d_cache_accesses =
-            add_u64_options(self.l1d_cache_accesses, other.l1d_cache_accesses);
-        self.l1d_cache_misses = add_u64_options(self.l1d_cache_misses, other.l1d_cache_misses);
     }
 }
 
@@ -337,17 +331,11 @@ fn add_usize_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
 }
 
 fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
-    let _ = L1DCacheCounterScope::counters_available();
     let process_start = ProcessTime::now();
     let cpu_start = ThreadTime::now();
     let mut result = None;
-    let mut l1d_cache_counts = L1DCacheCounts::default();
     let allocation_info = allocation_counter::measure(|| {
-        let l1d_cache_scope = L1DCacheCounterScope::start();
         result = Some(run());
-        l1d_cache_counts = l1d_cache_scope
-            .map(L1DCacheCounterScope::finish)
-            .unwrap_or_default();
     });
 
     let cpu_thread_ns = cpu_start.elapsed().as_nanos();
@@ -361,8 +349,6 @@ fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
             cpu_process_ns: Some(cpu_process_ns),
             alloc_bytes: Some(allocation_info.bytes_total),
             alloc_count: Some(allocation_info.count_total),
-            l1d_cache_accesses: l1d_cache_counts.accesses,
-            l1d_cache_misses: l1d_cache_counts.misses,
             ..Default::default()
         },
     )
@@ -487,7 +473,7 @@ pub fn make_subspan_event_with_span(
         .or_else(libsignal_protocol::profiling::current_benchmark_context);
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
-        profile_schema_version: 5,
+        profile_schema_version: 6,
         span_id,
         parent_span_id,
         parent_operation,

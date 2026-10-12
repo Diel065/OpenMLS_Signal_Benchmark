@@ -257,7 +257,6 @@ openmls_v6_component_label <- function(operation, operation_family_label, is_pro
   label <- str_replace_all(label, "_", " ")
   label <- str_squish(label)
   label <- str_replace_all(label, "\\bhpke\\b", "HPKE")
-  label <- str_replace_all(label, "\\bl1d\\b", "L1D")
   label <- if_else(is.na(label) | label == "", as.character(operation), label)
   if_else(is_protocol_parent, parent_label, label)
 }
@@ -272,12 +271,7 @@ openmls_v6_span_metric_base <- function(df) {
       component_label = openmls_v6_component_label(operation, operation_family_label, is_protocol_parent),
       component_label = if_else(component_label == "total NA", "total", component_label),
       alloc_mib = alloc_bytes / (1024 * 1024),
-      rss_delta_kib = ram_rss_delta_bytes / 1024,
-      l1d_miss_rate = if_else(
-        is.finite(l1d_cache_accesses) & l1d_cache_accesses > 0,
-        l1d_cache_misses / l1d_cache_accesses,
-        NA_real_
-      )
+      rss_delta_kib = ram_rss_delta_bytes / 1024
     )
 }
 
@@ -297,10 +291,6 @@ openmls_v6_span_by_size_stats <- function(df) {
       p95_alloc_count = openmls_v6_q(alloc_count, 0.95),
       median_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.50),
       p95_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.95),
-      median_l1d_cache_accesses = openmls_v6_q(l1d_cache_accesses, 0.50),
-      median_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.50),
-      p95_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.95),
-      median_l1d_miss_rate = openmls_v6_q(l1d_miss_rate, 0.50),
       .groups = "drop"
     ) |>
     arrange(operation_family_label, device_publication_label, span_role, component_label, size_n)
@@ -323,10 +313,6 @@ openmls_v6_span_overall_stats <- function(df) {
       p95_alloc_count = openmls_v6_q(alloc_count, 0.95),
       median_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.50),
       p95_rss_delta_kib = openmls_v6_q(rss_delta_kib, 0.95),
-      median_l1d_cache_accesses = openmls_v6_q(l1d_cache_accesses, 0.50),
-      median_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.50),
-      p95_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.95),
-      median_l1d_miss_rate = openmls_v6_q(l1d_miss_rate, 0.50),
       .groups = "drop"
     ) |>
     arrange(operation_family_label, device_publication_label, span_role, desc(median_cpu_thread_ms))
@@ -395,8 +381,7 @@ openmls_v6_rfc9420_metric_spec <- function() {
     "wall_time", "median_wall_ms", "median wall time (ms)",
     "cpu_thread_time", "median_cpu_thread_ms", "median CPU thread time (ms)",
     "ram_counts", "median_alloc_count", "median allocation count",
-    "ram_bytes", "median_alloc_mib", "median allocated memory (MiB)",
-    "l1d_cache", "median_l1d_cache_misses", "median L1D cache misses"
+    "ram_bytes", "median_alloc_mib", "median allocated memory (MiB)"
   )
 }
 
@@ -405,12 +390,7 @@ openmls_v6_rfc9420_component_base <- function(df) {
   df |>
     mutate(
       alloc_mib = alloc_bytes / (1024 * 1024),
-      rss_delta_kib = ram_rss_delta_bytes / 1024,
-      l1d_miss_rate = if_else(
-        is.finite(l1d_cache_accesses) & l1d_cache_accesses > 0,
-        l1d_cache_misses / l1d_cache_accesses,
-        NA_real_
-      )
+      rss_delta_kib = ram_rss_delta_bytes / 1024
     ) |>
     inner_join(spec, by = "operation") |>
     mutate(
@@ -436,10 +416,6 @@ openmls_v6_rfc9420_component_by_size_stats <- function(df) {
       p95_alloc_mib = openmls_v6_q(alloc_mib, 0.95),
       median_alloc_count = openmls_v6_q(alloc_count, 0.50),
       p95_alloc_count = openmls_v6_q(alloc_count, 0.95),
-      median_l1d_cache_accesses = openmls_v6_q(l1d_cache_accesses, 0.50),
-      median_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.50),
-      p95_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.95),
-      median_l1d_miss_rate = openmls_v6_q(l1d_miss_rate, 0.50),
       .groups = "drop"
     ) |>
     arrange(operation_label, component_order, device_publication_label, size_n)
@@ -456,8 +432,6 @@ openmls_v6_rfc9420_component_overall_stats <- function(df) {
       median_cpu_thread_ms = openmls_v6_q(cpu_thread_ms, 0.50),
       median_alloc_mib = openmls_v6_q(alloc_mib, 0.50),
       median_alloc_count = openmls_v6_q(alloc_count, 0.50),
-      median_l1d_cache_misses = openmls_v6_q(l1d_cache_misses, 0.50),
-      median_l1d_miss_rate = openmls_v6_q(l1d_miss_rate, 0.50),
       .groups = "drop"
     ) |>
     arrange(operation_label, component_order, device_publication_label)
@@ -884,7 +858,6 @@ openmls_v6_missingness_table <- function(df) {
   fields <- c(
     "member_count", "tree_size", "tree_size_effective", "wall_ms", "cpu_thread_ms",
     "alloc_bytes", "alloc_count", "ram_rss_delta_bytes", "ram_rss_utilization",
-    "l1d_cache_accesses", "l1d_cache_misses",
     "filtered_direct_path_len", "update_path_nodes_count", "encrypted_path_secret_count",
     "hpke_encrypt_count", "sum_copath_resolution_sizes", "welcome_bytes_norm",
     "ratchet_tree_bytes_norm", "commit_size_bytes", "commit_id", "commit_create_op",
@@ -1594,34 +1567,10 @@ plot_openmls_v6_span_alloc_count_lines <- function(by_size, overall) {
   )
 }
 
-plot_openmls_v6_span_l1d_miss_lines <- function(by_size, overall) {
-  plot_openmls_v6_span_metric_lines(
-    by_size,
-    overall,
-    "median_l1d_cache_misses",
-    "median L1D cache misses (log scale)",
-    "Suboperation L1D cache-miss decomposition",
-    "Raw L1D miss counters are plotted directly; zero-access rows are excluded before log scaling.",
-    top_n = 5
-  )
-}
-
-plot_openmls_v6_span_l1d_miss_rate_lines <- function(by_size, overall) {
-  plot_openmls_v6_span_metric_lines(
-    by_size,
-    overall,
-    "median_l1d_miss_rate",
-    "median L1D miss rate (log scale)",
-    "Suboperation L1D miss-rate decomposition",
-    "Miss rate is computed per row as misses divided by accesses when access counters are positive.",
-    top_n = 5
-  )
-}
-
 plot_openmls_v6_span_metric_leaders <- function(overall, top_n = 6) {
   metrics <- tibble(
-    metric = c("median_cpu_thread_ms", "median_alloc_mib", "median_alloc_count", "median_l1d_cache_misses"),
-    metric_label = c("median CPU ms", "median allocated MiB", "median allocation count", "median L1D misses")
+    metric = c("median_cpu_thread_ms", "median_alloc_mib", "median_alloc_count"),
+    metric_label = c("median CPU ms", "median allocated MiB", "median allocation count")
   )
 
   d <- overall |>
@@ -1797,13 +1746,11 @@ openmls_v6_plot_registry <- function() {
       "span_compute_by_size",
       "span_alloc_bytes_by_size",
       "span_alloc_count_by_size",
-      "span_l1d_misses_by_size",
-      "span_l1d_miss_rate_by_size",
       "span_metric_leaders"
     ),
-    filename = paste0(sprintf("%02d", seq_along(name)), "_", name, ".png"),
-    width = c(11, 11, 10, 10, 11, 10, 10, 10, 11, 10, 13.5, 13, 10, 17, 17, 17, 17, 17, 18),
-    height = c(7, 7, 6.5, 6.5, 7, 6, 6, 6, 6.5, 6.5, 9.2, 8, 6, 10, 10, 10, 10, 10, 12),
+    filename = paste0(sprintf("%02d", c(seq_len(16), 19L)), "_", name, ".png"),
+    width = c(11, 11, 10, 10, 11, 10, 10, 10, 11, 10, 13.5, 13, 10, 17, 17, 17, 18),
+    height = c(7, 7, 6.5, 6.5, 7, 6, 6, 6, 6.5, 6.5, 9.2, 8, 6, 10, 10, 10, 12),
     fun = list(
       function(df, tables) plot_openmls_v6_frontier(df),
       function(df, tables) plot_openmls_v6_slowdown(df),
@@ -1821,8 +1768,6 @@ openmls_v6_plot_registry <- function() {
       function(df, tables) plot_openmls_v6_span_compute_lines(tables$span_decomposition_by_size, tables$span_decomposition_overall),
       function(df, tables) plot_openmls_v6_span_alloc_bytes_lines(tables$span_decomposition_by_size, tables$span_decomposition_overall),
       function(df, tables) plot_openmls_v6_span_alloc_count_lines(tables$span_decomposition_by_size, tables$span_decomposition_overall),
-      function(df, tables) plot_openmls_v6_span_l1d_miss_lines(tables$span_decomposition_by_size, tables$span_decomposition_overall),
-      function(df, tables) plot_openmls_v6_span_l1d_miss_rate_lines(tables$span_decomposition_by_size, tables$span_decomposition_overall),
       function(df, tables) plot_openmls_v6_span_metric_leaders(tables$span_decomposition_overall)
     )
   )

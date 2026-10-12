@@ -3074,8 +3074,6 @@ def launch_external_devices(
         print(f"[device] {dev_id}: checking clock...", flush=True)
         backend.ensure_clock_synchronized()
 
-        print(f"[device] {dev_id}: checking perf-event access...", flush=True)
-        backend.ensure_perf_event_access()
 
         transport = dev_config.transport
         device_ip = transport.get("device_ip", "172.32.0.93")

@@ -26,7 +26,7 @@ use mls_playground::worker_api::{
     IncomingCommandRequest, PendingIntent,
 };
 use openmls::profiling::{
-    l1d_cache_counters_available, l1d_cache_profiling_enabled, profiling_enabled,
+    profiling_enabled,
     set_benchmark_context, set_worker_id, valid_persisted_canonical_total_count, BenchmarkContext,
 };
 
@@ -329,8 +329,6 @@ async fn health() -> &'static str {
 async fn profiling_capabilities() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "profiling_enabled": profiling_enabled(),
-        "l1d_cache_profiling_enabled": l1d_cache_profiling_enabled(),
-        "l1d_cache_counters_available": l1d_cache_counters_available(),
     }))
 }
 
@@ -342,8 +340,6 @@ async fn client_profiling_capabilities(
         "client_id": client_id,
         "client_exists": state.client_handles.contains_key(&client_id),
         "profiling_enabled": profiling_enabled(),
-        "l1d_cache_profiling_enabled": l1d_cache_profiling_enabled(),
-        "l1d_cache_counters_available": l1d_cache_counters_available(),
     }))
 }
 

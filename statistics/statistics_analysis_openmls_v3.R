@@ -50,8 +50,6 @@ openmls_v3_selected_cols <- c(
   "artifact_size_bytes",
   "welcome_bytes",
   "ratchet_tree_bytes",
-  "l1d_cache_accesses",
-  "l1d_cache_misses",
   "commit_semantics",
   "add_semantics"
 )
@@ -66,9 +64,7 @@ openmls_v3_numeric_cols <- c(
   "alloc_count",
   "artifact_size_bytes",
   "welcome_bytes",
-  "ratchet_tree_bytes",
-  "l1d_cache_accesses",
-  "l1d_cache_misses"
+  "ratchet_tree_bytes"
 )
 
 metric_labels <- c(
@@ -77,8 +73,7 @@ metric_labels <- c(
   artifact_size_bytes = "artifact size (bytes)",
   welcome_bytes = "welcome size (bytes)",
   ratchet_tree_bytes = "ratchet tree size (bytes)",
-  cpu_usage_percent = "CPU usage (%)",
-  l1d_hit_ratio = "L1D cache hit ratio"
+  cpu_usage_percent = "CPU usage (%)"
 )
 
 metric_label <- function(metric) {
@@ -148,17 +143,6 @@ read_openmls_v3_raw <- function(files = discover_openmls_v3_events(),
       cpu_usage_percent = if_else(
         !is.na(wall_ns) & wall_ns > 0 & !is.na(cpu_thread_ns),
         (cpu_thread_ns / wall_ns) * 100,
-        NA_real_
-      ),
-      # Future dense L1D datasets need no special handling here: the hit ratio
-      # is intentionally derived on raw rows before median aggregation and
-      # Savitzky-Golay smoothing. Once every protocol event carries counters,
-      # the same column will naturally produce dense 2D trends and 3D surfaces.
-      l1d_hit_ratio = if_else(
-        !is.na(l1d_cache_accesses) &
-          !is.na(l1d_cache_misses) &
-          (l1d_cache_accesses + l1d_cache_misses) > 0,
-        l1d_cache_accesses / (l1d_cache_accesses + l1d_cache_misses),
         NA_real_
       ),
       members_added = if_else(
@@ -594,11 +578,6 @@ build_surface_grid <- function(df, operation, x_col, y_col, metric,
   x_grid <- complete_integer_grid(surface_df$x)
   y_grid <- complete_integer_grid(surface_df$y)
 
-  # Compatibility path for the current sparse L1D CSVs: a few L1D metric
-  # slices currently contain only one y value, so base R cannot draw them as a
-  # surface. Dense future L1D data will have length(y_grid) > 1 and will skip
-  # this branch completely. Set OPENMLS_V3_PAD_SINGLE_AXIS_SURFACES=false if
-  # you prefer such sparse panels to fail loudly while validating new runs.
   if (pad_single_axis && length(x_grid) == 1L) {
     x_grid <- c(x_grid, x_grid + 1)
   }
@@ -808,7 +787,7 @@ plot_openmls_commit_add <- function(df) {
 
   plot_surface_group(
     df, "commit_create_protocol_add",
-    specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+    specs(surface_spec("cpu_usage_percent")),
     "OpenMLS commit_create_protocol_add (+forced UpdatePath+Welcome): CPU metrics",
     x_col = "member_count",
     y_col = "members_added",
@@ -846,7 +825,7 @@ plot_openmls_commit_remove <- function(df) {
 
   plot_surface_group(
     df, "commit_create_protocol_remove",
-    specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+    specs(surface_spec("cpu_usage_percent")),
     "OpenMLS commit_create_protocol_remove: CPU metrics",
     x_col = "member_count",
     y_col = "members_removed",
@@ -879,7 +858,7 @@ plot_openmls_commit_update <- function(df) {
 
   print(plot_2d_group(
     df, "commit_create_protocol_update",
-    c("cpu_usage_percent", "l1d_hit_ratio"),
+    c("cpu_usage_percent"),
     "OpenMLS commit_create_protocol_update: CPU metrics",
     x_window = 100
   ))
@@ -902,7 +881,7 @@ plot_openmls_join_from_welcome <- function(df) {
 
   print(plot_2d_group(
     df, "join_from_welcome_protocol",
-    c("cpu_usage_percent", "l1d_hit_ratio"),
+    c("cpu_usage_percent"),
     "OpenMLS join_from_welcome_protocol: CPU metrics",
     x_window = 100
   ))
@@ -930,7 +909,7 @@ plot_openmls_application_message_create <- function(df) {
 
   plot_surface_group(
     df, "application_message_create_protocol",
-    specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+    specs(surface_spec("cpu_usage_percent")),
     "OpenMLS application_message_create_protocol: CPU metrics",
     x_col = "member_count",
     y_col = "app_msg_plaintext_bytes",
@@ -956,7 +935,7 @@ plot_openmls_application_message_receive <- function(df) {
 
   plot_surface_group(
     df, "application_message_receive_protocol",
-    specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+    specs(surface_spec("cpu_usage_percent")),
     "OpenMLS application_message_receive_protocol: CPU metrics",
     x_col = "member_count",
     y_col = "app_msg_plaintext_bytes",
@@ -1031,7 +1010,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     save_openmls_v3_surface_png(
       file.path(output_dir, "02_commit_add_cpu.png"),
       df, "commit_create_protocol_add",
-      specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+      specs(surface_spec("cpu_usage_percent")),
       "OpenMLS commit_create_protocol_add (+forced UpdatePath+Welcome): CPU metrics",
       "member_count", "members_added",
       "group member count", "members added",
@@ -1058,7 +1037,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     save_openmls_v3_surface_png(
       file.path(output_dir, "05_commit_remove_cpu.png"),
       df, "commit_create_protocol_remove",
-      specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+      specs(surface_spec("cpu_usage_percent")),
       "OpenMLS commit_create_protocol_remove: CPU metrics",
       "member_count", "members_removed",
       "group member count", "members removed",
@@ -1080,7 +1059,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     ),
     save_openmls_v3_2d_png(
       file.path(output_dir, "08_commit_update_cpu.png"),
-      plot_2d_group(df, "commit_create_protocol_update", c("cpu_usage_percent", "l1d_hit_ratio"),
+      plot_2d_group(df, "commit_create_protocol_update", c("cpu_usage_percent"),
                     "OpenMLS commit_create_protocol_update: CPU metrics", 100)
     ),
     save_openmls_v3_2d_png(
@@ -1095,7 +1074,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     ),
     save_openmls_v3_2d_png(
       file.path(output_dir, "11_join_from_welcome_cpu.png"),
-      plot_2d_group(df, "join_from_welcome_protocol", c("cpu_usage_percent", "l1d_hit_ratio"),
+      plot_2d_group(df, "join_from_welcome_protocol", c("cpu_usage_percent"),
                     "OpenMLS join_from_welcome_protocol: CPU metrics", 100)
     ),
     save_openmls_v3_2d_png(
@@ -1115,7 +1094,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     save_openmls_v3_surface_png(
       file.path(output_dir, "14_application_message_create_cpu.png"),
       df, "application_message_create_protocol",
-      specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+      specs(surface_spec("cpu_usage_percent")),
       "OpenMLS application_message_create_protocol: CPU metrics",
       "member_count", "app_msg_plaintext_bytes",
       "group member count", "application plaintext bytes",
@@ -1133,7 +1112,7 @@ export_all_openmls_v3_plots <- function(df = NULL,
     save_openmls_v3_surface_png(
       file.path(output_dir, "16_application_message_receive_cpu.png"),
       df, "application_message_receive_protocol",
-      specs(surface_spec("cpu_usage_percent"), surface_spec("l1d_hit_ratio")),
+      specs(surface_spec("cpu_usage_percent")),
       "OpenMLS application_message_receive_protocol: CPU metrics",
       "member_count", "app_msg_plaintext_bytes",
       "group member count", "application plaintext bytes",
@@ -1152,7 +1131,6 @@ summarise_openmls_v3_data <- function(df) {
       rows = n(),
       member_count_min = min(member_count, na.rm = TRUE),
       member_count_max = max(member_count, na.rm = TRUE),
-      finite_l1d_hit_ratio = sum(is.finite(l1d_hit_ratio)),
       .groups = "drop"
     ) |>
     arrange(match(op, openmls_v3_operations))
@@ -1184,7 +1162,7 @@ run_openmls_v3_smoke_test <- function(output_dir = "/tmp/openmls_v3_smoke") {
   png(file.path(output_dir, "02_commit_update_cpu.png"), width = 1800, height = 900, res = 140, bg = "white")
   print(plot_2d_group(
     df, "commit_create_protocol_update",
-    c("cpu_usage_percent", "l1d_hit_ratio"),
+    c("cpu_usage_percent"),
     "OpenMLS commit_create_protocol_update: CPU metrics",
     x_window = 100
   ))

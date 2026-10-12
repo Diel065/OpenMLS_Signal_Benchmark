@@ -103,8 +103,6 @@ openmls_v5_numeric_cols <- c(
   "cpu_throttled_time_ratio",
   "alloc_bytes",
   "alloc_count",
-  "l1d_cache_accesses",
-  "l1d_cache_misses",
   "ram_rss_delta_bytes",
   "ram_rss_utilization",
   "artifact_size_bytes",

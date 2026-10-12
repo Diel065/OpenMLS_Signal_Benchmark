@@ -2,7 +2,6 @@ pub mod debug;
 pub mod embedded_heap_budget;
 pub mod http_retry;
 pub mod key_repository;
-pub mod l1d_cache;
 pub mod message_relay;
 pub mod service_metrics;
 pub mod signal_metrics;

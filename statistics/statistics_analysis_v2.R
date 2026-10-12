@@ -33,8 +33,6 @@ openmls_metrics <- c(
   "encrypted_secrets_count",
   "app_msg_plaintext_bytes",
   "app_msg_ciphertext_bytes",
-  "l1d_cache_accesses",
-  "l1d_cache_misses",
   "ram_rss_delta_bytes",
   "ram_rss_utilization",
   "cpu_envelope_utilization",
@@ -53,8 +51,6 @@ signal_metrics <- c(
   "ciphertext_bytes",
   "plaintext_bytes",
   "peer_count",
-  "l1d_cache_accesses",
-  "l1d_cache_misses",
   "ram_rss_delta_bytes",
   "ram_rss_utilization",
   "cpu_envelope_utilization",
@@ -65,9 +61,7 @@ openmls_resource_metrics <- c(
   "cpu_envelope_utilization",
   "cpu_throttled_time_ratio",
   "ram_rss_delta_bytes",
-  "ram_rss_utilization",
-  "l1d_cache_accesses",
-  "l1d_cache_misses"
+  "ram_rss_utilization"
 )
 
 openmls_character_cols <- c(
