@@ -4550,7 +4550,6 @@ pub fn aggregate_csv(
                 prekey_refill_count: Option<usize>,
                 prekey_refill_trigger: Option<String>,
                 session_count: Option<usize>,
-                ratchet_step_count: Option<usize>,
                 ciphertext_bytes: Option<usize>,
                 plaintext_bytes: Option<usize>,
                 handshake_protocol: Option<String>,
@@ -4604,18 +4603,10 @@ pub fn aggregate_csv(
                 cgroup_cpu_max: Option<String>,
                 cpuset_cpus_requested: Option<String>,
                 cpuset_cpus_effective: Option<String>,
-                cpu_nr_periods: Option<u64>,
-                cpu_nr_throttled: Option<u64>,
-                cpu_throttled_usec: Option<u64>,
                 memory_model: Option<String>,
                 requested_memory_limit: Option<String>,
                 requested_memory_limit_bytes: Option<u64>,
                 applied_memory_limit_bytes: Option<u64>,
-                memory_current_bytes: Option<u64>,
-                memory_peak_bytes: Option<u64>,
-                memory_events_max: Option<u64>,
-                memory_events_oom: Option<u64>,
-                memory_events_oom_kill: Option<u64>,
                 app_heap_budget: Option<String>,
                 app_heap_budget_bytes: Option<u64>,
                 heap_current_live_bytes: Option<u64>,
@@ -4632,8 +4623,6 @@ pub fn aggregate_csv(
                 failure_operation: Option<String>,
                 failure_span: Option<String>,
                 failure_phase: Option<String>,
-                container_exit_code: Option<i32>,
-                oom_killed: Option<bool>,
             }
 
             let row = CsvRow {
@@ -4725,7 +4714,6 @@ pub fn aggregate_csv(
                 prekey_refill_count: event.prekey_refill_count,
                 prekey_refill_trigger: event.prekey_refill_trigger,
                 session_count: event.session_count,
-                ratchet_step_count: event.ratchet_step_count,
                 ciphertext_bytes: event.ciphertext_bytes,
                 plaintext_bytes: event.plaintext_bytes,
                 handshake_protocol: event.handshake_protocol,
@@ -4781,18 +4769,10 @@ pub fn aggregate_csv(
                 cgroup_cpu_max: event.cgroup_cpu_max,
                 cpuset_cpus_requested: event.cpuset_cpus_requested,
                 cpuset_cpus_effective: event.cpuset_cpus_effective,
-                cpu_nr_periods: event.cpu_nr_periods,
-                cpu_nr_throttled: event.cpu_nr_throttled,
-                cpu_throttled_usec: event.cpu_throttled_usec,
                 memory_model: event.memory_model,
                 requested_memory_limit: event.requested_memory_limit,
                 requested_memory_limit_bytes: event.requested_memory_limit_bytes,
                 applied_memory_limit_bytes: event.applied_memory_limit_bytes,
-                memory_current_bytes: event.memory_current_bytes,
-                memory_peak_bytes: event.memory_peak_bytes,
-                memory_events_max: event.memory_events_max,
-                memory_events_oom: event.memory_events_oom,
-                memory_events_oom_kill: event.memory_events_oom_kill,
                 app_heap_budget: event.app_heap_budget,
                 app_heap_budget_bytes: event.app_heap_budget_bytes,
                 heap_current_live_bytes: event.heap_current_live_bytes,
@@ -4809,8 +4789,6 @@ pub fn aggregate_csv(
                 failure_operation: event.failure_operation,
                 failure_span: event.failure_span,
                 failure_phase: event.failure_phase,
-                container_exit_code: event.container_exit_code,
-                oom_killed: event.oom_killed,
             };
 
             wtr.serialize(row)?;
@@ -5199,6 +5177,41 @@ mod aggregate_csv_runner_event_tests {
         assert_eq!(value("failure_evidence_source"), "docker_state");
         assert_eq!(value("benchmark_operation"), "prepare_participant");
         assert!(run_dir.join("participant-00001.jsonl").exists());
+
+        let profile: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(run_dir.join("participant-00001.jsonl"))
+                .expect("profile jsonl")
+                .lines()
+                .next()
+                .expect("profile row"),
+        )
+        .expect("profile json");
+        for removed in [
+            "ratchet_step_count",
+            "cpu_nr_periods",
+            "cpu_nr_throttled",
+            "cpu_throttled_usec",
+            "memory_current_bytes",
+            "memory_peak_bytes",
+            "memory_events_max",
+            "memory_events_oom",
+            "memory_events_oom_kill",
+            "container_exit_code",
+            "oom_killed",
+        ] {
+            assert!(!headers.iter().any(|header| header == removed));
+            assert!(profile.get(removed).is_none());
+        }
+
+        write_worker_failures_csv(&run_dir, "test-run").expect("failure sidecar");
+        let mut failures = csv::Reader::from_path(run_dir.join("worker_failures.csv"))
+            .expect("failure csv");
+        let failure_headers = failures.headers().expect("failure headers").clone();
+        let oom_index = failure_headers.iter().position(|header| header == "oom_killed")
+            .expect("sidecar OOM evidence retained");
+        assert!(failure_headers.iter().any(|header| header == "container_exit_code"));
+        let failure = failures.records().next().expect("failure row").expect("valid failure");
+        assert_eq!(failure.get(oom_index), Some("true"));
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

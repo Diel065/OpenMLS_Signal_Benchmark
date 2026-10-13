@@ -102,7 +102,7 @@ def test_csv_schema_contains_scientific_columns() -> None:
     ]
     assert_contains_all(csv, required, "SignalCsvRow")
     assert "profile_schema_version: 6" in read("Signal_containerized/libsignal-main/rust/protocol/src/profiling.rs")
-    assert "profile_schema_version: 7" in read("Signal_containerized/src/bin/worker.rs")
+    assert "profile_schema_version: 8" in read("Signal_containerized/src/bin/worker.rs")
 
 
 def test_event_taxonomy_separates_wrapper_and_protocol_rows() -> None:
@@ -213,9 +213,7 @@ def test_opk_stock_is_recipient_owned_and_dynamic() -> None:
     assert "prekey_stock" in key_repo
 
 
-def test_synthetic_ratchet_counts_are_not_emitted() -> None:
-    worker_api = read("Signal_containerized/src/worker_api.rs")
-    assert "ratchet_step_count = Some" not in worker_api
+def test_real_ratchet_progression_is_emitted() -> None:
     libsignal_ratchet = "\n".join(
         read(path)
         for path in [
@@ -252,7 +250,7 @@ def main() -> int:
         test_pqxdh_prekey_paths_are_distinguishable,
         test_initial_and_ordinary_message_paths_are_separate,
         test_opk_stock_is_recipient_owned_and_dynamic,
-        test_synthetic_ratchet_counts_are_not_emitted,
+        test_real_ratchet_progression_is_emitted,
         test_pairwise_fanout_is_not_labeled_sender_keys,
     ]
     passed = 0

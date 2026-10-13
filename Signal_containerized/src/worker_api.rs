@@ -256,7 +256,6 @@ pub struct CommandMetrics {
     pub prekey_refill_count: Option<usize>,
     pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
-    pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
     pub plaintext_bytes: Option<usize>,
     pub new_session_established: Option<bool>,
@@ -270,8 +269,6 @@ impl CommandMetrics {
         self.prekey_bundle_count =
             add_usize_options(self.prekey_bundle_count, other.prekey_bundle_count);
         self.session_count = add_usize_options(self.session_count, other.session_count);
-        self.ratchet_step_count =
-            add_usize_options(self.ratchet_step_count, other.ratchet_step_count);
         self.ciphertext_bytes = add_usize_options(self.ciphertext_bytes, other.ciphertext_bytes);
         self.plaintext_bytes = add_usize_options(self.plaintext_bytes, other.plaintext_bytes);
     }
@@ -473,7 +470,7 @@ pub fn make_subspan_event_with_span(
         .or_else(libsignal_protocol::profiling::current_benchmark_context);
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
-        profile_schema_version: 7,
+        profile_schema_version: 8,
         span_id,
         parent_span_id,
         parent_operation,

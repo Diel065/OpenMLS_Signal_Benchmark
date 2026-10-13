@@ -130,8 +130,6 @@ Signal has no MLS epoch. `ratchet_progression_value` is a protocol-local Double 
 - `spqr_step_performed`: whether an SPQR send/receive step ran.
 - `ciphertext_message_type`: `PreKeySignalMessage`, `SignalMessage`, `SenderKeyMessage`, or `Unknown`.
 
-The deprecated `ratchet_step_count` column is retained only for old-schema compatibility and is not populated by new wrapper rows.
-
 ## Prekey And Ciphertext Metadata
 
 PQXDH rows expose `classical_one_time_prekey_present`, `classical_one_time_prekey_id`, `signed_prekey_id`, `pq_prekey_id`, `pq_prekey_type`, and `pq_prekey_signature_present`. `pq_prekey_type=one_time` and `pq_prekey_type=last_resort` are separate paths and must not be pooled unless the analysis explicitly intends to combine them.

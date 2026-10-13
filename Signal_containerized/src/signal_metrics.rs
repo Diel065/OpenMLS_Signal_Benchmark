@@ -126,7 +126,6 @@ pub struct SignalProfileEvent {
     #[serde(default)]
     pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
-    pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
     pub plaintext_bytes: Option<usize>,
     #[serde(default)]
@@ -204,12 +203,6 @@ pub struct SignalProfileEvent {
     #[serde(default)]
     pub cpuset_cpus_effective: Option<String>,
     #[serde(default)]
-    pub cpu_nr_periods: Option<u64>,
-    #[serde(default)]
-    pub cpu_nr_throttled: Option<u64>,
-    #[serde(default)]
-    pub cpu_throttled_usec: Option<u64>,
-    #[serde(default)]
     pub memory_model: Option<String>,
     #[serde(default)]
     pub requested_memory_limit: Option<String>,
@@ -217,16 +210,6 @@ pub struct SignalProfileEvent {
     pub requested_memory_limit_bytes: Option<u64>,
     #[serde(default)]
     pub applied_memory_limit_bytes: Option<u64>,
-    #[serde(default)]
-    pub memory_current_bytes: Option<u64>,
-    #[serde(default)]
-    pub memory_peak_bytes: Option<u64>,
-    #[serde(default)]
-    pub memory_events_max: Option<u64>,
-    #[serde(default)]
-    pub memory_events_oom: Option<u64>,
-    #[serde(default)]
-    pub memory_events_oom_kill: Option<u64>,
     #[serde(default)]
     pub app_heap_budget: Option<String>,
     #[serde(default)]
@@ -259,10 +242,6 @@ pub struct SignalProfileEvent {
     pub failure_span: Option<String>,
     #[serde(default)]
     pub failure_phase: Option<String>,
-    #[serde(default)]
-    pub container_exit_code: Option<i32>,
-    #[serde(default)]
-    pub oom_killed: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -345,7 +324,6 @@ pub struct SignalCsvRow<'a> {
     pub prekey_refill_count: Option<usize>,
     pub prekey_refill_trigger: Option<String>,
     pub session_count: Option<usize>,
-    pub ratchet_step_count: Option<usize>,
     pub ciphertext_bytes: Option<usize>,
     pub plaintext_bytes: Option<usize>,
     pub handshake_protocol: Option<String>,
@@ -399,18 +377,10 @@ pub struct SignalCsvRow<'a> {
     pub cgroup_cpu_max: Option<String>,
     pub cpuset_cpus_requested: Option<String>,
     pub cpuset_cpus_effective: Option<String>,
-    pub cpu_nr_periods: Option<u64>,
-    pub cpu_nr_throttled: Option<u64>,
-    pub cpu_throttled_usec: Option<u64>,
     pub memory_model: Option<String>,
     pub requested_memory_limit: Option<String>,
     pub requested_memory_limit_bytes: Option<u64>,
     pub applied_memory_limit_bytes: Option<u64>,
-    pub memory_current_bytes: Option<u64>,
-    pub memory_peak_bytes: Option<u64>,
-    pub memory_events_max: Option<u64>,
-    pub memory_events_oom: Option<u64>,
-    pub memory_events_oom_kill: Option<u64>,
     pub app_heap_budget: Option<String>,
     pub app_heap_budget_bytes: Option<u64>,
     pub heap_current_live_bytes: Option<u64>,
@@ -427,6 +397,4 @@ pub struct SignalCsvRow<'a> {
     pub failure_operation: Option<String>,
     pub failure_span: Option<String>,
     pub failure_phase: Option<String>,
-    pub container_exit_code: Option<i32>,
-    pub oom_killed: Option<bool>,
 }

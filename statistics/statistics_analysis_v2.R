@@ -45,7 +45,6 @@ signal_metrics <- c(
   "artifact_size_bytes",
   "prekey_bundle_count",
   "session_count",
-  "ratchet_step_count",
   "ciphertext_bytes",
   "plaintext_bytes",
   "peer_count",

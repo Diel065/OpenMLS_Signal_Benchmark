@@ -862,7 +862,7 @@ async fn participant_command_actor(
                     .zip(wrapper_span_id)
                     .map(|(w, s)| format!("{}:{}", w, s));
                 let event = SignalProfileEvent {
-                    profile_schema_version: 7,
+                    profile_schema_version: 8,
                     span_id: wrapper_span_id,
                     parent_span_id: None,
                     parent_operation: None,
@@ -922,7 +922,6 @@ async fn participant_command_actor(
                     prekey_refill_count: metrics.prekey_refill_count,
                     prekey_refill_trigger: metrics.prekey_refill_trigger,
                     session_count: metrics.session_count,
-                    ratchet_step_count: metrics.ratchet_step_count,
                     ciphertext_bytes: metrics.ciphertext_bytes,
                     plaintext_bytes: metrics.plaintext_bytes,
                     handshake_protocol: None,
