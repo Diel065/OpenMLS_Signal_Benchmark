@@ -6,9 +6,9 @@ import csv
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Set
 
 
 MIN_PROFILE_SCHEMA_VERSION = 3

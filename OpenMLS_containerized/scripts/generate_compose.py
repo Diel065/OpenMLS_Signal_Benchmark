@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
         default="one-container-per-client",
-        help="Worker layout mode: one-container-per-client (legacy) or hybrid",
+        help="Worker layout mode: one-container-per-client or hybrid",
     )
     p.add_argument(
         "--singleton-min-count",
@@ -175,63 +175,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--resource-profiles-file",
         default=None,
         help="Path to a pre-computed resource_profiles.csv or JSON file for this run",
-    )
-    p.add_argument(
-        "--profiled-singleton-count",
-        type=int,
-        default=1,
-        help="Number of profiled singleton workers in resource experiment mode",
-    )
-    p.add_argument(
-        "--ram-sweep-values",
-        default="32m,64m,128m,256m,512m,1g",
-        help="Comma-separated list of Docker memory limits for RAM sweep",
-    )
-    p.add_argument(
-        "--ram-sweep-cpu-count",
-        type=int,
-        default=10,
-        help="Number of CPUs assigned to each singleton in RAM sweep",
-    )
-    p.add_argument(
-        "--cpu-matrix-core-counts",
-        default="1,2,4",
-        help="Comma-separated list of CPU core counts for CPU matrix",
-    )
-    p.add_argument(
-        "--cpu-matrix-capacity-fractions",
-        default="0.25,0.50,0.75,1.00",
-        help="Comma-separated list of capacity fractions for CPU matrix",
-    )
-    p.add_argument(
-        "--embedded-heap-budgets",
-        default="32k,64k,128k,256k,512k,1m,2m",
-        help="Comma-separated synthetic application heap budgets for embedded-budget mode",
-    )
-    p.add_argument(
-        "--embedded-cpu-fractions",
-        default="1.00,0.50,0.25,0.10,0.05",
-        help="Comma-separated Docker CPU fractions for embedded-budget mode",
-    )
-    p.add_argument(
-        "--embedded-cpu-cores",
-        default="1",
-        help="Comma-separated Docker CPU core counts for embedded-budget mode",
-    )
-    p.add_argument(
-        "--embedded-docker-memory",
-        default="256m",
-        help="Safe Docker memory limit used while Rust enforces app heap budget",
-    )
-    p.add_argument(
-        "--ram-app-heap-sweep-values",
-        default="",
-        help="Comma-separated list of 10 application heap budgets for ram-app-heap-sweep",
-    )
-    p.add_argument(
-        "--resource-experiment-output-dir",
-        default=None,
-        help="Directory to write resource experiment sidecar files",
     )
 
     return p
@@ -716,7 +659,7 @@ def build_hybrid_layout(
     return clients, physical_workers
 
 
-def build_legacy_layout(
+def build_singleton_layout(
     args: argparse.Namespace,
 ) -> tuple[list[ClientLayoutEntry], list[PhysicalWorkerEntry]]:
     clients: list[ClientLayoutEntry] = []
@@ -1334,7 +1277,7 @@ def main() -> None:
               f"packed_clients_per_container={args.packed_clients_per_container} "
               f"profile_policy=singletons_only")
     else:
-        clients, physical_workers = build_legacy_layout(args)
+        clients, physical_workers = build_singleton_layout(args)
         layout_info = {
             "singleton_count": args.workers,
             "packed_client_count": 0,

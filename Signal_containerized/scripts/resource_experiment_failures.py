@@ -17,7 +17,7 @@ import os
 import re
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 FAILURE_CLASSES = [

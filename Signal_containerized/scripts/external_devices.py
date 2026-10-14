@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 import re
 import shlex
@@ -10,12 +9,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Optional
-
-
-# ---------------------------------------------------------------------------
 # Data types
-# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -45,11 +39,7 @@ class WorkerLaunch:
     remote_results_root: str
     remote_tmp: str
     node_name: str = ""
-
-
-# ---------------------------------------------------------------------------
 # Run ID validation (mirrors the Rust validate_run_id)
-# ---------------------------------------------------------------------------
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -65,11 +55,7 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError(
             f"Run ID must only contain [A-Za-z0-9._-], got '{run_id}'"
         )
-
-
-# ---------------------------------------------------------------------------
 # YAML loader
-# ---------------------------------------------------------------------------
 
 
 def load_devices_config(path: Path) -> list[DeviceConfig]:
@@ -158,11 +144,7 @@ def wait_for_first_healthy_url(urls: list[str], timeout_s: float = 30.0) -> str:
         "Timed out waiting for external worker health. "
         f"Tried: {', '.join(candidates)}. Last error: {last_error}"
     )
-
-
-# ---------------------------------------------------------------------------
 # Abstract backend
-# ---------------------------------------------------------------------------
 
 
 class DeviceBackend:
@@ -239,11 +221,7 @@ class DeviceBackend:
                 f"(skew={remaining_skew}s, max={max_skew_seconds}s)."
             )
         print(f"[device] clock synchronized (skew {remaining_skew}s)", flush=True)
-
-
-# ---------------------------------------------------------------------------
 # ADB backend
-# ---------------------------------------------------------------------------
 
 
 class AdbDeviceBackend(DeviceBackend):
@@ -397,10 +375,7 @@ class AdbDeviceBackend(DeviceBackend):
             f"killall worker 2>/dev/null || pkill worker 2>/dev/null || true"
         )
         self._adb(["shell", cmd], check=False)
-
-# ---------------------------------------------------------------------------
 # SSH backend (stub for future Raspberry Pi support)
-# ---------------------------------------------------------------------------
 
 
 class SshDeviceBackend(DeviceBackend):
@@ -699,11 +674,7 @@ class SshDeviceBackend(DeviceBackend):
     def stop_worker(self) -> None:
         self._ensure_selected()
         self._ssh("killall worker 2>/dev/null || pkill worker 2>/dev/null || true", check=False)
-
-
-# ---------------------------------------------------------------------------
 # Factory
-# ---------------------------------------------------------------------------
 
 
 def create_backend(config: DeviceConfig) -> DeviceBackend:
@@ -715,11 +686,7 @@ def create_backend(config: DeviceConfig) -> DeviceBackend:
         return SshDeviceBackend(config)
     else:
         raise ValueError(f"Unsupported connection type: {conn_type}")
-
-
-# ---------------------------------------------------------------------------
 # Build worker layout entries for external devices
-# ---------------------------------------------------------------------------
 
 
 def build_external_device_layout_entry(

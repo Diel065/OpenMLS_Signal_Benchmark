@@ -4,7 +4,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import random
 import re
 from pathlib import Path
@@ -61,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
         default="one-container-per-client",
-        help="Worker layout mode: one-container-per-client (legacy) or hybrid",
+        help="Worker layout mode: one-container-per-client or hybrid",
     )
     p.add_argument(
         "--singleton-min-count",
@@ -598,7 +597,7 @@ def build_hybrid_layout(
     return clients, physical_workers
 
 
-def build_legacy_layout(
+def build_singleton_layout(
     args: argparse.Namespace,
 ) -> tuple[list[ClientLayoutEntry], list[PhysicalWorkerEntry]]:
     clients: list[ClientLayoutEntry] = []
@@ -1056,7 +1055,7 @@ def main() -> None:
               f"packed_clients_per_container={args.packed_clients_per_container} "
               f"profile_policy=singletons_only")
     else:
-        clients, physical_workers = build_legacy_layout(args)
+        clients, physical_workers = build_singleton_layout(args)
         layout_info = {
             "singleton_count": args.workers,
             "packed_client_count": 0,

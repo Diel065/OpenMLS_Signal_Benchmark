@@ -7,7 +7,6 @@ containers. Hard-fails on any violation that would compromise the experiment.
 """
 
 import os
-import re
 import subprocess
 from typing import Any, Dict, List, Optional, Set, Tuple
 

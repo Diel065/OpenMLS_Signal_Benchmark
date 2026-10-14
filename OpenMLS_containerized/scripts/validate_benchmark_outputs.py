@@ -8,7 +8,7 @@ import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 
 MIN_PROFILE_SCHEMA_VERSION = 10

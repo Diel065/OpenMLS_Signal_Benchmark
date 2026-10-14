@@ -340,13 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Before starting, forcibly remove existing Docker containers with names beginning with 'mls-'",
     )
-
-    # Hybrid layout flags
     p.add_argument(
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
         default="one-container-per-client",
-        help="Worker layout mode: one-container-per-client (legacy) or hybrid",
+        help="Worker layout mode: one-container-per-client or hybrid",
     )
     p.add_argument(
         "--singleton-min-count",
@@ -455,8 +453,6 @@ def build_parser() -> argparse.ArgumentParser:
             "remain unconstrained). Overrides --singleton-cpus and --singleton-memory."
         ),
     )
-
-    # ── Resource experiment flags ───────────────────────────────────
     p.add_argument(
         "--resource-experiment",
         choices=[
@@ -553,21 +549,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Reserve SMT/hyperthread siblings of profiled CPUs",
     )
     p.add_argument(
-        "--affinity-plan-file",
-        default=None,
-        help="Path to a pre-computed cpu_affinity_plan.json",
-    )
-    p.add_argument(
-        "--resource-profiles-file",
-        default=None,
-        help="Path to a pre-computed resource_profiles.json file",
-    )
-    p.add_argument(
-        "--resource-experiment-output-dir",
-        default=None,
-        help="Directory to write resource experiment sidecar files",
-    )
-    p.add_argument(
         "--resource-profile-index",
         type=int,
         default=None,
@@ -609,8 +590,6 @@ def build_parser() -> argparse.ArgumentParser:
         dest="resource_output_validation",
         help="Skip resource experiment output validation after run.",
     )
-
-    # External device flags
     p.add_argument(
         "--devices-file",
         default=None,
@@ -1781,7 +1760,7 @@ def write_artifact_validation(
         aggregation_status: Aggregation status (e.g., "complete_success", "partial_success").
     """
     try:
-        from resource_experiment_sidecars import validate_sidecars_exist, get_expected_files
+        from resource_experiment_sidecars import validate_sidecars_exist
     except ImportError:
         return
 
@@ -2673,7 +2652,7 @@ class ResourceMonitor:
                     "cpu_usage_usec_delta": row.get("cpu_usage_usec_delta"),
                     "cpu_nr_throttled_delta": row.get("cpu_nr_throttled_delta"),
                     "cpu_throttled_usec_delta": row.get("cpu_throttled_usec_delta"),
-                    # Legacy column name: this is nr_throttled / nr_periods, not throttled time.
+                    # This is nr_throttled / nr_periods, not the fraction of throttled time.
                     "cpu_throttled_time_fraction": row.get("throttled_period_fraction"),
                     "max_thread_count": row.get("pids_current_max"),
                     "max_process_count": "",
@@ -3054,8 +3033,6 @@ def launch_external_devices(
         print(f"[device] launching external device: {dev_id}", flush=True)
 
         backend = create_backend(dev_config)
-
-        # Check reachable
         print(f"[device] {dev_id}: checking reachability...", flush=True)
         backend.check_reachable()
 
@@ -3080,17 +3057,11 @@ def launch_external_devices(
         host_ip = transport.get("host_ip", "172.32.0.98")
         worker_port = transport.get("worker_port", 8080)
         listen_addr = f"0.0.0.0:{worker_port}"
-
-        # Stop existing worker
         print(f"[device] {dev_id}: stopping existing worker...", flush=True)
         backend.stop_worker()
-
-        # Wipe remote directories
         if args.wipe_device_run_dirs:
             print(f"[device] {dev_id}: wiping remote directories...", flush=True)
             backend.wipe_for_run(run_id)
-
-        # Push worker binary
         configured_binary = Path(dev_config.target.get(
             "binary",
             "target/armv7-unknown-linux-musleabihf/minsize/worker",
@@ -3112,8 +3083,6 @@ def launch_external_devices(
                     f"Expected local binary at {local_binary} or executable remote binary at {remote_binary}."
                 )
             print(f"[device] {dev_id}: using existing remote worker binary {remote_binary}", flush=True)
-
-        # Build DS/relay URLs for device
         device_ds_url = f"http://{host_ip}:{ds_port}"
         device_relay_url = f"http://{host_ip}:{relay_port}"
 
@@ -3139,8 +3108,6 @@ def launch_external_devices(
 
         print(f"[device] {dev_id}: starting worker (DS={device_ds_url}, Relay={device_relay_url})...", flush=True)
         backend.start_worker(launch)
-
-        # Health check
         worker_urls = build_worker_url_candidates(dev_config, device_ip, worker_port)
         print(f"[device] {dev_id}: waiting for health on {', '.join(worker_urls)}...", flush=True)
         try:
@@ -3162,8 +3129,6 @@ def launch_external_devices(
             if log:
                 details.append(f"Worker log:\n{log}")
             raise RuntimeError("\n".join(details)) from e
-
-        # Build layout entries
         client_entry, phys_entry, worker_line = build_external_device_layout_entry(
             dev_config,
             transport_ip=device_ip,
@@ -3283,7 +3248,6 @@ def pull_external_device_profiles(
                     print(f"[device] {dev_id}: pulling individual JSONL failed after 3 attempts (non-fatal): {e}", flush=True)
 
         if not pulled:
-            # Check what files exist on the device
             print(f"[device] {dev_id}: checking remote directory contents for debugging...", flush=True)
             try:
                 ls_result = backend.shell(f"ls -la {shlex.quote(remote_path)}/ 2>/dev/null || echo 'NO_DIR'", check=False)
@@ -3890,8 +3854,6 @@ def main() -> int:
 
         if args.failure_experiment:
             generator_cmd.append("--failure-experiment")
-
-        # ── Affinity planning for unconstrained container baselines ───
         if (
             resource_experiment == "none"
             and args.cpu_affinity_mode != "none"
@@ -3972,8 +3934,6 @@ def main() -> int:
             print(f"[affinity] Background cpuset: {len(plan.background_cpus)} CPUs", flush=True)
             os.makedirs(str(run_dir), exist_ok=True)
             generator_cmd += ["--affinity-plan-file", write_affinity_plan_json(plan, str(run_dir))]
-
-        # ── Affinity planning for resource experiments ───────────────
         if resource_experiment != "none":
             from generate_compose import worker_id, select_singleton_ids, compute_hybrid_layout
             from cpu_mask_util import cpu_list_to_docker_cpuset
@@ -3982,19 +3942,7 @@ def main() -> int:
                 validate_affinity_plan,
                 write_affinity_plan_json,
             )
-            from resource_profiles import (
-                generate_ram_sweep_profiles,
-                generate_cpu_matrix_profiles,
-                generate_embedded_budget_profiles,
-                generate_parallel_ram_sweep_profiles,
-                generate_parallel_cpu_sweep_profiles,
-                select_profile,
-                select_all_profiles,
-                get_selected_profile,
-                get_selected_profile_index,
-                get_group_creator_profile,
-                get_group_creator_client_index,
-            )
+            from resource_profiles import generate_ram_sweep_profiles, generate_cpu_matrix_profiles, generate_embedded_budget_profiles, generate_parallel_ram_sweep_profiles, generate_parallel_cpu_sweep_profiles, select_profile, select_all_profiles, get_selected_profile_index, get_group_creator_profile, get_group_creator_client_index
             from resource_experiment_sidecars import SidecarWriter
 
             layout_info = compute_hybrid_layout(
@@ -4060,8 +4008,6 @@ def main() -> int:
                     docker_memory_limit=args.embedded_docker_memory,
                     run_id=run_id,
                 )
-
-            # ── Select single profile for threshold mode ──
             profile_index = getattr(args, "resource_profile_index", None)
             profile_id = getattr(args, "resource_profile_id", None)
 
@@ -4226,21 +4172,9 @@ def main() -> int:
 
             generator_cmd += [
                 "--resource-experiment", resource_experiment,
-                "--profiled-singleton-count", str(args.profiled_singleton_count),
-                "--ram-sweep-values", args.ram_sweep_values,
-                "--ram-sweep-cpu-count", str(args.ram_sweep_cpu_count),
-                "--cpu-matrix-core-counts", args.cpu_matrix_core_counts,
-                "--cpu-matrix-capacity-fractions", args.cpu_matrix_capacity_fractions,
-                "--embedded-heap-budgets", args.embedded_heap_budgets,
-                "--embedded-cpu-fractions", args.embedded_cpu_fractions,
-                "--embedded-cpu-cores", args.embedded_cpu_cores,
-                "--embedded-docker-memory", args.embedded_docker_memory,
-                "--ram-app-heap-sweep-values", getattr(args, "ram_app_heap_sweep_values", "") or "",
                 "--affinity-plan-file", plan_path,
                 "--resource-profiles-file", profiles_path,
             ]
-
-            # Store for later lifecycle phases
             resource_experiment_state = {
                 "plan": plan,
                 "profiles": profiles_for_assignment,
@@ -4427,8 +4361,6 @@ def main() -> int:
                 args.health_poll_seconds,
                 args.host_health_parallelism,
             )
-
-        # ---- External device orchestration ---------------------------------
         external_layout_clients: list[dict] = []
         external_layout_workers: list[dict] = []
         external_worker_lines: list[str] = []
@@ -4448,8 +4380,6 @@ def main() -> int:
                 interval_ms=args.resource_monitor_interval_ms,
             )
             external_oom_monitor.start()
-
-            # Merge external devices into worker layout
             layout_path = run_dir / "worker_layout.json"
             if layout_path.exists():
                 layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
@@ -4461,27 +4391,18 @@ def main() -> int:
                 layout_data["logical_worker_count"] = len(layout_data["clients"])
                 layout_data["physical_worker_count"] = len(layout_data["physical_workers"])
                 layout_path.write_text(json.dumps(layout_data, indent=2), encoding="utf-8")
-                # Also update the temp layout file for the runner
                 if layout_tmp.exists():
                     layout_tmp.write_text(json.dumps(layout_data, indent=2), encoding="utf-8")
-
-            # Merge external devices into workers files
             combined_workers = run_dir / "workers.combined.txt"
             combined_host_workers = run_dir / "workers.combined.host.txt"
-
-            # Start with Docker internal workers
             internal_lines = read_worker_lines(workers_internal_tmp) if workers_internal_tmp.exists() else []
             internal_lines = insert_after_leader(internal_lines, external_worker_lines)
             combined_workers.write_text("\n".join(internal_lines) + "\n", encoding="utf-8")
-
-            # Host workers
             host_lines = read_worker_lines(workers_host_tmp) if workers_host_tmp.exists() else []
             host_lines = insert_after_leader(host_lines, external_worker_lines)
             combined_host_workers.write_text("\n".join(host_lines) + "\n", encoding="utf-8")
 
             print(f"[device] merged {len(external_layout_clients)} external device(s) into layout/workers files", flush=True)
-
-        # ---- Decide which layout / workers files to use ----
         effective_layout_tmp = layout_tmp
         effective_workers_host_tmp = workers_host_tmp
         effective_workers_internal_tmp = workers_internal_tmp
@@ -4514,9 +4435,6 @@ def main() -> int:
         )
 
         use_no_aggregate = args.no_aggregate or args.enable_external_devices
-
-        # ── Resource experiment preflight ──────────────────────────
-        resource_experiment_integration_obj = None
         preflight_passed = True
         if resource_experiment != "none" and resource_experiment_state is not None:
             state = resource_experiment_state  # noqa: F821
@@ -4628,8 +4546,6 @@ def main() -> int:
                 else:
                     print(f"[preflight] All {len(preflight_results)} checks PASSED "
                           f"({pf_summary['warn_count']} warnings)", flush=True)
-
-        # ── Benchmark command construction ──────────────────────────
 
         if args.runner_in_docker:
             benchmark_cmd = [
@@ -4806,8 +4722,6 @@ def main() -> int:
                 evidence["termination_signal"] = exit_code - 128
 
             flush_and_pull_external_profiles()
-
-            # ── Run partial aggregation on failure ──────────────────
             try:
                 layout_file = run_dir / "worker_layout.json"
                 workers_file = run_dir / "workers.combined.txt"
@@ -4823,8 +4737,6 @@ def main() -> int:
                     print(f"[aggregate] partial aggregation exit={agg_exit}, continuing", flush=True)
             except Exception as agg_exc:
                 print(f"[aggregate] partial aggregation exception: {agg_exc}", flush=True)
-
-            # ── Capture container evidence before cleanup ──────────
             if resource_experiment != "none":
                 try:
                     profiled_cnames = resource_experiment_state.get("profiled_container_names", []) if "resource_experiment_state" in dir() else []
@@ -4838,8 +4750,6 @@ def main() -> int:
                     )
                 except Exception:
                     pass
-
-            # ── Write resource experiment failure sidecars ─────────
             # Aggregate first so runner-events.jsonl is authoritative for both
             # the operation cursor and the failure reason.
             if resource_experiment != "none":
@@ -4967,8 +4877,6 @@ def main() -> int:
                 terminal_output_path=terminal_output_path,
             )
             raise RuntimeError(f"Benchmark runner exited with code {exit_code}")
-
-        # ---- Post-run: pull external device profiles -----------------------
         if args.enable_external_devices and args.devices_file:
             flush_and_pull_external_profiles()
 
@@ -4992,15 +4900,11 @@ def main() -> int:
                 require_aggregate=True,
             )
             write_integrated_aggregation_manifest(run_dir, run_id)
-
-        # Stop external device workers
         if external_device_stop_required:
             stop_external_device_workers(args, root)
             external_device_stop_required = False
 
         write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
-
-        # ── Resource experiment sidecar generation ─────────────────
         # Must run BEFORE strict validation so sidecars exist even
         # if publication validation flags non-critical issues.
         output_validation_passed = True
@@ -5082,8 +4986,6 @@ def main() -> int:
             except Exception as re_exc:
                 print(f"[resource] Failed to write sidecars: {re_exc}", flush=True)
                 output_validation_passed = False
-
-        # ── Strict output validation (publication checks) ──────────
         if not args.preflight_only and not use_no_aggregate:
             try:
                 run_strict_output_validation(root, run_dir)
@@ -5143,8 +5045,6 @@ def main() -> int:
                 else None,
             },
         )
-
-        # Run resource experiment output validation
         if resource_experiment != "none" and getattr(args, "resource_output_validation", True):
             validator_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),
@@ -5192,8 +5092,6 @@ def main() -> int:
                     raise RuntimeError("Resource experiment output validation failed")
                 else:
                     print(f"[resource] Output validation PASSED", flush=True)
-
-            # ── Write artifact validation on success ─────────────────
             write_artifact_validation(
                 run_dir,
                 run_success=True,
@@ -5254,8 +5152,6 @@ def main() -> int:
             )
         except Exception as agg_exc:
             print(f"[aggregate] fatal-path partial aggregation failed: {agg_exc}", flush=True)
-
-        # ── Write resource experiment sidecars even on fatal error ─
         if resource_experiment != "none" and resource_experiment_state is not None:
             try:
                 from resource_experiment_failures import (
@@ -5344,8 +5240,6 @@ def main() -> int:
                 sw_re_fatal.write_run_status(run_id, rs_fatal)
             except Exception as re_exc_fatal:
                 print(f"[resource] Failed to write fatal-error sidecars: {re_exc_fatal}", flush=True)
-
-        # ── Capture container evidence on fatal error ────────────
         try:
             profiled_cnames_fatal = []
             if resource_experiment != "none":
@@ -5363,8 +5257,6 @@ def main() -> int:
             )
         except Exception:
             pass
-
-        # ── Write artifact validation on fatal error ────────────
         if resource_experiment != "none":
             try:
                 write_artifact_validation(

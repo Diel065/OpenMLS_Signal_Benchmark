@@ -99,8 +99,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--roundtrips", type=int, default=1)
 
-    p.add_argument("--update-rounds", type=int, default=2)
-    p.add_argument("--max-update-samples-per-plateau", type=int, default=16)
 
     p.add_argument("--app-rounds", type=int, default=2)
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
@@ -219,11 +217,6 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=60000,
         help="SIGNAL_RUNNER_HTTP_REQUEST_TIMEOUT_MS for runner->worker clients.",
-    )
-    p.add_argument(
-        "--process-pending-fanout",
-        action="store_true",
-        help="Accepted for compatibility; Signal pairwise receives are already batched by worker.",
     )
     p.add_argument(
         "--worker-http-pool-max-idle-per-host",
@@ -364,7 +357,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
         default="one-container-per-client",
-        help="Worker layout mode: one-container-per-client (legacy) or hybrid",
+        help="Worker layout mode: one-container-per-client or hybrid",
     )
     p.add_argument(
         "--singleton-min-count",
@@ -2897,7 +2890,6 @@ def int_or_zero(value) -> int:
         return 0
 
 
-
 def chunks(items: list[str], size: int):
     for start in range(0, len(items), size):
         yield items[start:start + size]
@@ -3417,7 +3409,6 @@ def run_standalone_aggregation(
     return result.returncode
 
 
-
 def command_stdout(cmd: list[str], cwd: Path | None = None) -> str:
     try:
         result = subprocess.run(
@@ -3883,7 +3874,6 @@ def main() -> int:
             generator_cmd += ["--singleton-pids-limit", str(args.singleton_pids_limit)]
         if args.singleton_app_heap_budget is not None:
             generator_cmd += ["--singleton-app-heap-budget", args.singleton_app_heap_budget]
-        # ── Affinity planning (OpenMLS-compatible) ───
         if (
             args.cpu_affinity_mode != "none"
             and args.profiled_singleton_count > 0
@@ -4089,8 +4079,6 @@ def main() -> int:
                 args.health_poll_seconds,
                 args.host_health_parallelism,
             )
-
-        # ---- External device orchestration ---------------------------------
         external_layout_clients: list[dict] = []
         external_layout_workers: list[dict] = []
         external_worker_lines: list[str] = []
@@ -4142,8 +4130,6 @@ def main() -> int:
             combined_host_workers.write_text("\n".join(host_lines) + "\n", encoding="utf-8")
 
             print(f"[device] merged {len(external_layout_clients)} external device(s) into layout/workers files", flush=True)
-
-        # ---- Decide which layout / workers files to use ----
         effective_layout_tmp = layout_tmp
         effective_workers_host_tmp = workers_host_tmp
         effective_workers_internal_tmp = workers_internal_tmp
@@ -4355,8 +4341,6 @@ def main() -> int:
                 terminal_output_path=terminal_output_path,
             )
             raise RuntimeError(f"Benchmark runner exited with code {exit_code}")
-
-        # ---- Post-run: pull external device profiles -----------------------
         if args.enable_external_devices and args.devices_file:
             flush_and_pull_external_profiles()
 

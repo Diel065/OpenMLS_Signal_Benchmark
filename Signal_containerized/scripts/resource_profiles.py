@@ -15,9 +15,8 @@ scientific threshold experiments. Supports parallel 10-profile sweeps.
 Signal supports both docker-cgroup memory sweeps and app-heap-budget sweeps.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
-import uuid
 
 
 DOCKER_MIN_MEMORY_BYTES = 6 * 1024 * 1024
@@ -487,31 +486,11 @@ def generate_parallel_cpu_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 10 parallel CPU quota profiles for CPU sweep.
+    """Create CPU quota profiles, retaining the largest profile as group creator.
 
-    Each profile tests a single Docker CPU fraction.
-    Docker memory is held absurdly high (64 GiB default) so memory
-    cannot plausibly be the limiting factor.
-
-    Signal uses docker-cgroup memory model (no app-heap-budget allocator).
-
-    The highest-valued profile (1.00 CPU fraction) is marked as the
-    group creator.
-
-    CPU period starts at 100000 us (standard Docker/CFS default) and may
-    scale up to Docker's 1000000 us CFS period limit so tiny fractions still
-    have distinct quotas.
-
-    Args:
-        cpu_fractions: List of 10 CPU fraction values.
-        app_heap_budget: Absurdly high docker-cgroup memory limit string
-            (kept for API compatibility; Signal uses docker-cgroup).
-        docker_memory_limit: Docker memory envelope (above the working memory).
-        assigned_cpu_count: CPU cores assigned to each profiled worker.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of 10 ResourceProfile objects, ordered by decreasing fraction.
+    The period may increase to keep small quotas above the cgroup minimum.
+    app_heap_budget is validated and recorded in labels; docker_memory_limit
+    supplies the actual container memory limit for this CPU treatment.
     """
     if cpu_fractions is None:
         cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]

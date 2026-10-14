@@ -11,8 +11,7 @@ Adapted for Signal (docker-cgroup memory model, no app-heap-budget allocator).
 import csv
 import json
 import os
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 
 RESOURCE_PROFILES_HEADER = [

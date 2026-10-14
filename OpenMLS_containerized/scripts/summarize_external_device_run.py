@@ -63,10 +63,10 @@ def _coverage_operation(row: dict[str, Any]) -> str | None:
     source = str(row.get("membership_batch_source") or "")
     phase = str(row.get("benchmark_phase") or "")
     k = _integer(row.get("added_members_count"))
-    density_add_receive_legacy = op == "commit_receive_total_local" and not source
+    receiver_source_missing = op == "commit_receive_total_local" and not source
     if benchmark_operation == "add_commit" and (
         source in {"external_density_k1", "external_density_k8"}
-        or density_add_receive_legacy
+        or receiver_source_missing
     ):
         variant = "k1" if k == 1 else "k8" if k == 8 else None
         if variant and op == "add_commit_total_local" and family == "add_commit_create":
@@ -131,7 +131,7 @@ def summarize_run(
             "rows": 0,
             "alloc_bytes_positive_rows": 0,
             "cpu_process_ns_positive_rows": 0,
-            "v11_primary_rows": 0,
+            "primary_operation_rows": 0,
             "last_event_ts_unix_ns": -1,
             "last_operation": None,
             "last_group_size": None,
@@ -161,7 +161,7 @@ def summarize_run(
             device["rows"] += 1
             device["alloc_bytes_positive_rows"] += int(_nonzero(row.get("alloc_bytes")))
             device["cpu_process_ns_positive_rows"] += int(_nonzero(row.get("cpu_process_ns")))
-            device["v11_primary_rows"] += int(str(row.get("op") or "") in primary_total_ops)
+            device["primary_operation_rows"] += int(str(row.get("op") or "") in primary_total_ops)
             remove_rejoin_mode = remove_rejoin_mode or row.get("benchmark_phase") == "remove_rejoin"
             coverage_operation = _coverage_operation(row)
             target = _integer(row.get("benchmark_target_size"))
@@ -210,7 +210,7 @@ def summarize_run(
             device["rows"] > 0
             and device["alloc_bytes_positive_rows"] > 0
             and device["cpu_process_ns_positive_rows"] > 0
-            and device["v11_primary_rows"] > 0
+            and device["primary_operation_rows"] > 0
         )
         attrited = device["failure"] is not None
         device["metrics_complete"] = metrics_complete
@@ -224,7 +224,7 @@ def summarize_run(
                 f"{worker_id}: incomplete external metrics without allowed attrition evidence "
                 f"(rows={device['rows']}, alloc={device['alloc_bytes_positive_rows']}, "
                 f"cpu_process={device['cpu_process_ns_positive_rows']}, "
-                f"v11_primary={device['v11_primary_rows']})"
+                f"primary_operations={device['primary_operation_rows']})"
             )
 
     scenario_plan_path = run_dir / "scenario_plan.json"
@@ -329,7 +329,7 @@ def main() -> int:
             f"  [external] {device['worker_id']}: status={device['status']} "
             f"rows={device['rows']} alloc_positive={device['alloc_bytes_positive_rows']} "
             f"cpu_process_positive={device['cpu_process_ns_positive_rows']} "
-            f"v11_primary={device['v11_primary_rows']} "
+            f"primary_operations={device['primary_operation_rows']} "
             f"last_operation={device['last_operation']} last_group_size={device['last_group_size']}"
         )
     print(f"  [external] report={output}")

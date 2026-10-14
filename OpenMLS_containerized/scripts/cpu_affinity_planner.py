@@ -14,52 +14,14 @@ import os
 import socket
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set
 
 try:
-    from .cpu_mask_util import (
-        cpu_list_to_mask,
-        cpu_list_to_docker_cpuset,
-        mask_to_hex,
-        mask_to_cpu_list,
-        masks_overlap,
-        complement_mask,
-        union_masks,
-        mask_popcount,
-        ensure_non_overlapping,
-    )
-    from .cpu_topology import (
-        CpuTopology,
-        detect_cpu_topology,
-        get_online_cpu_list,
-        sample_cpu_load,
-        select_least_loaded_cpus,
-        get_smt_siblings,
-        topology_to_dict,
-    )
-    from .resource_profiles import ResourceProfile
+    from .cpu_mask_util import cpu_list_to_mask, cpu_list_to_docker_cpuset, mask_to_hex, mask_to_cpu_list, masks_overlap, complement_mask
+    from .cpu_topology import detect_cpu_topology, get_online_cpu_list, sample_cpu_load, select_least_loaded_cpus, get_smt_siblings, topology_to_dict
 except ImportError:
-    from cpu_mask_util import (
-        cpu_list_to_mask,
-        cpu_list_to_docker_cpuset,
-        mask_to_hex,
-        mask_to_cpu_list,
-        masks_overlap,
-        complement_mask,
-        union_masks,
-        mask_popcount,
-        ensure_non_overlapping,
-    )
-    from cpu_topology import (
-        CpuTopology,
-        detect_cpu_topology,
-        get_online_cpu_list,
-        sample_cpu_load,
-        select_least_loaded_cpus,
-        get_smt_siblings,
-        topology_to_dict,
-    )
-    from resource_profiles import ResourceProfile
+    from cpu_mask_util import cpu_list_to_mask, cpu_list_to_docker_cpuset, mask_to_hex, mask_to_cpu_list, masks_overlap, complement_mask
+    from cpu_topology import detect_cpu_topology, get_online_cpu_list, sample_cpu_load, select_least_loaded_cpus, get_smt_siblings, topology_to_dict
 
 
 @dataclass

@@ -7,8 +7,7 @@ hex mask strings, and Docker cpuset strings.
 All conversions are stable, deterministic, and handle edge cases.
 """
 
-from typing import List, Optional, Set, Tuple
-import re
+from typing import List, Set, Tuple
 
 
 def cpu_list_to_mask(cpu_list: List[int]) -> int:

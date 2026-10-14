@@ -12,9 +12,8 @@ Supports explicit profile selection via index or ID for single-profile
 scientific threshold experiments. Supports parallel 10-profile sweeps.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional
-import uuid
 
 
 DOCKER_MIN_MEMORY_BYTES = 6 * 1024 * 1024
