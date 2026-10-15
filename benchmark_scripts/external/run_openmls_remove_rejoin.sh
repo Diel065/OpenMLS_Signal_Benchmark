@@ -55,12 +55,8 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
-python_bin() {
-  [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
 relpath_from_stack() {
-  python3 - "$1" "$OPENMLS_DIR" <<'PY'
+  uv run --frozen --project "$REPO_ROOT" python - "$1" "$OPENMLS_DIR" <<'PY'
 import os, sys
 print(os.path.relpath(sys.argv[1], sys.argv[2]))
 PY
@@ -95,7 +91,7 @@ verify_external_metrics() {
   for worker_id in $ATTRITION_ALLOWED_WORKER_IDS; do
     summary_args+=(--attrition-allowed-worker "$worker_id")
   done
-  "$(python_bin)" "$OPENMLS_DIR/scripts/summarize_external_device_run.py" \
+  uv run --frozen --project "$REPO_ROOT" python "$OPENMLS_DIR/scripts/summarize_external_device_run.py" \
     "$run_dir" "${summary_args[@]}" \
     --minimum-observations "$MIN_EXTERNAL_SAMPLES_PER_OPERATION"
 }
@@ -112,10 +108,9 @@ run_external() {
   local iter="$1"
   local run_id="cal06_ext_remove_rejoin_openmls_i${iter}_${DATE_TAG}"
   local run_dir="$OUTPUT_ROOT/$run_id"
-  local py scenario_seed singleton_selection_seed
+  local scenario_seed singleton_selection_seed
   local -a device_args build_args image_args
 
-  py="$(python_bin)"
   scenario_seed="$(shuf -i 1-2147483647 -n 1)"
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   image_args=()
@@ -139,7 +134,7 @@ run_external() {
 
   cd "$OPENMLS_DIR"
   ( ulimit -n "$NOFILE_LIMIT" 2>/dev/null || true
-    "$py" scripts/run_compose_benchmark.py \
+    uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
       --workers "$WORKERS" \
       --run-id "$run_id" \
       --scenario "$SCENARIO" \

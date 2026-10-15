@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --frozen python
 """Validate external-device metrics and persist attrition/last-operation evidence."""
-
-from __future__ import annotations
 
 import argparse
 import csv

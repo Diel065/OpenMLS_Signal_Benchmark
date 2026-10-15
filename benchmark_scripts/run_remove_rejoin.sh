@@ -36,15 +36,9 @@ REPORT="$OUTPUT_ROOT/${RUN_TOKEN}_report.txt"
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
-random_seed() { python3 -c 'import random; print(random.randint(1,2147483647))'; }
+random_seed() { uv run --frozen --project "$REPO_ROOT" python -c 'import random; print(random.randint(1,2147483647))'; }
 
-python_bin_for() {
-  local dir="$1"
-  if [ -x "$dir/.venv/bin/python" ]; then printf '%s\n' "$dir/.venv/bin/python"
-  else printf '%s\n' python3; fi
-}
-
-relpath_from() { python3 -c "import os,sys; print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$1" "$2"; }
+relpath_from() { uv run --frozen --project "$REPO_ROOT" python -c "import os,sys; print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$1" "$2"; }
 
 cleanup() {
   if [ -f "$RUN_DIR/docker-compose.generated.yml" ]; then
@@ -64,7 +58,6 @@ export OPENMLS_MEMORY_MODEL="${OPENMLS_MEMORY_MODEL:-app-heap-budget}"
 export OPENMLS_APP_HEAP_BUDGET="${OPENMLS_APP_HEAP_BUDGET:-1024g}"
 export OPENMLS_APP_HEAP_BUDGET_BYTES="${OPENMLS_APP_HEAP_BUDGET_BYTES:-1099511627776}"
 
-py="$(python_bin_for "$OPENMLS_DIR")"
 output_arg="$(relpath_from "$OUTPUT_ROOT" "$OPENMLS_DIR")"
 scenario_seed="$(random_seed)"
 singleton_seed="$(random_seed)"
@@ -73,7 +66,7 @@ image_args=()
 if [ "$BUILD_IMAGES" = "1" ]; then image_args=(--build-images); fi
 
 cmd=(
-  "$py" scripts/run_compose_benchmark.py
+  uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py
   --workers "$WORKERS"
   --run-id "$RUN_ID"
   --scenario tmp-two-run-unconstrained-container-baseline

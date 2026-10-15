@@ -59,19 +59,15 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
-python_bin() {
-  [ -x "$SIGNAL_DIR/.venv/bin/python" ] && printf '%s\n' "$SIGNAL_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
 relpath_from_stack() {
-  python3 - "$1" "$SIGNAL_DIR" <<'PY'
+  uv run --frozen --project "$REPO_ROOT" python - "$1" "$SIGNAL_DIR" <<'PY'
 import os, sys
 print(os.path.relpath(sys.argv[1], sys.argv[2]))
 PY
 }
 
 random_seed() {
-  python3 - <<'PY'
+  uv run --frozen --project "$REPO_ROOT" python - <<'PY'
 import random
 print(random.randint(1, 2147483647))
 PY
@@ -121,7 +117,7 @@ verify_signal_external_metrics() {
     worker_args+=(--external-worker-id "$worker_id")
   done
 
-  "$(python_bin)" "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
+  uv run --frozen --project "$REPO_ROOT" python "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
     "$run_dir/events.csv" \
     --layout "$run_dir/worker_layout.json" \
     --runner-events "$run_dir/runner-events.jsonl" \
@@ -151,10 +147,9 @@ run_external_signal() {
   local iter="$1"
   local run_id="cal07_ext_signal_pairwise_i${iter}_${DATE_TAG}"
   local run_dir="$OUTPUT_ROOT/$run_id"
-  local py scenario_seed singleton_selection_seed
+  local scenario_seed singleton_selection_seed
   local -a device_args build_args image_args
 
-  py="$(python_bin)"
   scenario_seed="$(random_seed)"
   singleton_selection_seed="$(random_seed)"
 
@@ -181,7 +176,7 @@ run_external_signal() {
 
   cd "$SIGNAL_DIR"
   ( ulimit -n "$NOFILE_LIMIT" 2>/dev/null || true
-    "$py" scripts/run_compose_benchmark.py \
+    uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
       --workers "$WORKERS" \
       --run-id "$run_id" \
       --scenario "$SCENARIO" \

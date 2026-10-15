@@ -75,14 +75,6 @@ raise_nofile_limit() {
   }
 }
 
-python_bin() {
-  [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
-python_bin_signal() {
-  [ -x "$SIGNAL_DIR/.venv/bin/python" ] && printf '%s\n' "$SIGNAL_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
 cleanup_docker() {
   for f in "$OPENMLS_DIR"/docker-compose.*.generated.yml; do
     [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
@@ -102,7 +94,7 @@ cleanup_docker_signal() {
 output_dir_arg_for() {
   local base_dir="$1"
   if [ -n "$OUTPUT_ROOT" ]; then
-    python3 - "$OUTPUT_ROOT" "$base_dir" <<'PY'
+    uv run --frozen --project "$REPO_ROOT" python - "$OUTPUT_ROOT" "$base_dir" <<'PY'
 import os, sys
 print(os.path.relpath(sys.argv[1], sys.argv[2]))
 PY
@@ -131,7 +123,7 @@ require_events_csv() {
 validate_resource_output() {
   local run_dir="$1"
   [ "$RESOURCE_OUTPUT_VALIDATION" = "1" ] || return 0
-  python3 "$OPENMLS_DIR/scripts/validate_resource_experiment_outputs.py" "$run_dir"
+  uv run --frozen --project "$REPO_ROOT" python "$OPENMLS_DIR/scripts/validate_resource_experiment_outputs.py" "$run_dir"
 }
 
 validate_resource_output_signal() {
@@ -139,7 +131,7 @@ validate_resource_output_signal() {
   [ "$RESOURCE_OUTPUT_VALIDATION" = "1" ] || return 0
   local validator="$SIGNAL_DIR/scripts/validate_resource_experiment_outputs.py"
   if [ -f "$validator" ]; then
-    python3 "$validator" "$run_dir"
+    uv run --frozen --project "$REPO_ROOT" python "$validator" "$run_dir"
   else
     echo "WARN: Signal validator not found at $validator; skipping" >&2
   fi
@@ -170,13 +162,12 @@ run_sweep() {
   local label="$3"
   local run_id="cal01_${sweep_type}_i${iter}_${DATE_TAG}"
   local run_dir output_arg
-  local scenario_seed singleton_selection_seed mode py
+  local scenario_seed singleton_selection_seed mode
   local -a image_args validation_args
 
   scenario_seed="$(shuf -i 1-2147483647 -n 1)"
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   mode="$(affinity_mode)"
-  py="$(python_bin)"
   output_arg="$(output_dir_arg_for "$OPENMLS_DIR")"
   run_dir="$(run_dir_for "$OPENMLS_DIR" "$run_id")"
   image_args=()
@@ -194,7 +185,7 @@ run_sweep() {
 
   echo "===== [01/$label] iteration $iter/$N run_id=$run_id ====="
   cd "$OPENMLS_DIR"
-  "$py" scripts/run_compose_benchmark.py \
+  uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$WORKERS" \
     --run-id "$run_id" \
     --scenario-seed "$scenario_seed" \
@@ -251,11 +242,10 @@ run_signal_sweep() {
   local sweep_type="$2"
   local label="$3"
   local run_id="cal01_signal_${sweep_type}_i${iter}_${DATE_TAG}"
-  local run_dir output_arg singleton_selection_seed py
+  local run_dir output_arg singleton_selection_seed
   local -a image_args
 
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
-  py="$(python_bin_signal)"
   output_arg="$(output_dir_arg_for "$SIGNAL_DIR")"
   run_dir="$(run_dir_for "$SIGNAL_DIR" "$run_id")"
   image_args=()
@@ -279,7 +269,7 @@ run_signal_sweep() {
 
   case "$sweep_type" in
     cpu-quota-sweep)
-      "$py" scripts/run_compose_benchmark.py \
+      uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
         --singleton-selection-seed "$singleton_selection_seed" \
@@ -322,7 +312,7 @@ run_signal_sweep() {
         "${image_args[@]}"
       ;;
     ram-app-heap-sweep|ram-docker-cgroup-sweep)
-      "$py" scripts/run_compose_benchmark.py \
+      uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
         --singleton-selection-seed "$singleton_selection_seed" \

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --frozen python
 """Validate OpenMLS publication outputs, with strict AddCommit contracts."""
 
 import argparse

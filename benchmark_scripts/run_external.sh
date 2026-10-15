@@ -100,14 +100,14 @@ strict_openmls_validation() {
   if [ "$mode" = "regular" ]; then
     validator_args=(--require-k-values 1,8)
   fi
-  python3 "$OPENMLS_DIR/scripts/validate_benchmark_outputs.py" \
+  uv run --frozen --project "$REPO_ROOT" python "$OPENMLS_DIR/scripts/validate_benchmark_outputs.py" \
     "${validator_args[@]}" "$run_dir"
   test -s "$coverage_json" || {
     echo "ERROR: missing external-device coverage report: $coverage_json" >&2
     return 1
   }
 
-  python3 - "$coverage_json" <<'PY'
+  uv run --frozen --project "$REPO_ROOT" python - "$coverage_json" <<'PY'
 import json
 import sys
 
@@ -124,7 +124,7 @@ PY
 
 strict_signal_validation() {
   local run_dir="$1"
-  python3 "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
+  uv run --frozen --project "$REPO_ROOT" python "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
     "$run_dir/events.csv" \
     --layout "$run_dir/worker_layout.json" \
     --runner-events "$run_dir/runner-events.jsonl" \
@@ -159,7 +159,7 @@ write_campaign_manifest() {
   ln -sfn "$OPENMLS_REMOVE_JOIN_RUN" "$CAMPAIGN_DIR/openmls/remove-rejoin"
   ln -sfn "$SIGNAL_RUN" "$CAMPAIGN_DIR/signal"
 
-  python3 - \
+  uv run --frozen --project "$REPO_ROOT" python - \
     "$CAMPAIGN_DIR" "$OPENMLS_RUN" "$OPENMLS_REMOVE_JOIN_RUN" "$SIGNAL_RUN" \
     "$OPENMLS_TARGETS" "$MIN_EXTERNAL_SAMPLES_PER_OPERATION" <<'PY'
 import json

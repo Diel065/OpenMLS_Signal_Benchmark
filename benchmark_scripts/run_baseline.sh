@@ -58,14 +58,6 @@ raise_nofile_limit() {
   }
 }
 
-python_bin() {
-  [ -x "$OPENMLS_DIR/.venv/bin/python" ] && printf '%s\n' "$OPENMLS_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
-python_bin_signal() {
-  [ -x "$SIGNAL_DIR/.venv/bin/python" ] && printf '%s\n' "$SIGNAL_DIR/.venv/bin/python" || printf '%s\n' python3
-}
-
 cleanup_docker() {
   for f in "$OPENMLS_DIR"/docker-compose.*.generated.yml; do
     [ -f "$f" ] && docker compose -f "$f" down --timeout 2 2>/dev/null || true
@@ -109,13 +101,12 @@ run_baseline() {
   local iter="$1"
   local run_id="cal02_unconstrained_container_baseline_i${iter}_${DATE_TAG}"
   local run_dir="$OPENMLS_DIR/benchmark_output/$run_id"
-  local scenario_seed singleton_selection_seed mode py
+  local scenario_seed singleton_selection_seed mode
   local -a image_args
 
   scenario_seed="$(shuf -i 1-2147483647 -n 1)"
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   mode="$(affinity_mode)"
-  py="$(python_bin)"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
@@ -127,7 +118,7 @@ run_baseline() {
     batch_args=(--add-batch-extremes-only)
   fi
   cd "$OPENMLS_DIR"
-  "$py" scripts/run_compose_benchmark.py \
+  uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$WORKERS" \
     --run-id "$run_id" \
     --scenario-seed "$scenario_seed" \
@@ -175,11 +166,10 @@ run_signal_baseline() {
   local iter="$1"
   local run_id="cal02_signal_unconstrained_baseline_i${iter}_${DATE_TAG}"
   local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
-  local singleton_selection_seed py
+  local singleton_selection_seed
   local -a image_args
 
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
-  py="$(python_bin_signal)"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
@@ -187,7 +177,7 @@ run_signal_baseline() {
 
   echo "===== [02/Signal-baseline] iteration $iter/$N run_id=$run_id ====="
   cd "$SIGNAL_DIR"
-  "$py" scripts/run_compose_benchmark.py \
+  uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$SIGNAL_WORKERS" \
     --run-id "$run_id" \
     --singleton-selection-seed "$singleton_selection_seed" \

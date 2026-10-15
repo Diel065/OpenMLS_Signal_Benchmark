@@ -1,9 +1,9 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --frozen python
 """
 Validate resource experiment output files.
 
 Usage:
-    python3 validate_resource_experiment_outputs.py <run_directory>
+    uv run --frozen python scripts/validate_resource_experiment_outputs.py <run_directory>
 
 Checks that all required sidecar files exist, CSV headers match expected
 schemas, JSON files parse correctly, and cross-file joins are valid.

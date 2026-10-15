@@ -1,7 +1,5 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --frozen python
 """Strict coverage gate for Signal external-device benchmark runs."""
-
-from __future__ import annotations
 
 import argparse
 import csv

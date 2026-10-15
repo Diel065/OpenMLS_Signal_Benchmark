@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import os
 import re
 import shlex
@@ -59,13 +57,7 @@ def validate_run_id(run_id: str) -> None:
 
 
 def load_devices_config(path: Path) -> list[DeviceConfig]:
-    try:
-        import yaml
-    except ImportError:
-        raise RuntimeError(
-            "PyYAML is required to parse device config. "
-            "Install it with: pip install pyyaml"
-        )
+    import yaml
 
     raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not raw or "devices" not in raw:
@@ -446,13 +438,7 @@ class SshDeviceBackend(DeviceBackend):
         check: bool,
         timeout: int,
     ) -> subprocess.CompletedProcess:
-        try:
-            import pexpect
-        except ImportError as exc:
-            raise RuntimeError(
-                "Password-based SSH requires the Python 'pexpect' package. "
-                "Install pexpect, configure connection.identity_file, or use an SSH agent."
-            ) from exc
+        import pexpect
 
         child = pexpect.spawn(cmd[0], cmd[1:], encoding="utf-8", timeout=timeout)
         output_parts: list[str] = []
