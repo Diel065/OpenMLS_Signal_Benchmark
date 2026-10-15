@@ -698,6 +698,10 @@ async fn participant_command_actor(
             }
         }
 
+        // Keep counter I/O outside the existing wrapper CPU/allocation measurements.
+        let throttled_start = slot.profile_enabled
+            .then(libsignal_protocol::profiling::current_cpu_throttled_ns)
+            .flatten();
         let start = Instant::now();
         let process_start = ProcessTime::now();
         let start_unix_ms = unix_ms_now();
@@ -729,7 +733,10 @@ async fn participant_command_actor(
         let profile_this_command = slot.profile_enabled && command_profile_enabled;
         let external_profiling = env_nonempty("SIGNAL_PROFILE_EXECUTION_BACKEND").as_deref()
             == Some("real_device");
-        let expected_profile_total = (profile_this_command && external_profiling)
+        let has_benchmark = envelope.benchmark_phase.is_some()
+            || envelope.benchmark_operation.is_some()
+            || envelope.benchmark_plateau_index.is_some();
+        let expected_profile_total = (profile_this_command && external_profiling && has_benchmark)
             .then(|| expected_canonical_profile_total(&envelope.command))
             .flatten();
         let persisted_profile_count_before = expected_profile_total
@@ -759,9 +766,6 @@ async fn participant_command_actor(
             mark_worker_command_execution();
         }
 
-        let has_benchmark = envelope.benchmark_phase.is_some()
-            || envelope.benchmark_operation.is_some()
-            || envelope.benchmark_plateau_index.is_some();
         let benchmark_context = (profile_this_command && has_benchmark).then(|| {
             libsignal_protocol::profiling::BenchmarkContext {
                 benchmark_plateau_index: envelope.benchmark_plateau_index,
@@ -828,6 +832,9 @@ async fn participant_command_actor(
             }
             Err(err) => CommandResponse::error(err.to_string()),
         };
+        let throttled_end = slot.profile_enabled
+            .then(libsignal_protocol::profiling::current_cpu_throttled_ns)
+            .flatten();
 
         if let (Some(op), Some(before)) = (expected_profile_total, persisted_profile_count_before) {
             if response.status == "ok"
@@ -850,10 +857,11 @@ async fn participant_command_actor(
                         .then(|| "protocol_error".to_string())
                         .or_else(|| deadline_failure.clone())
                 };
-                let cpu_throttled = if wall_ns > 0 && wall_ns > deadline_ns {
-                    Some((wall_ns.saturating_sub(deadline_ns)) as f64 / wall_ns as f64)
-                } else {
-                    None
+                let cpu_throttled = match (throttled_start, throttled_end) {
+                    (Some(start), Some(end)) if wall_ns > 0 && end >= start => {
+                        Some((end - start) as f64 / wall_ns as f64)
+                    }
+                    _ => None,
                 };
                 let heap_snapshot = signal_benchmark::embedded_heap_budget::snapshot();
                 let worker_id_opt = libsignal_protocol::profiling::current_worker_id();
@@ -862,7 +870,7 @@ async fn participant_command_actor(
                     .zip(wrapper_span_id)
                     .map(|(w, s)| format!("{}:{}", w, s));
                 let event = SignalProfileEvent {
-                    profile_schema_version: 8,
+                    profile_schema_version: 9,
                     span_id: wrapper_span_id,
                     parent_span_id: None,
                     parent_operation: None,

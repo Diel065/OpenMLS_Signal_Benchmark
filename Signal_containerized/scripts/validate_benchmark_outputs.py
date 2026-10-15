@@ -277,6 +277,11 @@ def validate_run(
     missing_wrappers = required_wrappers - observed_wrappers
     if missing_wrappers:
         result.add_error(f"missing required wrapper rows: {sorted(missing_wrappers)}")
+    try:
+        with open(os.path.join(run_path, "scenario_plan.json"), encoding="utf-8") as handle:
+            external_density = int(json.load(handle).get("min_external_samples_per_operation", 0)) > 0
+    except (OSError, ValueError, TypeError, AttributeError):
+        external_density = False
     workflows = defaultdict(list)
     for row in wrapper_rows:
         if truthy(row.get("success")) is not True:
@@ -290,7 +295,14 @@ def validate_run(
             result.add_error(f"workflow {workflow_id} ({wrapper}) has invalid workflow_pair_count values")
             continue
         expected = next(iter(counts))
-        if len(rows_for_workflow) != expected:
+        # External onboarding estimates use sampled pairs, not a complete timed join.
+        sampled_external_setup = (
+            external_density
+            and wrapper == "session_establish_pair_wrapper"
+            and all(row.get("execution_backend") == "real_device" for row in rows_for_workflow)
+            and 0 < len(rows_for_workflow) < expected
+        )
+        if len(rows_for_workflow) != expected and not sampled_external_setup:
             result.add_error(
                 f"workflow {workflow_id} ({wrapper}) row count {len(rows_for_workflow)} != workflow_pair_count {expected}"
             )

@@ -312,14 +312,10 @@ fn read_cpu_throttled_ns(path: &Path) -> Option<u128> {
     parse_keyed_u128(&contents, "throttled_time")
 }
 
-fn current_cpu_throttled_ns() -> Option<u128> {
+/// Read cumulative cgroup CPU throttled time in nanoseconds, if available.
+pub fn current_cpu_throttled_ns() -> Option<u128> {
     let counter = CPU_STAT_PATH.get_or_init(|| first_existing_cgroup_file("cpu", "cpu.stat"));
-    Some(
-        counter
-            .as_ref()
-            .and_then(|path| read_cpu_throttled_ns(path))
-            .unwrap_or(0),
-    )
+    counter.as_ref().and_then(|path| read_cpu_throttled_ns(path))
 }
 
 fn read_cpu_max_limit(path: &Path) -> Option<f64> {
@@ -636,7 +632,7 @@ impl ProfileScope {
         let op_clone = self.op.clone();
 
         ProfileEvent {
-            profile_schema_version: 6,
+            profile_schema_version: 7,
             ts_unix_ns: unix_timestamp_ns(),
             op: op_clone.clone(),
             span_name: Some(self.op.clone()),
