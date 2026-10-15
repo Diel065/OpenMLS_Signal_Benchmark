@@ -11,9 +11,9 @@ export PATH="$HOME/.cargo/bin:$PATH"
 # Output paths are relative to the protocol stack for Compose bind mounts.
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
 N="${N:-1}"
-DEVICES_FILE="${DEVICES_FILE:-devices.yaml}"
+DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
-# Worker (client) ids of the external devices, from devices.yaml worker.id.
+# Worker (client) ids of the external devices, from devices.json worker.id.
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 # Luckfox attrition requires classified failure evidence.
 ATTRITION_ALLOWED_WORKER_IDS="${ATTRITION_ALLOWED_WORKER_IDS:-pico-plus-00001}"

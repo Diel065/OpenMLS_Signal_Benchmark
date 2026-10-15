@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import shlex
@@ -53,13 +54,11 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError(
             f"Run ID must only contain [A-Za-z0-9._-], got '{run_id}'"
         )
-# YAML loader
+# JSON loader
 
 
 def load_devices_config(path: Path) -> list[DeviceConfig]:
-    import yaml
-
-    raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    raw = json.loads(path.read_text(encoding="utf-8"))
     if not raw or "devices" not in raw:
         raise ValueError(f"No 'devices' key found in {path}")
 

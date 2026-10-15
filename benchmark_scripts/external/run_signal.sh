@@ -15,9 +15,9 @@ if [ "$N" != "1" ]; then
   echo "ERROR: this Signal external-device benchmark is intentionally exactly one run; got N=$N" >&2
   exit 2
 fi
-DEVICES_FILE="${DEVICES_FILE:-devices.yaml}"
+DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
-# Worker/client ids of the external devices, from Signal_containerized/devices.yaml.
+# Worker/client ids of the external devices, from Signal_containerized/devices.json.
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 SCENARIO="${SCENARIO:-external-device-signal-pairwise-baseline}"
 # Keep the (single) run going if a profiled external device fails: evict it and

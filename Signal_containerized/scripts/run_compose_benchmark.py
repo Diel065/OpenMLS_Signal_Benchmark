@@ -522,7 +522,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--devices-file",
         default=None,
-        help="Path to YAML config file for external real devices",
+        help="Path to JSON config file for external real devices",
     )
     p.add_argument(
         "--enable-external-devices",
@@ -3771,7 +3771,7 @@ def main() -> int:
             )
 
         if args.build_external_binaries:
-            devices_file = Path(args.devices_file) if args.devices_file else root / "devices.yaml"
+            devices_file = Path(args.devices_file) if args.devices_file else root / "devices.json"
             if not devices_file.is_absolute():
                 devices_file = root / devices_file
             if not devices_file.exists():
