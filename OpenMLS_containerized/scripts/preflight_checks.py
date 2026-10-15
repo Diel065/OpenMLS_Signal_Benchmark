@@ -1,10 +1,8 @@
-"""
-Preflight checks for CPU affinity validation.
+import sys
+from pathlib import Path
 
-Verifies that Docker applied the expected cpusets, probes /proc for actual
-CPU affinity, and checks that profiled CPUs are not overlapped by background
-containers. Hard-fails on any violation that would compromise the experiment.
-"""
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
+
 
 import os
 import subprocess
@@ -12,10 +10,6 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 def run_docker_inspect_cpuset(container_name: str) -> Optional[str]:
-    """Get the HostConfig.CpusetCpus for a container via docker inspect.
-
-    Returns the cpuset string or None if the container is not found.
-    """
     try:
         result = subprocess.run(
             ["docker", "inspect", "--format", "{{.HostConfig.CpusetCpus}}", container_name],
@@ -30,7 +24,6 @@ def run_docker_inspect_cpuset(container_name: str) -> Optional[str]:
 
 
 def run_docker_inspect_pid(container_name: str) -> Optional[int]:
-    """Get the host PID for a container."""
     try:
         result = subprocess.run(
             ["docker", "inspect", "--format", "{{.State.Pid}}", container_name],
@@ -45,7 +38,6 @@ def run_docker_inspect_pid(container_name: str) -> Optional[int]:
 
 
 def read_proc_cpus_allowed_list(pid: int) -> Optional[str]:
-    """Read Cpus_allowed_list from /proc/<pid>/status."""
     try:
         with open(f"/proc/{pid}/status") as f:
             for line in f:
@@ -57,10 +49,6 @@ def read_proc_cpus_allowed_list(pid: int) -> Optional[str]:
 
 
 def read_proc_task_cpus_allowed_lists(pid: int) -> Dict[int, str]:
-    """Read Cpus_allowed_list for all threads of a process.
-
-    Returns dict mapping tid -> cpus_allowed_list string.
-    """
     results: Dict[int, str] = {}
     task_dir = f"/proc/{pid}/task"
     if not os.path.exists(task_dir):
@@ -84,7 +72,6 @@ def read_proc_task_cpus_allowed_lists(pid: int) -> Dict[int, str]:
 
 
 def get_container_env_var(container_name: str, var_name: str) -> Optional[str]:
-    """Get an environment variable value from a container via docker inspect."""
     try:
         result = subprocess.run(
             ["docker", "inspect", "--format", f"{{{{range .Config.Env}}}}{{{{.}}}}{{{{println}}}}{{{{end}}}}", container_name],
@@ -99,13 +86,6 @@ def get_container_env_var(container_name: str, var_name: str) -> Optional[str]:
 
 
 def check_host_processes_on_cpus(cpus: List[int]) -> List[Dict[str, Any]]:
-    """Check for unrelated host processes running on specified CPUs.
-
-    Uses ps to list processes and their current CPU (psr).
-    Excludes kernel threads (PID 2, kthreadd children) and known system processes.
-
-    Returns list of warnings for each observed process.
-    """
     warnings: List[Dict[str, Any]] = []
     try:
         result = subprocess.run(
@@ -138,14 +118,10 @@ def check_host_processes_on_cpus(cpus: List[int]) -> List[Dict[str, Any]]:
 
 
 def parse_cpuset_to_set(cpuset_str: str) -> Set[int]:
-    """Parse a cpuset string into a set of CPU IDs."""
     if not cpuset_str or cpuset_str.strip() == "":
         return set()
 
-    try:
-        from .cpu_mask_util import docker_cpuset_to_cpu_list
-    except ImportError:
-        from cpu_mask_util import docker_cpuset_to_cpu_list
+    from cpu_mask_util import docker_cpuset_to_cpu_list
     return set(docker_cpuset_to_cpu_list(cpuset_str))
 
 
@@ -155,21 +131,6 @@ def run_preflight(
     background_containers: List[Dict[str, Any]],
     affinity_plan: Any,
 ) -> Tuple[List[Dict[str, Any]], bool]:
-    """Run all preflight checks and return results.
-
-    Args:
-        run_id: Benchmark run ID.
-        profiled_containers: List of dicts with keys:
-            container_name, container_role, expected_cpuset, expected_rayon_threads
-        background_containers: List of dicts with keys:
-            container_name, container_role
-        affinity_plan: The AffinityPlan object.
-
-    Returns:
-        Tuple of (results_list, all_passed).
-        results_list is a list of preflight check dicts.
-        all_passed is True if no FAIL statuses exist.
-    """
     results: List[Dict[str, Any]] = []
     has_fail = False
     profiled_cpu_set: Set[int] = set()

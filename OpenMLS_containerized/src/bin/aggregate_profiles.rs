@@ -186,8 +186,7 @@ fn main() -> Result<()> {
         input_files_missing: missing_files,
         malformed_records: Vec::new(),
         truncated_records: Vec::new(),
-        runner_events_included: run_dir.join("runner_events.jsonl").exists()
-            || run_dir.join("runner-events.jsonl").exists(),
+        runner_events_included: run_dir.join("runner-events.jsonl").exists(),
         output_path: events_path.to_string_lossy().to_string(),
         error_message: None,
         temporary_file_retained: None,

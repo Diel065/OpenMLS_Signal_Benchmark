@@ -8,7 +8,6 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-# Data types
 
 
 @dataclass
@@ -38,7 +37,6 @@ class WorkerLaunch:
     remote_results_root: str
     remote_tmp: str
     node_name: str = ""
-# Run ID validation (mirrors the Rust validate_run_id)
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -54,7 +52,6 @@ def validate_run_id(run_id: str) -> None:
         raise ValueError(
             f"Run ID must only contain [A-Za-z0-9._-], got '{run_id}'"
         )
-# JSON loader
 
 
 def load_devices_config(path: Path) -> list[DeviceConfig]:
@@ -77,14 +74,6 @@ def load_devices_config(path: Path) -> list[DeviceConfig]:
     return devices
 
 
-def _as_list(value) -> list:
-    if value is None:
-        return []
-    if isinstance(value, list):
-        return value
-    return [value]
-
-
 def _dedupe_strings(values) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -103,12 +92,7 @@ def build_worker_url_candidates(
 ) -> list[str]:
     transport = config.transport
     urls: list[str] = [f"http://{transport_ip}:{worker_port}"]
-    urls.extend(
-        f"http://{ip}:{worker_port}"
-        for ip in _as_list(transport.get("device_ip_candidates"))
-    )
-    urls.extend(_as_list(transport.get("worker_urls")))
-    urls.extend(_as_list(transport.get("worker_url_candidates")))
+    urls.extend(transport.get("worker_url_candidates", []))
     return _dedupe_strings(urls)
 
 
@@ -135,7 +119,6 @@ def wait_for_first_healthy_url(urls: list[str], timeout_s: float = 30.0) -> str:
         "Timed out waiting for external worker health. "
         f"Tried: {', '.join(candidates)}. Last error: {last_error}"
     )
-# Abstract backend
 
 
 class DeviceBackend:
@@ -167,18 +150,6 @@ class DeviceBackend:
     def stop_worker(self) -> None:
         raise NotImplementedError
 
-    def wait_health(self, url: str, timeout_s: float = 30.0) -> None:
-        deadline = time.time() + timeout_s
-        while time.time() < deadline:
-            try:
-                with urllib.request.urlopen(url, timeout=5) as resp:
-                    body = resp.read().decode("utf-8", errors="replace").strip()
-                    if 200 <= resp.status < 300 and body == "ok":
-                        return
-            except (urllib.error.URLError, TimeoutError, ConnectionError):
-                pass
-            time.sleep(0.5)
-        raise RuntimeError(f"Timed out waiting for health endpoint: {url}")
 
     def read_epoch_seconds(self) -> int:
         result = self.shell("date -u +%s", check=True)
@@ -212,7 +183,6 @@ class DeviceBackend:
                 f"(skew={remaining_skew}s, max={max_skew_seconds}s)."
             )
         print(f"[device] clock synchronized (skew {remaining_skew}s)", flush=True)
-# ADB backend
 
 
 class AdbDeviceBackend(DeviceBackend):
@@ -226,11 +196,8 @@ class AdbDeviceBackend(DeviceBackend):
             self._adb_base += ["-s", self.serial]
 
     def _server_socket_candidates(self) -> list[str]:
-        values = [""]
-        values.extend(_as_list(self.config.connection.get("server_socket")))
-        values.extend(_as_list(self.config.connection.get("server_sockets")))
-        values.extend(_as_list(self.config.connection.get("server_socket_candidates")))
-        return ["" if str(value).strip().lower() == "local" else str(value).strip()
+        values = self.config.connection["server_socket_candidates"]
+        return ["" if value.lower() == "local" else value
                 for value in _dedupe_strings(values)]
 
     def _adb(self, args: list[str], check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
@@ -366,7 +333,6 @@ class AdbDeviceBackend(DeviceBackend):
             f"killall worker 2>/dev/null || pkill worker 2>/dev/null || true"
         )
         self._adb(["shell", cmd], check=False)
-# SSH backend (stub for future Raspberry Pi support)
 
 
 class SshDeviceBackend(DeviceBackend):
@@ -374,37 +340,20 @@ class SshDeviceBackend(DeviceBackend):
         self.config = config
         self.user = config.connection.get("user", "root")
         self.identity_file = config.connection.get("identity_file", "")
-        self.password = str(config.connection.get("password", ""))
-        password_env = config.connection.get("password_env", "")
-        if not self.password and password_env:
-            self.password = os.environ.get(password_env, "")
         self.host = config.connection.get("host", "")
         self.port = int(config.connection.get("port", 22))
         self._selected = False
-
-    def _parse_candidate(self, value) -> tuple[str, int]:
-        if isinstance(value, dict):
-            host = str(value.get("host", self.host)).strip()
-            port = int(value.get("port", self.port))
-            return host, port
-        text = str(value).strip()
-        if text.count(":") == 1:
-            host, port = text.rsplit(":", 1)
-            if port.isdigit():
-                return host, int(port)
-        return text, self.port
 
     def _candidate_hosts(self) -> list[tuple[str, int]]:
         values = [
             {"host": self.config.connection.get("host", ""), "port": self.config.connection.get("port", 22)}
         ]
-        values.extend(_as_list(self.config.connection.get("host_candidates")))
-        values.extend(_as_list(self.config.connection.get("connection_candidates")))
-        values.extend(_as_list(self.config.connection.get("ssh_candidates")))
+        values.extend(self.config.connection.get("host_candidates", []))
         seen: set[tuple[str, int]] = set()
         result: list[tuple[str, int]] = []
         for value in values:
-            host, port = self._parse_candidate(value)
+            host = str(value.get("host", self.host)).strip()
+            port = int(value.get("port", self.port))
             if not host:
                 continue
             key = (host, port)
@@ -421,110 +370,14 @@ class SshDeviceBackend(DeviceBackend):
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
-                "-o", "BatchMode=no",
+                "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=10",
                 f"{self.user}@{self.host}"]
         return cmd
 
-    def _run_password_command(
-        self,
-        cmd: list[str],
-        *,
-        check: bool,
-        timeout: int,
-    ) -> subprocess.CompletedProcess:
-        import pexpect
-
-        child = pexpect.spawn(cmd[0], cmd[1:], encoding="utf-8", timeout=timeout)
-        output_parts: list[str] = []
-        password_prompts = 0
-
-        try:
-            while True:
-                idx = child.expect([
-                    r"(?i)are you sure you want to continue connecting",
-                    r"(?i)(?:password|passphrase).*:",
-                    pexpect.EOF,
-                    pexpect.TIMEOUT,
-                ])
-                before = child.before or ""
-
-                if idx == 0:
-                    child.sendline("yes")
-                elif idx == 1:
-                    password_prompts += 1
-                    if password_prompts > 4:
-                        child.close(force=True)
-                        output = "".join(output_parts)
-                        result = subprocess.CompletedProcess(cmd, 255, output, output)
-                        if check:
-                            raise subprocess.CalledProcessError(
-                                result.returncode,
-                                cmd,
-                                output=result.stdout,
-                                stderr=result.stderr,
-                            )
-                        return result
-                    child.sendline(self.password)
-                elif idx == 2:
-                    output_parts.append(before)
-                    break
-                else:
-                    child.close(force=True)
-                    output_parts.append(before)
-                    output = "".join(output_parts)
-                    if check:
-                        raise subprocess.TimeoutExpired(cmd, timeout, output=output)
-                    return subprocess.CompletedProcess(cmd, 124, output, output)
-        finally:
-            if child.isalive():
-                child.close(force=True)
-            else:
-                child.close()
-
-        output = "".join(output_parts)
-        if child.exitstatus is not None:
-            returncode = int(child.exitstatus)
-        elif child.signalstatus is not None:
-            returncode = 128 + int(child.signalstatus)
-        else:
-            returncode = 1
-
-        result = subprocess.CompletedProcess(
-            cmd,
-            returncode,
-            output,
-            output if returncode != 0 else "",
-        )
-        if check and returncode != 0:
-            raise subprocess.CalledProcessError(
-                returncode,
-                cmd,
-                output=result.stdout,
-                stderr=result.stderr,
-            )
-        return result
-
-    def _run_command(
-        self,
-        cmd: list[str],
-        *,
-        check: bool = True,
-        timeout: int = 60,
-    ) -> subprocess.CompletedProcess:
-        if self.password:
-            return self._run_password_command(cmd, check=check, timeout=timeout)
-        return subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            check=check,
-            timeout=timeout,
-        )
-
     def _ssh(self, command: str, check: bool = True, timeout: int = 60) -> subprocess.CompletedProcess:
         cmd = self._ssh_base() + [command]
-        return self._run_command(cmd, check=check, timeout=timeout)
+        return subprocess.run(cmd, capture_output=True, text=True, check=check, timeout=timeout)
 
     def check_reachable(self) -> None:
         errors: list[str] = []
@@ -560,7 +413,7 @@ class SshDeviceBackend(DeviceBackend):
                 "-o", "StrictHostKeyChecking=no",
                 "-o", "UserKnownHostsFile=/dev/null",
                 "-o", "LogLevel=ERROR",
-                "-o", "BatchMode=no",
+                "-o", "BatchMode=yes",
                 "-o", "ConnectTimeout=10"]
         cmd += [src, dst]
         return cmd
@@ -568,23 +421,21 @@ class SshDeviceBackend(DeviceBackend):
     def push(self, local: Path, remote: str) -> None:
         self._ensure_selected()
         remote_scp = f"{self.user}@{self.host}:{remote}"
-        self._run_command(self._scp_cmd(str(local), remote_scp), check=True, timeout=120)
+        subprocess.run(self._scp_cmd(str(local), remote_scp), capture_output=True, text=True, check=True, timeout=120)
 
     def pull(self, remote: str, local: Path) -> None:
         self._ensure_selected()
         local.parent.mkdir(parents=True, exist_ok=True)
-        # Remove a stale local destination file first. The in-docker runner
-        # runs as root and may leave a root-owned placeholder here; scp runs as
-        # the calling user and cannot truncate/overwrite it in place, which
-        # would fail the transfer (the parent dir is user-owned so unlink works).
         if local.is_file():
             try:
                 local.unlink()
             except OSError:
                 pass
         remote_scp = f"{self.user}@{self.host}:{remote}"
-        self._run_command(
+        subprocess.run(
             self._scp_cmd(remote_scp, str(local), recursive=True),
+            capture_output=True,
+            text=True,
             check=True,
             timeout=120,
         )
@@ -659,7 +510,6 @@ class SshDeviceBackend(DeviceBackend):
     def stop_worker(self) -> None:
         self._ensure_selected()
         self._ssh("killall worker 2>/dev/null || pkill worker 2>/dev/null || true", check=False)
-# Factory
 
 
 def create_backend(config: DeviceConfig) -> DeviceBackend:
@@ -671,30 +521,14 @@ def create_backend(config: DeviceConfig) -> DeviceBackend:
         return SshDeviceBackend(config)
     else:
         raise ValueError(f"Unsupported connection type: {conn_type}")
-# Build worker layout entries for external devices
 
 
 def build_external_device_layout_entry(
     config: DeviceConfig,
     transport_ip: str,
-    host_ip: str,
     worker_port: int,
-    kr_port: int | None = None,
-    relay_port: int = 4000,
-    run_id: str = "",
-    ds_port: int | None = None,
     worker_url: str | None = None,
 ) -> tuple[dict, dict, str]:
-    """
-    Returns (layout_client_entry, layout_physical_worker_entry, worker_file_line).
-
-    The `worker_file_line` is in ID=URL format for the workers file.
-    """
-    if kr_port is None:
-        kr_port = ds_port
-    if kr_port is None:
-        raise ValueError("kr_port is required")
-
     worker_id = config.worker.get("id", config.id)
     device_ip = config.transport.get("device_ip", transport_ip)
     url = (worker_url or f"http://{device_ip}:{worker_port}").rstrip("/")

@@ -24,6 +24,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
+
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
@@ -80,7 +82,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
     p.add_argument(
         "--min-external-samples-per-operation",
-        "--min-profiled-samples-per-operation",
         dest="min_profiled_samples_per_operation",
         type=int,
         default=0,
@@ -975,7 +976,6 @@ def read_worker_lines(path: Path) -> list[str]:
 
 
 def build_host_runner_layout(layout_data: dict, worker_lines: list[str]) -> dict:
-    """Return a layout whose command endpoints are reachable from the host."""
     worker_urls: dict[str, str] = {}
     for line in worker_lines:
         worker_id, worker_url = line.split("=", 1)
@@ -1055,10 +1055,7 @@ def write_integrated_aggregation_manifest(run_dir: Path, run_id: str) -> None:
         "input_files_missing": [],
         "malformed_records": [],
         "truncated_records": [],
-        "runner_events_included": any(
-            (run_dir / filename).exists()
-            for filename in ("runner-events.jsonl", "runner_events.jsonl")
-        ),
+        "runner_events_included": (run_dir / "runner-events.jsonl").exists(),
         "output_path": str(events_path),
         "error_message": None,
         "temporary_file_retained": None,
@@ -1378,11 +1375,6 @@ def capture_failure_evidence(
     project_name: str,
     profiled_container_names: list[str] | None = None,
 ) -> dict | None:
-    """Capture Docker inspect and cgroup state for profiled containers before cleanup.
-
-    Must be called BEFORE docker compose down.
-    Writes failure_evidence.json and returns the evidence dict.
-    """
     import csv as csv_mod
     evidence_entries: list[dict] = []
     container_names = list(profiled_container_names or [])
@@ -1429,7 +1421,6 @@ def _capture_single_container(
     container_name: str,
     compose_env: dict[str, str] | None,
 ) -> dict | None:
-    """Capture docker inspect and cgroup state for a single container."""
     container_id = compose_container_id(root, compose_file, container_name, compose_env)
     if not container_id:
         return None
@@ -1514,7 +1505,6 @@ def _capture_single_container(
 
 
 def run_capture_to_str(root: Path, cmd: list[str], *, env: dict[str, str] | None = None) -> str | None:
-    """Run a command and return stdout as string, or None on failure."""
     try:
         result = subprocess.run(
             cmd, cwd=str(root), capture_output=True, text=True, timeout=15,
@@ -1748,15 +1738,6 @@ def write_artifact_validation(
     failure_class: str = "",
     aggregation_status: str = "",
 ) -> None:
-    """Write artifact_validation.json with sidecar presence and consistency checks.
-
-    Args:
-        run_dir: The run output directory.
-        run_success: Whether the run succeeded (affects strictness of checks).
-        primary_outcome: The primary run outcome (e.g., "completed", "failed_workload").
-        failure_class: Failure classification if run failed.
-        aggregation_status: Aggregation status (e.g., "complete_success", "partial_success").
-    """
     try:
         from resource_experiment_sidecars import validate_sidecars_exist
     except ImportError:
@@ -2650,7 +2631,6 @@ class ResourceMonitor:
                     "cpu_usage_usec_delta": row.get("cpu_usage_usec_delta"),
                     "cpu_nr_throttled_delta": row.get("cpu_nr_throttled_delta"),
                     "cpu_throttled_usec_delta": row.get("cpu_throttled_usec_delta"),
-                    # This is nr_throttled / nr_periods, not the fraction of throttled time.
                     "cpu_throttled_time_fraction": row.get("throttled_period_fraction"),
                     "max_thread_count": row.get("pids_current_max"),
                     "max_process_count": "",
@@ -2994,7 +2974,6 @@ def launch_external_devices(
     relay_port: int,
     run_id: str,
 ) -> tuple[list[dict], list[dict], list[str]]:
-    """Start external devices and return (layout_clients, layout_workers, worker_lines)."""
     from external_devices import (
         create_backend,
         load_devices_config,
@@ -3130,11 +3109,7 @@ def launch_external_devices(
         client_entry, phys_entry, worker_line = build_external_device_layout_entry(
             dev_config,
             transport_ip=device_ip,
-            host_ip=host_ip,
             worker_port=worker_port,
-            ds_port=ds_port,
-            relay_port=relay_port,
-            run_id=run_id,
             worker_url=worker_url,
         )
 
@@ -3179,7 +3154,6 @@ def pull_external_device_profiles(
     run_id: str,
     run_dir: Path,
 ) -> None:
-    """Pull profile files from external devices into the local run directory."""
     from external_devices import create_backend, load_devices_config, validate_run_id as py_validate_run_id
 
     devices_file = Path(args.devices_file)
@@ -3211,8 +3185,6 @@ def pull_external_device_profiles(
         except Exception as e:
             print(f"[device] {dev_id}: pull failed (non-fatal): {e}", flush=True)
 
-        # Also try pulling individual JSONL files to the top-level run dir.
-        # Retry with backoff in case the device worker is still flushing data.
         worker_id = dev_config.worker.get("id", dev_id)
         remote_jsonl = f"{remote_path}/client-{worker_id}.jsonl"
         local_jsonl = run_dir / f"client-{worker_id}.jsonl"
@@ -3255,7 +3227,6 @@ def pull_external_device_profiles(
 
 
 def trim_incomplete_jsonl_tail(path: Path, block_size: int = 64 * 1024) -> int:
-    """Drop only a non-newline-terminated final record after device attrition."""
     if not path.is_file():
         return 0
     with path.open("r+b") as handle:
@@ -3290,15 +3261,6 @@ def run_standalone_aggregation(
     allow_partial: bool = False,
     manifest_path: Optional[Path] = None,
 ) -> int:
-    """Run the Rust aggregate_profiles binary.
-
-    Args:
-        run_dir: The run directory to aggregate.
-        layout_file: Optional path to worker_layout.json.
-        workers_file: Optional path to workers file.
-        allow_partial: If True, pass --allow-partial flag for failure-tolerant aggregation.
-        manifest_path: Optional path for aggregation manifest (defaults to run dir).
-    """
     root = repo_root()
     aggregate_binary = os.environ.get("OPENMLS_AGGREGATE_PROFILES_BINARY")
     if aggregate_binary:
@@ -3552,8 +3514,6 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
 def main() -> int:
     args = build_parser().parse_args()
     if args.enable_external_devices:
-        # External runs are publication inputs, so device coverage is mandatory rather
-        # than an opt-in sampling mode.
         args.external_coverage_lane = True
     root = repo_root()
 
@@ -4450,7 +4410,6 @@ def main() -> int:
                 from preflight_checks import run_preflight as re_run_preflight
                 from resource_experiment_failures import build_run_status as re_build_run_status_pf
 
-                # Docker compose names containers as <project>-<service>-<replica>
                 profiled_names = [f"{project_name}-{name}-1" for name in state["profiled_container_names"]]
                 bg_names_raw = [s["container_name"] for s in state["bg_specs"]]
                 bg_names_raw = [name for name in bg_names_raw if name != "runner"]
@@ -4748,8 +4707,6 @@ def main() -> int:
                     )
                 except Exception:
                     pass
-            # Aggregate first so runner-events.jsonl is authoritative for both
-            # the operation cursor and the failure reason.
             if resource_experiment != "none":
                 try:
                     from resource_experiment_failures import (
@@ -4903,8 +4860,6 @@ def main() -> int:
             external_device_stop_required = False
 
         write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
-        # Must run BEFORE strict validation so sidecars exist even
-        # if publication validation flags non-critical issues.
         output_validation_passed = True
         if resource_experiment != "none":
             try:

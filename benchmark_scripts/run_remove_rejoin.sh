@@ -36,9 +36,6 @@ REPORT="$OUTPUT_ROOT/${RUN_TOKEN}_report.txt"
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
-random_seed() { uv run --frozen --project "$REPO_ROOT" python -c 'import random; print(random.randint(1,2147483647))'; }
-
-relpath_from() { uv run --frozen --project "$REPO_ROOT" python -c "import os,sys; print(os.path.relpath(sys.argv[1],sys.argv[2]))" "$1" "$2"; }
 
 cleanup() {
   if [ -f "$RUN_DIR/docker-compose.generated.yml" ]; then
@@ -58,9 +55,9 @@ export OPENMLS_MEMORY_MODEL="${OPENMLS_MEMORY_MODEL:-app-heap-budget}"
 export OPENMLS_APP_HEAP_BUDGET="${OPENMLS_APP_HEAP_BUDGET:-1024g}"
 export OPENMLS_APP_HEAP_BUDGET_BYTES="${OPENMLS_APP_HEAP_BUDGET_BYTES:-1099511627776}"
 
-output_arg="$(relpath_from "$OUTPUT_ROOT" "$OPENMLS_DIR")"
-scenario_seed="$(random_seed)"
-singleton_seed="$(random_seed)"
+output_arg="$(realpath -ms --relative-to="$OPENMLS_DIR" -- "$OUTPUT_ROOT")"
+scenario_seed="$(shuf -i 1-2147483647 -n 1)"
+singleton_seed="$(shuf -i 1-2147483647 -n 1)"
 
 image_args=()
 if [ "$BUILD_IMAGES" = "1" ]; then image_args=(--build-images); fi

@@ -1,28 +1,20 @@
-"""Resource assignments recorded with each experiment."""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
+
 
 from typing import Any, Dict, List, Optional
 
-try:
-    from .cpu_affinity_planner import AffinityPlan, get_background_cpuset
-    from .cpu_mask_util import cpu_list_to_docker_cpuset
-    from .resource_profiles import ResourceProfile, get_selected_profile
-except ImportError:
-    from cpu_affinity_planner import AffinityPlan, get_background_cpuset
-    from cpu_mask_util import cpu_list_to_docker_cpuset
-    from resource_profiles import ResourceProfile, get_selected_profile
+from cpu_affinity_planner import AffinityPlan
+from cpu_mask_util import cpu_list_to_docker_cpuset
+from resource_profiles import ResourceProfile, get_selected_profile
 
 
 def _profile_for_profiled_index(
     profiles: List[ResourceProfile],
     index: int,
 ) -> Optional[ResourceProfile]:
-    """Return the resource profile for a profiled singleton index.
-
-    Singleton experiments select exactly one profile and apply it to the one
-    profiled worker. Parallel sweeps select multiple profiles; in that case the
-    sidecars and affinity plan must preserve the one-profile-per-singleton
-    ordering used by compose generation.
-    """
     if not profiles:
         return None
 
@@ -49,12 +41,11 @@ def build_worker_resource_assignments(
     infrastructure_container_names: List[str],
     container_ids: Optional[Dict[str, str]] = None,
 ) -> List[Dict[str, Any]]:
-    """Build worker_resource_assignments.csv rows."""
     if container_ids is None:
         container_ids = {}
 
     assignments = []
-    background_cpuset = get_background_cpuset(plan)
+    background_cpuset = cpu_list_to_docker_cpuset(plan.background_cpus)
     bg_mask_hex = plan.background_mask_hex if plan else ""
 
     selected_sp_profile_id = ""

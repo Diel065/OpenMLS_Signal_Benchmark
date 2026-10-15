@@ -1,11 +1,14 @@
 #!/usr/bin/env -S uv run --frozen python
 import argparse
+import sys
 import json
 import math
 import random
 import re
 from pathlib import Path
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
 
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
@@ -53,7 +56,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
 
-    # Hybrid layout flags
     p.add_argument(
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
@@ -150,7 +152,6 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ── Resource experiment flags ──────────────────────────────────────
     p.add_argument(
         "--resource-experiment",
         choices=[
@@ -400,8 +401,6 @@ def empty_resource_limits() -> dict:
     }
 
 
-# ── Failure-experiment grid ────────────────────────────────────────────
-
 FAILURE_EXPERIMENT_CPU_CAPS = [0.125, 0.25, 0.5, 1.0, 2.0]
 FAILURE_EXPERIMENT_RAM_CAPS = [
     "64m", "96m", "128m", "192m", "256m", "384m", "512m", "768m", "1g",
@@ -447,8 +446,6 @@ def failure_experiment_resource_limits(
     }
 
 
-# ── Hybrid layout calculation ──────────────────────────────────────────
-
 def compute_hybrid_layout(
     total_logical_workers: int,
     singleton_min_count: int,
@@ -470,8 +467,6 @@ def compute_hybrid_layout(
         "physical_worker_count": physical_worker_count,
     }
 
-
-# ── Singleton selection ────────────────────────────────────────────────
 
 def select_singleton_ids(
     total_logical_workers: int,
@@ -507,8 +502,6 @@ def select_singleton_ids(
 
     return sorted(singletons)
 
-
-# ── Layout builder ─────────────────────────────────────────────────────
 
 class ClientLayoutEntry:
     def __init__(
@@ -750,9 +743,6 @@ def generate_worker_layout_json(
         "clients": [c.to_dict() for c in clients],
         "physical_workers": [pw.to_dict() for pw in physical_workers],
     }
-
-
-# ── Compose generation ─────────────────────────────────────────────────
 
 
 def append_bounded_logging(lines: list[str], indent: str = "    ") -> None:
@@ -1077,7 +1067,6 @@ def write_text(path: Path, text: str) -> None:
 
 
 def load_affinity_plan(args: argparse.Namespace) -> dict | None:
-    """Load a pre-computed affinity plan JSON file."""
     plan_file = getattr(args, "affinity_plan_file", None)
     if not plan_file:
         return None
@@ -1090,7 +1079,6 @@ def load_affinity_plan(args: argparse.Namespace) -> dict | None:
 
 
 def load_resource_profiles(args: argparse.Namespace) -> list | None:
-    """Load pre-computed resource profiles from a JSON file."""
     profiles_file = getattr(args, "resource_profiles_file", None)
     if not profiles_file:
         return None
@@ -1107,7 +1095,6 @@ def restrict_profile_enabled_clients_to_affinity_selection(
     physical_workers: list[PhysicalWorkerEntry],
     affinity_plan: dict | None,
 ) -> None:
-    """For resource experiments, only the selected singleton(s) should emit profiles."""
     selected_client_ids: set[str] = set()
     selected_container_names: set[str] = set()
     for assignment in (affinity_plan or {}).get("profiled_assignments", []):
@@ -1153,9 +1140,6 @@ def apply_affinity_to_compose(
     profile_idx: int,
     args: argparse.Namespace,
 ) -> dict | None:
-    """Apply cpuset and resource limits to compose service lines.
-    Returns a dict with 'rayon_num_threads' and 'cpuset' info for later environment emission.
-    """
     result = {}
     if affinity_plan is None:
         return result

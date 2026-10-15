@@ -1,11 +1,14 @@
 #!/usr/bin/env -S uv run --frozen python
 import argparse
+import sys
 import json
 import math
 import random
 import re
 from pathlib import Path
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
 
 MEMORY_RE = re.compile(r"^(?P<value>[0-9]+(?:\.[0-9]+)?)(?P<unit>[bkmgt]?b?)?$", re.IGNORECASE)
 
@@ -53,7 +56,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
 
-    # Hybrid layout flags
     p.add_argument(
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
@@ -411,8 +413,6 @@ def apply_resource_profiles(
         limits["profile_notes"] = profile.get("profile_notes", "")
 
 
-# ── Hybrid layout calculation ──────────────────────────────────────────
-
 def compute_hybrid_layout(
     total_logical_workers: int,
     singleton_min_count: int,
@@ -434,8 +434,6 @@ def compute_hybrid_layout(
         "physical_worker_count": physical_worker_count,
     }
 
-
-# ── Singleton selection ────────────────────────────────────────────────
 
 def select_singleton_ids(
     total_logical_workers: int,
@@ -471,8 +469,6 @@ def select_singleton_ids(
 
     return sorted(singletons)
 
-
-# ── Layout builder ─────────────────────────────────────────────────────
 
 class ClientLayoutEntry:
     def __init__(
@@ -729,9 +725,6 @@ def generate_worker_layout_json(
     }
 
 
-# ── Compose generation ─────────────────────────────────────────────────
-
-
 def append_bounded_logging(lines: list[str], indent: str = "    ") -> None:
     lines.append(f"{indent}logging:")
     lines.append(f'{indent}  driver: "local"')
@@ -876,7 +869,6 @@ def generate_compose_text(
             lines.append(f'      SIGNAL_PROFILE_PATH_TEMPLATE: "/results/{args.run_id}/participant-{{participant_id}}.jsonl"')
             first_cid = pw.profile_enabled_client_ids[0]
             lines.append(f'      SIGNAL_PROFILE_PATH: "/results/{args.run_id}/participant-{first_cid}.jsonl"')
-            # Resource model env vars for constrained singletons
             if limits.get("resource_limit_cpus") is not None:
                 cpu_period = int(limits.get("cpu_period_us") or 100000)
                 cpu_quota = int(limits.get("cpu_quota_us") or round(float(limits["resource_limit_cpus"]) * cpu_period))

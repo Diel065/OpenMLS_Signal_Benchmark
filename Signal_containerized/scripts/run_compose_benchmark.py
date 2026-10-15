@@ -23,6 +23,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
+
 try:
     from resource_experiment_failures import (
         build_run_status,
@@ -102,7 +104,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
     p.add_argument(
         "--min-external-samples-per-operation",
-        "--min-profiled-samples-per-operation",
         dest="min_profiled_samples_per_operation",
         type=int,
         default=0,
@@ -350,7 +351,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Before starting, forcibly remove existing Docker containers with names beginning with 'signal-'",
     )
 
-    # Hybrid layout flags
     p.add_argument(
         "--worker-layout-mode",
         choices=["one-container-per-client", "hybrid"],
@@ -518,7 +518,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Exit successfully after this many unique profiled singleton resource failures (0 disables).",
     )
 
-    # External device flags
     p.add_argument(
         "--devices-file",
         default=None,
@@ -3031,7 +3030,6 @@ def launch_external_devices(
     relay_port: int,
     run_id: str,
 ) -> tuple[list[dict], list[dict], list[str]]:
-    """Start external devices and return (layout_clients, layout_workers, worker_lines)."""
     from external_devices import (
         create_backend,
         load_devices_config,
@@ -3069,7 +3067,6 @@ def launch_external_devices(
 
         backend = create_backend(dev_config)
 
-        # Check reachable
         print(f"[device] {dev_id}: checking reachability...", flush=True)
         backend.check_reachable()
 
@@ -3092,16 +3089,13 @@ def launch_external_devices(
         worker_port = transport.get("worker_port", 8080)
         listen_addr = f"0.0.0.0:{worker_port}"
 
-        # Stop existing worker
         print(f"[device] {dev_id}: stopping existing worker...", flush=True)
         backend.stop_worker()
 
-        # Wipe remote directories
         if args.wipe_device_run_dirs:
             print(f"[device] {dev_id}: wiping remote directories...", flush=True)
             backend.wipe_for_run(run_id)
 
-        # Push worker binary
         configured_binary = Path(dev_config.target.get(
             "binary",
             "target/armv7-unknown-linux-musleabihf/minsize/worker",
@@ -3124,7 +3118,6 @@ def launch_external_devices(
                 )
             print(f"[device] {dev_id}: using existing remote worker binary {remote_binary}", flush=True)
 
-        # Build DS/relay URLs for device
         device_kr_url = f"http://{host_ip}:{kr_port}"
         device_relay_url = f"http://{host_ip}:{relay_port}"
 
@@ -3151,7 +3144,6 @@ def launch_external_devices(
         print(f"[device] {dev_id}: starting worker (KR={device_kr_url}, Relay={device_relay_url})...", flush=True)
         backend.start_worker(launch)
 
-        # Health check
         worker_urls = build_worker_url_candidates(dev_config, device_ip, worker_port)
         print(f"[device] {dev_id}: waiting for health on {', '.join(worker_urls)}...", flush=True)
         try:
@@ -3174,15 +3166,10 @@ def launch_external_devices(
                 details.append(f"Worker log:\n{log}")
             raise RuntimeError("\n".join(details)) from e
 
-        # Build layout entries
         client_entry, phys_entry, worker_line = build_external_device_layout_entry(
             dev_config,
             transport_ip=device_ip,
-            host_ip=host_ip,
             worker_port=worker_port,
-            kr_port=kr_port,
-            relay_port=relay_port,
-            run_id=run_id,
             worker_url=worker_url,
         )
 
@@ -3227,7 +3214,6 @@ def pull_external_device_profiles(
     run_id: str,
     run_dir: Path,
 ) -> None:
-    """Pull profile files from external devices into the local run directory."""
     from external_devices import create_backend, load_devices_config, validate_run_id as py_validate_run_id
 
     devices_file = Path(args.devices_file)
@@ -3259,8 +3245,6 @@ def pull_external_device_profiles(
         except Exception as e:
             print(f"[device] {dev_id}: pull failed (non-fatal): {e}", flush=True)
 
-        # Also try pulling individual JSONL files to the top-level run dir.
-        # Retry with backoff in case the device worker is still flushing data.
         worker_id = dev_config.worker.get("id", dev_id)
         remote_jsonl = f"{remote_path}/participant-{worker_id}.jsonl"
         local_jsonl = run_dir / f"participant-{worker_id}.jsonl"
@@ -3294,7 +3278,6 @@ def pull_external_device_profiles(
                     print(f"[device] {dev_id}: pulling individual JSONL failed after 3 attempts (non-fatal): {e}", flush=True)
 
         if not pulled:
-            # Check what files exist on the device
             print(f"[device] {dev_id}: checking remote directory contents for debugging...", flush=True)
             try:
                 ls_result = backend.shell(f"ls -la {shlex.quote(remote_path)}/ 2>/dev/null || echo 'NO_DIR'", check=False)
@@ -3304,7 +3287,6 @@ def pull_external_device_profiles(
 
 
 def trim_incomplete_jsonl_tail(path: Path, block_size: int = 64 * 1024) -> int:
-    """Drop only a non-newline-terminated final record after device attrition."""
     if not path.is_file():
         return 0
     with path.open("r+b") as handle:
@@ -3336,7 +3318,6 @@ def run_standalone_aggregation(
     layout_file: Optional[Path],
     workers_file: Optional[Path],
 ) -> int:
-    """Run the Rust aggregate_profiles binary."""
     root = repo_root()
     aggregate_binary = os.environ.get("SIGNAL_AGGREGATE_PROFILES_BINARY")
     if aggregate_binary:
@@ -3386,11 +3367,6 @@ def run_standalone_aggregation(
     if workers_file:
         cmd += ["--workers-file", str(workers_file)]
 
-    # Remove stale aggregation outputs before regenerating. The in-docker runner
-    # runs as root and may leave root-owned placeholders (e.g. a header-only
-    # events.csv) that this host-side aggregator cannot overwrite in place,
-    # which fails with EACCES. run_dir is owned by the calling user, so unlink
-    # works even for root-owned files inside it.
     for stale in (run_dir / "events.csv", run_dir / "aggregation_manifest.json"):
         if stale.is_file():
             try:
@@ -4097,7 +4073,6 @@ def main() -> int:
             )
             external_oom_monitor.start()
 
-            # Merge external devices into worker layout
             layout_path = run_dir / "worker_layout.json"
             if layout_path.exists():
                 layout_data = json.loads(layout_path.read_text(encoding="utf-8"))
@@ -4109,20 +4084,16 @@ def main() -> int:
                 layout_data["logical_worker_count"] = len(layout_data["clients"])
                 layout_data["physical_worker_count"] = len(layout_data["physical_workers"])
                 layout_path.write_text(json.dumps(layout_data, indent=2), encoding="utf-8")
-                # Also update the temp layout file for the runner
                 if layout_tmp.exists():
                     layout_tmp.write_text(json.dumps(layout_data, indent=2), encoding="utf-8")
 
-            # Merge external devices into workers files
             combined_workers = run_dir / "workers.combined.txt"
             combined_host_workers = run_dir / "workers.combined.host.txt"
 
-            # Start with Docker internal workers
             internal_lines = read_worker_lines(workers_internal_tmp) if workers_internal_tmp.exists() else []
             internal_lines = insert_after_leader(internal_lines, external_worker_lines)
             combined_workers.write_text("\n".join(internal_lines) + "\n", encoding="utf-8")
 
-            # Host workers
             host_lines = read_worker_lines(workers_host_tmp) if workers_host_tmp.exists() else []
             host_lines = insert_after_leader(host_lines, external_worker_lines)
             combined_host_workers.write_text("\n".join(host_lines) + "\n", encoding="utf-8")
@@ -4362,7 +4333,6 @@ def main() -> int:
         else:
             print("[preflight] skipping artifact validation because --preflight-only was used")
 
-        # Stop external device workers
         if external_device_stop_required:
             stop_external_device_workers(args, root)
             external_device_stop_required = False

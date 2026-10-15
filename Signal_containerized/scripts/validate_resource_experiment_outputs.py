@@ -1,25 +1,15 @@
 #!/usr/bin/env -S uv run --frozen python
-"""
-Validate Signal resource experiment output files.
-
-Usage:
-    uv run --frozen python scripts/validate_resource_experiment_outputs.py <run_directory>
-
-Checks that all required sidecar files exist, CSV headers match expected
-schemas, JSON files parse correctly, and cross-file joins are valid.
-
-Exits with code 0 on success, non-zero on validation failure.
-
-Signal supports docker-cgroup memory and app-heap-budget allocator runs.
-"""
 
 import argparse
 import csv
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
 
 EXPECTED_FILES = [
     "resource_profiles.csv",
@@ -483,11 +473,6 @@ class Validator:
             self.error(f"cpu_affinity_plan.json: {e}")
 
     def _check_docker_cgroup_run(self):
-        """Check docker-cgroup memory model runs (Signal has no app-heap-budget).
-
-        Signal uses docker-cgroup for all memory constraints. This validates
-        that docker-cgroup runs are correctly configured.
-        """
         status_rows = self._read_rows(os.path.join(self.run_dir, "run_status.csv"))
         if not status_rows:
             return

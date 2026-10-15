@@ -83,7 +83,6 @@ struct Args {
     /// Zero preserves the ordinary cap-only workload.
     #[arg(
         long = "min-external-samples-per-operation",
-        alias = "min-profiled-samples-per-operation",
         default_value_t = 0
     )]
     min_profiled_samples_per_operation: usize,

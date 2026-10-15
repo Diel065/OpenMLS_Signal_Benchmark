@@ -8,20 +8,14 @@ OPENMLS_DIR="$REPO_ROOT/OpenMLS_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
 export PATH="$HOME/.cargo/bin:$PATH"
-# Output paths are relative to the protocol stack for Compose bind mounts.
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
 N="${N:-1}"
 DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
-# Worker (client) ids of the external devices, from devices.json worker.id.
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 ATTRITION_ALLOWED_WORKER_IDS="${ATTRITION_ALLOWED_WORKER_IDS:-pico-plus-00001}"
 SCENARIO="${SCENARIO:-external-device-openmls-remove-rejoin}"
-# Keep the benchmark running when a profiled (external) device fails: evict it
-# and continue rather than aborting the run.
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
-# Build fresh images + external worker binaries once (first iteration) so the
-# runner and the pushed device workers match the current source tree.
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-1}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
@@ -30,17 +24,13 @@ MAX_SIZE="${MAX_SIZE:-1024}"
 MIN_SIZE="${MIN_SIZE:-4}"
 STEP_SIZE="${STEP_SIZE:-32}"
 PLATEAU_SIZES="${PLATEAU_SIZES:-4,64,256,512,1024}"
-# ASCENDING only: for RemoveCommit / JoinFromWelcome the staircase descent phase
-# is wasted work. Size 4 is the smallest configured plateau that includes the
-# leader and all three external devices, so every plateau gets all device roles.
 PLATEAU_ORDER="${PLATEAU_ORDER:-ascending}"
 ROUNDTRIPS="${ROUNDTRIPS:-1}"
-# remove-rejoin mode: the runner skips update/app phases, so these are zeroed.
 UPDATE_ROUNDS="${UPDATE_ROUNDS:-0}"
 APP_ROUNDS="${APP_ROUNDS:-0}"
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-0}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-0}"
-MIN_EXTERNAL_SAMPLES_PER_OPERATION="${MIN_EXTERNAL_SAMPLES_PER_OPERATION:-${MIN_PROFILED_SAMPLES_PER_OPERATION:-10}}"
+MIN_EXTERNAL_SAMPLES_PER_OPERATION="${MIN_EXTERNAL_SAMPLES_PER_OPERATION:-10}"
 PAYLOAD_SIZES="${PAYLOAD_SIZES:-32}"
 SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
 SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
@@ -55,17 +45,9 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
-relpath_from_stack() {
-  uv run --frozen --project "$REPO_ROOT" python - "$1" "$OPENMLS_DIR" <<'PY'
-import os, sys
-print(os.path.relpath(sys.argv[1], sys.argv[2]))
-PY
-}
 
 mkdir -p "$OUTPUT_ROOT"
-# Path to OUTPUT_ROOT expressed relative to the stack dir, for --output-dir and
-# the compose "./<output_dir>:/results" bind mount.
-OUTPUT_DIR_ARG="$(relpath_from_stack "$OUTPUT_ROOT")"
+OUTPUT_DIR_ARG="$(realpath -ms --relative-to="$OPENMLS_DIR" -- "$OUTPUT_ROOT")"
 
 cleanup_docker() {
   for f in "$OPENMLS_DIR"/docker-compose.*.generated.yml; do

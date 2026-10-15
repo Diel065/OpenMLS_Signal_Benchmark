@@ -1,15 +1,3 @@
-"""
-CPU topology detection and load-sampling utilities.
-
-Detects online CPUs, CPU topology (core, socket, NUMA node), and samples
-per-CPU load from /proc/stat for least-loaded CPU selection.
-
-Uses:
-  - lscpu for topology
-  - /proc/stat for per-CPU load sampling
-  - /sys/devices/system/cpu/ for online status
-"""
-
 import os
 import subprocess
 import time
@@ -20,7 +8,6 @@ import json
 
 @dataclass
 class CpuInfo:
-    """Information about a single CPU thread."""
     cpu_id: int
     core_id: Optional[int] = None
     socket_id: Optional[int] = None
@@ -32,7 +19,6 @@ class CpuInfo:
 
 @dataclass
 class CpuTopology:
-    """Complete CPU topology snapshot."""
     cpus: Dict[int, CpuInfo] = field(default_factory=dict)
     online_cpu_count: int = 0
     total_cpu_count: int = 0
@@ -42,7 +28,6 @@ class CpuTopology:
 
 @dataclass
 class CpuStat:
-    """Per-CPU /proc/stat snapshot."""
     user: int = 0
     nice: int = 0
     system: int = 0
@@ -66,11 +51,6 @@ class CpuStat:
 
 
 def detect_cpu_topology() -> CpuTopology:
-    """Detect CPU topology using lscpu and /sys/devices/system/cpu/.
-
-    Falls back gracefully if lscpu is not available, detecting only
-    online CPUs from /sys/devices/system/cpu/cpu*/online.
-    """
     topology = CpuTopology()
 
     lscpu_topology: Dict[int, Dict[str, Optional[int]]] = {}
@@ -156,7 +136,6 @@ def detect_cpu_topology() -> CpuTopology:
 
 
 def _detect_online_cpus_from_sys() -> List[int]:
-    """Detect online CPUs from /sys/devices/system/cpu/cpu*/online."""
     cpus = []
     sys_cpu_path = "/sys/devices/system/cpu"
     if not os.path.exists(sys_cpu_path):
@@ -179,15 +158,10 @@ def _detect_online_cpus_from_sys() -> List[int]:
 
 
 def get_online_cpu_list(topology: CpuTopology) -> List[int]:
-    """Get a sorted list of online CPU IDs from topology."""
     return sorted(cpu_id for cpu_id, info in topology.cpus.items() if info.online)
 
 
 def _parse_proc_stat_cpu_line(line: str) -> Tuple[int, CpuStat]:
-    """Parse a single CPU line from /proc/stat.
-
-    Returns (cpu_id, CpuStat). The 'cpu' total line has cpu_id=-1.
-    """
     parts = line.strip().split()
     if not parts:
         return -1, CpuStat()
@@ -211,13 +185,6 @@ def _parse_proc_stat_cpu_line(line: str) -> Tuple[int, CpuStat]:
 
 
 def sample_cpu_load(duration_seconds: float = 20.0) -> Dict[int, float]:
-    """Sample per-CPU busy fraction over the given duration.
-
-    Reads /proc/stat twice, waiting duration_seconds between reads,
-    and computes the busy fraction per CPU.
-
-    Returns a dict mapping cpu_id -> busy_fraction (0.0 to 1.0).
-    """
     def read_proc_stat() -> Dict[int, CpuStat]:
         stats: Dict[int, CpuStat] = {}
         try:
@@ -265,24 +232,6 @@ def select_least_loaded_cpus(
     prefer_physical_cores: bool = True,
     reserve_smt_siblings: bool = False,
 ) -> List[int]:
-    """Select the least-loaded CPUs for profiled worker assignment.
-
-    If required_count is 0, returns an empty list (no CPUs to assign).
-
-    Args:
-        topology: Detected CPU topology.
-        required_count: Number of CPUs to select.
-        load_samples: Per-CPU busy fractions (0.0 to 1.0).
-        exclude_cpus: CPUs to exclude from selection.
-        prefer_physical_cores: If True, prefer CPUs that are NOT SMT siblings.
-        reserve_smt_siblings: If True, also reserve the SMT siblings of selected CPUs.
-
-    Returns:
-        Sorted list of selected CPU IDs.
-
-    Raises:
-        ValueError: If insufficient CPUs are available.
-    """
     if required_count <= 0:
         return []
 
@@ -340,11 +289,6 @@ def select_least_loaded_cpus(
 
 
 def get_smt_siblings(topology: CpuTopology, cpu_list: List[int]) -> List[int]:
-    """Get SMT sibling CPUs for the given CPU list.
-
-    Returns CPUs that share a physical core with any CPU in the input list,
-    excluding the input CPUs themselves.
-    """
     if not topology.smt_enabled:
         return []
 
@@ -361,7 +305,6 @@ def get_smt_siblings(topology: CpuTopology, cpu_list: List[int]) -> List[int]:
 
 
 def topology_to_dict(topology: CpuTopology) -> Dict:
-    """Convert a CpuTopology to a JSON-serializable dict."""
     cpus_list = []
     for cpu_id in sorted(topology.cpus.keys()):
         info = topology.cpus[cpu_id]

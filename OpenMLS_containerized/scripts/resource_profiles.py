@@ -1,16 +1,3 @@
-"""
-Resource profile generation for RAM sweep, CPU matrix, and parallel sweep experiments.
-
-Generates structured resource profiles for:
-  - ram_sweep_singleton: Sweep memory limits with abundant CPU
-  - cpu_matrix_singleton: Matrix of (core_count, capacity_fraction) combinations
-  - embedded_budget_singleton: App heap budget x Docker CPU combinations
-  - ram_app_heap_sweep: Parallel 10-profile sweep of application heap budgets
-  - cpu_quota_sweep: Parallel 10-profile sweep of Docker CPU fractions
-
-Supports explicit profile selection via index or ID for single-profile
-scientific threshold experiments. Supports parallel 10-profile sweeps.
-"""
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -26,18 +13,17 @@ DOCKER_CFS_MAX_PERIOD_US = 1_000_000
 
 @dataclass
 class ResourceProfile:
-    """A single resource profile for a profiled singleton container."""
     resource_profile_id: str
-    experiment_kind: str  # "ram_sweep_singleton", "cpu_matrix_singleton", "embedded_budget_singleton", "ram_app_heap_sweep", "cpu_quota_sweep"
+    experiment_kind: str
     profile_label: str
     resource_profile_index: int = -1
-    cpu_limit_cpus: Optional[float] = None  # Docker cpus quota
-    capacity_fraction: Optional[float] = None  # 0.25, 0.50, etc.
+    cpu_limit_cpus: Optional[float] = None
+    capacity_fraction: Optional[float] = None
     assigned_cpu_count: int = 1
-    memory_limit: Optional[str] = None  # e.g., "128m"
+    memory_limit: Optional[str] = None
     memory_swap: Optional[str] = None
     rayon_num_threads: int = 1
-    cpuset_cpus: Optional[str] = None  # Docker cpuset string
+    cpuset_cpus: Optional[str] = None
     cpuset_mask_hex: Optional[str] = None
     profile_notes: str = ""
     selected_for_this_run: bool = False
@@ -88,7 +74,6 @@ class ResourceProfile:
         }
 
     def to_csv_row(self) -> Dict:
-        """Return a dict suitable for CSV writing, with empty strings for None."""
         return self.to_dict()
 
 
@@ -97,21 +82,6 @@ def generate_ram_sweep_profiles(
     assigned_cpu_count: int = 10,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate resource profiles for a RAM sweep experiment.
-
-    Each profile varies only memory_limit; CPU is abundant.
-    CPU quota is unset (cpu_limit_cpus = None).
-    RAYON_NUM_THREADS = assigned_cpu_count.
-    memory_swap = memory_limit for each profile.
-
-    Args:
-        ram_values: List of memory limit strings, e.g., ["32m", "64m", "128m"].
-        assigned_cpu_count: Number of CPUs assigned to cpuset.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of ResourceProfile objects, one per RAM value.
-    """
     if len(ram_values) > 32:
         raise ValueError(f"RAM sweep supports at most 32 values, got {len(ram_values)}")
 
@@ -152,24 +122,6 @@ def generate_cpu_matrix_profiles(
     high_memory_limit: Optional[str] = None,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate resource profiles for a CPU matrix experiment.
-
-    Creates a full Cartesian product of core_counts x capacity_fractions.
-    Docker cpus quota = assigned_cpu_count * capacity_fraction.
-    RAYON_NUM_THREADS = assigned_cpu_count.
-    Memory is unlimited or set to a safe high value (not an experimental variable).
-
-    Invalid combinations (e.g., capacity > assigned_cpu_count) are skipped.
-
-    Args:
-        core_counts: List of CPU thread counts, e.g., [1, 2, 4].
-        capacity_fractions: List of capacity fractions, e.g., [0.25, 0.5, 0.75, 1.0].
-        high_memory_limit: Optional safe-high memory limit to prevent RAM bottleneck.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of ResourceProfile objects.
-    """
     profiles = []
     for assigned_cpus in core_counts:
         if assigned_cpus < 1:
@@ -220,12 +172,6 @@ def generate_embedded_budget_profiles(
     docker_memory_limit: str = "256m",
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate profiles for deeply embedded application heap-budget experiments.
-
-    Docker still supplies CPU affinity/quota and a safe Linux container memory
-    envelope. The small memory variable is passed to the Rust worker as an
-    application heap budget and is not used as a Docker memory limit.
-    """
     if not validate_memory_string(docker_memory_limit):
         raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")
     docker_memory_bytes = parse_memory_to_bytes(docker_memory_limit)
@@ -306,25 +252,6 @@ def generate_parallel_ram_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate parallel app-heap budget profiles for RAM sweep.
-
-    Each profile tests a single application heap budget.
-    Docker memory is held high (4 GiB default) so Linux/container memory
-    is not the limiting factor.
-    CPU is non-limiting: one core per worker with capacity 1.0.
-
-    The highest-valued profile (1 GiB = largest heap budget) is marked
-    as the group creator.
-
-    Args:
-        heap_budgets: List of heap budget strings.
-        docker_memory_limit: Safe Docker memory limit for all containers.
-        assigned_cpu_count: CPU cores assigned to each profiled worker.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        ResourceProfile objects, ordered by increasing budget.
-    """
     if heap_budgets is None:
         heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
     if not heap_budgets:
@@ -403,30 +330,6 @@ def generate_parallel_cpu_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 10 parallel CPU quota profiles for CPU sweep.
-
-    Each profile tests a single Docker CPU fraction.
-    App heap budget is held absurdly high (64 GiB default) so memory
-    cannot plausibly be the limiting factor.
-    Docker memory is a safe container envelope above the heap budget.
-
-    The highest-valued profile (1.00 CPU fraction) is marked as the
-    group creator.
-
-    CPU period starts at 100000 us (standard Docker/CFS default) and may
-    scale up to Docker's 1000000 us CFS period limit so tiny fractions still
-    have distinct quotas.
-
-    Args:
-        cpu_fractions: List of 10 CPU fraction values.
-        app_heap_budget: Absurdly high heap budget string.
-        docker_memory_limit: Docker memory envelope (above heap budget).
-        assigned_cpu_count: CPU cores assigned to each profiled worker.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of 10 ResourceProfile objects, ordered by decreasing fraction.
-    """
     if cpu_fractions is None:
         cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
     if len(cpu_fractions) != 10:
@@ -540,15 +443,10 @@ def generate_parallel_cpu_sweep_profiles(
 
 
 def generate_resource_profile_id(experiment_kind: str, index: int, key: str) -> str:
-    """Generate a unique resource profile ID."""
     return f"{experiment_kind}_{key}_{index}"
 
 
 def validate_memory_string(mem_str: str) -> bool:
-    """Validate a Docker memory limit string like '128m' or '1g'.
-
-    Returns True if valid, False otherwise.
-    """
     if not mem_str:
         return True
 
@@ -558,11 +456,6 @@ def validate_memory_string(mem_str: str) -> bool:
 
 
 def parse_memory_to_bytes(mem_str: str) -> int:
-    """Parse a Docker memory string to bytes.
-
-    Supports: b (bytes), k (kilobytes), m (megabytes), g (gigabytes).
-    Returns -1 for unparseable strings.
-    """
     if not mem_str:
         return -1
 
@@ -585,16 +478,6 @@ def parse_memory_to_bytes(mem_str: str) -> int:
 
 
 def profile_to_compose_dict(profile: ResourceProfile) -> Dict:
-    """Convert a ResourceProfile to a dict suitable for docker-compose generation.
-
-    Returns a dict with keys that can be directly merged into a compose service definition.
-    Fields that are None are omitted from the result.
-
-    When cpu_quota_us is explicitly set and cpu_period_us differs from the Docker
-    default of 100000 us, cpu_quota and cpu_period compose keys are emitted instead
-    of the cpus key.  This avoids the cgroup v2 cpu.max minimum-quota floor (1000 us)
-    that would otherwise collapse sub-0.01-CPU profiles into a single effective limit.
-    """
     result: Dict = {}
 
     if profile.cpuset_cpus:
@@ -619,18 +502,6 @@ def select_profile_by_index(
     profiles: List[ResourceProfile],
     profile_index: int,
 ) -> ResourceProfile:
-    """Select a single resource profile by its zero-based index.
-
-    Args:
-        profiles: List of all available resource profiles.
-        profile_index: Zero-based index into the list.
-
-    Returns:
-        The selected ResourceProfile with selected_for_this_run set to True.
-
-    Raises:
-        ValueError: If profile_index is out of range.
-    """
     if profile_index < 0 or profile_index >= len(profiles):
         raise ValueError(
             f"Resource profile index {profile_index} is out of range "
@@ -649,18 +520,6 @@ def select_profile_by_id(
     profiles: List[ResourceProfile],
     profile_id: str,
 ) -> ResourceProfile:
-    """Select a single resource profile by its resource_profile_id.
-
-    Args:
-        profiles: List of all available resource profiles.
-        profile_id: The resource_profile_id to match.
-
-    Returns:
-        The selected ResourceProfile with selected_for_this_run set to True.
-
-    Raises:
-        ValueError: If no profile matches the given ID.
-    """
     for p in profiles:
         p.selected_for_this_run = False
 
@@ -682,26 +541,6 @@ def select_profile(
     profile_id: Optional[str] = None,
     profiled_singleton_count: int = 1,
 ) -> ResourceProfile:
-    """Select a single resource profile for a threshold experiment.
-
-    In production threshold mode (profiled_singleton_count == 1), exactly
-    one profile must be selected. Fails if neither index nor ID is provided.
-
-    In parallel sweep mode (profiled_singleton_count > 1), returns the first
-    profile as default; use select_all_profiles() for full assignment.
-
-    Args:
-        profiles: List of all available resource profiles.
-        profile_index: Optional zero-based index.
-        profile_id: Optional resource_profile_id string.
-        profiled_singleton_count: Number of profiled singletons.
-
-    Returns:
-        The selected ResourceProfile.
-
-    Raises:
-        ValueError: If selection is ambiguous, mismatched, or missing.
-    """
     if profiled_singleton_count == 1:
         if profile_index is None and profile_id is None:
             raise ValueError(
@@ -731,14 +570,6 @@ def select_profile(
 
 
 def select_all_profiles(profiles: List[ResourceProfile]) -> List[ResourceProfile]:
-    """Mark all profiles as selected for a parallel sweep run.
-
-    Args:
-        profiles: List of all available resource profiles.
-
-    Returns:
-        The same list with all profiles marked selected_for_this_run=True.
-    """
     for p in profiles:
         p.selected_for_this_run = True
     return profiles
@@ -748,10 +579,6 @@ def select_profiles_for_parallel_sweep(
     profiles: List[ResourceProfile],
     profiled_singleton_count: int,
 ) -> List[ResourceProfile]:
-    """Select N profiles for N profiled singletons.
-    Assigns one profile per singleton, cyclically if needed.
-    Marks all selected.
-    """
     if profiled_singleton_count > len(profiles):
         assigned = []
         for i in range(profiled_singleton_count):
@@ -770,7 +597,6 @@ def select_profiles_for_parallel_sweep(
 
 
 def get_group_creator_profile(profiles: List[ResourceProfile]) -> Optional[ResourceProfile]:
-    """Get the profile marked as group_creator, if any."""
     for p in profiles:
         if p.group_creator:
             return p
@@ -778,7 +604,6 @@ def get_group_creator_profile(profiles: List[ResourceProfile]) -> Optional[Resou
 
 
 def get_group_creator_client_index(profiles: List[ResourceProfile]) -> Optional[int]:
-    """Get the resource_profile_index of the group creator profile."""
     gc = get_group_creator_profile(profiles)
     if gc is not None:
         return gc.resource_profile_index
@@ -786,7 +611,6 @@ def get_group_creator_client_index(profiles: List[ResourceProfile]) -> Optional[
 
 
 def get_selected_profile(profiles: List[ResourceProfile]) -> Optional[ResourceProfile]:
-    """Get the currently selected profile from a list, if any."""
     for p in profiles:
         if p.selected_for_this_run:
             return p
@@ -794,7 +618,6 @@ def get_selected_profile(profiles: List[ResourceProfile]) -> Optional[ResourcePr
 
 
 def get_selected_profile_index(profiles: List[ResourceProfile]) -> Optional[int]:
-    """Get the index of the selected profile, if any."""
     sp = get_selected_profile(profiles)
     if sp is not None:
         return sp.resource_profile_index

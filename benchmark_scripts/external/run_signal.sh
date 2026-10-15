@@ -8,7 +8,6 @@ SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
 export PATH="$HOME/.cargo/bin:$PATH"
-# Output paths are relative to the protocol stack for Compose bind mounts.
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
 N="${N:-1}"
 if [ "$N" != "1" ]; then
@@ -17,14 +16,9 @@ if [ "$N" != "1" ]; then
 fi
 DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
-# Worker/client ids of the external devices, from Signal_containerized/devices.json.
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 SCENARIO="${SCENARIO:-external-device-signal-pairwise-baseline}"
-# Keep the (single) run going if a profiled external device fails: evict it and
-# continue instead of aborting the whole run.
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
-# Build fresh images + external worker binaries on this run so the runner,
-# Docker workers, and pushed device workers all match current source.
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-1}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
@@ -39,11 +33,9 @@ PLATEAU_ORDER="${PLATEAU_ORDER:-ascending}"
 ROUNDTRIPS="${ROUNDTRIPS:-1}"
 APP_ROUNDS="${APP_ROUNDS:-4}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
-MIN_EXTERNAL_SAMPLES_PER_OPERATION="${MIN_EXTERNAL_SAMPLES_PER_OPERATION:-${MIN_PROFILED_SAMPLES_PER_OPERATION:-10}}"
+MIN_EXTERNAL_SAMPLES_PER_OPERATION="${MIN_EXTERNAL_SAMPLES_PER_OPERATION:-10}"
 PAYLOAD_SIZES="${PAYLOAD_SIZES:-512}"
 
-# One unprofiled singleton is retained for the hybrid layout. Every Docker
-# client is unprofiled; only real-device layout entries emit measurements.
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-0}"
 SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-1}"
 SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
@@ -59,22 +51,9 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
-relpath_from_stack() {
-  uv run --frozen --project "$REPO_ROOT" python - "$1" "$SIGNAL_DIR" <<'PY'
-import os, sys
-print(os.path.relpath(sys.argv[1], sys.argv[2]))
-PY
-}
-
-random_seed() {
-  uv run --frozen --project "$REPO_ROOT" python - <<'PY'
-import random
-print(random.randint(1, 2147483647))
-PY
-}
 
 mkdir -p "$OUTPUT_ROOT"
-OUTPUT_DIR_ARG="$(relpath_from_stack "$OUTPUT_ROOT")"
+OUTPUT_DIR_ARG="$(realpath -ms --relative-to="$SIGNAL_DIR" -- "$OUTPUT_ROOT")"
 
 cleanup_docker() {
   for f in "$SIGNAL_DIR"/docker-compose.*.generated.yml; do
@@ -150,8 +129,8 @@ run_external_signal() {
   local scenario_seed singleton_selection_seed
   local -a device_args build_args image_args
 
-  scenario_seed="$(random_seed)"
-  singleton_selection_seed="$(random_seed)"
+  scenario_seed="$(shuf -i 1-2147483647 -n 1)"
+  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
 
   image_args=()
   build_args=()

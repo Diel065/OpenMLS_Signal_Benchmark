@@ -1,12 +1,3 @@
-"""
-Sidecar file writers for Signal resource experiment output files.
-
-Writes resource_profiles.csv, worker_resource_assignments.csv,
-resource_summary.csv, worker_failures.csv, run_status.csv,
-and benchmark_timeline.csv.
-
-Adapted for Signal (docker-cgroup memory model, no app-heap-budget allocator).
-"""
 
 import csv
 import json
@@ -247,7 +238,6 @@ BENCHMARK_TIMELINE_HEADER = [
 
 
 class SidecarWriter:
-    """Writes resource experiment sidecar files incrementally."""
 
     def __init__(self, output_dir: str):
         self.output_dir = output_dir

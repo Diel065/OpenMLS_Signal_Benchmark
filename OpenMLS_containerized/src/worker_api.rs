@@ -1152,9 +1152,6 @@ pub async fn maybe_retry_pending_intent(
 }
 
 fn restore_profiling_context(client: &Client, benchmark_context: &BenchmarkContext) {
-    // Tokio may resume this command on another worker thread after an await.
-    // OpenMLS profiling context is thread-local, so restore it immediately
-    // before every synchronous operation that can emit profiling events.
     set_worker_id(client.name.clone());
     set_benchmark_context(benchmark_context.clone());
 }

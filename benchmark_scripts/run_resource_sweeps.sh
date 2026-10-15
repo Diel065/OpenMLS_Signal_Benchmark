@@ -57,7 +57,6 @@ STEP_SIZE_SWITCH_AT="${STEP_SIZE_SWITCH_AT:-}"
 STEP_SIZE_AFTER_SWITCH="${STEP_SIZE_AFTER_SWITCH:-}"
 CPU_THROTTLED_PERIOD_THRESHOLD="${CPU_THROTTLED_PERIOD_THRESHOLD:-0.05}"
 
-# Signal-specific defaults (smaller sizes, pairwise semantics)
 SIGNAL_MIN_CONVERSATION_SIZE="${SIGNAL_MIN_CONVERSATION_SIZE:-2}"
 SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-256}"
 SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
@@ -94,10 +93,7 @@ cleanup_docker_signal() {
 output_dir_arg_for() {
   local base_dir="$1"
   if [ -n "$OUTPUT_ROOT" ]; then
-    uv run --frozen --project "$REPO_ROOT" python - "$OUTPUT_ROOT" "$base_dir" <<'PY'
-import os, sys
-print(os.path.relpath(sys.argv[1], sys.argv[2]))
-PY
+    realpath -ms --relative-to="$base_dir" -- "$OUTPUT_ROOT"
   else
     printf '%s\n' benchmark_output
   fi
@@ -368,7 +364,6 @@ run_signal_sweep() {
 
 raise_nofile_limit
 
-# ── OpenMLS sweeps ──────────────────────────────────────────────────────────
 if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
   cleanup_docker
   for iter in $(seq 1 "$N"); do
@@ -385,7 +380,6 @@ if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
   echo "All constrained container OpenMLS sweeps completed."
 fi
 
-# ── Signal sweeps ───────────────────────────────────────────────────────────
 if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
   cleanup_docker_signal
   for iter in $(seq 1 "$N"); do

@@ -4897,8 +4897,6 @@ fn cap_count(raw: usize, cap: usize) -> usize {
 }
 
 fn membership_batch_group_cap(_current_group_size: usize) -> usize {
-    // AddCommit permits k > N. An N-dependent ceiling systematically starved
-    // larger k values, so the publication sampler uses a fixed configured cap.
     MAX_RANDOM_MEMBERSHIP_BATCH_SIZE
 }
 
@@ -5041,7 +5039,6 @@ fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize)
     let one_based_index =
         ((sample_no + 1) as u128 * member_count as u128 / sample_count as u128) as usize;
 
-    // Pick the right edge of each equal bucket: e.g. 20 / 4 => 5, 10, 15, 20.
     one_based_index.saturating_sub(1)
 }
 
@@ -5103,10 +5100,6 @@ fn build_commit_receive_sampling_map(
         seq_no,
     );
 
-    // External devices are the scarce observations in hybrid campaigns. They
-    // remain part of the deterministic sample even when the ordinary cap would
-    // select different recipients. This can exceed max_samples by the number
-    // of external devices, and the recorded sample count/index reflects that.
     for (idx, worker) in recipients.iter().enumerate() {
         if worker.profile_enabled && is_external_device(worker) && !sample_indices.contains(&idx) {
             sample_indices.push(idx);
@@ -5323,8 +5316,6 @@ async fn add_n_members(
         return Ok(());
     }
     let joiners = prepared_joiners;
-    // OOM attrition can shrink a planned batch. Persist the actual commit k,
-    // while retaining the requested value and caps for sampling diagnostics.
     batch_decision.effective = joiners.len();
     let joiner_ids: Vec<String> = joiners.iter().map(|joiner| joiner.id.clone()).collect();
 
@@ -7331,9 +7322,6 @@ async fn recover_remove_rejoin_cycle_failure(
         }
     }
 
-    // A failure can occur while either the remove or re-add commit is in
-    // flight. Removing both cycle participants gives the surviving members a
-    // single unambiguous state; healthy participants can rejoin later.
     evict_oom_group_members(
         http,
         active,
@@ -7393,7 +7381,6 @@ async fn run_single_remove_rejoin_cycle(
         plateau_size, victim.id, actor.id, remove_victim_active
     );
 
-    // ── Generate KeyPackage (profiled, uploaded to DS) ──
     let kp_cursor = BenchmarkCursor::new(
         plateau_index,
         plateau_size,
@@ -7410,9 +7397,7 @@ async fn run_single_remove_rejoin_cycle(
     );
     let _ =
         send_command_with_context(http, victim, &Command::GenerateKeyPackage, &kp_context).await?;
-    // KeyPackage is now stored on DS at /keypackage/{victim.id}; AddMembers will fetch it.
 
-    // ── Remove victim ──
     let remove_cursor = BenchmarkCursor::new(
         plateau_index,
         plateau_size,
@@ -7470,7 +7455,6 @@ async fn run_single_remove_rejoin_cycle(
         .await?;
     }
 
-    // Fanout RemoveCommit receivers
     {
         let recipients: Vec<WorkerSpec> = active
             .iter()
@@ -7556,11 +7540,9 @@ async fn run_single_remove_rejoin_cycle(
         .await?;
     }
 
-    // Move victim to idle
     active.retain(|w| w.id != victim.id);
     idle.push_back(victim.clone());
 
-    // ── Re-add victim ──
     let re_add_active = active.len() + 1;
     let add_cursor = BenchmarkCursor::new(
         plateau_index,
@@ -7621,7 +7603,6 @@ async fn run_single_remove_rejoin_cycle(
         .await?;
     }
 
-    // Fanout AddCommit receivers
     {
         let recipients: Vec<WorkerSpec> = active
             .iter()
@@ -7707,7 +7688,6 @@ async fn run_single_remove_rejoin_cycle(
         .await?;
     }
 
-    // ── Victim processes Welcome via JoinFromWelcome (fetches from DS) ──
     let welcome_cursor = BenchmarkCursor::new(
         plateau_index,
         plateau_size,
@@ -8477,7 +8457,6 @@ pub fn aggregate_csv(
         worker_ids.iter().map(|s| s.as_str()).collect()
     };
 
-    // Build per-client metadata lookup from layout clients
     let mut client_meta: std::collections::HashMap<&str, &WorkerLayoutClient> =
         std::collections::HashMap::new();
     let mut physical_meta: std::collections::HashMap<&str, &WorkerLayoutPhysicalWorker> =
@@ -9695,8 +9674,6 @@ mod aggregate_csv_resource_tests {
     }
 }
 
-/// Validate a run ID string for safe filesystem usage.
-/// Rejects empty, `/`, `.`, `..`, strings containing `/`, or anything outside `[A-Za-z0-9._-]+`.
 pub fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty() {
         return Err(anyhow!("Run ID must not be empty"));

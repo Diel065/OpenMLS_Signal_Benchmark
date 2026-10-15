@@ -12,6 +12,5 @@ pub use staircase_runner::{
     WorkerLayoutClient, WorkerLayoutPhysicalWorker,
 };
 
-pub mod local_launcher;
 
 pub mod message_relay;

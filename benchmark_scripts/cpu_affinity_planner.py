@@ -1,14 +1,3 @@
-"""
-CPU affinity planner.
-
-Implements the full CPU affinity planning pipeline:
-  1. Detect online CPUs and topology
-  2. Sample per-CPU load
-  3. Select least-loaded CPUs for profiled workers
-  4. Compute profiled/background masks
-  5. Write cpu_affinity_plan.json
-"""
-
 import json
 import os
 import socket
@@ -16,17 +5,12 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
-try:
-    from .cpu_mask_util import cpu_list_to_mask, cpu_list_to_docker_cpuset, mask_to_hex, mask_to_cpu_list, masks_overlap, complement_mask
-    from .cpu_topology import detect_cpu_topology, get_online_cpu_list, sample_cpu_load, select_least_loaded_cpus, get_smt_siblings, topology_to_dict
-except ImportError:
-    from cpu_mask_util import cpu_list_to_mask, cpu_list_to_docker_cpuset, mask_to_hex, mask_to_cpu_list, masks_overlap, complement_mask
-    from cpu_topology import detect_cpu_topology, get_online_cpu_list, sample_cpu_load, select_least_loaded_cpus, get_smt_siblings, topology_to_dict
+from cpu_mask_util import cpu_list_to_mask, mask_to_cpu_list, masks_overlap, complement_mask
+from cpu_topology import detect_cpu_topology, get_online_cpu_list, sample_cpu_load, select_least_loaded_cpus, get_smt_siblings, topology_to_dict
 
 
 @dataclass
 class ProfiledAssignment:
-    """Assignment of a profiled singleton to specific CPUs."""
     worker_id: str
     container_name: str
     logical_client_id: str
@@ -40,22 +24,20 @@ class ProfiledAssignment:
 
 @dataclass
 class BackgroundAssignment:
-    """Assignment of a background container to the background mask."""
     container_name: str
-    container_role: str  # "packed", "infrastructure", "runner_or_helper"
+    container_role: str
     assigned_cpus: List[int]
     assigned_mask_hex: str
 
 
 @dataclass
 class AffinityPlan:
-    """Complete CPU affinity plan for a benchmark run."""
     run_id: str
     created_at: str
     hostname: str
-    cpu_affinity_mode: str  # "profiled-nor-background" or "none"
+    cpu_affinity_mode: str
     sample_seconds: float
-    selection_policy: str  # "least_loaded"
+    selection_policy: str
     online_cpus: List[int]
     online_cpu_mask_hex: str
     cpu_topology: Dict[str, Any]
@@ -79,27 +61,6 @@ def create_affinity_plan(
     reserve_smt_siblings: bool = False,
     profiled_cpu_counts: Optional[Dict[str, int]] = None,
 ) -> AffinityPlan:
-    """Create a complete CPU affinity plan.
-
-    Args:
-        run_id: Benchmark run ID.
-        profiled_worker_specs: List of dicts with keys:
-            worker_id, container_name, logical_client_id, experiment_kind,
-            resource_profile_id
-        background_specs: List of dicts with keys:
-            container_name, container_role
-        cpu_affinity_mode: Affinity mode string.
-        sample_seconds: Duration in seconds for CPU load sampling.
-        reserve_smt_siblings: Whether to reserve SMT siblings.
-        profiled_cpu_counts: Optional dict mapping worker_id -> required CPU count.
-                             If not provided, each profiled worker gets 1 CPU.
-
-    Returns:
-        An AffinityPlan object.
-
-    Raises:
-        ValueError: If insufficient CPUs are available.
-    """
     if cpu_affinity_mode == "none":
         return _create_empty_affinity_plan(run_id, sample_seconds)
 
@@ -165,7 +126,7 @@ def create_affinity_plan(
             container_name=spec["container_name"],
             logical_client_id=spec["logical_client_id"],
             assigned_cpus=sorted(assigned),
-            assigned_mask_hex=mask_to_hex(mask),
+            assigned_mask_hex=hex(mask),
             assigned_cpu_count=len(assigned),
             rayon_num_threads=rayon_n,
             experiment_kind=spec.get("experiment_kind", ""),
@@ -195,7 +156,7 @@ def create_affinity_plan(
         )
 
     background_assignments: List[BackgroundAssignment] = []
-    bg_mask_hex = mask_to_hex(background_mask)
+    bg_mask_hex = hex(background_mask)
     for spec in background_specs:
         background_assignments.append(BackgroundAssignment(
             container_name=spec["container_name"],
@@ -220,12 +181,12 @@ def create_affinity_plan(
         sample_seconds=sample_seconds,
         selection_policy="least_loaded",
         online_cpus=online_cpus,
-        online_cpu_mask_hex=mask_to_hex(online_mask),
+        online_cpu_mask_hex=hex(online_mask),
         cpu_topology=topology_to_dict(topology),
         sampled_cpu_load=load_samples,
         profiled_assignments=profiled_assignments,
-        profiled_mask_hex=mask_to_hex(profiled_mask),
-        reserved_mask_hex=mask_to_hex(reserved_mask),
+        profiled_mask_hex=hex(profiled_mask),
+        reserved_mask_hex=hex(reserved_mask),
         background_cpus=background_cpus,
         background_mask_hex=bg_mask_hex,
         smt_sibling_policy=smt_policy,
@@ -237,7 +198,6 @@ def create_affinity_plan(
 
 
 def _create_empty_affinity_plan(run_id: str, sample_seconds: float) -> AffinityPlan:
-    """Create an empty affinity plan when affinity mode is 'none'."""
     return AffinityPlan(
         run_id=run_id,
         created_at=time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -261,10 +221,6 @@ def _create_empty_affinity_plan(run_id: str, sample_seconds: float) -> AffinityP
 
 
 def write_affinity_plan_json(plan: AffinityPlan, output_dir: str) -> str:
-    """Write the affinity plan to cpu_affinity_plan.json.
-
-    Returns the path to the written file.
-    """
     os.makedirs(output_dir, exist_ok=True)
     filepath = os.path.join(output_dir, "cpu_affinity_plan.json")
 
@@ -318,32 +274,7 @@ def write_affinity_plan_json(plan: AffinityPlan, output_dir: str) -> str:
     return filepath
 
 
-def get_background_cpuset(plan: AffinityPlan) -> str:
-    """Get the Docker cpuset string for background containers."""
-    return cpu_list_to_docker_cpuset(plan.background_cpus)
-
-
-def get_profiled_cpuset(plan: AffinityPlan, worker_id: str) -> Optional[str]:
-    """Get the Docker cpuset string for a specific profiled worker."""
-    for pa in plan.profiled_assignments:
-        if pa.worker_id == worker_id:
-            return cpu_list_to_docker_cpuset(pa.assigned_cpus)
-    return None
-
-
-def get_rayon_num_threads(plan: AffinityPlan, worker_id: str) -> Optional[int]:
-    """Get the RAYON_NUM_THREADS value for a specific profiled worker."""
-    for pa in plan.profiled_assignments:
-        if pa.worker_id == worker_id:
-            return pa.rayon_num_threads
-    return None
-
-
 def validate_affinity_plan(plan: AffinityPlan) -> List[str]:
-    """Validate an affinity plan for correctness.
-
-    Returns a list of error messages (empty if valid).
-    """
     errors: List[str] = []
 
     if plan.cpu_affinity_mode == "none":

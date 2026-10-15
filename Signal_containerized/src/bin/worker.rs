@@ -698,7 +698,6 @@ async fn participant_command_actor(
             }
         }
 
-        // Keep counter I/O outside the existing wrapper CPU/allocation measurements.
         let throttled_start = slot.profile_enabled
             .then(libsignal_protocol::profiling::current_cpu_throttled_ns)
             .flatten();

@@ -1,15 +1,3 @@
-"""
-Failure classification and tracking for Signal resource experiments.
-
-Tracks when and where a profiled singleton failed, classifies failures,
-and writes worker_failures.csv and run_status.csv.
-
-Includes cross-referencing with events.csv to extract benchmark cursor
-context (group size, operation, phase) when a worker fails.
-
-Adapted for Signal: docker-cgroup memory model (no app-heap-budget allocator).
-Signal uses conversation_size/participant_count instead of member_count/epoch.
-"""
 
 import csv
 import json
@@ -41,7 +29,6 @@ FAILURE_CLASSES = [
 
 @dataclass
 class WorkerFailureInfo:
-    """Information about a worker failure for classification."""
     worker_id: str
     physical_worker_id: str = ""
     logical_client_id: str = ""

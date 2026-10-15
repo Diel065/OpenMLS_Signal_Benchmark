@@ -1,12 +1,3 @@
-"""
-Failure classification and tracking for resource experiments.
-
-Tracks when and where a profiled singleton failed, classifies failures,
-and writes worker_failures.csv and run_status.csv.
-
-Includes cross-referencing with events.csv to extract benchmark cursor
-context (group size, operation, epoch, phase) when a worker fails.
-"""
 
 import csv
 import json
@@ -38,7 +29,6 @@ FAILURE_CLASSES = [
 
 @dataclass
 class WorkerFailureInfo:
-    """Information about a worker failure for classification."""
     worker_id: str
     physical_worker_id: str = ""
     logical_client_id: str = ""
@@ -94,21 +84,6 @@ def classify_worker_failure(
     resource_samples_path: Optional[str] = None,
     cpu_throttle_threshold_fraction: float = 0.5,
 ) -> str:
-    """Classify a worker failure based on available evidence.
-
-    Returns one of the FAILURE_CLASSES strings.
-
-    Classification rules (in order):
-    1. If container was OOM-killed (Docker state or cgroup): hard_ram_oom_kill
-    2. If oom_events.jsonl records an OOM kill: hard_ram_oom_kill
-    3. If container exited nonzero without OOM evidence: hard_container_exit
-    4. If worker is unreachable (health check fails): worker_unreachable
-    5. If infrastructure (DS/relay) failed: infrastructure_failure
-    6. If benchmark protocol failure: benchmark_protocol_failure
-    7. If CPU-starved (timeout, high throttling, no OOM): cpu_starvation_suspected
-    8. If memory pressure without OOM: memory_pressure_no_oom
-    9. Otherwise: unknown_failure
-    """
     failure_class = "unknown_failure"
 
     oom_killed = info.container_oom_killed or check_oom_events_file(
@@ -152,10 +127,6 @@ def classify_worker_failure_from_resource_summary(
     resource_summary: Dict[str, Any],
     oom_events_path: Optional[str] = None,
 ) -> Tuple[str, WorkerFailureInfo]:
-    """Classify failure from a resource_summary.csv row dict.
-
-    Returns (failure_class, WorkerFailureInfo).
-    """
     info = WorkerFailureInfo(
         worker_id=str(resource_summary.get("worker_id", "")),
         physical_worker_id=str(resource_summary.get("physical_worker_id", "")),
@@ -199,7 +170,6 @@ def build_run_status(
     sweep_kind: str = "",
     strict_cpuset_satisfied: bool = False,
 ) -> Dict[str, Any]:
-    """Build a run_status.csv row dict matching the full corrected schema."""
     first_failure = None
     for wf in worker_failures:
         if wf.failure_class != "completed_successfully":
@@ -276,7 +246,6 @@ def build_run_status(
 
 
 def worker_failure_info_to_dict(info: WorkerFailureInfo) -> Dict[str, Any]:
-    """Convert a WorkerFailureInfo to a CSV-safe dict."""
     return {
         "worker_id": info.worker_id,
         "physical_worker_id": info.physical_worker_id,
@@ -369,7 +338,6 @@ _APP_HEAP_KV_RE = re.compile(r'([A-Za-z0-9_]+)=("([^"]*)"|[^ ]*)')
 
 
 def parse_app_heap_budget_failure(detail: str) -> Dict[str, str]:
-    """Parse the structured worker APP_HEAP_BUDGET_EXCEEDED error payload."""
     if "APP_HEAP_BUDGET_EXCEEDED" not in (detail or ""):
         return {}
     parsed: Dict[str, str] = {}
@@ -381,7 +349,6 @@ def parse_app_heap_budget_failure(detail: str) -> Dict[str, str]:
 
 
 def worker_failures_from_terminal_output(terminal_output_path: Optional[str]) -> List[WorkerFailureInfo]:
-    """Extract app-heap failures emitted before any profile event exists."""
     if not terminal_output_path or not os.path.exists(terminal_output_path):
         return []
 
@@ -442,7 +409,6 @@ def worker_failures_from_terminal_output(terminal_output_path: Optional[str]) ->
 
 
 def check_oom_events_file(oom_events_path: str, container_name: str) -> bool:
-    """Check if oom_events.jsonl contains an OOM kill for a specific container."""
     if not os.path.exists(oom_events_path):
         return False
     try:
@@ -487,19 +453,6 @@ def _benchmark_operation_family(operation: str, phase: str = "") -> str:
 def extract_failure_cursors_from_events_csv(
     events_csv_path: str,
 ) -> Dict[str, Dict[str, Any]]:
-    """Extract benchmark cursor context for failed workers from events.csv.
-
-    Reads the events.csv file (aggregated from client-*.jsonl by the Rust
-    runner) and collects cursor data for every row that has a non-empty
-    failed_worker_id column.
-
-    Returns a dict mapping logical_client_id (the failed_worker_id) to
-    a dict with cursor fields:
-        benchmark_target_size, benchmark_active_size, benchmark_phase,
-        benchmark_operation, benchmark_operation_seq, benchmark_plateau_index,
-        group_epoch, member_count, operation_family, failure_class,
-        failure_detail, failure_timestamp_ns (from timestamp_ns or ts_unix_ns)
-    """
     if not os.path.exists(events_csv_path):
         return {}
 
@@ -618,7 +571,6 @@ def extract_failure_cursors_from_events_csv(
                 existing = cursors[failed_id]
 
                 def _cursor_priority(c: Dict[str, Any]) -> int:
-                    """Higher means more direct failure evidence."""
                     has_failure = bool(
                         (c.get("failure_class") or "").strip()
                         or (c.get("failure_detail") or "").strip()
@@ -652,7 +604,6 @@ def extract_failure_cursors_from_events_csv(
 
 
 def worker_failures_from_events_csv(events_csv_path: str) -> List[WorkerFailureInfo]:
-    """Create failure records from authoritative runner failure events."""
     failures = []
     for failed_id, cursor in extract_failure_cursors_from_events_csv(events_csv_path).items():
         failure_class = _normalize_failure_class(cursor.get("failure_class", ""))
@@ -695,12 +646,6 @@ def worker_failures_from_events_csv(events_csv_path: str) -> List[WorkerFailureI
 
 
 def worker_failures_from_runner_events_jsonl(runner_events_path: str) -> List[WorkerFailureInfo]:
-    """Create failure records from the runner failure journal.
-
-    This is the authoritative source when --no-aggregate is used: the Rust
-    runner still writes runner-events.jsonl, but events.csv is deliberately not
-    produced until an external aggregation pass runs.
-    """
     if not runner_events_path or not os.path.exists(runner_events_path):
         return []
 
@@ -821,11 +766,6 @@ def append_synthetic_runner_failure_event(
     failure: WorkerFailureInfo,
     events_csv_path: str,
 ) -> bool:
-    """Append a terminal fallback event when no live runner event survived.
-
-    The benchmark operation is taken from the most recent observed event and is
-    deliberately marked as temporal correlation, not exact runner attribution.
-    """
     existing = extract_failure_cursors_from_events_csv(events_csv_path)
     if failure.logical_client_id in existing:
         return False
@@ -998,7 +938,6 @@ def write_synthetic_failure_events_csv(
     events_csv_path: str,
     failures: List[WorkerFailureInfo],
 ) -> bool:
-    """Write a minimal events.csv for failures before profiling emitted rows."""
     if os.path.exists(events_csv_path) and os.path.getsize(events_csv_path) > 0:
         return False
     rows = [
@@ -1055,7 +994,6 @@ def merge_resource_summary_into_failure(
     failure: WorkerFailureInfo,
     resource_summary: Dict[str, Any],
 ) -> WorkerFailureInfo:
-    """Attach container/cgroup evidence without replacing runner attribution."""
     failure.worker_id = str(resource_summary.get("worker_id") or failure.worker_id)
     failure.physical_worker_id = str(
         resource_summary.get("physical_worker_id") or failure.physical_worker_id
@@ -1095,11 +1033,6 @@ def collect_worker_failures_from_artifacts(
     oom_events_path: Optional[str] = None,
     terminal_output_path: Optional[str] = None,
 ) -> List[WorkerFailureInfo]:
-    """Merge runner failure events with hard container/cgroup failure evidence.
-
-    CPU throttling and non-fatal memory pressure are measurements, not failures.
-    They only explain a failure when a runner event already reports one.
-    """
     failures = worker_failures_from_events_csv(events_csv_path)
     existing_clients = {failure.logical_client_id for failure in failures}
     run_dir = os.path.dirname(os.path.abspath(events_csv_path)) if events_csv_path else ""
@@ -1144,19 +1077,6 @@ def enrich_worker_failures_with_cursors(
     worker_failures: List[WorkerFailureInfo],
     events_csv_path: str,
 ) -> List[WorkerFailureInfo]:
-    """Enrich WorkerFailureInfo objects with cursor context from events.csv.
-
-    For each WorkerFailureInfo, looks up the logical_client_id in the
-    events.csv failure cursors and populates current_phase,
-    current_operation_family, current_benchmark_operation,
-    current_member_count, current_epoch, and failure_timestamp_ns.
-
-    Also backfills the failure_class from events.csv if the existing
-    classification is unknown_failure and events.csv has a more specific
-    class.
-
-    Returns the same list (mutated in place).
-    """
     cursors = extract_failure_cursors_from_events_csv(events_csv_path)
 
     for wf in worker_failures:
@@ -1221,7 +1141,6 @@ def enrich_worker_failures_with_cursors(
 
 
 def _normalize_failure_class(runner_class: str) -> str:
-    """Map Rust runner failure class strings to Python-side classes."""
     mapping = {
         "oom_kill": "hard_ram_oom_kill",
         "hard_upper_bound_oom_kill": "hard_ram_oom_kill",

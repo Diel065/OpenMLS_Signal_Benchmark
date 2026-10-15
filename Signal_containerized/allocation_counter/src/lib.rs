@@ -1,7 +1,6 @@
 mod allocator;
 pub mod embedded_heap_budget;
 
-/// Allocation totals measured by a thread-local `measure` scope.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq, Hash)]
 pub struct AllocationInfo {
     pub count_total: u64,
@@ -23,7 +22,6 @@ impl std::ops::AddAssign for AllocationInfo {
     }
 }
 
-/// Monotonic process-wide allocation totals suitable for snapshot deltas.
 #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct ProcessAllocationSnapshot {
     pub count_total: u64,
@@ -39,12 +37,10 @@ impl ProcessAllocationSnapshot {
     }
 }
 
-/// Return cumulative allocations made by every thread in this process.
 pub fn process_snapshot() -> ProcessAllocationSnapshot {
     allocator::process_snapshot()
 }
 
-/// Run a closure while measuring allocations made on the current thread.
 pub fn measure<F: FnOnce()>(run_while_measuring: F) -> AllocationInfo {
     allocator::ALLOCATIONS.with(|info_stack| {
         let mut info_stack = info_stack.borrow_mut();
@@ -70,7 +66,6 @@ pub fn measure<F: FnOnce()>(run_while_measuring: F) -> AllocationInfo {
     })
 }
 
-/// Exclude allocations on the current thread from thread-local measurements.
 pub fn opt_out<F: FnOnce()>(run_while_not_counting: F) {
     allocator::DO_COUNT.with(|depth| {
         *depth.borrow_mut() += 1;

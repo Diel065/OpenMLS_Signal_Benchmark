@@ -672,7 +672,6 @@ async fn client_command_actor(
             );
         }
 
-        // Clear stale benchmark context and worker ID, then set current command's context.
         set_benchmark_context(BenchmarkContext::default());
         set_worker_id(client_id.clone());
         let benchmark_context = BenchmarkContext {

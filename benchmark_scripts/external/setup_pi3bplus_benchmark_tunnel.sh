@@ -44,9 +44,6 @@ proxy() {
   echo "$pid" >> "$PID_FILE"
 }
 
-# Shared VM service forward (3000/4000 on the laptop LAN IP). The Raspberry Pi 5
-# tunnel binds the same address:port, so reuse it when it is already up instead
-# of failing on "address already in use".
 shared_proxy() {
   local bind_ip="$1" listen_port="$2" target_host="$3" target_port="$4"
   if port_listening "$bind_ip" "$listen_port"; then

@@ -42,7 +42,6 @@ WORKER_OUTBOUND_PERMITS="${WORKER_OUTBOUND_PERMITS:-32}"
 FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 
-# Signal-specific defaults (smaller sizes, pairwise semantics)
 SIGNAL_MAX_CONVERSATION_SIZE="${SIGNAL_MAX_CONVERSATION_SIZE:-256}"
 SIGNAL_STEP_SIZE="${SIGNAL_STEP_SIZE:-16}"
 SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
@@ -215,7 +214,6 @@ run_signal_baseline() {
 
 raise_nofile_limit
 
-# ── OpenMLS baseline ────────────────────────────────────────────────────────
 if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
   cleanup_docker
   for iter in $(seq 1 "$N"); do
@@ -224,7 +222,6 @@ if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then
   echo "All unconstrained container OpenMLS baseline runs completed."
 fi
 
-# ── Signal baseline ─────────────────────────────────────────────────────────
 if [ "$PROTOCOL" = "signal" ] || [ "$PROTOCOL" = "both" ]; then
   cleanup_docker_signal
   for iter in $(seq 1 "$N"); do

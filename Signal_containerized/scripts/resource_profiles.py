@@ -1,19 +1,3 @@
-"""
-Resource profile generation for RAM sweep, CPU matrix, and parallel sweep experiments.
-
-Generates structured resource profiles for:
-  - ram_sweep_singleton: Sweep memory limits with abundant CPU
-  - cpu_matrix_singleton: Matrix of (core_count, capacity_fraction) combinations
-  - embedded_budget_singleton: Docker memory x Docker CPU combinations
-  - ram_sweep: Parallel 10-profile sweep of Docker memory limits
-  - ram_app_heap_sweep: Parallel 10-profile sweep of application heap budgets
-  - cpu_quota_sweep: Parallel 10-profile sweep of Docker CPU fractions
-
-Supports explicit profile selection via index or ID for single-profile
-scientific threshold experiments. Supports parallel 10-profile sweeps.
-
-Signal supports both docker-cgroup memory sweeps and app-heap-budget sweeps.
-"""
 
 from dataclasses import dataclass
 from typing import Dict, List, Optional
@@ -29,7 +13,6 @@ DOCKER_CFS_MAX_PERIOD_US = 1_000_000
 
 @dataclass
 class ResourceProfile:
-    """A single resource profile for a profiled singleton container."""
     resource_profile_id: str
     experiment_kind: str
     profile_label: str
@@ -99,21 +82,6 @@ def generate_ram_sweep_profiles(
     assigned_cpu_count: int = 10,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate resource profiles for a RAM sweep experiment.
-
-    Each profile varies only memory_limit; CPU is abundant.
-    CPU quota is unset (cpu_limit_cpus = None).
-    RAYON_NUM_THREADS = assigned_cpu_count.
-    memory_swap = memory_limit for each profile.
-
-    Args:
-        ram_values: List of memory limit strings, e.g., ["32m", "64m", "128m"].
-        assigned_cpu_count: Number of CPUs assigned to cpuset.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of ResourceProfile objects, one per RAM value.
-    """
     if len(ram_values) > 32:
         raise ValueError(f"RAM sweep supports at most 32 values, got {len(ram_values)}")
 
@@ -155,24 +123,6 @@ def generate_cpu_matrix_profiles(
     high_memory_limit: Optional[str] = None,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate resource profiles for a CPU matrix experiment.
-
-    Creates a full Cartesian product of core_counts x capacity_fractions.
-    Docker cpus quota = assigned_cpu_count * capacity_fraction.
-    RAYON_NUM_THREADS = assigned_cpu_count.
-    Memory is unlimited or set to a safe high value (not an experimental variable).
-
-    Invalid combinations (e.g., capacity > assigned_cpu_count) are skipped.
-
-    Args:
-        core_counts: List of CPU thread counts, e.g., [1, 2, 4].
-        capacity_fractions: List of capacity fractions, e.g., [0.25, 0.5, 0.75, 1.0].
-        high_memory_limit: Optional safe-high memory limit to prevent RAM bottleneck.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of ResourceProfile objects.
-    """
     profiles = []
     for assigned_cpus in core_counts:
         if assigned_cpus < 1:
@@ -225,15 +175,6 @@ def generate_embedded_budget_profiles(
     docker_memory_limit: str = "256m",
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate profiles for deeply embedded memory-budget experiments.
-
-    Signal uses docker-cgroup memory model. Docker supplies CPU affinity/quota
-    and a safe Linux container memory envelope. The small memory variable is
-    passed to the Rust worker as a docker-cgroup memory limit.
-
-    Signal has no app-heap-budget allocator; all memory constraints are
-    applied via docker-cgroup.
-    """
     if not validate_memory_string(docker_memory_limit):
         raise ValueError(f"Invalid Docker memory limit '{docker_memory_limit}'")
     docker_memory_bytes = parse_memory_to_bytes(docker_memory_limit)
@@ -313,24 +254,6 @@ def generate_parallel_ram_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate 10 parallel docker-cgroup memory profiles for RAM sweep.
-
-    Each profile tests a single Docker memory limit. Signal uses docker-cgroup
-    (no app-heap-budget allocator). CPU is non-limiting: one core per worker
-    with capacity 1.0.
-
-    The highest-valued profile (1 GiB = largest memory limit) is marked
-    as the group creator.
-
-    Args:
-        heap_budgets: List of 10 memory limit strings for docker-cgroup.
-        docker_memory_limit: Safe Docker memory limit for reference (unused as wall).
-        assigned_cpu_count: CPU cores assigned to each profiled worker.
-        run_id: Benchmark run ID for profile labeling.
-
-    Returns:
-        List of 10 ResourceProfile objects, ordered by increasing limit.
-    """
     if heap_budgets is None:
         heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
     if not heap_budgets:
@@ -407,7 +330,6 @@ def generate_parallel_ram_app_heap_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Generate parallel app-heap budget profiles for RAM sweep."""
     if heap_budgets is None:
         heap_budgets = ["32k", "64k", "128k", "512k", "1m", "2m", "8m", "32m", "256m", "1g"]
     if not heap_budgets:
@@ -486,12 +408,6 @@ def generate_parallel_cpu_sweep_profiles(
     assigned_cpu_count: int = 1,
     run_id: str = "",
 ) -> List[ResourceProfile]:
-    """Create CPU quota profiles, retaining the largest profile as group creator.
-
-    The period may increase to keep small quotas above the cgroup minimum.
-    app_heap_budget is validated and recorded in labels; docker_memory_limit
-    supplies the actual container memory limit for this CPU treatment.
-    """
     if cpu_fractions is None:
         cpu_fractions = [1.00, 0.75, 0.50, 0.25, 0.10, 0.05, 0.04, 0.03, 0.02, 0.01]
     if not cpu_fractions:

@@ -1,23 +1,15 @@
 #!/usr/bin/env -S uv run --frozen python
-"""
-Validate resource experiment output files.
-
-Usage:
-    uv run --frozen python scripts/validate_resource_experiment_outputs.py <run_directory>
-
-Checks that all required sidecar files exist, CSV headers match expected
-schemas, JSON files parse correctly, and cross-file joins are valid.
-
-Exits with code 0 on success, non-zero on validation failure.
-"""
 
 import argparse
 import csv
 import json
 import os
 import sys
+from pathlib import Path
 from typing import Dict, List, Optional, Set
 
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "benchmark_scripts"))
 
 EXPECTED_FILES = [
     "resource_profiles.csv",

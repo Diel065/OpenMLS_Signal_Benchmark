@@ -280,8 +280,6 @@ impl Client {
             key_packages.push(key_package);
         }
 
-        // Canonical publication total: local AddCommit create + stage + serialization +
-        // pending-output preparation. Network publication and remote processing happen later.
         wrap_add_commit_total(
             member_count_before,
             member_count_after,
@@ -414,11 +412,6 @@ impl Client {
     }
 
     pub fn join_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
-        // A remove-rejoin victim never processes its own removal commit, so it
-        // still holds the stale pre-removal group under the same GroupId. Delete
-        // that persisted state first, otherwise the rejoin welcome collides with
-        // "A group with this GroupId already exists". delete() leaves the
-        // signature keypair and generated KeyPackage private keys intact.
         if let Some(mut stale_group) = self.group.take() {
             stale_group
                 .delete(self.crypto.storage())
@@ -575,7 +568,6 @@ impl Client {
             member_count_before,
             member_count_before,
         ));
-        // Feature lanes omit unsampled totals; ordinary runs retain main's rows.
         let total_scope = if profile.enabled || !selective_receive_profiling() {
             ProfileScope::start("commit_receive_total_local", "openmls")
         } else {

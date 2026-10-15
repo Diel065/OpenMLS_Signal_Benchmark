@@ -554,7 +554,6 @@ impl RunnerEventLog {
     }
 
     async fn find_oom_evidence(&self, worker: &WorkerSpec) -> Option<OomEvidence> {
-        // The Python monitors flush cgroup and dmesg evidence asynchronously.
         for attempt in 0..6 {
             if let Some(evidence) = latest_oom_evidence_for(&self.oom_evidence_path, worker) {
                 return Some(evidence);
@@ -1561,7 +1560,6 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         eprintln!("[aggregate] --no-aggregate set, skipping CSV aggregation");
     }
 
-    // Always write sidecars, even on failure
     if let Err(e) = write_post_benchmark_sidecars(&run_dir, &config.run_id) {
         eprintln!(
             "[sidecars] failed to write post-benchmark sidecars: {:#}",
@@ -2222,7 +2220,6 @@ async fn send_cmd_expect_ok_fragment_with_context(
     }
 }
 
-// ── Participant setup ─────────────────────────────────────────────────────────
 
 async fn register_participant(http: &reqwest::Client, worker: &WorkerSpec) -> Result<()> {
     send_cmd_expect_ok_fragment(http, worker, &Command::RegisterParticipant, "registered").await?;
@@ -2609,7 +2606,6 @@ async fn broadcast_message(
         .await?;
     }
 
-    // Receive at each recipient
     let commands_by_physical = build_batch_commands(recipients, |worker| {
         let is_profiled = profiling_recipient_id == Some(worker.id.as_str());
         let receive_workflow_id = is_profiled.then(next_workflow_id);
@@ -2652,7 +2648,6 @@ async fn broadcast_message(
     Ok(())
 }
 
-// ── Transition helpers ────────────────────────────────────────────────────────
 
 async fn enroll_participants(
     http: &reqwest::Client,
@@ -2734,22 +2729,10 @@ async fn enroll_participants(
         return Ok(());
     }
 
-    // Establish pairwise sessions from each new participant to every participant that
-    // will be active after this enrollment batch. This includes peers enrolled in the
-    // same batch; otherwise the first plateau in a batched ascent lacks new-new sessions.
     let mut existing_ids: Vec<WorkerSpec> = active.clone();
     let mut failed_ids = HashSet::new();
     if profile_only_singletons {
-        // When only singletons carry profiling, prioritise profile-enabled
-        // initiators so every (singleton→peer) session establishment runs
-        // PQXDH while no responder-side session exists yet. Without this
-        // ordering the bidirectional handshake creates a session on the
-        // singleton in loop 1 (via DecryptMessage), and loop 2's
-        // EstablishSessions hits has_session_with=true → skips all PQXDH
-        // crypto → no profiled initiator data.
 
-        // Phase A: existing profile-enabled → new non-profiled
-        //          decrypt_on_peer = true (packed workers need the session)
         let mut profile_enabled_existing: Vec<_> = existing_ids
             .iter()
             .filter(|w| w.profile_enabled)
@@ -2792,8 +2775,6 @@ async fn enroll_participants(
         existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
         profile_enabled_existing.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase B: existing profile-enabled → new profile-enabled.
-        // Decrypt now so application receives do not consume stale handshakes.
         let profile_prepared: Vec<_> = prepared
             .iter()
             .filter(|w| w.profile_enabled)
@@ -2833,7 +2814,6 @@ async fn enroll_participants(
         active.retain(|worker| !failed_ids.contains(&worker.id));
         existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase C: new profile-enabled → existing + peer-new
         for p in &profile_prepared {
             if failed_ids.contains(&p.id) {
                 continue;
@@ -2875,7 +2855,6 @@ async fn enroll_participants(
         existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
         prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase D: existing non-profiled → prepared
         let non_profile_existing: Vec<_> = existing_ids
             .iter()
             .filter(|w| !w.profile_enabled)
@@ -2916,7 +2895,6 @@ async fn enroll_participants(
         existing_ids.retain(|worker| !failed_ids.contains(&worker.id));
         prepared.retain(|worker| !failed_ids.contains(&worker.id));
 
-        // Phase E: new non-profiled → existing + peer-new
         for participant in &non_profile_prepared {
             if failed_ids.contains(&participant.id) {
                 continue;
@@ -2987,7 +2965,6 @@ async fn enroll_participants(
             );
         }
 
-        // Also establish sessions from existing participants to the new ones.
         for existing in &existing_ids {
             let enroll_cursor = BenchmarkCursor::new(
                 plateau_index,
@@ -3136,7 +3113,6 @@ async fn transition_to_size(
     Ok(())
 }
 
-// ── Application phase ─────────────────────────────────────────────────────────
 
 async fn run_application_phase(
     http: &reqwest::Client,
@@ -3664,7 +3640,6 @@ fn build_plateau_sequence_for_order<R: Rng + ?Sized>(
         );
     }
 
-    // Randomized
     let mut candidates = vec![min_size];
     let mut current = min_size;
     while current < max_size {
@@ -3948,7 +3923,6 @@ mod random_input_tests {
     }
 }
 
-// ── Fanout infrastructure ─────────────────────────────────────────────────────
 
 fn latency_percentiles(
     mut latencies: Vec<u128>,
@@ -4375,7 +4349,6 @@ fn emit_network_metrics(metrics: NetworkPhaseMetrics) {
     }
 }
 
-// ── CSV aggregation ───────────────────────────────────────────────────────────
 
 pub fn aggregate_csv(
     run_dir: &Path,
@@ -4799,7 +4772,6 @@ pub fn aggregate_csv(
     Ok(())
 }
 
-// ── Post-benchmark sidecars ────────────────────────────────────────────────
 
 pub fn write_worker_failures_csv(run_dir: &Path, run_id: &str) -> Result<()> {
     let path = run_dir.join("worker_failures.csv");
@@ -4966,7 +4938,6 @@ pub fn write_post_benchmark_sidecars(run_dir: &Path, run_id: &str) -> Result<()>
         false
     };
 
-    // If no events.csv exists (failure before aggregation), write a minimal one
     if !events_csv_exists {
         let mut wtr = csv::Writer::from_path(&events_csv_path)?;
         wtr.write_record(&[
@@ -5217,7 +5188,6 @@ mod aggregate_csv_runner_event_tests {
     }
 }
 
-/// Validate a run ID string for safe filesystem usage.
 pub fn validate_run_id(run_id: &str) -> Result<()> {
     if run_id.is_empty() {
         return Err(anyhow!("Run ID must not be empty"));

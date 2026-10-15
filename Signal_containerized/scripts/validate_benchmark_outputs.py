@@ -295,7 +295,6 @@ def validate_run(
             result.add_error(f"workflow {workflow_id} ({wrapper}) has invalid workflow_pair_count values")
             continue
         expected = next(iter(counts))
-        # External onboarding estimates use sampled pairs, not a complete timed join.
         sampled_external_setup = (
             external_density
             and wrapper == "session_establish_pair_wrapper"

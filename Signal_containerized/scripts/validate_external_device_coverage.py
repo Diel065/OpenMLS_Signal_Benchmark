@@ -201,17 +201,11 @@ def validate(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
                 and luckfox_failure_target is not None
                 and target >= luckfox_failure_target
             ):
-                # The failure plateau can contain a partial command row.  It is
-                # outside the required coverage domain once authoritative
-                # attrition evidence records the Luckfox removal boundary.
                 continue
             payload: int | None = None
             if operation in APPLICATION_TOTALS:
                 payload_raw = row.get("benchmark_payload_size") or ""
                 if not payload_raw:
-                    # Non-sampled fanout receives can still write a canonical
-                    # total on a profiled worker, but they are not measurement
-                    # rows and deliberately carry no payload metadata.
                     continue
                 try:
                     payload = int(payload_raw)

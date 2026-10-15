@@ -1,6 +1,5 @@
 # syntax=docker/dockerfile:1.7
 
-# ---------- builder ----------
 FROM rust:bookworm AS builder
 
 WORKDIR /app
@@ -37,22 +36,18 @@ RUN mkdir -p /out \
     && cp /app/target/x86_64-unknown-linux-musl/minsize/worker /out/worker \
     && cp /app/target/x86_64-unknown-linux-musl/release/benchmark_runner_http_staircase /out/benchmark_runner_http_staircase
 
-# ---------- kr runtime ----------
 FROM scratch AS kr-runtime
 COPY --from=builder /out/key_repository /key_repository
 ENTRYPOINT ["/key_repository"]
 
-# ---------- relay runtime ----------
 FROM scratch AS relay-runtime
 COPY --from=builder /out/message_relay /message_relay
 ENTRYPOINT ["/message_relay"]
 
-# ---------- worker runtime ----------
 FROM scratch AS worker-runtime
 COPY --from=builder /out/worker /worker
 ENTRYPOINT ["/worker"]
 
-# ---------- runner runtime ----------
 FROM scratch AS runner-runtime
 COPY --from=builder /out/benchmark_runner_http_staircase /benchmark_runner_http_staircase
 ENTRYPOINT ["/benchmark_runner_http_staircase"]

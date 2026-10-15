@@ -1,10 +1,3 @@
-"""
-Sidecar file writers for resource experiment output files.
-
-Writes resource_profiles.csv, worker_resource_assignments.csv,
-resource_summary.csv, worker_failures.csv, run_status.csv,
-and benchmark_timeline.csv.
-"""
 
 import csv
 import json
@@ -245,7 +238,6 @@ BENCHMARK_TIMELINE_HEADER = [
 
 
 class SidecarWriter:
-    """Writes resource experiment sidecar files incrementally."""
 
     def __init__(self, output_dir: str):
         self.output_dir = output_dir
@@ -255,7 +247,6 @@ class SidecarWriter:
         os.makedirs(self.output_dir, exist_ok=True)
 
     def write_csv(self, filename: str, header: List[str], rows: List[Dict[str, Any]]):
-        """Write a CSV file with given header and rows."""
         self._ensure_dir()
         filepath = os.path.join(self.output_dir, filename)
         with open(filepath, "w", newline="") as f:
@@ -267,7 +258,6 @@ class SidecarWriter:
         return filepath
 
     def append_csv_row(self, filename: str, header: List[str], row: Dict[str, Any]):
-        """Append a single row to a CSV file. Creates file with header if needed."""
         self._ensure_dir()
         filepath = os.path.join(self.output_dir, filename)
         file_exists = os.path.exists(filepath)
@@ -279,21 +269,18 @@ class SidecarWriter:
             writer.writerow(safe_row)
 
     def write_jsonl_line(self, filename: str, data: Dict[str, Any]):
-        """Append a JSON line to a JSONL file."""
         self._ensure_dir()
         filepath = os.path.join(self.output_dir, filename)
         with open(filepath, "a") as f:
             f.write(json.dumps(data) + "\n")
 
     def write_json(self, filename: str, data: Dict[str, Any]):
-        """Write a JSON file."""
         self._ensure_dir()
         filepath = os.path.join(self.output_dir, filename)
         with open(filepath, "w") as f:
             json.dump(data, f, indent=2)
 
     def write_resource_profiles(self, run_id: str, profiles: List[Dict[str, Any]]):
-        """Write resource_profiles.csv from a list of profile dicts."""
         rows = []
         for p in profiles:
             row = {
@@ -304,7 +291,6 @@ class SidecarWriter:
         return self.write_csv("resource_profiles.csv", RESOURCE_PROFILES_HEADER, rows)
 
     def write_worker_resource_assignments(self, run_id: str, assignments: List[Dict[str, Any]]):
-        """Write worker_resource_assignments.csv."""
         rows = []
         for a in assignments:
             row = {"run_id": run_id, **a}
@@ -312,7 +298,6 @@ class SidecarWriter:
         return self.write_csv("worker_resource_assignments.csv", WORKER_RESOURCE_ASSIGNMENTS_HEADER, rows)
 
     def write_preflight_results(self, run_id: str, results: List[Dict[str, Any]]):
-        """Write cpu_affinity_preflight.csv."""
         rows = []
         for r in results:
             row = {"run_id": run_id, **r}
@@ -320,7 +305,6 @@ class SidecarWriter:
         return self.write_csv("cpu_affinity_preflight.csv", CPU_AFFINITY_PREFLIGHT_HEADER, rows)
 
     def write_resource_summary(self, run_id: str, summaries: List[Dict[str, Any]]):
-        """Write resource_summary.csv."""
         rows = []
         for s in summaries:
             row = {"run_id": run_id, **s}
@@ -328,7 +312,6 @@ class SidecarWriter:
         return self.write_csv("resource_summary.csv", RESOURCE_SUMMARY_HEADER, rows)
 
     def write_worker_failures(self, run_id: str, failures: List[Dict[str, Any]]):
-        """Write worker_failures.csv."""
         rows = []
         for f in failures:
             row = {"run_id": run_id, **f}
@@ -336,18 +319,15 @@ class SidecarWriter:
         return self.write_csv("worker_failures.csv", WORKER_FAILURES_HEADER, rows)
 
     def write_run_status(self, run_id: str, status: Dict[str, Any]):
-        """Write run_status.csv."""
         row = {"run_id": run_id, **status}
         return self.write_csv("run_status.csv", RUN_STATUS_HEADER, [row])
 
     def append_benchmark_timeline(self, run_id: str, event: Dict[str, Any]):
-        """Append a timeline event to benchmark_timeline.csv."""
         row = {"run_id": run_id, **event}
         return self.append_csv_row("benchmark_timeline.csv", BENCHMARK_TIMELINE_HEADER, row)
 
 
 def _safe_csv_value(value: Any) -> str:
-    """Convert a value to a CSV-safe string."""
     if value is None:
         return ""
     if isinstance(value, bool):
@@ -375,7 +355,6 @@ VALIDATOR_SCHEMAS = {
 
 
 def get_expected_files() -> List[str]:
-    """Get the list of expected sidecar files."""
     return [
         "cpu_affinity_plan.json",
         "cpu_affinity_preflight.csv",
@@ -396,19 +375,6 @@ def get_expected_files() -> List[str]:
 
 
 def validate_sidecars_exist(run_dir: str, run_success: bool = True) -> Dict[str, Any]:
-    """Validate that expected sidecar files exist in the run directory.
-
-    On success runs, missing sidecars are hard failures.
-    On failure runs, missing sidecars are reported as warnings but the
-    validation result reflects that artifacts are incomplete.
-
-    Returns a dict with keys:
-        valid: bool - True if all expected sidecars exist (success) or
-                      at least the most critical ones exist (failure)
-        missing: List[str] - files that are missing
-        empty: List[str] - files that exist but are empty
-        present: List[str] - files that exist and are non-empty
-    """
     import os as _os
     result = {"valid": True, "missing": [], "empty": [], "present": []}
     expected = get_expected_files()
