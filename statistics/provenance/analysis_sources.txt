@@ -1,0 +1,797 @@
+Analysis provenance
+===================
+
+Original source revision: 5aebc45214b3cd59c8212803e6a74752fbe41fb6
+All source and cached notebook outputs listed below are exactly recoverable from this immutable Git revision.
+Retrieve with: git show REVISION:PATH
+
+The exact thesis/paper publication figure generator and original accepted-run datasets have not been identified.
+The current OpenMLS analysis uses observed-row medians and groups Raspberry Pi models; resource analysis is calibration/diagnostics.
+Neither implements the full manuscript run-median / process-CPU LOESS / isotonic / separate-device publication workflow.
+No new estimator or publication generator was introduced by consolidating notebook entry points.
+
+Current sources: openmls_analysis.R (former v8), resource_analysis.R (former v9), signal_diagnostics.R (shared notebook code cell 2).
+The v5 -> v6 -> v7 R chain remains here because it contains unique unresolved historical structural/LOESS analysis.
+Original cached plots are historical diagnostic outputs; Git retains their exact bytes. Historical raw benchmark datasets are untouched.
+
+Original file identity (SHA-256, byte size, repository path):
+6ecf351b6859dd584bf0550ca625e12d43b1171004c89436a9734daaaf81599b 1053366 OpenMLS_containerized/statistics_analysis.ipynb
+2899803e88b16b94e833000435034b86f38cce4798af996fce8db00636059397 26847635 statistics/openmls_resource_metrics_analysis.ipynb
+6d4c9f2eb0df9cc398f32438d61da8a86da1c4b655f0d1f8f6fde4a75f332543 51245422 statistics/statistics_analysis.ipynb
+b317c7b0774ed7472e18e13d153ef3c77dca63929bf03ee4034d57588e042978 36719 statistics/statistics_analysis_openmls_v3.R
+21ac4b58d0b7b5c6b569fe1944b99cb71df6086300305971660859734947d33f 44106 statistics/statistics_analysis_openmls_v4.R
+be1591a5c79d1cf47a4797d7c9a281c390bda6db37ae325d733879d7b7100a52 2400734 statistics/statistics_analysis_openmls_v4.ipynb
+710c70a54146c83d3c19a026ee2bac05e9639c0030a0ed47829d331e90d31279 97829 statistics/statistics_analysis_openmls_v5.R
+64ecf4d5ac0b580a569ec0587b2b7e7b9f3a9915559b16462bfeed61c32e7d16 4834165 statistics/statistics_analysis_openmls_v5.ipynb
+c436f86911ac2dfa26f833a8d08729e7af838f224065113e2ff93d2ce2966439 78626 statistics/statistics_analysis_openmls_v6.R
+7475299fc2810670e0c83cd68202f5baddf62a05b3be983c89b96bef125a560d 50582 statistics/statistics_analysis_openmls_v7.R
+bacbad0a936e5d5b051077de6914370f9bc6d72b0e4181136b717dc4617490b4 61098 statistics/statistics_analysis_openmls_v7.ipynb
+29a06b89a0d9bff35e625db667ed403401fec27101f4f667636bf6ee5cad25dd 94811 statistics/statistics_analysis_openmls_v8.R
+5791b63ac43bb5e9f8ed8e1627fff5d87e66b88ab3531493dcadd75717bf9e65 242763 statistics/statistics_analysis_openmls_v8.ipynb
+4c0ace7beae3c04dc81ca254319163aeba03318cc07793f7a2afaf4b7bf086be 25332 statistics/statistics_analysis_openmls_v9.R
+f7f642998690fadec66679b2d2733116195e655df5cb81a4ce39c15848d74dcf 558295 statistics/statistics_analysis_openmls_v9.ipynb
+c7d10ffa9d7b759ee8e593fd6d105ed2850e2de44891291ef3ecb6c9474ae695 12551 statistics/statistics_analysis_v2.R
+b62f7013c041367894c9dee1b9c829fa8e1f3abbbcd0a59923f0c623c2af5343 49344835 statistics/statistics_analysis_v2.ipynb
+
+Source input/path literals: OpenMLS_containerized/statistics_analysis.ipynb
+benchmark_output
+
+Source input/path literals: statistics/openmls_resource_metrics_analysis.ipynb
+OpenMLS_containerized/OpenMLS_containerized/benchmark_output/*/events.csv
+OpenMLS_containerized/benchmark_output/*/events.csv
+
+Cached input/coverage record: statistics/openmls_resource_metrics_analysis.ipynb, cell 3, output 0
+# A tibble: 48 × 7
+   run_id_from_path    resource_envelope metric_label   rows non_missing missing
+   <chr>               <chr>             <fct>         <int>       <int>   <int>
+ 1 cal01_cpu-quota-sw… cpus=0.01, memor… CPU envelop…  22118       22118       0
+ 2 cal01_cpu-quota-sw… cpus=0.02, memor… CPU envelop…  23300       23300       0
+ 3 cal01_cpu-quota-sw… cpus=0.03, memor… CPU envelop…  24384       24384       0
+ 4 cal01_cpu-quota-sw… cpus=0.04, memor… CPU envelop…  27901       27901       0
+ 5 cal01_cpu-quota-sw… cpus=0.05, memor… CPU envelop…  29264       29263       1
+ 6 cal01_cpu-quota-sw… cpus=0.1, memory… CPU envelop…  31879       31879       0
+ 7 cal01_cpu-quota-sw… cpus=0.25, memor… CPU envelop…  33346       33346       0
+ 8 cal01_cpu-quota-sw… cpus=0.5, memory… CPU envelop…  35391       35391       0
+ 9 cal01_cpu-quota-sw… cpus=0.75, memor… CPU envelop…  38514       38514       0
+10 cal01_cpu-quota-sw… cpus=1, memory=7… CPU envelop…  45907       45905       2
+11 cal01_cpu-quota-sw… cpus=0.01, memor… CPU throttl…  22118       22118       0
+12 cal01_cpu-quota-sw… cpus=0.02, memor… CPU throttl…  23300       23300       0
+13 cal01_cpu-quota-sw… cpus=0.03, memor… CPU throttl…  24384       24384       0
+14 cal01_cpu-quota-sw… cpus=0.04, memor… CPU throttl…  27901       27901       0
+15 cal01_cpu-quota-sw… cpus=0.05, memor… CPU throttl…  29264       29263       1
+16 cal01_cpu-quota-sw… cpus=0.1, memory… CPU throttl…  31879       31879       0
+17 cal01_cpu-quota-sw… cpus=0.25, memor… CPU throttl…  33346       33346       0
+18 cal01_cpu-quota-sw… cpus=0.5, memory… CPU throttl…  35391       35391       0
+19 cal01_cpu-quota-sw… cpus=0.75, memor… CPU throttl…  38514       38514       0
+20 cal01_cpu-quota-sw… cpus=1, memory=7… CPU throttl…  45907       45905       2
+21 cal01_cpu-quota-sw… cpus=0.01, memor… RAM RSS del…  22118       22118       0
+22 cal01_cpu-quota-sw… cpus=0.02, memor… RAM RSS del…  23300       23300       0
+23 cal01_cpu-quota-sw… cpus=0.03, memor… RAM RSS del…  24384       24384       0
+24 cal01_cpu-quota-sw… cpus=0.04, memor… RAM RSS del…  27901       27901       0
+25 cal01_cpu-quota-sw… cpus=0.05, memor… RAM RSS del…  29264       29264       0
+26 cal01_cpu-quota-sw… cpus=0.1, memory… RAM RSS del…  31879       31879       0
+27 cal01_cpu-quota-sw… cpus=0.25, memor… RAM RSS del…  33346       33346       0
+28 cal01_cpu-quota-sw… cpus=0.5, memory… RAM RSS del…  35391       35391       0
+29 cal01_cpu-quota-sw… cpus=0.75, memor… RAM RSS del…  38514       38514       0
+30 cal01_cpu-quota-sw… cpus=1, memory=7… RAM RSS del…  45907       45907       0
+31 cal01_cpu-quota-sw… cpus=0.01, memor… RAM RSS uti…  22118       22118       0
+32 cal01_cpu-quota-sw… cpus=0.02, memor… RAM RSS uti…  23300       23300       0
+33 cal01_cpu-quota-sw… cpus=0.03, memor… RAM RSS uti…  24384       24384       0
+34 cal01_cpu-quota-sw… cpus=0.04, memor… RAM RSS uti…  27901       27901       0
+35 cal01_cpu-quota-sw… cpus=0.05, memor… RAM RSS uti…  29264       29264       0
+36 cal01_cpu-quota-sw… cpus=0.1, memory… RAM RSS uti…  31879       31879       0
+37 cal01_cpu-quota-sw… cpus=0.25, memor… RAM RSS uti…  33346       33346       0
+38 cal01_cpu-quota-sw… cpus=0.5, memory… RAM RSS uti…  35391       35391       0
+39 cal01_cpu-quota-sw… cpus=0.75, memor… RAM RSS uti…  38514       38514       0
+40 cal01_cpu-quota-sw… cpus=1, memory=7… RAM RSS uti…  45907       45907       0
+41 cal01_ram-app-heap… cpus=1, memory=4g CPU envelop… 103684      103675       9
+42 cal01_ram-app-heap… cpus=1, memory=4g CPU throttl… 103684      103675       9
+43 cal01_ram-app-heap… cpus=1, memory=4g RAM RSS del… 103684      103677       7
+44 cal01_ram-app-heap… cpus=1, memory=4g RAM RSS uti… 103684      103677       7
+45 tmp02_20260702_143… unconstrained / … CPU envelop…  20689       20689       0
+46 tmp02_20260702_143… unconstrained / … CPU throttl…  20689       20689       0
+47 tmp02_20260702_143… unconstrained / … RAM RSS del…  20689       20689       0
+48 tmp02_20260702_143… unconstrained / … RAM RSS uti…  20689       20689       0
+# ℹ 1 more variable: pct_missing <dbl>
+
+Source input/path literals: statistics/statistics_analysis.ipynb
+OpenMLS_containerized/OpenMLS_containerized/benchmark_output/*/events.csv
+OpenMLS_containerized/benchmark_output/*/events.csv
+Signal_containerized/benchmark_output
+Signal_containerized/benchmark_output/*/events.csv
+benchmark_output/*/events.csv
+
+Cached input/coverage record: statistics/statistics_analysis.ipynb, cell 2, output 1
+# A tibble: 2 × 13
+  source_run      schema_generation protocol_stack profile_schema_version   rows
+  <chr>           <chr>             <chr>                           <dbl>  <int>
+1 cal01_signal_c… refactored schema signal                              4 3.81e6
+2 tmp02_20260702… refactored schema signal                              4 1.63e5
+# ℹ 8 more variables: success_rows <int>, failed_rows <int>, operations <int>,
+#   max_n_members <dbl>, max_session_count <dbl>, participants_seen <int>,
+#   singleton_rows <int>, singleton_rows_with_resource_caps <int>
+
+Cached input/coverage record: statistics/statistics_analysis.ipynb, cell 2, output 23
+# A tibble: 11 × 12
+   source_run           layout_mode container_mode worker_group resource_profile
+   <chr>                <chr>       <chr>          <fct>        <chr>           
+ 1 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p01  
+ 2 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p02  
+ 3 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p03  
+ 4 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p04  
+ 5 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p05  
+ 6 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p1   
+ 7 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p25  
+ 8 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p5   
+ 9 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_0p75  
+10 cal01_signal_cpu-qu… hybrid      singleton      other worke… cpu_quota_1p0   
+11 tmp02_20260702_1439… hybrid      singleton      other worke… singleton-resou…
+# ℹ 7 more variables: resource_limit_cpus <dbl>,
+#   resource_limit_memory_bytes <dbl>, resource_limit_memory_swap_bytes <dbl>,
+#   resource_limit_pids <dbl>, rows <int>, participants_seen <int>,
+#   max_n_members <dbl>
+
+Source input/path literals: statistics/statistics_analysis_openmls_v5.ipynb
+OpenMLS_containerized/benchmark_output
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v5.ipynb, cell 1, output 0
+[1] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark"
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v5.ipynb, cell 3, output 0
+  run_folder                                 
+1 .analysis_cache_v4                         
+2 cal01_cpu-quota-sweep_i1_20260703_024206   
+3 cal01_ram-app-heap-sweep_i1_20260703_024206
+4 tmp02_20260702_143942_pid1589303_openmls   
+  run_dir                                                                           
+1 OpenMLS_containerized/benchmark_output/.analysis_cache_v4                         
+2 OpenMLS_containerized/benchmark_output/cal01_cpu-quota-sweep_i1_20260703_024206   
+3 OpenMLS_containerized/benchmark_output/cal01_ram-app-heap-sweep_i1_20260703_024206
+4 OpenMLS_containerized/benchmark_output/tmp02_20260702_143942_pid1589303_openmls   
+  events_csv                                                                                   
+1 OpenMLS_containerized/benchmark_output/.analysis_cache_v4/events.csv                         
+2 OpenMLS_containerized/benchmark_output/cal01_cpu-quota-sweep_i1_20260703_024206/events.csv   
+3 OpenMLS_containerized/benchmark_output/cal01_ram-app-heap-sweep_i1_20260703_024206/events.csv
+4 OpenMLS_containerized/benchmark_output/tmp02_20260702_143942_pid1589303_openmls/events.csv   
+  has_events_csv events_size_bytes events_mtime               jsonl_count
+1 FALSE                 NA         NA                          0         
+2  TRUE          257589382         2026-07-03 12:37:02.653749 12         
+3  TRUE           86254663         2026-07-03 07:40:26.372581 13         
+4  TRUE           14906321         2026-07-02 14:40:37.525936 11         
+  has_benchmark_outcome benchmark_outcome_status  has_metadata column_count
+1 FALSE                 missing                   FALSE          0         
+2  TRUE                 success                    TRUE        193         
+3  TRUE                 success                    TRUE        193         
+4  TRUE                 output_validation_failure  TRUE        193         
+  has_commit_receive_columns has_resource_columns included ignored_reason    
+1 FALSE                      FALSE                FALSE    missing events.csv
+2  TRUE                       TRUE                 TRUE    NA                
+3  TRUE                       TRUE                 TRUE    NA                
+4  TRUE                       TRUE                 TRUE    NA
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v5.ipynb, cell 4, output 1
+[openmls-v5] Reading file batch 1/2: cal01_cpu-quota-sweep_i1_20260703_024206, cal01_ram-app-heap-sweep_i1_20260703_024206
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v5.ipynb, cell 4, output 3
+[openmls-v5] Reading file batch 2/2: tmp02_20260702_143942_pid1589303_openmls
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v5.ipynb, cell 4, output 6
+  source_run_folder                          
+1 cal01_cpu-quota-sweep_i1_20260703_024206   
+2 cal01_ram-app-heap-sweep_i1_20260703_024206
+3 tmp02_20260702_143942_pid1589303_openmls   
+  run_id                                      rows   operation_count
+1 cal01_cpu-quota-sweep_i1_20260703_024206    312004 74             
+2 cal01_ram-app-heap-sweep_i1_20260703_024206 103684 75             
+3 tmp02_20260702_143942_pid1589303_openmls     20689 74             
+  parent_operation_rows device_kind_count device_kinds     
+1 9266                  1                 scratch_container
+2 7651                  1                 scratch_container
+3  719                  1                 scratch_container
+  execution_backend_count execution_backends worker_id_count ciphersuite_count
+1 1                       docker_container   10              1                
+2 1                       docker_container   10              1                
+3 1                       docker_container   10              1                
+  ciphersuites                                 profile_schema_versions
+1 MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 11                     
+2 MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 11                     
+3 MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519 11                     
+  has_external_device_rows has_container_rows has_resource_fields
+1 FALSE                    TRUE               TRUE               
+2 FALSE                    TRUE               TRUE               
+3 FALSE                    TRUE               TRUE               
+  run_looks_complete
+1 TRUE              
+2 TRUE              
+3 TRUE
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 2, output 0
+Using existing backend outputs in /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7. Set force_backend <- TRUE to regenerate.
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 0
+[openmls-v7] Loaded AddCommit raw cache: /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/cache/openmls_v7_addcommit_raw.rds
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 2
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_total_cpu_thread_time_thin_plate_heatmap.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 4
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_total_cpu_wall_time_thin_plate_heatmap.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 8
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_total_ram_alloc_bytes_thin_plate_heatmap.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 10
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_total_ram_alloc_count_thin_plate_heatmap.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 12
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_groupinfo_aead_tree_cpu_thread_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 14
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_groupinfo_aead_tree_cpu_wall_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 18
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_groupinfo_aead_tree_ram_alloc_bytes_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 20
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_groupinfo_aead_tree_ram_alloc_count_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 22
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_path_key_derivation_cpu_thread_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 24
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_path_key_derivation_cpu_wall_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 60
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_path_key_derivation_ram_alloc_bytes_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 94
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_path_key_derivation_ram_alloc_count_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 96
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_updatepath_hpke_cpu_thread_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 98
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_updatepath_hpke_cpu_wall_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 102
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_updatepath_hpke_ram_alloc_bytes_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 104
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_updatepath_hpke_ram_alloc_count_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 106
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_welcome_hpke_cpu_thread_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 108
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_welcome_hpke_cpu_wall_time_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 112
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_welcome_hpke_ram_alloc_bytes_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 114
+[openmls-v7] Wrote /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_welcome_hpke_ram_alloc_count_loess_iqr.png
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 115
+
+OpenMLS v7 AddCommit statistics report
+======================================
+events.csv files inspected: 3
+total event rows inspected: 436,377
+create-side AddCommit rows retained: 13,447
+plots created: 20
+plots skipped: 5
+# A tibble: 5 × 3
+  plot_name                                                   filename                                            reason
+  <chr>                                                       <chr>                                               <chr> 
+1 addcommit_total_l1_cache_misses_thin_plate_heatmap.png      addcommit_total_l1_cache_misses_thin_plate_heatmap… cover…
+2 addcommit_groupinfo_aead_tree_l1_cache_misses_loess_iqr.png addcommit_groupinfo_aead_tree_l1_cache_misses_loes… cover…
+3 addcommit_path_key_derivation_l1_cache_misses_loess_iqr.png addcommit_path_key_derivation_l1_cache_misses_loes… cover…
+4 addcommit_updatepath_hpke_l1_cache_misses_loess_iqr.png     addcommit_updatepath_hpke_l1_cache_misses_loess_iq… cover…
+5 addcommit_welcome_hpke_l1_cache_misses_loess_iqr.png        addcommit_welcome_hpke_l1_cache_misses_loess_iqr.p… cover…
+report: /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/report/addcommit_report.md
+output directory: /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v7.ipynb, cell 3, output 116
+  pdf_page_count
+1 20            
+  individual_pdf_dir                                                                                      
+1 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots_pdf_pages
+  combine_method   
+1 qpdf::pdf_combine
+  combined_pdf                                                                                                          
+1 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v7/plots/addcommit_all_plots.pdf
+
+Source input/path literals: statistics/statistics_analysis_openmls_v8.ipynb
+/tmp/MLS_container_no_constraints
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v8.ipynb, cell 1, output 2
+   suboperation_key    suboperation_label              plot_class metric_key     column          
+1  addcommit_total     AddCommit total                 final      alloc_bytes    alloc_bytes     
+2  addcommit_total     AddCommit total                 final      alloc_count    alloc_count     
+3  addcommit_total     AddCommit total                 final      cpu_process_ms cpu_process_ns  
+4  addcommit_total     AddCommit total                 final      cpu_thread_ms  cpu_thread_ns   
+5  addcommit_total     AddCommit total                 final      l1d_misses     l1d_cache_misses
+6  addcommit_total     AddCommit total                 final      wall_ms        wall_ns         
+7  groupinfo_aead      GroupInfo AEAD                  final      alloc_bytes    alloc_bytes     
+8  groupinfo_aead      GroupInfo AEAD                  final      alloc_count    alloc_count     
+9  groupinfo_aead      GroupInfo AEAD                  final      cpu_process_ms cpu_process_ns  
+10 groupinfo_aead      GroupInfo AEAD                  final      cpu_thread_ms  cpu_thread_ns   
+11 groupinfo_aead      GroupInfo AEAD                  final      l1d_misses     l1d_cache_misses
+12 groupinfo_aead      GroupInfo AEAD                  final      wall_ms        wall_ns         
+13 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic alloc_bytes    alloc_bytes     
+14 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic alloc_count    alloc_count     
+15 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic cpu_process_ms cpu_process_ns  
+16 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic cpu_thread_ms  cpu_thread_ns   
+17 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic l1d_misses     l1d_cache_misses
+18 groupinfo_aead_tree GroupInfo AEAD by tree artifact diagnostic wall_ms        wall_ns         
+19 groupinfo_serialize GroupInfo serialization         final      alloc_bytes    alloc_bytes     
+20 groupinfo_serialize GroupInfo serialization         final      alloc_count    alloc_count     
+21 groupinfo_serialize GroupInfo serialization         final      cpu_process_ms cpu_process_ns  
+22 groupinfo_serialize GroupInfo serialization         final      cpu_thread_ms  cpu_thread_ns   
+23 groupinfo_serialize GroupInfo serialization         final      l1d_misses     l1d_cache_misses
+24 groupinfo_serialize GroupInfo serialization         final      wall_ms        wall_ns         
+25 path_key_derivation Path key derivation             final      alloc_bytes    alloc_bytes     
+26 path_key_derivation Path key derivation             final      alloc_count    alloc_count     
+27 path_key_derivation Path key derivation             final      cpu_process_ms cpu_process_ns  
+28 path_key_derivation Path key derivation             final      cpu_thread_ms  cpu_thread_ns   
+29 path_key_derivation Path key derivation             final      l1d_misses     l1d_cache_misses
+30 path_key_derivation Path key derivation             final      wall_ms        wall_ns         
+31 updatepath_hpke     UpdatePath HPKE                 final      alloc_bytes    alloc_bytes     
+32 updatepath_hpke     UpdatePath HPKE                 final      alloc_count    alloc_count     
+33 updatepath_hpke     UpdatePath HPKE                 final      cpu_process_ms cpu_process_ns  
+34 updatepath_hpke     UpdatePath HPKE                 final      cpu_thread_ms  cpu_thread_ns   
+35 updatepath_hpke     UpdatePath HPKE                 final      l1d_misses     l1d_cache_misses
+36 updatepath_hpke     UpdatePath HPKE                 final      wall_ms        wall_ns         
+37 welcome_hpke        Welcome HPKE                    final      alloc_bytes    alloc_bytes     
+38 welcome_hpke        Welcome HPKE                    final      alloc_count    alloc_count     
+39 welcome_hpke        Welcome HPKE                    final      cpu_process_ms cpu_process_ns  
+40 welcome_hpke        Welcome HPKE                    final      cpu_thread_ms  cpu_thread_ns   
+41 welcome_hpke        Welcome HPKE                    final      l1d_misses     l1d_cache_misses
+42 welcome_hpke        Welcome HPKE                    final      wall_ms        wall_ns         
+   metric_label           unit        filename_key     metric_class          plot_kind  
+1  allocated bytes        bytes       allocated_bytes  final                 raw_heatmap
+2  allocation count       allocations allocation_count final                 raw_heatmap
+3  process CPU time       ms          cpu_process_ms   final                 raw_heatmap
+4  caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_heatmap
+5  L1D cache misses       misses      l1d_cache_misses final_where_available raw_heatmap
+6  wall time              ms          wall_time_ms     final                 raw_heatmap
+7  allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+8  allocation count       allocations allocation_count final                 raw_iqr    
+9  process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+10 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+11 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+12 wall time              ms          wall_time_ms     final                 raw_iqr    
+13 allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+14 allocation count       allocations allocation_count final                 raw_iqr    
+15 process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+16 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+17 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+18 wall time              ms          wall_time_ms     final                 raw_iqr    
+19 allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+20 allocation count       allocations allocation_count final                 raw_iqr    
+21 process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+22 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+23 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+24 wall time              ms          wall_time_ms     final                 raw_iqr    
+25 allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+26 allocation count       allocations allocation_count final                 raw_iqr    
+27 process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+28 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+29 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+30 wall time              ms          wall_time_ms     final                 raw_iqr    
+31 allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+32 allocation count       allocations allocation_count final                 raw_iqr    
+33 process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+34 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+35 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+36 wall time              ms          wall_time_ms     final                 raw_iqr    
+37 allocated bytes        bytes       allocated_bytes  final                 raw_iqr    
+38 allocation count       allocations allocation_count final                 raw_iqr    
+39 process CPU time       ms          cpu_process_ms   final                 raw_iqr    
+40 caller-thread CPU time ms          cpu_thread_ms    diagnostic            raw_iqr    
+41 L1D cache misses       misses      l1d_cache_misses final_where_available raw_iqr    
+42 wall time              ms          wall_time_ms     final                 raw_iqr    
+   filename                                                   width height span                                     
+1  addcommit_total_allocated_bytes_raw_heatmap.png            13    5.2    NA                                       
+2  addcommit_total_allocation_count_raw_heatmap.png           13    5.2    NA                                       
+3  addcommit_total_cpu_process_ms_raw_heatmap.png             13    5.2    NA                                       
+4  addcommit_total_cpu_thread_ms_raw_heatmap.png              13    5.2    NA                                       
+5  addcommit_total_l1d_cache_misses_raw_heatmap.png           13    5.2    NA                                       
+6  addcommit_total_wall_time_ms_raw_heatmap.png               13    5.2    NA                                       
+7  addcommit_groupinfo_aead_allocated_bytes_raw_iqr.png       12    5.6    commit_add.group_info.aead_encrypt       
+8  addcommit_groupinfo_aead_allocation_count_raw_iqr.png      12    5.6    commit_add.group_info.aead_encrypt       
+9  addcommit_groupinfo_aead_cpu_process_ms_raw_iqr.png        12    5.6    commit_add.group_info.aead_encrypt       
+10 addcommit_groupinfo_aead_cpu_thread_ms_raw_iqr.png         12    5.6    commit_add.group_info.aead_encrypt       
+11 addcommit_groupinfo_aead_l1d_cache_misses_raw_iqr.png      12    5.6    commit_add.group_info.aead_encrypt       
+12 addcommit_groupinfo_aead_wall_time_ms_raw_iqr.png          12    5.6    commit_add.group_info.aead_encrypt       
+13 addcommit_groupinfo_aead_tree_allocated_bytes_raw_iqr.png  12    5.6    commit_add.group_info.aead_encrypt       
+14 addcommit_groupinfo_aead_tree_allocation_count_raw_iqr.png 12    5.6    commit_add.group_info.aead_encrypt       
+15 addcommit_groupinfo_aead_tree_cpu_process_ms_raw_iqr.png   12    5.6    commit_add.group_info.aead_encrypt       
+16 addcommit_groupinfo_aead_tree_cpu_thread_ms_raw_iqr.png    12    5.6    commit_add.group_info.aead_encrypt       
+17 addcommit_groupinfo_aead_tree_l1d_cache_misses_raw_iqr.png 12    5.6    commit_add.group_info.aead_encrypt       
+18 addcommit_groupinfo_aead_tree_wall_time_ms_raw_iqr.png     12    5.6    commit_add.group_info.aead_encrypt       
+19 addcommit_groupinfo_serialize_allocated_bytes_raw_iqr.png  12    5.6    commit_add.group_info.serialize_plaintext
+20 addcommit_groupinfo_serialize_allocation_count_raw_iqr.png 12    5.6    commit_add.group_info.serialize_plaintext
+21 addcommit_groupinfo_serialize_cpu_process_ms_raw_iqr.png   12    5.6    commit_add.group_info.serialize_plaintext
+22 addcommit_groupinfo_serialize_cpu_thread_ms_raw_iqr.png    12    5.6    commit_add.group_info.serialize_plaintext
+23 addcommit_groupinfo_serialize_l1d_cache_misses_raw_iqr.png 12    5.6    commit_add.group_info.serialize_plaintext
+24 addcommit_groupinfo_serialize_wall_time_ms_raw_iqr.png     12    5.6    commit_add.group_info.serialize_plaintext
+25 addcommit_path_key_derivation_allocated_bytes_raw_iqr.png  12    5.6    commit_add.path_secret_derive            
+26 addcommit_path_key_derivation_allocation_count_raw_iqr.png 12    5.6    commit_add.path_secret_derive            
+27 addcommit_path_key_derivation_cpu_process_ms_raw_iqr.png   12    5.6    commit_add.path_secret_derive            
+28 addcommit_path_key_derivation_cpu_thread_ms_raw_iqr.png    12    5.6    commit_add.path_secret_derive            
+29 addcommit_path_key_derivation_l1d_cache_misses_raw_iqr.png 12    5.6    commit_add.path_secret_derive            
+30 addcommit_path_key_derivation_wall_time_ms_raw_iqr.png     12    5.6    commit_add.path_secret_derive            
+31 addcommit_updatepath_hpke_allocated_bytes_raw_iqr.png      12    5.6    commit_add.path_hpke_encrypt             
+32 addcommit_updatepath_hpke_allocation_count_raw_iqr.png     12    5.6    commit_add.path_hpke_encrypt             
+33 addcommit_updatepath_hpke_cpu_process_ms_raw_iqr.png       12    5.6    commit_add.path_hpke_encrypt             
+34 addcommit_updatepath_hpke_cpu_thread_ms_raw_iqr.png        12    5.6    commit_add.path_hpke_encrypt             
+35 addcommit_updatepath_hpke_l1d_cache_misses_raw_iqr.png     12    5.6    commit_add.path_hpke_encrypt             
+36 addcommit_updatepath_hpke_wall_time_ms_raw_iqr.png         12    5.6    commit_add.path_hpke_encrypt             
+37 addcommit_welcome_hpke_allocated_bytes_raw_iqr.png         12    5.6    commit_add.welcome_group_secrets_encrypt 
+38 addcommit_welcome_hpke_allocation_count_raw_iqr.png        12    5.6    commit_add.welcome_group_secrets_encrypt 
+39 addcommit_welcome_hpke_cpu_process_ms_raw_iqr.png          12    5.6    commit_add.welcome_group_secrets_encrypt 
+40 addcommit_welcome_hpke_cpu_thread_ms_raw_iqr.png           12    5.6    commit_add.welcome_group_secrets_encrypt 
+41 addcommit_welcome_hpke_l1d_cache_misses_raw_iqr.png        12    5.6    commit_add.welcome_group_secrets_encrypt 
+42 addcommit_welcome_hpke_wall_time_ms_raw_iqr.png            12    5.6    commit_add.welcome_group_secrets_encrypt 
+   x_col                      x_label                         x_discrete
+1  NA                         NA                                 NA     
+2  NA                         NA                                 NA     
+3  NA                         NA                                 NA     
+4  NA                         NA                                 NA     
+5  NA                         NA                                 NA     
+6  NA                         NA                                 NA     
+7  group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+8  group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+9  group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+10 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+11 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+12 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+13 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+14 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+15 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+16 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+17 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+18 tree_artifact_bytes        ratchet tree artifact bytes     FALSE     
+19 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+20 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+21 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+22 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+23 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+24 group_info_plaintext_bytes GroupInfo plaintext bytes       FALSE     
+25 F                          filtered direct path length (F)  TRUE     
+26 F                          filtered direct path length (F)  TRUE     
+27 F                          filtered direct path length (F)  TRUE     
+28 F                          filtered direct path length (F)  TRUE     
+29 F                          filtered direct path length (F)  TRUE     
+30 F                          filtered direct path length (F)  TRUE     
+31 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+32 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+33 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+34 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+35 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+36 C                          UpdatePath HPKE ciphertexts (C)  TRUE     
+37 k                          new members added (k)            TRUE     
+38 k                          new members added (k)            TRUE     
+39 k                          new members added (k)            TRUE     
+40 k                          new members added (k)            TRUE     
+41 k                          new members added (k)            TRUE     
+42 k                          new members added (k)            TRUE     
+   path                                                                                                                                                     
+1  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_allocated_bytes_raw_heatmap.png           
+2  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_allocation_count_raw_heatmap.png          
+3  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_cpu_process_ms_raw_heatmap.png            
+4  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_cpu_thread_ms_raw_heatmap.png             
+5  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_l1d_cache_misses_raw_heatmap.png          
+6  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_total_wall_time_ms_raw_heatmap.png              
+7  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_allocated_bytes_raw_iqr.png      
+8  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_allocation_count_raw_iqr.png     
+9  /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_cpu_process_ms_raw_iqr.png       
+10 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_cpu_thread_ms_raw_iqr.png        
+11 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_l1d_cache_misses_raw_iqr.png     
+12 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_wall_time_ms_raw_iqr.png         
+13 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_allocated_bytes_raw_iqr.png 
+14 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_allocation_count_raw_iqr.png
+15 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_cpu_process_ms_raw_iqr.png  
+16 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_cpu_thread_ms_raw_iqr.png   
+17 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_l1d_cache_misses_raw_iqr.png
+18 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_aead_tree_wall_time_ms_raw_iqr.png    
+19 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_allocated_bytes_raw_iqr.png 
+20 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_allocation_count_raw_iqr.png
+21 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_cpu_process_ms_raw_iqr.png  
+22 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_cpu_thread_ms_raw_iqr.png   
+23 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_l1d_cache_misses_raw_iqr.png
+24 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_groupinfo_serialize_wall_time_ms_raw_iqr.png    
+25 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_allocated_bytes_raw_iqr.png 
+26 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_allocation_count_raw_iqr.png
+27 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_cpu_process_ms_raw_iqr.png  
+28 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_cpu_thread_ms_raw_iqr.png   
+29 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_l1d_cache_misses_raw_iqr.png
+30 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_path_key_derivation_wall_time_ms_raw_iqr.png    
+31 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_allocated_bytes_raw_iqr.png     
+32 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_allocation_count_raw_iqr.png    
+33 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_cpu_process_ms_raw_iqr.png      
+34 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_cpu_thread_ms_raw_iqr.png       
+35 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_l1d_cache_misses_raw_iqr.png    
+36 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_updatepath_hpke_wall_time_ms_raw_iqr.png        
+37 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_allocated_bytes_raw_iqr.png        
+38 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_allocation_count_raw_iqr.png       
+39 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_cpu_process_ms_raw_iqr.png         
+40 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_cpu_thread_ms_raw_iqr.png          
+41 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_l1d_cache_misses_raw_iqr.png       
+42 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_welcome_hpke_wall_time_ms_raw_iqr.png           
+   status 
+1  created
+2  created
+3  created
+4  created
+5  created
+6  created
+7  created
+8  created
+9  created
+10 created
+11 created
+12 created
+13 created
+14 created
+15 created
+16 created
+17 created
+18 created
+19 created
+20 created
+21 created
+22 created
+23 created
+24 created
+25 created
+26 created
+27 created
+28 created
+29 created
+30 created
+31 created
+32 created
+33 created
+34 created
+35 created
+36 created
+37 created
+38 created
+39 created
+40 created
+41 created
+42 created
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v8.ipynb, cell 2, output 0
+  pdf_page_count
+1 42            
+  individual_pdf_dir                                                                                      
+1 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots_pdf_pages
+  combine_method
+1 qpdf          
+  combined_pdf                                                                                                          
+1 /home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v8/plots/addcommit_all_plots.pdf
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v8.ipynb, cell 3, output 0
+$file_inventory
+# A tibble: 13 × 5
+   source_file                                                                 source_run_folder status rows_kept detail
+   <chr>                                                                       <chr>             <chr>      <dbl> <lgl> 
+ 1 /tmp/MLS_container_no_constraints/tmp02_20260706_105828_pid2346579_openmls… tmp02_20260706_1… accep…       242 NA    
+ 2 /tmp/MLS_container_no_constraints/tmp02_20260706_110147_pid2354678_openmls… tmp02_20260706_1… accep…       242 NA    
+ 3 /tmp/MLS_container_no_constraints/tmp02_20260706_110540_pid2362791_openmls… tmp02_20260706_1… accep…       242 NA    
+ 4 /tmp/MLS_container_no_constraints/tmp02_20260706_110804_pid2370267_openmls… tmp02_20260706_1… accep…      4224 NA    
+ 5 /tmp/MLS_container_no_constraints/tmp02_20260706_112805_pid2376811_openmls… tmp02_20260706_1… accep…      4246 NA    
+ 6 /tmp/MLS_container_no_constraints/tmp02_20260706_114822_pid2383073_openmls… tmp02_20260706_1… accep…      4224 NA    
+ 7 /tmp/MLS_container_no_constraints/tmp02_20260706_120855_pid2389368_openmls… tmp02_20260706_1… accep…      4224 NA    
+ 8 /tmp/MLS_container_no_constraints/tmp02_20260706_122833_pid2395380_openmls… tmp02_20260706_1… accep…      4246 NA    
+ 9 /tmp/MLS_container_no_constraints/tmp02_20260706_124837_pid2401383_openmls… tmp02_20260706_1… accep…      4224 NA    
+10 /tmp/MLS_container_no_constraints/tmp02_20260706_130828_pid2407419_openmls… tmp02_20260706_1… accep…      4224 NA    
+11 /tmp/MLS_container_no_constraints/tmp02_20260706_132911_pid2413610_openmls… tmp02_20260706_1… accep…      4224 NA    
+12 /tmp/MLS_container_no_constraints/tmp02_20260706_134852_pid2419666_openmls… tmp02_20260706_1… accep…      4224 NA    
+13 /tmp/MLS_container_no_constraints/tmp02_20260706_140846_pid2425701_openmls… tmp02_20260706_1… accep…      4224 NA    
+
+$l1d_coverage
+# A tibble: 1 × 6
+  platform_label op                     total_rows available_rows missing_rows pct_available
+  <chr>          <chr>                       <dbl>          <dbl>        <dbl>         <dbl>
+1 Containers     add_commit_total_local       1955              0         1955             0
+
+$metric_missingness
+# A tibble: 91 × 5
+   platform_label suboperation_key    metric_key     valid_observations missing
+   <chr>          <chr>               <chr>                       <dbl> <lgl>  
+ 1 Containers     addcommit_total     l1d_misses                      0 TRUE   
+ 2 Containers     groupinfo_aead      l1d_misses                      0 TRUE   
+ 3 Containers     groupinfo_aead_tree l1d_misses                      0 TRUE   
+ 4 Containers     groupinfo_serialize l1d_misses                      0 TRUE   
+ 5 Containers     path_key_derivation l1d_misses                      0 TRUE   
+ 6 Containers     updatepath_hpke     l1d_misses                      0 TRUE   
+ 7 Containers     welcome_hpke        l1d_misses                      0 TRUE   
+ 8 Raspberry Pi   addcommit_total     alloc_bytes                     0 TRUE   
+ 9 Raspberry Pi   addcommit_total     alloc_count                     0 TRUE   
+10 Raspberry Pi   addcommit_total     cpu_process_ms                  0 TRUE   
+# ℹ 81 more rows
+
+$platform_inventory
+# A tibble: 1 × 6
+  platform_label device_kind       execution_backend observations workers  runs
+  <fct>          <chr>             <chr>                    <int>   <int> <int>
+1 Containers     scratch_container docker_container         43010     103    13
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v8.ipynb, cell 6, output 0
+$file_inventory
+# A tibble: 13 × 5
+   source_file                                                                 source_run_folder status rows_kept detail
+   <chr>                                                                       <chr>             <chr>      <int> <chr> 
+ 1 /tmp/MLS_container_no_constraints/tmp02_20260706_105828_pid2346579_openmls… tmp02_20260706_1… accep…      3998 ""    
+ 2 /tmp/MLS_container_no_constraints/tmp02_20260706_110147_pid2354678_openmls… tmp02_20260706_1… accep…      4022 ""    
+ 3 /tmp/MLS_container_no_constraints/tmp02_20260706_110540_pid2362791_openmls… tmp02_20260706_1… accep…      5472 ""    
+ 4 /tmp/MLS_container_no_constraints/tmp02_20260706_110804_pid2370267_openmls… tmp02_20260706_1… accep…    101336 ""    
+ 5 /tmp/MLS_container_no_constraints/tmp02_20260706_112805_pid2376811_openmls… tmp02_20260706_1… accep…    101420 ""    
+ 6 /tmp/MLS_container_no_constraints/tmp02_20260706_114822_pid2383073_openmls… tmp02_20260706_1… accep…    101228 ""    
+ 7 /tmp/MLS_container_no_constraints/tmp02_20260706_120855_pid2389368_openmls… tmp02_20260706_1… accep…    101282 ""    
+ 8 /tmp/MLS_container_no_constraints/tmp02_20260706_122833_pid2395380_openmls… tmp02_20260706_1… accep…    101422 ""    
+ 9 /tmp/MLS_container_no_constraints/tmp02_20260706_124837_pid2401383_openmls… tmp02_20260706_1… accep…    101304 ""    
+10 /tmp/MLS_container_no_constraints/tmp02_20260706_130828_pid2407419_openmls… tmp02_20260706_1… accep…    101252 ""    
+11 /tmp/MLS_container_no_constraints/tmp02_20260706_132911_pid2413610_openmls… tmp02_20260706_1… accep…    101220 ""    
+12 /tmp/MLS_container_no_constraints/tmp02_20260706_134852_pid2419666_openmls… tmp02_20260706_1… accep…    101304 ""    
+13 /tmp/MLS_container_no_constraints/tmp02_20260706_140846_pid2425701_openmls… tmp02_20260706_1… accep…    101280 ""    
+
+$metadata_coverage
+# A tibble: 13 × 2
+   column                    nonmissing_pct
+   <chr>                              <dbl>
+ 1 member_count_before                100  
+ 2 member_count_after                 100  
+ 3 commit_kind                          3.4
+ 4 commit_size_bytes                    2.3
+ 5 receiver_leaf_index                 51.1
+ 6 committer_leaf_index                27.8
+ 7 receiver_is_committer                3.4
+ 8 proposal_count                       3.4
+ 9 add_proposal_count                   3.4
+10 remove_proposal_count                3.4
+11 update_proposal_count                3.4
+12 update_path_present                 11.5
+13 confirmation_tag_verified            9.3
+
+$l1d_coverage
+# A tibble: 10 × 6
+   platform_label op                                     total_rows available_rows missing_rows pct_available
+   <fct>          <chr>                                       <int>          <int>        <int>         <dbl>
+ 1 Containers     commit_receive.confirmation_tag_verify      83610              0        83610             0
+ 2 Containers     commit_receive.deserialize                  11610              0        11610             0
+ 3 Containers     commit_receive.group_state_install          83610              0        83610             0
+ 4 Containers     commit_receive.key_schedule_step            83610              0        83610             0
+ 5 Containers     commit_receive.message_auth_verify          83610              0        83610             0
+ 6 Containers     commit_receive.path_secret_decrypt          83610              0        83610             0
+ 7 Containers     commit_receive.proposal_apply               83610              0        83610             0
+ 8 Containers     commit_receive.update_path_validate         83610              0        83610             0
+ 9 Containers     commit_receive_protocol                     11610              0        11610             0
+10 Containers     commit_receive_total_local                  83610              0        83610             0
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v9.ipynb, cell 2, output 0
+# A tibble: 4 × 8
+  run_id                                      run_kind           has_events events_rows has_resource_summary has_worker_failures
+  <chr>                                       <chr>              <lgl>            <int> <lgl>                <lgl>              
+1 .analysis_cache_v4                          other              FALSE                0 FALSE                FALSE              
+2 cal01_cpu-quota-sweep_i1_20260703_024206    01 constrained CPU TRUE            312004 TRUE                 TRUE               
+3 cal01_ram-app-heap-sweep_i1_20260703_024206 01 constrained RAM TRUE            103684 TRUE                 TRUE               
+4 tmp02_20260702_143942_pid1589303_openmls    other              TRUE             20689 FALSE                FALSE              
+  outcome_class             terminal_finished
+  <chr>                     <lgl>            
+1 unknown                   FALSE            
+2 success                   TRUE             
+3 success                   TRUE             
+4 output_validation_failure TRUE
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v9.ipynb, cell 3, output 0
+# A tibble: 10 × 13
+   resource_profile_id app_heap_budget heap_bytes profile_index  runs profiled_workers failures survived first_failure_operation
+   <chr>               <chr>                <dbl>         <dbl> <int>            <int>    <int>    <int> <chr>                  
+ 1 ram_app_heap_32k    32k                  32768             0     1                1        1        0 "key_package_create"   
+ 2 ram_app_heap_64k    64k                  65536             1     1                1        1        0 "key_package_create"   
+ 3 ram_app_heap_128k   128k                131072             2     1                1        1        0 "key_package_create"   
+ 4 ram_app_heap_512k   512k                524288             3     1                1        1        0 "welcome_receive"      
+ 5 ram_app_heap_1m     1m                 1048576             4     1                1        1        0 "welcome_receive"      
+ 6 ram_app_heap_2m     2m                 2097152             5     1                1        1        0 "welcome_receive"      
+ 7 ram_app_heap_8m     8m                 8388608             6     1                1        1        0 "add_commit"           
+ 8 ram_app_heap_32m    32m               33554432             7     1                1        0        1 ""                     
+ 9 ram_app_heap_256m   256m             268435456             8     1                1        0        1 ""                     
+10 ram_app_heap_1g     1g              1073741824             9     1                1        0        1 ""                     
+   min_failure_member_count median_failure_peak_kib failure_action                  status          
+                      <dbl>                   <dbl> <chr>                           <chr>           
+ 1                      202                    88.0 "drop_idle_joiner"              fails / attrited
+ 2                      409                    88.0 "drop_idle_joiner"              fails / attrited
+ 3                      610                   136.  "drop_idle_joiner"              fails / attrited
+ 4                      810                   644.  "evict_joiner_after_add_commit" fails / attrited
+ 5                     1018                  1141.  "evict_joiner_after_add_commit" fails / attrited
+ 6                     1221                  2048.  "evict_joiner_after_add_commit" fails / attrited
+ 7                     1642                  8232.  "evict_add_recipient_and_retry" fails / attrited
+ 8                       NA                    NA   ""                              survived        
+ 9                       NA                    NA   ""                              survived        
+10                       NA                    NA   ""                              survived
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v9.ipynb, cell 4, output 0
+# A tibble: 10 × 21
+   resource_profile_id cpu_fraction cpu_limit profile_index  runs profiled_workers event_csv_available event_rows matched_operation_strata
+   <chr>                      <dbl>     <dbl>         <dbl> <int>            <int> <lgl>                    <int>                    <int>
+ 1 cpu_quota_1p0               1         1                0     1                1 TRUE                      4878                       11
+ 2 cpu_quota_0p75              0.75      0.75             1     1                1 TRUE                      4286                       10
+ 3 cpu_quota_0p5               0.5       0.5              2     1                1 TRUE                      4078                        9
+ 4 cpu_quota_0p25              0.25      0.25             3     1                1 TRUE                      3886                       10
+ 5 cpu_quota_0p1               0.1       0.1              4     1                1 TRUE                      3678                        9
+ 6 cpu_quota_0p05              0.05      0.05             5     1                1 TRUE                      3470                       10
+ 7 cpu_quota_0p04              0.04      0.04             6     1                1 TRUE                      3262                       10
+ 8 cpu_quota_0p03              0.03      0.03             7     1                1 TRUE                      3070                       10
+ 9 cpu_quota_0p02              0.02      0.02             8     1                1 TRUE                      2862                       10
+10 cpu_quota_0p01              0.01      0.01             9     1                1 TRUE                      2654                       10
+   median_event_p95_slowdown p95_event_slowdown max_event_slowdown worst_phase       worst_operation                        
+                       <dbl>              <dbl>              <dbl> <chr>             <chr>                                  
+ 1                     1                   1                  1    membership_add    add_commit_total_local                 
+ 2                     1.21                4.11               5.63 membership_remove remove_commit_create_total_local       
+ 3                     0.987               1.96               1.98 application       application_message_receive_total_local
+ 4                     1.25                3.75               5.29 membership_remove remove_commit_create_total_local       
+ 5                     1.07                1.74               2.03 update            update_commit_create_total_local       
+ 6                     1.32                1.85               1.86 application       application_message_receive_total_local
+ 7                     1.08               14.5               24.4  update            update_commit_create_total_local       
+ 8                     1.04               53.4               69.4  membership_remove remove_commit_create_total_local       
+ 9                     1.76               85.8              112.   membership_remove remove_commit_create_total_local       
+10                     1.35              151.               157.   update            update_commit_create_total_local       
+   max_group_size_seen median_cpu_throttled_period_fraction max_cpu_throttled_period_fraction median_nr_throttled
+                 <dbl>                                <dbl>                             <dbl>               <dbl>
+ 1                2048                             0                                 0                          0
+ 2                2048                             0                                 0                          0
+ 3                2048                             0                                 0                          0
+ 4                2048                             0                                 0                          0
+ 5                2048                             0                                 0                          0
+ 6                2048                             0.000392                          0.000392                   2
+ 7                2048                             0.0143                            0.0143                    68
+ 8                2048                             0.0535                            0.0535                   243
+ 9                2048                             0.157                             0.157                    705
+10                2048                             0.406                             0.406                   2009
+   median_cpu_throttled_time_rate max_cpu_throttled_time_rate status                         
+                            <dbl>                       <dbl> <chr>                          
+ 1                       0                           0        no 10x p95 slowdown            
+ 2                       0                           0        no 10x p95 slowdown            
+ 3                       0                           0        no 10x p95 slowdown            
+ 4                       0                           0        no 10x p95 slowdown            
+ 5                       0                           0        no 10x p95 slowdown            
+ 6                       0.000068                    0.000068 no 10x p95 slowdown            
+ 7                       0.00185                     0.00185  infeasible: p95 slowdown >= 10x
+ 8                       0.00704                     0.00704  infeasible: p95 slowdown >= 10x
+ 9                       0.0223                      0.0223   infeasible: p95 slowdown >= 10x
+10                       0.0870                      0.0870   infeasible: p95 slowdown >= 10x
+
+Cached input/coverage record: statistics/statistics_analysis_openmls_v9.ipynb, cell 8, output 0
+ [1] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/01_quick_overview.png"      
+ [2] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/02_ram_failures.png"        
+ [3] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/03_cpu_slowdown.png"        
+ [4] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/04_operation_p95.png"       
+ [5] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/05_components.png"          
+ [6] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/06_external_devices.png"    
+ [7] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/component_summary.csv"      
+ [8] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/cpu_slowdown_table.csv"     
+ [9] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/external_device_summary.csv"
+[10] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/operation_summary.csv"      
+[11] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/quick_decision_table.csv"   
+[12] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/ram_failure_table.csv"      
+[13] "/home/docker/Schreibtisch/OpenMLS_Signal_Benchmark/statistics/analysis_output/openmls_v9/run_inventory.csv"
+
+Cached input/coverage record: statistics/statistics_analysis_v2.ipynb, cell 1, output 0
+Reading 1/3: OpenMLS_containerized/benchmark_output/cal01_cpu-quota-sweep_i1_20260703_024206/events.csv
+
+Cached input/coverage record: statistics/statistics_analysis_v2.ipynb, cell 1, output 1
+Reading 2/3: OpenMLS_containerized/benchmark_output/cal01_ram-app-heap-sweep_i1_20260703_024206/events.csv
+
+Cached input/coverage record: statistics/statistics_analysis_v2.ipynb, cell 1, output 2
+Reading 3/3: OpenMLS_containerized/benchmark_output/tmp02_20260702_143942_pid1589303_openmls/events.csv
+
+Cached input/coverage record: statistics/statistics_analysis_v2.ipynb, cell 2, output 0
+Reading 1/2: Signal_containerized/benchmark_output/cal01_signal_cpu-quota-sweep_i1_20260703_024206/events.csv
+
+Cached input/coverage record: statistics/statistics_analysis_v2.ipynb, cell 2, output 1
+Reading 2/2: Signal_containerized/benchmark_output/tmp02_20260702_143942_pid1589303_signal/events.csv
