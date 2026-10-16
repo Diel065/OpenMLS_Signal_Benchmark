@@ -55,6 +55,24 @@ pub fn valid_persisted_signal_canonical_total_count(participant_id: &str, op: &s
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
+    SenderKeyDistribute {
+        recipients: Vec<String>,
+        generation: Option<u64>,
+        conversation_size: usize,
+    },
+    SenderKeyOnboard {
+        participants: Vec<String>,
+        generation: u64,
+        conversation_size: usize,
+    },
+    SenderKeyReceiveDistribution { sender: String, conversation_size: usize, expected_generation: Option<u64> },
+    SenderKeyEncrypt { recipients: Vec<String>, message: String, conversation_size: usize },
+    SenderKeyDecrypt {
+        sender: String,
+        profile: bool,
+        conversation_size: usize,
+        expected_plaintext_bytes: usize,
+    },
     RegisterParticipant,
     GeneratePrekeyBundle,
     PublishPrekeyBundle,
@@ -99,6 +117,11 @@ fn default_profile_true() -> bool {
 impl Command {
     pub fn kind(&self) -> &'static str {
         match self {
+            Command::SenderKeyDistribute { .. } => "SenderKeyDistribute",
+            Command::SenderKeyOnboard { .. } => "SenderKeyOnboard",
+            Command::SenderKeyReceiveDistribution { .. } => "SenderKeyReceiveDistribution",
+            Command::SenderKeyEncrypt { .. } => "SenderKeyEncrypt",
+            Command::SenderKeyDecrypt { .. } => "SenderKeyDecrypt",
             Command::RegisterParticipant => "RegisterParticipant",
             Command::GeneratePrekeyBundle => "GeneratePrekeyBundle",
             Command::PublishPrekeyBundle => "PublishPrekeyBundle",
@@ -116,7 +139,12 @@ impl Command {
     pub fn is_mutating(&self) -> bool {
         matches!(
             self,
-            Command::RegisterParticipant
+            Command::SenderKeyDistribute { .. }
+                | Command::SenderKeyOnboard { .. }
+                | Command::SenderKeyReceiveDistribution { .. }
+                | Command::SenderKeyEncrypt { .. }
+                | Command::SenderKeyDecrypt { .. }
+                | Command::RegisterParticipant
                 | Command::GeneratePrekeyBundle
                 | Command::PublishPrekeyBundle
                 | Command::UpdateOneTimePrekeys
@@ -273,7 +301,7 @@ impl CommandMetrics {
         self.plaintext_bytes = add_usize_options(self.plaintext_bytes, other.plaintext_bytes);
     }
 
-    fn merge_profile(&mut self, other: &CommandMetrics) {
+    pub(crate) fn merge_profile(&mut self, other: &CommandMetrics) {
         self.cpu_thread_ns = add_u128_options(self.cpu_thread_ns, other.cpu_thread_ns);
         self.cpu_process_ns = add_u128_options(self.cpu_process_ns, other.cpu_process_ns);
         self.alloc_bytes = add_u64_options(self.alloc_bytes, other.alloc_bytes);
@@ -327,7 +355,7 @@ fn add_usize_options(a: Option<usize>, b: Option<usize>) -> Option<usize> {
     }
 }
 
-fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
+pub(crate) fn measure_profile<R>(run: impl FnOnce() -> R) -> (R, CommandMetrics) {
     let process_start = ProcessTime::now();
     let cpu_start = ThreadTime::now();
     let mut result = None;
@@ -1063,14 +1091,14 @@ pub async fn relay_get_message(relay_url: &str, recipient: &str) -> Result<Vec<u
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct PendingMessageResponse {
-    id: String,
-    conversation_id: String,
-    sender: String,
-    message_hex: String,
+pub(crate) struct PendingMessageResponse {
+    pub(crate) id: String,
+    pub(crate) conversation_id: String,
+    pub(crate) sender: String,
+    pub(crate) message_hex: String,
 }
 
-async fn relay_get_pending_message(
+pub(crate) async fn relay_get_pending_message(
     relay_url: &str,
     recipient: &str,
     sender: Option<&str>,
@@ -1126,7 +1154,7 @@ async fn relay_get_pending_message(
     .await
 }
 
-async fn relay_ack_message(relay_url: &str, recipient: &str, message_id: &str) -> Result<()> {
+pub(crate) async fn relay_ack_message(relay_url: &str, recipient: &str, message_id: &str) -> Result<()> {
     let url = format!(
         "{}/message/{}/ack/{}",
         relay_url.trim_end_matches('/'),
@@ -1173,7 +1201,7 @@ fn looks_like_duplicate_receive(error: &str) -> bool {
         || lower.contains("stale")
 }
 
-fn ciphertext_from_bytes(bytes: &[u8]) -> Result<libsignal_protocol::CiphertextMessage> {
+pub(crate) fn ciphertext_from_bytes(bytes: &[u8]) -> Result<libsignal_protocol::CiphertextMessage> {
     if let Ok(msg) = PreKeySignalMessage::try_from(bytes) {
         return Ok(libsignal_protocol::CiphertextMessage::PreKeySignalMessage(
             msg,
@@ -1553,6 +1581,13 @@ pub async fn handle_command(
     benchmark_context: Option<&BenchmarkContext>,
 ) -> Result<CommandOutcome> {
     match command {
+        command @ (Command::SenderKeyDistribute { .. }
+            | Command::SenderKeyOnboard { .. }
+            | Command::SenderKeyReceiveDistribution { .. }
+            | Command::SenderKeyEncrypt { .. }
+            | Command::SenderKeyDecrypt { .. }) => {
+            crate::sender_keys::handle_command(participant, relay_url, command, phase, profile_path, benchmark_context).await
+        }
         Command::RegisterParticipant => Ok(CommandOutcome::new(
             format!("participant {} registered", participant.name),
             CommandMetrics {

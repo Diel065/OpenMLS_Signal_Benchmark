@@ -62,7 +62,12 @@ fn has_positive_plot_metrics(event: &SignalProfileEvent) -> bool {
 fn expected_canonical_profile_total(command: &Command) -> Option<&'static str> {
     match command {
         Command::EstablishSessions { profile: true, .. } => Some("signal_session_establish.total"),
-        Command::EncryptMessage { .. } => Some("signal_application_message_create.total"),
+        Command::EncryptMessage { .. } | Command::SenderKeyEncrypt { .. } => {
+            Some("signal_application_message_create.total")
+        }
+        Command::SenderKeyDecrypt { profile: true, .. } => {
+            Some("signal_application_message_receive.total")
+        }
         Command::DecryptMessage { profile: true, .. } => {
             Some("signal_application_message_receive.total")
         }
@@ -520,6 +525,51 @@ fn signal_event_context(
     phase: Option<&str>,
 ) -> SignalEventContext {
     let mut ctx = match command {
+        Command::SenderKeyDistribute { .. }
+        | Command::SenderKeyOnboard { .. }
+        | Command::SenderKeyReceiveDistribution { .. }
+        | Command::SenderKeyEncrypt { .. }
+        | Command::SenderKeyDecrypt { .. } => SignalEventContext {
+            measurement_class: "wrapper",
+            event_family: "sender_keys",
+            event_subtype: match command {
+                Command::SenderKeyDistribute { .. } => "sender_key_distribution_send_wrapper",
+                Command::SenderKeyOnboard { .. } => "sender_key_onboarding_wrapper",
+                Command::SenderKeyReceiveDistribution { .. } => {
+                    "sender_key_distribution_receive_wrapper"
+                }
+                Command::SenderKeyEncrypt { .. } => "sender_key_send_wrapper",
+                _ => "sender_key_receive_wrapper",
+            },
+            event_side: Some("local"),
+            direction: None,
+            role: Some(if matches!(command, Command::SenderKeyOnboard { .. }) {
+                "joiner"
+            } else {
+                "member"
+            }),
+            peer_id: None,
+            peer_device_id: None,
+            peer_count: Some(match command {
+                Command::SenderKeyDistribute {
+                    conversation_size, ..
+                }
+                | Command::SenderKeyOnboard {
+                    conversation_size, ..
+                }
+                | Command::SenderKeyReceiveDistribution {
+                    conversation_size, ..
+                }
+                | Command::SenderKeyEncrypt {
+                    conversation_size, ..
+                }
+                | Command::SenderKeyDecrypt {
+                    conversation_size, ..
+                } => conversation_size.saturating_sub(1),
+                _ => unreachable!(),
+            }),
+            phase: None,
+        },
         Command::RegisterParticipant => SignalEventContext {
             measurement_class: "wrapper",
             event_family: "identity_bootstrap",
@@ -719,13 +769,17 @@ async fn participant_command_actor(
             );
         }
 
+        let sender_keys_command = matches!(envelope.command,
+            Command::SenderKeyDistribute { .. } | Command::SenderKeyOnboard { .. }
+            | Command::SenderKeyReceiveDistribution { .. } | Command::SenderKeyEncrypt { .. }
+            | Command::SenderKeyDecrypt { .. });
         let event_context = signal_event_context(
             &envelope.command,
             &participant_id,
             envelope.phase.as_deref(),
         );
         let command_profile_enabled = match &envelope.command {
-            Command::EstablishSessions { profile, .. } => *profile,
+            Command::EstablishSessions { profile, .. } | Command::SenderKeyDecrypt { profile, .. } => *profile,
             Command::ResetSessions { .. } => false,
             _ => true,
         };
@@ -735,6 +789,8 @@ async fn participant_command_actor(
         let has_benchmark = envelope.benchmark_phase.is_some()
             || envelope.benchmark_operation.is_some()
             || envelope.benchmark_plateau_index.is_some();
+        let sender_key_substrate = envelope.benchmark_operation.as_deref() == Some("sender_key_onboarding")
+            && matches!(envelope.command, Command::EstablishSessions { .. });
         let expected_profile_total = (profile_this_command && external_profiling && has_benchmark)
             .then(|| expected_canonical_profile_total(&envelope.command))
             .flatten();
@@ -749,7 +805,9 @@ async fn participant_command_actor(
                 operation_family: operation_family.clone(),
                 benchmark_operation: operation_family,
                 span_or_phase: phase.to_string(),
-                member_count: event_context.peer_count,
+                member_count: if sender_keys_command {
+                    envelope.benchmark_active_size.or_else(|| event_context.peer_count.map(|n| n + 1))
+                } else { event_context.peer_count },
                 epoch: None,
                 worker_id: participant_id.clone(),
                 resource_profile_id: embedded_heap_budget.resource_profile_id.clone(),
@@ -804,7 +862,7 @@ async fn participant_command_actor(
             envelope.command,
             envelope.phase.as_deref(),
             effective_profile_path,
-            benchmark_context.as_ref().filter(|_| external_profiling),
+            benchmark_context.as_ref().filter(|_| external_profiling || sender_keys_command),
         )
         .await;
 
@@ -837,6 +895,7 @@ async fn participant_command_actor(
 
         if let (Some(op), Some(before)) = (expected_profile_total, persisted_profile_count_before) {
             if response.status == "ok"
+                && !(sender_key_substrate && metrics.as_ref().and_then(|m| m.new_session_established) == Some(false))
                 && valid_persisted_signal_canonical_total_count(&participant_id, op) <= before
             {
                 response = CommandResponse::error(format!(

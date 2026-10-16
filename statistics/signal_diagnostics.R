@@ -212,7 +212,11 @@ read_signal <- function() {
   if (length(files) == 0) stop("No Signal events.csv files found")
 
   map_dfr(files, function(path) {
-    read_csv(path, show_col_types = FALSE, progress = FALSE) |>
+    data <- read_csv(path, show_col_types = FALSE, progress = FALSE)
+    if ("group_model" %in% names(data) && any(is.na(data$group_model) | data$group_model != "pairwise")) {
+      stop("Signal diagnostics supports pairwise rows only; separate Sender Keys analysis is required: ", path)
+    }
+    data |>
       mutate(source_path = path, source_run = basename(dirname(path)))
   }) |>
     classify_signal_workers()

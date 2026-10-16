@@ -263,16 +263,20 @@ def validate_run(
             f"missing required Signal core operation families: {sorted(missing_core)}"
         )
 
-    wrapper_rows = [row for row in profile_rows if row.get("event_subtype") in {
-        "session_establish_pair_wrapper",
-        "pairwise_fanout_send_wrapper",
-        "pairwise_fanout_receive_wrapper",
-    }]
+    models = {row.get("group_model", "pairwise") for row in profile_rows}
+    if len(models) != 1 or not models <= {"pairwise", "sender_keys"}:
+        result.add_error(f"invalid or mixed group_model values: {sorted(models)}")
+    sender_keys = models == {"sender_keys"}
+    if not sender_keys and any("sender_key" in row.get("op", "") for row in profile_rows):
+        result.add_error("Sender Keys operations require group_model=sender_keys")
     required_wrappers = {
         "session_establish_pair_wrapper",
-        "pairwise_fanout_send_wrapper",
-        "pairwise_fanout_receive_wrapper",
+        "sender_key_send_wrapper" if sender_keys else "pairwise_fanout_send_wrapper",
+        "sender_key_receive_wrapper" if sender_keys else "pairwise_fanout_receive_wrapper",
     }
+    wrapper_rows = [row for row in profile_rows if row.get("event_subtype") in required_wrappers]
+    if sender_keys and "signal_sender_key_onboarding" not in observed_op_families:
+        result.add_error("missing Sender Keys onboarding measurements")
     observed_wrappers = {row.get("event_subtype") for row in wrapper_rows}
     missing_wrappers = required_wrappers - observed_wrappers
     if missing_wrappers:
@@ -305,6 +309,21 @@ def validate_run(
             result.add_error(
                 f"workflow {workflow_id} ({wrapper}) row count {len(rows_for_workflow)} != workflow_pair_count {expected}"
             )
+
+    send_totals = defaultdict(list)
+    send_op = "signal_application_message_create.total" if sender_keys else "pairwise_fanout_send_wrapper"
+    for row in profile_rows:
+        if (row.get("op") == send_op
+                and row.get("benchmark_phase") == "application"
+                and present(row.get("benchmark_workflow_id"))):
+            send_totals[(row.get("participant_id"), row["benchmark_workflow_id"])].append(row)
+    for (_, workflow), totals in send_totals.items():
+        population = integer(totals[0], "benchmark_active_size")
+        expected = 1 if sender_keys else (population - 1 if population else None)
+        if expected is not None and len(totals) != expected:
+            result.add_error(f"logical send {workflow} has {len(totals)} totals; expected {expected}")
+        if any(integer(row, "workflow_pair_count") != expected for row in totals):
+            result.add_error(f"logical send {workflow} has incorrect workflow_pair_count")
 
     prekey_ops = {"signal_prekey_bundle_create", "signal_prekey_maintenance"}
     missing_prekey = prekey_ops - observed_op_families

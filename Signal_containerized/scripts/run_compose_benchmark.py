@@ -76,6 +76,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
     p.add_argument("--run-id", default=None, help="Optional explicit run id")
+    p.add_argument("--group-model", choices=("pairwise", "sender-keys"), default="pairwise")
     p.add_argument("--scenario", default="http-staircase-compose", help="Scenario label")
     p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed")
     p.add_argument("--output-dir", default="benchmark_output", help="Base output directory")
@@ -3507,6 +3508,8 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "max_app_samples_per_payload": args.max_app_samples_per_payload,
             "min_external_samples_per_operation": args.min_profiled_samples_per_operation,
             "payload_sizes": args.payload_sizes,
+            "group_model": args.group_model.replace("-", "_"),
+            "sender_key_removal_policy": "eager_all_senders_fresh_generation" if args.group_model == "sender-keys" else None,
             "worker_layout_mode": args.worker_layout_mode,
             "singleton_resource_envelope": singleton_resource_envelope(args),
             "profile_only_singletons": args.profile_only_singletons,
@@ -4160,6 +4163,8 @@ def main() -> int:
                 str(args.max_app_samples_per_payload),
                 "--min-external-samples-per-operation",
                 str(args.min_profiled_samples_per_operation),
+                "--group-model",
+                args.group_model,
                 "--payload-sizes",
                 args.payload_sizes,
                 "--worker-health-timeout-seconds",
@@ -4228,6 +4233,8 @@ def main() -> int:
                 str(args.max_app_samples_per_payload),
                 "--min-external-samples-per-operation",
                 str(args.min_profiled_samples_per_operation),
+                "--group-model",
+                args.group_model,
                 "--payload-sizes",
                 args.payload_sizes,
                 "--worker-health-timeout-seconds",

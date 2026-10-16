@@ -17,6 +17,7 @@ hex = "0.4.3"
 csv = "1.4"
 clap = { version = "4.6", default-features = false, features = ["std", "derive", "help", "usage", "error-context"] }
 rand = "0.9"
+uuid = "1"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 once_cell = "1"
 cpu-time = "1.0"

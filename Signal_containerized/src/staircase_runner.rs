@@ -1,3 +1,4 @@
+use crate::sender_keys::{GroupModel, REMOVAL_POLICY};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     error::Error as StdError,
@@ -86,6 +87,7 @@ impl fmt::Display for PlateauOrder {
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
+    pub group_model: GroupModel,
     pub preflight_only: bool,
     pub kr_url: String,
     pub relay_url: String,
@@ -506,6 +508,7 @@ struct RunnerEventLog {
     profiled_failure_stop_after: usize,
     resource_sweep: bool,
     external_devices: bool,
+    group_model: GroupModel,
 }
 
 impl RunnerEventLog {
@@ -518,6 +521,7 @@ impl RunnerEventLog {
             profiled_failure_stop_after,
             resource_sweep: profiled_failure_stop_after > 0,
             external_devices: false,
+            group_model: GroupModel::Pairwise,
         }
     }
 
@@ -1232,6 +1236,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     let run_dir = run_dir_for(&config.output_dir, &config.run_id);
     fs::create_dir_all(&run_dir)?;
     let mut runner_events = RunnerEventLog::new(&run_dir, config.profiled_failure_stop_after);
+    runner_events.group_model = config.group_model;
     if let Some(layout) = config.worker_layout.as_ref() {
         runner_events.resource_sweep |= layout.physical_workers.iter().any(|worker| {
             worker.execution_backend != "real_device"
@@ -1356,6 +1361,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     #[derive(Serialize)]
     struct ScenarioPlan<'a> {
+        group_model: GroupModel,
+        sender_key_removal_policy: Option<&'static str>,
         run_id: &'a str,
         plateau_order: PlateauOrder,
         plateau_sequence: &'a [usize],
@@ -1367,6 +1374,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         min_external_samples_per_operation: usize,
     }
     let scenario_plan = ScenarioPlan {
+        group_model: config.group_model,
+        sender_key_removal_policy: (config.group_model == GroupModel::SenderKeys).then_some(REMOVAL_POLICY),
         run_id: &config.run_id,
         plateau_order: config.plateau_order,
         plateau_sequence: &plateau_sequence,
@@ -2575,35 +2584,54 @@ async fn broadcast_message(
     profiling_recipient_id: Option<&str>,
     cursor: &BenchmarkCursor,
     sender_specific_delivery: bool,
+    group_model: GroupModel,
 ) -> Result<()> {
     let conversation_size = recipients.len() + 1;
 
     let send_workflow_id = next_workflow_id();
     let pair_count = recipients.len();
-    for (pair_index, recipient) in recipients.iter().enumerate() {
-        let ctx = WorkerCommandContext::with_cursor(
-            sender,
-            &Command::EncryptMessage {
-                recipient: recipient.id.clone(),
-                message: payload.to_string(),
-                conversation_size: Some(conversation_size),
-            },
-            None,
-            Some(cursor),
-        )
-        .with_workflow(send_workflow_id, pair_index, pair_count);
+    if group_model == GroupModel::SenderKeys {
+        let command = Command::SenderKeyEncrypt {
+            recipients: recipients.iter().map(|w| w.id.clone()).collect(),
+            message: payload.to_owned(),
+            conversation_size,
+        };
+        let ctx = WorkerCommandContext::with_cursor(sender, &command, None, Some(cursor))
+            .with_workflow(send_workflow_id, 0, 1);
         send_cmd_expect_ok_fragment_with_context(
             http,
             sender,
-            &Command::EncryptMessage {
-                recipient: recipient.id.clone(),
-                message: payload.to_string(),
-                conversation_size: Some(conversation_size),
-            },
+            &command,
             "encrypted and sent",
             &ctx,
         )
         .await?;
+    } else {
+        for (pair_index, recipient) in recipients.iter().enumerate() {
+            let ctx = WorkerCommandContext::with_cursor(
+                sender,
+                &Command::EncryptMessage {
+                    recipient: recipient.id.clone(),
+                    message: payload.to_string(),
+                    conversation_size: Some(conversation_size),
+                },
+                None,
+                Some(cursor),
+            )
+            .with_workflow(send_workflow_id, pair_index, pair_count);
+            send_cmd_expect_ok_fragment_with_context(
+                http,
+                sender,
+                &Command::EncryptMessage {
+                    recipient: recipient.id.clone(),
+                    message: payload.to_string(),
+                    conversation_size: Some(conversation_size),
+                },
+                "encrypted and sent",
+                &ctx,
+            )
+            .await?;
+        }
     }
 
     let commands_by_physical = build_batch_commands(recipients, |worker| {
@@ -2612,12 +2640,22 @@ async fn broadcast_message(
         BatchFanoutCommand {
             participant_id: worker.id.clone(),
             request_id: None,
-            command: Command::DecryptMessage {
-                sender: sender.id.clone(),
-                profile: is_profiled,
-                conversation_size: Some(conversation_size),
-                expected_plaintext_bytes: sender_specific_delivery
-                    .then_some(cursor.payload_size).flatten(),
+            command: if group_model == GroupModel::SenderKeys {
+                Command::SenderKeyDecrypt {
+                    sender: sender.id.clone(),
+                    profile: is_profiled,
+                    conversation_size,
+                    expected_plaintext_bytes: payload.len(),
+                }
+            } else {
+                Command::DecryptMessage {
+                    sender: sender.id.clone(),
+                    profile: is_profiled,
+                    conversation_size: Some(conversation_size),
+                    expected_plaintext_bytes: sender_specific_delivery
+                        .then_some(cursor.payload_size)
+                        .flatten(),
+                }
             },
             phase: Some("application.fanout_receive_message".to_string()),
             profile: is_profiled.then_some(true),
@@ -2648,6 +2686,271 @@ async fn broadcast_message(
     Ok(())
 }
 
+#[derive(Debug)]
+struct SenderKeyEndpointFailure(String);
+
+impl fmt::Display for SenderKeyEndpointFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Sender Keys endpoint {} removed after resource failure",
+            self.0
+        )
+    }
+}
+impl StdError for SenderKeyEndpointFailure {}
+
+async fn sender_key_command(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: Command,
+    phase: &str,
+    cursor: &BenchmarkCursor,
+    expected: &str,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    let context = WorkerCommandContext::with_cursor(worker, &command, Some(phase), Some(cursor))
+        .with_workflow(next_workflow_id(), 0, 1);
+    match send_cmd_expect_ok_fragment_with_context(http, worker, &command, expected, &context).await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            if record_worker_oom_if_evidenced(
+                runner_events,
+                cursor,
+                worker,
+                &error,
+                "remove_failed_sender_keys_endpoint",
+                None,
+            )
+            .await?
+            {
+                return Err(
+                    anyhow::Error::new(SenderKeyEndpointFailure(worker.id.clone())).context(error),
+                );
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn enroll_sender_key_participant(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    idle: &mut VecDeque<WorkerSpec>,
+    progress: &mut Progress,
+    plateau_index: usize,
+    target_size: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    let joiner = idle
+        .pop_front()
+        .context("no idle Sender Keys participant")?;
+    let population = active.len() + 1;
+    let cursor = BenchmarkCursor::new(
+        plateau_index,
+        target_size,
+        population,
+        "enrollment",
+        "sender_key_onboarding",
+    );
+    let result: Result<()> = async {
+        sender_key_command(
+            http,
+            &joiner,
+            Command::RegisterParticipant,
+            "join.prepare",
+            &cursor,
+            "registered",
+            runner_events,
+        )
+        .await?;
+        sender_key_command(
+            http,
+            &joiner,
+            Command::PublishPrekeyBundle,
+            "join.prepare",
+            &cursor,
+            "stored",
+            runner_events,
+        )
+        .await?;
+        sender_key_command(
+            http,
+            &joiner,
+            Command::GeneratePrekeyBundle,
+            "join.prepare",
+            &cursor,
+            "published",
+            runner_events,
+        )
+        .await?;
+        for member in active.iter() {
+            sender_key_command(
+                http,
+                member,
+                Command::EstablishSessions {
+                    participants: vec![joiner.id.clone()],
+                    conversation_size: Some(population),
+                    profile: true,
+                },
+                "handshake.initiator_process_bundle",
+                &cursor,
+                "session establishment",
+                runner_events,
+            )
+            .await?;
+            sender_key_command(
+                http,
+                member,
+                Command::SenderKeyDistribute {
+                    recipients: vec![joiner.id.clone()],
+                    generation: None,
+                    conversation_size: population,
+                },
+                "join.distribution",
+                &cursor,
+                "sender key distributed",
+                runner_events,
+            )
+            .await?;
+        }
+        let generation = next_workflow_id();
+        sender_key_command(
+            http,
+            &joiner,
+            Command::SenderKeyOnboard {
+                participants: active.iter().map(|w| w.id.clone()).collect(),
+                generation,
+                conversation_size: population,
+            },
+            "join.onboarding",
+            &cursor,
+            "sender key onboarding complete",
+            runner_events,
+        )
+        .await?;
+        for member in active.iter() {
+            sender_key_command(
+                http,
+                member,
+                Command::SenderKeyReceiveDistribution {
+                    sender: joiner.id.clone(),
+                    conversation_size: population,
+                    expected_generation: Some(generation),
+                },
+                "join.distribution",
+                &cursor,
+                "sender key distribution processed",
+                runner_events,
+            )
+            .await?;
+        }
+        sender_key_command(
+            http,
+            &joiner,
+            Command::UpdateOneTimePrekeys,
+            "prekey.maintenance_after_handshake",
+            &cursor,
+            "one-time prekey stock",
+            runner_events,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            active.push(joiner);
+            progress.tick("Sender Keys participant onboarded");
+            Ok(())
+        }
+        Err(error) => {
+            if let Some(failure) = error.downcast_ref::<SenderKeyEndpointFailure>() {
+                active.retain(|w| w.id != failure.0);
+                refresh_sender_keys(http, active, plateau_index, target_size, runner_events)
+                    .await?;
+                return Ok(());
+            }
+            Err(error)
+        }
+    }
+}
+
+async fn refresh_sender_keys(
+    http: &reqwest::Client,
+    active: &mut Vec<WorkerSpec>,
+    plateau_index: usize,
+    target_size: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    loop {
+        let cursor = BenchmarkCursor::new(
+            plateau_index,
+            target_size,
+            active.len(),
+            "removal",
+            "sender_key_eager_refresh",
+        );
+        let senders: Vec<_> = active
+            .iter()
+            .cloned()
+            .map(|sender| (sender, next_workflow_id()))
+            .collect();
+        let attempt: Result<()> = async {
+            for (sender, generation) in &senders {
+                sender_key_command(
+                    http,
+                    sender,
+                    Command::SenderKeyDistribute {
+                        recipients: active
+                            .iter()
+                            .filter(|w| w.id != sender.id)
+                            .map(|w| w.id.clone())
+                            .collect(),
+                        generation: Some(*generation),
+                        conversation_size: active.len(),
+                    },
+                    "removal.eager_refresh",
+                    &cursor,
+                    "sender key distributed",
+                    runner_events,
+                )
+                .await?;
+            }
+            for recipient in active.iter() {
+                for (sender, generation) in senders.iter().filter(|(w, _)| w.id != recipient.id) {
+                    sender_key_command(
+                        http,
+                        recipient,
+                        Command::SenderKeyReceiveDistribution {
+                            sender: sender.id.clone(),
+                            conversation_size: active.len(),
+                            expected_generation: Some(*generation),
+                        },
+                        "removal.eager_refresh",
+                        &cursor,
+                        "sender key distribution processed",
+                        runner_events,
+                    )
+                    .await?;
+                }
+            }
+            Ok(())
+        }
+        .await;
+        match attempt {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                if let Some(failure) = error.downcast_ref::<SenderKeyEndpointFailure>() {
+                    active.retain(|w| w.id != failure.0);
+                } else {
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
 
 async fn enroll_participants(
     http: &reqwest::Client,
@@ -3083,6 +3386,10 @@ async fn transition_to_size(
         }
         let remaining = target_size - active.len();
         let batch_size = remaining.min(idle.len()).min(MAX_RANDOM_BATCH_SIZE).max(1);
+        if runner_events.group_model == GroupModel::SenderKeys {
+            enroll_sender_key_participant(http, active, idle, progress, plateau_index, target_size, runner_events).await?;
+            continue;
+        }
         enroll_participants(
             http,
             kr_url,
@@ -3108,6 +3415,9 @@ async fn transition_to_size(
             .min(MAX_RANDOM_BATCH_SIZE)
             .max(1);
         deactivate_participants(http, active, idle, batch_size, fanout, progress).await?;
+        if runner_events.group_model == GroupModel::SenderKeys {
+            refresh_sender_keys(http, active, plateau_index, target_size, runner_events).await?;
+        }
     }
 
     Ok(())
@@ -3268,6 +3578,7 @@ async fn run_application_phase(
                 profiling_recipient_id.as_deref(),
                 &cursor,
                 runner_events.resource_sweep || runner_events.external_devices,
+                runner_events.group_model,
             )
             .await;
 
@@ -3283,6 +3594,9 @@ async fn run_application_phase(
                 .await?
                 {
                     active.retain(|worker| worker.id != actor.id);
+                    if runner_events.group_model == GroupModel::SenderKeys {
+                        refresh_sender_keys(http, active, plateau_index, plateau_size, runner_events).await?;
+                    }
                     continue;
                 }
 
@@ -3317,6 +3631,9 @@ async fn run_application_phase(
                     }
                     if oom_ids.len() == batch_error.failures.len() {
                         active.retain(|worker| !oom_ids.contains(&worker.id));
+                        if runner_events.group_model == GroupModel::SenderKeys {
+                            refresh_sender_keys(http, active, plateau_index, plateau_size, runner_events).await?;
+                        }
                         continue;
                     }
                 }
@@ -4356,6 +4673,12 @@ pub fn aggregate_csv(
     provided_layout: &Option<WorkerLayout>,
 ) -> Result<()> {
     materialize_runner_profile_events(run_dir)?;
+    let plan_path = run_dir.join("scenario_plan.json");
+    let plan: serde_json::Value = if plan_path.exists() {
+        serde_json::from_slice(&fs::read(plan_path)?)?
+    } else { serde_json::Value::Null };
+    let group_model: GroupModel = plan.get("group_model").cloned()
+        .map(serde_json::from_value).transpose()?.unwrap_or_default();
 
     let csv_path = run_dir.join("events.csv");
     let mut wtr = csv::Writer::from_path(&csv_path)?;
@@ -4441,12 +4764,17 @@ pub fn aggregate_csv(
 
             let event: SignalProfileEvent = serde_json::from_str(&line)
                 .with_context(|| format!("Invalid json in {}", path.display()))?;
+            if event.event_family == "sender_keys" || event.op.contains("sender_key") {
+                anyhow::ensure!(group_model == GroupModel::SenderKeys,
+                    "Sender Keys trace requires group_model=sender_keys in scenario_plan.json");
+            }
             let physical_worker_id =
                 non_empty_or(meta.map(|m| m.physical_worker_id.as_str()), worker_id);
             let phys = physical_meta.get(physical_worker_id).copied();
 
             #[derive(Serialize)]
             struct CsvRow<'a> {
+                group_model: GroupModel,
                 participant_id: String,
                 physical_worker_id: &'a str,
                 container_mode: &'a str,
@@ -4599,6 +4927,7 @@ pub fn aggregate_csv(
             }
 
             let row = CsvRow {
+                group_model,
                 participant_id: event
                     .participant_id
                     .clone()
