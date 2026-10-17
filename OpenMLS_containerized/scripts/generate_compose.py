@@ -21,6 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
+    p.add_argument("--crypto-profile", choices=("classical", "hybrid-pq"), default="classical")
     p.add_argument("--run-id", default="compose-generated-001", help="Default run id baked into the compose env")
     p.add_argument("--scenario", default="http-staircase-compose", help="Default scenario label baked into the compose env")
     p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed baked into the profile env")
@@ -778,6 +779,7 @@ def generate_compose_text(
     lines.append("x-worker-common: &worker-common")
     lines.append("  image: mls-worker")
     lines.append("  environment:")
+    lines.append(f"    OPENMLS_CRYPTO_PROFILE: {args.crypto_profile}")
     lines.append(f"    OPENMLS_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO: {args.scenario}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")
@@ -924,6 +926,7 @@ def generate_compose_text(
         lines.append('      - "0.0.0.0:8080"')
 
         lines.append("    environment:")
+        lines.append(f"      OPENMLS_CRYPTO_PROFILE: {args.crypto_profile}")
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO_SEED: {args.scenario_seed}")

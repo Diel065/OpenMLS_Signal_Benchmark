@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 
 use mls_playground::client::Client;
+use mls_playground::crypto_profile::CryptoProfile;
 use mls_playground::debug::{debug_logs_enabled, worker_debug_logs_enabled};
 use mls_playground::embedded_heap_budget::{
     begin_operation as begin_heap_budget_operation, mark_worker_command_execution,
@@ -130,6 +131,7 @@ struct ClientSlot {
 
 struct WorkerProcessState {
     physical_worker_id: String,
+    crypto_profile: CryptoProfile,
     ds_url: String,
     relay_url: String,
     client_handles: HashMap<String, ClientActorHandle>,
@@ -242,9 +244,12 @@ fn parse_args() -> Result<(
     SocketAddr,
     String,
     String,
+    CryptoProfile,
 )> {
     let mut args = std::env::args().skip(1);
 
+    let mut crypto_profile = std::env::var("OPENMLS_CRYPTO_PROFILE")
+        .unwrap_or_else(|_| "classical".to_string()).parse::<CryptoProfile>()?;
     let mut name: Option<String> = None;
     let mut clients: Option<Vec<String>> = None;
     let mut profile_enabled_ids: Option<Vec<String>> = None;
@@ -256,6 +261,9 @@ fn parse_args() -> Result<(
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            "--crypto-profile" => {
+                crypto_profile = args.next().ok_or_else(|| anyhow!("Missing --crypto-profile value"))?.parse()?;
+            }
             "--name" => {
                 name = args.next();
             }
@@ -319,6 +327,7 @@ fn parse_args() -> Result<(
         listen_addr,
         ds_url,
         relay_url,
+        crypto_profile,
     ))
 }
 
@@ -326,9 +335,11 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn profiling_capabilities() -> Json<serde_json::Value> {
+async fn profiling_capabilities(State(state): State<Arc<WorkerProcessState>>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "profiling_enabled": profiling_enabled(),
+        "crypto_profile": state.crypto_profile,
+        "mls_ciphersuite": state.crypto_profile.ciphersuite().to_string(),
     }))
 }
 
@@ -340,6 +351,8 @@ async fn client_profiling_capabilities(
         "client_id": client_id,
         "client_exists": state.client_handles.contains_key(&client_id),
         "profiling_enabled": profiling_enabled(),
+        "crypto_profile": state.crypto_profile,
+        "mls_ciphersuite": state.crypto_profile.ciphersuite().to_string(),
     }))
 }
 
@@ -674,6 +687,7 @@ async fn client_command_actor(
 
         set_benchmark_context(BenchmarkContext::default());
         set_worker_id(client_id.clone());
+        slot.client.set_profiling_crypto_context();
         let benchmark_context = BenchmarkContext {
             benchmark_plateau_index: envelope.benchmark_plateau_index,
             benchmark_target_size: envelope.benchmark_target_size,
@@ -866,7 +880,10 @@ async fn main() -> Result<()> {
         listen_addr,
         worker_ds_url,
         worker_relay_url,
+        crypto_profile,
     ) = parse_args()?;
+
+    openmls::profiling::set_process_crypto_context(crypto_profile.name(), crypto_profile.ciphersuite());
 
     let client_ids = client_ids_opt.unwrap_or_else(|| vec![physical_worker_id.clone()]);
     let profile_enabled_set: std::collections::HashSet<String> = profile_enabled_ids_opt
@@ -899,7 +916,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        let client = Client::new(client_id)?;
+        let client = Client::new_with_crypto_profile(client_id, crypto_profile)?;
         let slot = ClientSlot {
             client,
             queued_intent: None,
@@ -933,6 +950,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(WorkerProcessState {
         physical_worker_id,
+        crypto_profile,
         ds_url: worker_ds_url.clone(),
         relay_url: worker_relay_url.clone(),
         client_handles,

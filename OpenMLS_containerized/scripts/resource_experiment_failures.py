@@ -761,6 +761,17 @@ def worker_failures_from_runner_events_jsonl(runner_events_path: str) -> List[Wo
     )
 
 
+def _run_crypto_metadata(run_dir: str) -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {}
+    for name in ("benchmark_run_metadata.json", "scenario_plan.json"):
+        path = os.path.join(run_dir, name)
+        if os.path.exists(path):
+            with open(path, encoding="utf-8") as handle:
+                run_metadata = json.load(handle)
+            metadata.update({key: run_metadata[key] for key in ("crypto_profile", "mls_ciphersuite") if run_metadata.get(key)})
+    return metadata
+
+
 def append_synthetic_runner_failure_event(
     run_dir: str,
     failure: WorkerFailureInfo,
@@ -858,7 +869,8 @@ def append_synthetic_runner_failure_event(
     )
 
     event = {
-        "profile_schema_version": 10,
+        **_run_crypto_metadata(run_dir),
+        "profile_schema_version": 14,
         "ts_unix_ns": failure.failure_timestamp_ns,
         "event_kind": "worker_failure",
         "failed_worker_id": failure.logical_client_id or failure.worker_id,
@@ -900,6 +912,8 @@ def append_synthetic_runner_failure_event(
 
 
 SYNTHETIC_FAILURE_EVENTS_HEADER = [
+    "crypto_profile",
+    "mls_ciphersuite",
     "client_id",
     "failed_worker_id",
     "failed_physical_worker_id",
@@ -950,11 +964,13 @@ def write_synthetic_failure_events_csv(
     ]
     if not rows:
         return False
+    crypto_metadata = _run_crypto_metadata(os.path.dirname(events_csv_path))
     with open(events_csv_path, "w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=SYNTHETIC_FAILURE_EVENTS_HEADER)
         writer.writeheader()
         for failure in rows:
             writer.writerow({
+                **crypto_metadata,
                 "client_id": failure.logical_client_id,
                 "failed_worker_id": failure.logical_client_id or failure.worker_id,
                 "failed_physical_worker_id": failure.physical_worker_id,

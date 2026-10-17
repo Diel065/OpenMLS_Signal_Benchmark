@@ -1,0 +1,26 @@
+{
+  "integration": "selective-pq-backport",
+  "previous_snapshot": {
+    "benchmark_commit": "710b8974b3a40a3bac00fb85a3b07e8cc9589fb4",
+    "openmls_git_tree": "32ea5afbf466ee6729df7a4a1814f1419289ae31",
+    "original_upstream_commit": null,
+    "note": "The imported snapshot did not record an exact upstream commit. The benchmark commit and subtree identify its exact content."
+  },
+  "backport_upstream_commit": "be2368a21ec5e0380abd568821addc57b79013ea",
+  "backported_scope": "Only MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519: suite and HPKE mappings, default capability advertisement, RustCrypto supported-suite dispatch. No primitive implementation or protocol-operation body replaced.",
+  "crate_versions": {
+    "openmls": "0.8.1",
+    "openmls_traits": "0.5.0",
+    "openmls_rust_crypto": "0.5.1",
+    "openmls_basic_credential": "0.5.0",
+    "openmls_memory_storage": "0.5.0"
+  },
+  "crypto_provider": "OpenMlsRustCrypto",
+  "feature_flags": [
+    "profiling-json",
+    "draft-ietf-mls-pq-ciphersuites"
+  ],
+  "hpke_dependencies": "Existing locked hpke-rs 0.6.0 / hpke-rs-rust-crypto 0.6.0; native XWingDraft06 at KEM 0x647a. No experimental feature needed by this dependency version.",
+  "pq_suite_status": "draft-ietf-mls-pq-ciphersuites-06 TBD1; OpenMLS provisional suite code point 0x004f; not an RFC-standardized MLS suite.",
+  "verified_on": "2026-10-17"
+}

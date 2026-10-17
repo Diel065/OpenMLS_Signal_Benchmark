@@ -37,6 +37,7 @@ class WorkerLaunch:
     remote_results_root: str
     remote_tmp: str
     node_name: str = ""
+    crypto_profile: str = "classical"
 
 RUN_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
 
@@ -304,6 +305,7 @@ class AdbDeviceBackend(DeviceBackend):
 
         worker_cmd = (
             f"{shlex.quote(launch.binary_path)}"
+            f" --crypto-profile {shlex.quote(launch.crypto_profile)}"
             f" --name {shlex.quote(launch.worker_id)}"
             f" --ds-url {shlex.quote(launch.ds_url)}"
             f" --relay-url {shlex.quote(launch.relay_url)}"
@@ -501,6 +503,7 @@ class SshDeviceBackend(DeviceBackend):
             f"{shlex.quote(launch.remote_tmp)}; "
             f"rm -f {shlex.quote(launch.remote_tmp)}/worker.pid; "
             f"{env_prefix}nohup {shlex.quote(launch.binary_path)}"
+            f" --crypto-profile {shlex.quote(launch.crypto_profile)}"
             f" --name {shlex.quote(launch.worker_id)}"
             f" --ds-url {shlex.quote(launch.ds_url)}"
             f" --relay-url {shlex.quote(launch.relay_url)}"

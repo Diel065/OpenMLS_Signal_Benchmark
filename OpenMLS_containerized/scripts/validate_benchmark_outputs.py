@@ -221,6 +221,13 @@ def validate_run(
     else:
         result.run_id = next(iter(run_ids))
 
+    plan_path = os.path.join(run_path, "scenario_plan.json")
+    plan = {}
+    if os.path.exists(plan_path):
+        with open(plan_path, encoding="utf-8") as handle:
+            plan = json.load(handle)
+    crypto_configurations = set()
+
     schema_versions: Set[int] = set()
     global_ids: Set[str] = set()
     duplicate_global_ids: Set[str] = set()
@@ -235,6 +242,16 @@ def validate_run(
                     f"row {row_number} ({row.get('op')}): stale schema {schema}; "
                     f"requires >= {MIN_PROFILE_SCHEMA_VERSION}"
                 )
+        if schema is not None and schema >= 14:
+            profile = row.get("crypto_profile") or ""
+            suite = row.get("mls_ciphersuite") or ""
+            crypto_configurations.add((profile, suite))
+            if profile not in ("classical", "hybrid-pq") or not present(suite):
+                result.add_error(f"row {row_number}: missing or invalid MLS crypto configuration")
+            if present(row.get("ciphersuite")) and row["ciphersuite"] != suite:
+                result.add_error(f"row {row_number}: runtime ciphersuite disagrees with mls_ciphersuite")
+            if plan and (profile, suite) != (plan.get("crypto_profile"), plan.get("mls_ciphersuite")):
+                result.add_error(f"row {row_number}: crypto configuration disagrees with scenario_plan.json")
         validate_numeric_nonnegative(result, row, row_number, "wall_ns")
         validate_numeric_nonnegative(result, row, row_number, "cpu_process_ns")
         validate_numeric_nonnegative(result, row, row_number, "alloc_bytes")
@@ -262,6 +279,9 @@ def validate_run(
                     f"row {row_number} ({row.get('op')}): expected nonzero allocation metrics, "
                     f"got bytes={alloc_bytes}, count={alloc_count}"
                 )
+
+    if len(crypto_configurations) > 1:
+        result.add_error(f"mixed MLS crypto configurations in one run: {sorted(crypto_configurations)}")
 
     if duplicate_global_ids:
         result.add_error(f"duplicate global_span_id values: {sorted(duplicate_global_ids)[:5]}")

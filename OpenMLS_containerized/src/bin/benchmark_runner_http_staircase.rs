@@ -4,6 +4,7 @@ use std::path::Path;
 use anyhow::{anyhow, Context, Result};
 use clap::ArgAction;
 
+use mls_playground::crypto_profile::CryptoProfile;
 use mls_playground::staircase_runner::{
     parse_worker_layout, parse_worker_specs, run_staircase_benchmark, workers_from_layout,
     PayloadSizes, PlateauOrder, ProfiledFailurePolicy, StaircaseConfig, StepSize,
@@ -11,6 +12,8 @@ use mls_playground::staircase_runner::{
 
 #[derive(clap::Parser, Debug)]
 struct Args {
+    #[arg(long, value_enum, default_value_t = CryptoProfile::Classical)]
+    crypto_profile: CryptoProfile,
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     ds_url: String,
 
@@ -231,6 +234,7 @@ fn main() -> Result<()> {
     };
 
     run_staircase_benchmark(StaircaseConfig {
+        crypto_profile: args.crypto_profile,
         preflight_only: args.preflight_only,
         ds_url: args.ds_url,
         workers,

@@ -49,6 +49,8 @@ openmls_v8_min_schema <- 10L
 
 openmls_v8_message <- function(...) message("[openmls-v8] ", paste0(..., collapse = ""))
 
+source(file.path(openmls_v8_statistics_dir, "crypto_profile_guard.R"))
+
 openmls_v8_columns <- c(
   "profile_schema_version", "run_id", "scenario", "source_file", "op", "span_name",
   "operation_family", "benchmark_operation", "benchmark_plateau_index",
@@ -129,8 +131,10 @@ openmls_v8_quantile <- function(x, probability) {
 }
 
 openmls_v8_discover_files <- function(input_dir) {
-  if (file.exists(input_dir) && basename(input_dir) == "events.csv") return(normalizePath(input_dir))
-  sort(list.files(input_dir, pattern = "^events\\.csv$", recursive = TRUE, full.names = TRUE))
+  files <- if (file.exists(input_dir) && basename(input_dir) == "events.csv") normalizePath(input_dir) else
+    sort(list.files(input_dir, pattern = "^events\\.csv$", recursive = TRUE, full.names = TRUE))
+  assert_single_mls_crypto_profile(files)
+  files
 }
 
 openmls_v8_layout_platforms <- function(events_file) {
