@@ -1,4 +1,5 @@
 pub mod client;
+pub mod crypto_profile;
 pub mod debug;
 pub mod delivery_service;
 pub mod embedded_heap_budget;

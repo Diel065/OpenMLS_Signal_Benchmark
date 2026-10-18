@@ -506,10 +506,12 @@ openmls_v9_save_outputs <- function(result) {
 
 openmls_v9_run <- function(input_dir = NULL, output_dir = NULL, save_outputs = TRUE) {
   script_dir <- openmls_v9_script_dir()
+  source(file.path(script_dir, "crypto_profile_guard.R"))
   repo_root <- if (basename(script_dir) == "statistics") normalizePath(file.path(script_dir, ".."), winslash = "/", mustWork = TRUE) else script_dir
   input_dir <- input_dir %||% openmls_v9_env("OPENMLS_V9_INPUT_DIR", file.path(repo_root, "OpenMLS_containerized", "benchmark_output"))
   output_dir <- output_dir %||% openmls_v9_env("OPENMLS_V9_OUTPUT_DIR", file.path(script_dir, "analysis_output", "openmls_v9"))
   run_inventory <- openmls_v9_discover_runs(input_dir)
+  assert_single_mls_crypto_profile(file.path(run_inventory$run_dir, "events.csv"))
   run_dirs <- run_inventory$run_dir
   assignments <- openmls_v9_read_sidecar(run_dirs, "worker_resource_assignments.csv")
   resources <- openmls_v9_read_sidecar(run_dirs, "resource_summary.csv")

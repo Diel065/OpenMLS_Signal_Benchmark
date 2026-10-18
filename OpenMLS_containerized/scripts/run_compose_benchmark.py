@@ -48,6 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p.add_argument("--workers", type=int, required=True, help="Number of logical worker clients")
+    p.add_argument("--crypto-profile", choices=("classical", "hybrid-pq"), default="classical")
     p.add_argument("--run-id", default=None, help="Optional explicit run id")
     p.add_argument("--scenario", default="http-staircase-compose", help="Scenario label")
     p.add_argument("--scenario-seed", type=int, default=1, help="Scenario randomization seed")
@@ -3081,6 +3082,7 @@ def launch_external_devices(
             remote_results_root=remote_results_root,
             remote_tmp=remote_tmp,
             node_name=dev_id,
+            crypto_profile=args.crypto_profile,
         )
 
         print(f"[device] {dev_id}: starting worker (DS={device_ds_url}, Relay={device_relay_url})...", flush=True)
@@ -3452,7 +3454,8 @@ def collect_cpu_metadata() -> dict:
 def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
     external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
     metadata = {
-        "profile_schema_version": 5,
+        "profile_schema_version": 6,
+        "crypto_profile": args.crypto_profile,
         "run_id": run_id,
         "scenario": scenario,
         "scenario_seed": args.scenario_seed,
@@ -3488,8 +3491,7 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
         "git": {
             "benchmark_commit": command_stdout(["git", "rev-parse", "HEAD"], cwd=root),
             "benchmark_dirty_short": command_stdout(["git", "status", "--short"], cwd=root),
-            "openmls_commit": command_stdout(["git", "-C", str(root / "openmls-main"), "rev-parse", "HEAD"]),
-            "openmls_dirty_short": command_stdout(["git", "-C", str(root / "openmls-main"), "status", "--short"]),
+            "openmls_source": json.loads((root / "openmls-main" / "UPSTREAM_REVISION.json").read_text(encoding="utf-8")),
         },
         "docker": {
             "version": command_stdout(["docker", "version", "--format", "{{json .}}"]),
@@ -3750,6 +3752,8 @@ def main() -> int:
         generator_cmd = [
             sys.executable,
             str(generator),
+            "--crypto-profile",
+            args.crypto_profile,
             "--workers",
             str(args.workers),
             "--run-id",
@@ -4513,6 +4517,8 @@ def main() -> int:
                 "run",
                 "--rm",
                 "runner",
+                "--crypto-profile",
+                args.crypto_profile,
                 "--ds-url",
                 f"http://ds:{args.ds_port}",
                 "--workers-file",
@@ -4586,6 +4592,8 @@ def main() -> int:
                 "--bin",
                 "benchmark_runner_http_staircase",
                 "--",
+                "--crypto-profile",
+                args.crypto_profile,
                 "--ds-url",
                 f"http://127.0.0.1:{args.ds_port}",
                 "--workers-file",

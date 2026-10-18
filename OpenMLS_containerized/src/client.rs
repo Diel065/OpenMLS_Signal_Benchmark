@@ -15,11 +15,13 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use tls_codec::{Deserialize, Serialize, Size};
 
+use crate::crypto_profile::CryptoProfile;
 use crate::debug::{debug_logs_enabled, print_bytes};
 
 pub struct Client {
     pub name: String,
     crypto: OpenMlsRustCrypto,
+    crypto_profile: CryptoProfile,
     signature_keypair: SignatureKeyPair,
     credential_with_key: CredentialWithKey,
     group: Option<MlsGroup>,
@@ -60,9 +62,10 @@ fn selective_receive_profiling() -> bool {
 }
 
 impl Client {
-    fn fresh(name: &str) -> Result<Self> {
+    fn fresh(name: &str, crypto_profile: CryptoProfile) -> Result<Self> {
         let crypto = OpenMlsRustCrypto::default();
-        let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+        let ciphersuite = crypto_profile.ciphersuite();
+        crypto.crypto().supports(ciphersuite)?;
         let credential = BasicCredential::new(name.as_bytes().to_vec());
         let signature_keypair = SignatureKeyPair::new(ciphersuite.signature_algorithm())?;
 
@@ -78,6 +81,7 @@ impl Client {
         Ok(Self {
             name: name.to_string(),
             crypto,
+            crypto_profile,
             signature_keypair,
             credential_with_key,
             group: None,
@@ -88,12 +92,28 @@ impl Client {
     }
 
     pub fn new(name: &str) -> Result<Self> {
-        Self::fresh(name)
+        Self::new_with_crypto_profile(name, CryptoProfile::Classical)
+    }
+
+    pub fn new_with_crypto_profile(name: &str, crypto_profile: CryptoProfile) -> Result<Self> {
+        Self::fresh(name, crypto_profile)
+    }
+
+    pub fn crypto_profile(&self) -> CryptoProfile {
+        self.crypto_profile
+    }
+
+    pub fn ciphersuite(&self) -> Ciphersuite {
+        self.group.as_ref().map(MlsGroup::ciphersuite).unwrap_or(self.crypto_profile.ciphersuite())
+    }
+
+    pub fn set_profiling_crypto_context(&self) {
+        openmls::profiling::set_crypto_context(self.crypto_profile.name(), self.ciphersuite());
     }
 
     fn reset_local_state_fully(&mut self) -> Result<()> {
         let name = self.name.clone();
-        *self = Self::fresh(&name)?;
+        *self = Self::fresh(&name, self.crypto_profile)?;
         Ok(())
     }
 
@@ -136,7 +156,9 @@ impl Client {
     }
 
     pub fn create_group(&mut self) -> Result<()> {
+        self.set_profiling_crypto_context();
         let group_config = MlsGroupCreateConfig::builder()
+            .ciphersuite(self.crypto_profile.ciphersuite())
             .use_ratchet_tree_extension(true)
             .build();
 
@@ -161,11 +183,12 @@ impl Client {
     }
 
     pub fn generate_key_package(&mut self) -> Result<Vec<u8>> {
+        self.set_profiling_crypto_context();
         set_key_package_create_context(KeyPackageCreateContext::new());
         let total_scope = ProfileScope::start("key_package_create_total_local", "openmls");
 
         let result = (|| -> Result<Vec<u8>, anyhow::Error> {
-            let ciphersuite = Ciphersuite::MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519;
+            let ciphersuite = self.crypto_profile.ciphersuite();
             let key_package_bundle = KeyPackage::builder().build(
                 ciphersuite,
                 &self.crypto,
@@ -248,6 +271,7 @@ impl Client {
         key_package_bytes_list: &[Vec<u8>],
         member_names: &[String],
     ) -> Result<EpochChangeOutput> {
+        self.set_profiling_crypto_context();
         if key_package_bytes_list.len() != member_names.len() {
             return Err(anyhow!(
                 "Number of key packages does not match number of member names"
@@ -336,6 +360,7 @@ impl Client {
     }
 
     pub fn remove_members(&mut self, target_names: &[String]) -> Result<EpochChangeOutput> {
+        self.set_profiling_crypto_context();
         let member_count_before = self
             .group
             .as_ref()
@@ -367,6 +392,7 @@ impl Client {
     }
 
     pub fn self_update(&mut self) -> Result<EpochChangeOutput> {
+        self.set_profiling_crypto_context();
         let member_count = self
             .group
             .as_ref()
@@ -412,6 +438,7 @@ impl Client {
     }
 
     pub fn join_from_welcome(&mut self, welcome_bytes: &[u8]) -> Result<()> {
+        self.set_profiling_crypto_context();
         if let Some(mut stale_group) = self.group.take() {
             stale_group
                 .delete(self.crypto.storage())
@@ -450,6 +477,7 @@ impl Client {
     }
 
     pub fn send_application_message(&mut self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        self.set_profiling_crypto_context();
         let member_count = self
             .group
             .as_ref()
@@ -485,6 +513,7 @@ impl Client {
         message_bytes: &[u8],
         profile: bool,
     ) -> Result<Vec<u8>> {
+        self.set_profiling_crypto_context();
         let member_count = self
             .group
             .as_ref()
@@ -524,6 +553,7 @@ impl Client {
         commit_bytes: &[u8],
         profile: CommitReceiveProfileOptions,
     ) -> Result<CommitReceiveOutcome> {
+        self.set_profiling_crypto_context();
         let is_own_pending_commit = self
             .pending_commit_bytes
             .as_ref()

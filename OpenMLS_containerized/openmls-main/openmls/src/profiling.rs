@@ -57,7 +57,19 @@ pub fn valid_persisted_canonical_total_count(op: &str) -> u64 {
         .unwrap_or(0)
 }
 
+static PROCESS_CRYPTO_CONTEXT: OnceLock<(&'static str, openmls_traits::types::Ciphersuite)> = OnceLock::new();
+
+pub fn set_process_crypto_context(profile: &'static str, ciphersuite: openmls_traits::types::Ciphersuite) {
+    let selected = PROCESS_CRYPTO_CONTEXT.get_or_init(|| (profile, ciphersuite));
+    assert_eq!(*selected, (profile, ciphersuite), "one crypto profile per worker process");
+}
+
+pub fn set_crypto_context(profile: &'static str, ciphersuite: openmls_traits::types::Ciphersuite) {
+    CRYPTO_CONTEXT.with(|slot| *slot.borrow_mut() = Some((profile, ciphersuite)));
+}
+
 thread_local! {
+    static CRYPTO_CONTEXT: RefCell<Option<(&'static str, openmls_traits::types::Ciphersuite)>> = const { RefCell::new(None) };
     static SPAN_STACK: RefCell<Vec<(u64, String)>> = const { RefCell::new(Vec::new()) };
     /// Propagated sender_generation from the most recent sender_data decryption,
     /// consumed by the parent receive protocol span.
@@ -1102,6 +1114,8 @@ pub struct ProfileEvent {
     pub parent_operation: Option<String>,
     pub span_inclusive: bool,
     pub implementation: String,
+    pub crypto_profile: Option<String>,
+    pub mls_ciphersuite: Option<String>,
 
     pub wall_ns: u128,
     pub cpu_thread_ns: Option<u128>,
@@ -1698,7 +1712,7 @@ impl ProfileScope {
         pop_span_id(self.span_id);
 
         let mut event = ProfileEvent {
-            profile_schema_version: 13,
+            profile_schema_version: 14,
             ts_unix_ns: unix_timestamp_ns(),
             measurement_class: measurement_class_for_op(&op).to_string(),
             measurement_plane: measurement_plane_for_op(&op).to_string(),
@@ -1710,6 +1724,8 @@ impl ProfileScope {
             span_inclusive: true,
             op,
             implementation,
+            crypto_profile: None,
+            mls_ciphersuite: None,
 
             wall_ns,
             cpu_thread_ns,
@@ -1895,6 +1911,13 @@ impl ProfileScope {
                 event.heap_failure_context = Some(snapshot.failure_context.as_str().to_string());
             }
         }
+
+        CRYPTO_CONTEXT.with(|slot| {
+            if let Some((profile, ciphersuite)) = (*slot.borrow()).or_else(|| PROCESS_CRYPTO_CONTEXT.get().copied()) {
+                event.crypto_profile = Some(profile.to_string());
+                event.mls_ciphersuite = Some(ciphersuite.to_string());
+            }
+        });
 
         COMMIT_RECEIVE_CONTEXT.with(|slot| {
             if let Some(ctx) = slot.borrow().as_ref() {

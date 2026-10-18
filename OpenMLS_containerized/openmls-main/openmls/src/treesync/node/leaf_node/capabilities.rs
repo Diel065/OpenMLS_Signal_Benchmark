@@ -389,6 +389,8 @@ pub(super) fn default_ciphersuites() -> Vec<Ciphersuite> {
         Ciphersuite::MLS_128_DHKEMP256_AES128GCM_SHA256_P256,
         Ciphersuite::MLS_128_DHKEMX25519_CHACHA20POLY1305_SHA256_Ed25519,
         Ciphersuite::MLS_256_XWING_CHACHA20POLY1305_SHA256_Ed25519,
+        #[cfg(feature = "draft-ietf-mls-pq-ciphersuites")]
+        Ciphersuite::MLS_128_MLKEM768X25519_AES128GCM_SHA256_Ed25519,
     ]
 }
 

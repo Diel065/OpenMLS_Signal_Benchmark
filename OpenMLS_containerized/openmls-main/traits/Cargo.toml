@@ -14,6 +14,7 @@ path = "src/traits.rs"
 
 [features]
 default = []
+draft-ietf-mls-pq-ciphersuites = []
 test-utils = []
 extensions-draft-08 = []
 

@@ -19,6 +19,7 @@ use futures_util::stream::{self, StreamExt};
 use rand::{rngs::StdRng, seq::SliceRandom, thread_rng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 
+use crate::crypto_profile::CryptoProfile;
 use crate::http_retry::{
     is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
     retry_transient_http_async, RetryDecision,
@@ -60,6 +61,7 @@ fn profiled_operation_journal() -> &'static Mutex<Option<PathBuf>> {
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
+    pub crypto_profile: CryptoProfile,
     pub preflight_only: bool,
     pub ds_url: String,
     pub workers: Vec<WorkerSpec>,
@@ -381,6 +383,8 @@ struct ProfilingCapabilities {
     client_exists: Option<bool>,
     #[serde(default)]
     profiling_enabled: bool,
+    crypto_profile: CryptoProfile,
+    mls_ciphersuite: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -599,6 +603,10 @@ impl BenchmarkCursor {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct RunnerEvent {
+    #[serde(default)]
+    crypto_profile: Option<String>,
+    #[serde(default)]
+    mls_ciphersuite: Option<String>,
     profile_schema_version: u32,
     ts_unix_ns: u128,
     event_kind: String,
@@ -626,6 +634,7 @@ struct RunnerEvent {
 }
 
 struct RunnerEventLog {
+    crypto_profile: Option<CryptoProfile>,
     path: PathBuf,
     oom_evidence_path: PathBuf,
     run_dir: PathBuf,
@@ -637,6 +646,7 @@ struct RunnerEventLog {
 impl RunnerEventLog {
     fn new(run_dir: &Path, profiled_failure_stop_after: usize) -> Self {
         Self {
+            crypto_profile: None,
             path: run_dir.join("runner-events.jsonl"),
             oom_evidence_path: run_dir.join("oom_events.jsonl"),
             run_dir: run_dir.to_path_buf(),
@@ -700,7 +710,9 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 13,
+            crypto_profile: self.crypto_profile.map(|profile| profile.name().to_string()),
+            mls_ciphersuite: self.crypto_profile.map(|profile| profile.ciphersuite().to_string()),
+            profile_schema_version: 14,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -761,7 +773,9 @@ impl RunnerEventLog {
         reassigned_to: Option<&WorkerSpec>,
     ) -> Result<()> {
         let event = RunnerEvent {
-            profile_schema_version: 13,
+            crypto_profile: self.crypto_profile.map(|profile| profile.name().to_string()),
+            mls_ciphersuite: self.crypto_profile.map(|profile| profile.ciphersuite().to_string()),
+            profile_schema_version: 14,
             ts_unix_ns: unix_time_ns(),
             event_kind: "worker_failure".to_string(),
             failed_worker_id: worker.id.clone(),
@@ -833,6 +847,8 @@ impl RunnerEvent {
     fn to_profile_event(&self) -> ProfileEvent {
         let mut event = ProfileEvent {
             profile_schema_version: Some(self.profile_schema_version),
+            crypto_profile: self.crypto_profile.clone(),
+            mls_ciphersuite: self.mls_ciphersuite.clone(),
             ts_unix_ns: self.ts_unix_ns,
             op: "benchmark.worker_failure".to_string(),
             measurement_class: Some("runner_failure".to_string()),
@@ -1325,6 +1341,10 @@ struct ProfileEvent {
     #[serde(default)]
     update_path_present: Option<bool>,
     ciphersuite: Option<String>,
+    #[serde(default)]
+    crypto_profile: Option<String>,
+    #[serde(default)]
+    mls_ciphersuite: Option<String>,
     #[serde(default)]
     committer_leaf_index: Option<u32>,
     #[serde(default)]
@@ -1882,6 +1902,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     fs::create_dir_all(&run_dir)?;
     configure_profiled_operation_journal(&run_dir);
     let mut runner_events = RunnerEventLog::new(&run_dir, config.profiled_failure_stop_after);
+    runner_events.crypto_profile = Some(config.crypto_profile);
     if let Some(layout) = config.worker_layout.as_ref() {
         runner_events.resource_sweep |= layout.physical_workers.iter().any(|worker| {
             worker.execution_backend != "real_device"
@@ -1966,6 +1987,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         worker_health_timeout,
         worker_health_poll,
         max_fanout_parallelism,
+        config.crypto_profile,
     )
     .await?;
 
@@ -2021,6 +2043,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     #[derive(Serialize)]
     struct ScenarioPlan<'a> {
+        crypto_profile: CryptoProfile,
+        mls_ciphersuite: String,
         run_id: &'a str,
         scenario_seed: u64,
         plateau_order: PlateauOrder,
@@ -2039,6 +2063,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     }
 
     let scenario_plan = ScenarioPlan {
+        crypto_profile: config.crypto_profile,
+        mls_ciphersuite: config.crypto_profile.ciphersuite().to_string(),
         run_id: &config.run_id,
         scenario_seed: config.scenario_seed,
         plateau_order: config.plateau_order,
@@ -2438,6 +2464,7 @@ async fn wait_for_all_workers_healthy(
     timeout: Duration,
     poll: Duration,
     max_parallelism: usize,
+    crypto_profile: CryptoProfile,
 ) -> Result<()> {
     let start = Instant::now();
     let mut remaining: Vec<usize> = (0..workers.len()).collect();
@@ -2481,7 +2508,7 @@ async fn wait_for_all_workers_healthy(
         let healthy_count = workers.len().saturating_sub(still_unhealthy.len());
 
         if still_unhealthy.is_empty() {
-            verify_publication_profiling_capabilities(http, workers, max_parallelism).await?;
+            verify_publication_profiling_capabilities(http, workers, max_parallelism, crypto_profile).await?;
             let (p50, p95, p99, max) = latency_percentiles(latencies);
             eprintln!(
                 "[preflight] all {} workers are healthy after {}",
@@ -2601,11 +2628,9 @@ async fn verify_publication_profiling_capabilities(
     http: &reqwest::Client,
     workers: &[WorkerSpec],
     max_parallelism: usize,
+    crypto_profile: CryptoProfile,
 ) -> Result<()> {
-    let publication_workers = workers
-        .iter()
-        .filter(|worker| worker.profile_enabled && !worker.device_kind.is_empty())
-        .collect::<Vec<_>>();
+    let publication_workers = workers.iter().collect::<Vec<_>>();
     if publication_workers.is_empty() {
         return Ok(());
     }
@@ -2639,7 +2664,14 @@ async fn verify_publication_profiling_capabilities(
                     worker.id
                 ));
             }
-            if !capabilities.profiling_enabled {
+            if capabilities.crypto_profile != crypto_profile
+                || capabilities.mls_ciphersuite != crypto_profile.ciphersuite().to_string()
+            {
+                return Err(anyhow!("crypto profile mismatch for worker {}: expected {} / {}, received {} / {}",
+                    worker.id, crypto_profile, crypto_profile.ciphersuite(),
+                    capabilities.crypto_profile, capabilities.mls_ciphersuite));
+            }
+            if worker.profile_enabled && !worker.device_kind.is_empty() && !capabilities.profiling_enabled {
                 return Err(anyhow!(
                     "profiling is disabled for publication worker {}",
                     worker.id
@@ -2655,7 +2687,7 @@ async fn verify_publication_profiling_capabilities(
         verified += 1;
     }
     eprintln!(
-        "[preflight] verified profiling capabilities on {} publication workers",
+        "[preflight] verified crypto profiles and profiling capabilities on {} workers",
         verified
     );
     Ok(())
@@ -8592,6 +8624,8 @@ pub fn aggregate_csv(
         force_self_update: Option<bool>,
         update_path_present: Option<bool>,
         ciphersuite: Option<String>,
+        crypto_profile: Option<String>,
+        mls_ciphersuite: Option<String>,
         committer_leaf_index: Option<u32>,
         joiner_leaf_index: Option<u32>,
         direct_path_len: Option<usize>,
@@ -8865,6 +8899,8 @@ pub fn aggregate_csv(
                 force_self_update: event.force_self_update,
                 update_path_present: event.update_path_present,
                 ciphersuite: event.ciphersuite,
+                crypto_profile: event.crypto_profile,
+                mls_ciphersuite: event.mls_ciphersuite,
                 committer_leaf_index: event.committer_leaf_index,
                 joiner_leaf_index: event.joiner_leaf_index,
                 direct_path_len: event.direct_path_len,
@@ -9465,6 +9501,8 @@ mod aggregate_csv_resource_tests {
         .expect("write completed span");
 
         let failure = RunnerEvent {
+            crypto_profile: None,
+            mls_ciphersuite: None,
             profile_schema_version: 10,
             ts_unix_ns: 200,
             event_kind: "worker_failure".to_string(),
