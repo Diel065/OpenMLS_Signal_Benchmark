@@ -40,7 +40,8 @@ pub struct SignalParticipant {
     initial_one_time_prekey_count: u32,
     one_time_prekey_refill_count: u32,
     one_time_prekey_low_watermark: usize,
-    csprng: StdRng,
+    pub(crate) csprng: StdRng,
+    pub(crate) sender_key_id: Option<uuid::Uuid>,
 }
 
 fn new_csprng() -> StdRng {
@@ -202,6 +203,7 @@ impl SignalParticipant {
             one_time_prekey_refill_count,
             one_time_prekey_low_watermark,
             csprng,
+            sender_key_id: None,
         })
     }
 

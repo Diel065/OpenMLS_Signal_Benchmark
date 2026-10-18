@@ -11,6 +11,8 @@ use signal_benchmark::staircase_runner::{
 
 #[derive(clap::Parser, Debug)]
 struct Args {
+    #[arg(long, value_enum, default_value = "pairwise")]
+    group_model: signal_benchmark::sender_keys::GroupModel,
     #[arg(long, default_value = "http://127.0.0.1:3000")]
     kr_url: String,
 
@@ -199,6 +201,7 @@ fn main() -> Result<()> {
     };
 
     run_staircase_benchmark(StaircaseConfig {
+        group_model: args.group_model,
         preflight_only: args.preflight_only,
         kr_url: args.kr_url,
         relay_url: args.relay_url,
