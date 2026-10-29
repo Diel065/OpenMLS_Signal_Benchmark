@@ -4,7 +4,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
-    extract::{Path, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
             "/group/{group_id}/commit/{sender}/{epoch}",
             post(publish_group_commit),
         )
+        .layer(DefaultBodyLimit::max(64 * 1024 * 1024))
         .with_state(state);
 
     println!("[DS] Listening on http://{}", addr);
