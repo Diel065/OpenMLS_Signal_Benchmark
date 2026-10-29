@@ -186,7 +186,7 @@ run_signal_baseline() {
     --singleton-fraction "$SINGLETON_FRACTION" \
     --packed-clients-per-container "$SIGNAL_PACKED_PER_CONTAINER" \
     --packed-worker-internal-parallelism "$PACKED_INTERNAL_PARALLELISM" \
-    --cpu-affinity-mode "${SIGNAL_CPU_AFFINITY_MODE:-none}" \
+    --cpu-affinity-mode "${SIGNAL_CPU_AFFINITY_MODE:-profiled-nor-background}" \
     --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
     --bridge-count "$BRIDGE_COUNT" \
     --health-timeout-seconds "$HEALTH_TIMEOUT" \
