@@ -25,14 +25,14 @@ RUN cargo build \
     --bin benchmark_runner_http_staircase
 
 RUN cargo build \
-    --profile minsize \
+    --release \
     --target x86_64-unknown-linux-musl \
     --bin worker
 
 RUN mkdir -p /out \
     && cp /app/target/x86_64-unknown-linux-musl/release/ds /out/ds \
     && cp /app/target/x86_64-unknown-linux-musl/release/message_relay /out/message_relay \
-    && cp /app/target/x86_64-unknown-linux-musl/minsize/worker /out/worker \
+    && cp /app/target/x86_64-unknown-linux-musl/release/worker /out/worker \
     && cp /app/target/x86_64-unknown-linux-musl/release/benchmark_runner_http_staircase /out/benchmark_runner_http_staircase
 
 FROM scratch AS ds-runtime
