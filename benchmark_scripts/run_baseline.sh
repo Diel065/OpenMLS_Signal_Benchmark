@@ -33,6 +33,7 @@ MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-4}"
 ADD_BATCH_EXTREMES_ONLY="${ADD_BATCH_EXTREMES_ONLY:-0}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-4}"
 PAYLOAD_SIZES="${PAYLOAD_SIZES:-32,256,2048}"
+CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
 
 CPU_AFFINITY_SAMPLE="${CPU_AFFINITY_SAMPLE:-20}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
@@ -48,6 +49,7 @@ SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
 SIGNAL_APP_ROUNDS="${SIGNAL_APP_ROUNDS:-4}"
 SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
 SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
+SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 
@@ -98,13 +100,13 @@ affinity_mode() {
 
 run_baseline() {
   local iter="$1"
-  local run_id="cal02_unconstrained_container_baseline_i${iter}_${DATE_TAG}"
+  local run_id="cal02_unconstrained_container_baseline_i${iter}_${DATE_TAG}_${CRYPTO_PROFILE}"
   local run_dir="$OPENMLS_DIR/benchmark_output/$run_id"
   local scenario_seed singleton_selection_seed mode
   local -a image_args
 
-  scenario_seed="$(shuf -i 1-2147483647 -n 1)"
-  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
+  scenario_seed="${SCENARIO_SEED:-$(shuf -i 1-2147483647 -n 1)}"
+  singleton_selection_seed="${SINGLETON_SELECTION_SEED:-$(shuf -i 1-2147483647 -n 1)}"
   mode="$(affinity_mode)"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
@@ -120,6 +122,7 @@ run_baseline() {
   uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$WORKERS" \
     --run-id "$run_id" \
+    --crypto-profile "$CRYPTO_PROFILE" \
     --scenario-seed "$scenario_seed" \
     --singleton-selection-seed "$singleton_selection_seed" \
     --output-dir benchmark_output \
@@ -163,7 +166,7 @@ run_baseline() {
 
 run_signal_baseline() {
   local iter="$1"
-  local run_id="cal02_signal_unconstrained_baseline_i${iter}_${DATE_TAG}"
+  local run_id="cal02_signal_unconstrained_baseline_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
   local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
   local singleton_selection_seed
   local -a image_args
@@ -179,6 +182,7 @@ run_signal_baseline() {
   uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$SIGNAL_WORKERS" \
     --run-id "$run_id" \
+    --group-model "$SIGNAL_GROUP_MODEL" \
     --singleton-selection-seed "$singleton_selection_seed" \
     --output-dir benchmark_output \
     --worker-layout-mode hybrid \
@@ -196,6 +200,7 @@ run_signal_baseline() {
     --min-size 2 \
     --max-size "$SIGNAL_MAX_CONVERSATION_SIZE" \
     --step-size "$SIGNAL_STEP_SIZE" \
+    --plateau-order "$PLATEAU_ORDER" \
     --roundtrips "$SIGNAL_ROUNDTRIPS" \
     --app-rounds "$SIGNAL_APP_ROUNDS" \
     --max-app-samples-per-payload "$MAX_APP_SAMPLES_PER_PAYLOAD" \

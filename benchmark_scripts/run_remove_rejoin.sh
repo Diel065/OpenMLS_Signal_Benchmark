@@ -27,10 +27,11 @@ FANOUT_PARALLELISM="${FANOUT_PARALLELISM:-128}"
 FANOUT_MIN="${FANOUT_MIN:-16}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
+CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
 
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_TOKEN="remove_rejoin_${DATE_TAG}_pid$$"
-RUN_ID="${RUN_TOKEN}_openmls"
+RUN_ID="${RUN_TOKEN}_openmls_${CRYPTO_PROFILE}"
 RUN_DIR="$OUTPUT_ROOT/$RUN_ID"
 REPORT="$OUTPUT_ROOT/${RUN_TOKEN}_report.txt"
 
@@ -56,8 +57,8 @@ export OPENMLS_APP_HEAP_BUDGET="${OPENMLS_APP_HEAP_BUDGET:-1024g}"
 export OPENMLS_APP_HEAP_BUDGET_BYTES="${OPENMLS_APP_HEAP_BUDGET_BYTES:-1099511627776}"
 
 output_arg="$(realpath -ms --relative-to="$OPENMLS_DIR" -- "$OUTPUT_ROOT")"
-scenario_seed="$(shuf -i 1-2147483647 -n 1)"
-singleton_seed="$(shuf -i 1-2147483647 -n 1)"
+scenario_seed="${SCENARIO_SEED:-$(shuf -i 1-2147483647 -n 1)}"
+singleton_seed="${SINGLETON_SELECTION_SEED:-$(shuf -i 1-2147483647 -n 1)}"
 
 image_args=()
 if [ "$BUILD_IMAGES" = "1" ]; then image_args=(--build-images); fi
@@ -66,6 +67,7 @@ cmd=(
   uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py
   --workers "$WORKERS"
   --run-id "$RUN_ID"
+  --crypto-profile "$CRYPTO_PROFILE"
   --scenario tmp-two-run-unconstrained-container-baseline
   --scenario-seed "$scenario_seed"
   --singleton-selection-seed "$singleton_seed"

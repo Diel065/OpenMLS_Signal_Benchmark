@@ -36,6 +36,7 @@ PLATEAU_ORDER="${PLATEAU_ORDER:-staircase}"
 MAX_UPDATE_SAMPLES_PER_PLATEAU="${MAX_UPDATE_SAMPLES_PER_PLATEAU:-2}"
 MAX_APP_SAMPLES_PER_PAYLOAD="${MAX_APP_SAMPLES_PER_PAYLOAD:-2}"
 PAYLOAD_SIZES="${PAYLOAD_SIZES:-32,2048}"
+CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
 
 CPU_AFFINITY_SAMPLE="${CPU_AFFINITY_SAMPLE:-20}"
 HEALTH_TIMEOUT="${HEALTH_TIMEOUT:-240}"
@@ -64,6 +65,7 @@ SIGNAL_ROUNDTRIPS="${SIGNAL_ROUNDTRIPS:-1}"
 SIGNAL_APP_ROUNDS="${SIGNAL_APP_ROUNDS:-2}"
 SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
 SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
+SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
 
 export PATH="$HOME/.cargo/bin:$PATH"
 export OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD="$CPU_THROTTLED_PERIOD_THRESHOLD"
@@ -156,13 +158,13 @@ run_sweep() {
   local iter="$1"
   local sweep_type="$2"
   local label="$3"
-  local run_id="cal01_${sweep_type}_i${iter}_${DATE_TAG}"
+  local run_id="cal01_${sweep_type}_i${iter}_${DATE_TAG}_${CRYPTO_PROFILE}"
   local run_dir output_arg
   local scenario_seed singleton_selection_seed mode
   local -a image_args validation_args
 
-  scenario_seed="$(shuf -i 1-2147483647 -n 1)"
-  singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
+  scenario_seed="${SCENARIO_SEED:-$(shuf -i 1-2147483647 -n 1)}"
+  singleton_selection_seed="${SINGLETON_SELECTION_SEED:-$(shuf -i 1-2147483647 -n 1)}"
   mode="$(affinity_mode)"
   output_arg="$(output_dir_arg_for "$OPENMLS_DIR")"
   run_dir="$(run_dir_for "$OPENMLS_DIR" "$run_id")"
@@ -184,6 +186,7 @@ run_sweep() {
   uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
     --workers "$WORKERS" \
     --run-id "$run_id" \
+    --crypto-profile "$CRYPTO_PROFILE" \
     --scenario-seed "$scenario_seed" \
     --singleton-selection-seed "$singleton_selection_seed" \
     --output-dir "$output_arg" \
@@ -237,7 +240,7 @@ run_signal_sweep() {
   local iter="$1"
   local sweep_type="$2"
   local label="$3"
-  local run_id="cal01_signal_${sweep_type}_i${iter}_${DATE_TAG}"
+  local run_id="cal01_signal_${sweep_type}_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
   local run_dir output_arg singleton_selection_seed
   local -a image_args
 
@@ -268,6 +271,7 @@ run_signal_sweep() {
       uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
+        --group-model "$SIGNAL_GROUP_MODEL" \
         --singleton-selection-seed "$singleton_selection_seed" \
         --output-dir "$output_arg" \
         --worker-layout-mode hybrid \
@@ -311,6 +315,7 @@ run_signal_sweep() {
       uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
         --workers "$SIGNAL_WORKERS" \
         --run-id "$run_id" \
+        --group-model "$SIGNAL_GROUP_MODEL" \
         --singleton-selection-seed "$singleton_selection_seed" \
         --output-dir "$output_arg" \
         --worker-layout-mode hybrid \
