@@ -74,6 +74,11 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     add_batch_extremes_only: bool,
 
+    /// Before each measured update phase, run one unprofiled SelfUpdate per active member
+    /// (populated ratchet tree).
+    #[arg(long, action = ArgAction::SetTrue)]
+    fill_tree_before_measure: bool,
+
     /// Base scaling factor before capping: requested sends = app_rounds * N per payload
     #[arg(long, default_value_t = 2)]
     app_rounds: usize,
@@ -273,6 +278,7 @@ fn main() -> Result<()> {
         profiled_failure_policy: args.profiled_failure_policy,
         profiled_failure_stop_after: args.profiled_failure_stop_after,
         remove_rejoin: args.remove_rejoin,
+        fill_tree_before_measure: args.fill_tree_before_measure,
         worker_layout,
     })
 }

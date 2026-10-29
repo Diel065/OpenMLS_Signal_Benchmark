@@ -102,6 +102,8 @@ thread_local! {
     /// Worker/client ID for span identity.
     /// Set before each command by the benchmark runner.
     pub(crate) static WORKER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
+    /// Set while a benchmark setup operation runs that must not produce profile output.
+    static PROFILING_SUPPRESSED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[derive(Clone, Debug, Default)]
@@ -589,6 +591,32 @@ pub fn clear_benchmark_context() {
     BENCHMARK_CONTEXT.with(|slot| {
         *slot.borrow_mut() = None;
     });
+}
+
+/// Suppresses all profile output on this thread until dropped; restores the previous state.
+/// Hold it only around a synchronous operation, never across an `.await`.
+pub struct ProfilingSuppressGuard {
+    previous: bool,
+    // The flag is per thread: the guard must not move to another thread.
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Drop for ProfilingSuppressGuard {
+    fn drop(&mut self) {
+        PROFILING_SUPPRESSED.with(|flag| flag.set(self.previous));
+    }
+}
+
+#[must_use]
+pub fn suppress_profiling() -> ProfilingSuppressGuard {
+    ProfilingSuppressGuard {
+        previous: PROFILING_SUPPRESSED.with(|flag| flag.replace(true)),
+        _not_send: std::marker::PhantomData,
+    }
+}
+
+fn profiling_suppressed() -> bool {
+    PROFILING_SUPPRESSED.with(Cell::get)
 }
 
 pub fn set_commit_receive_context(ctx: CommitReceiveContext) {
@@ -1300,6 +1328,9 @@ impl ProfileEvent {
 }
 
 pub fn emit_event(event: &ProfileEvent) {
+    if profiling_suppressed() {
+        return;
+    }
     let _heap_budget_context =
         allocation_counter::embedded_heap_budget::enter_attribution_context(
             allocation_counter::embedded_heap_budget::HeapBudgetContext::ProfilingEmit,
@@ -1592,7 +1623,7 @@ pub struct ProfileScope {
 
 impl ProfileScope {
     pub fn start(op: impl Into<String>, implementation: impl Into<String>) -> Option<Self> {
-        if !profiling_enabled() {
+        if !profiling_enabled() || profiling_suppressed() {
             return None;
         }
         allocation_counter::embedded_heap_budget::set_active_context(

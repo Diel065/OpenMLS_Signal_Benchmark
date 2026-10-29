@@ -10,7 +10,9 @@ use once_cell::sync::Lazy;
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use openmls::profiling::{set_benchmark_context, set_worker_id, BenchmarkContext};
+use openmls::profiling::{
+    set_benchmark_context, set_worker_id, suppress_profiling, BenchmarkContext,
+};
 
 use crate::client::{Client, CommitReceiveOutcome, CommitReceiveProfileOptions, EpochChangeOutput};
 use crate::http_retry::{
@@ -1095,6 +1097,7 @@ pub async fn try_start_intent(
         PendingIntent::SelfUpdate { benchmark_context } => {
             set_worker_id(client.name.clone());
             set_benchmark_context(benchmark_context.clone());
+            let _unprofiled = is_unprofiled_setup(benchmark_context).then(suppress_profiling);
             client.self_update()?
         }
     };
@@ -1151,6 +1154,14 @@ pub async fn maybe_retry_pending_intent(
     }
 }
 
+/// Benchmark phase of setup commits that must not produce profile output
+/// (runner option `--fill-tree-before-measure`).
+pub const TREE_FILL_PHASE: &str = "tree_fill";
+
+fn is_unprofiled_setup(benchmark_context: &BenchmarkContext) -> bool {
+    benchmark_context.benchmark_phase.as_deref() == Some(TREE_FILL_PHASE)
+}
+
 fn restore_profiling_context(client: &Client, benchmark_context: &BenchmarkContext) {
     set_worker_id(client.name.clone());
     set_benchmark_context(benchmark_context.clone());
@@ -1165,7 +1176,11 @@ async fn apply_commit_bytes(
     benchmark_context: &BenchmarkContext,
 ) -> Result<String> {
     restore_profiling_context(client, benchmark_context);
-    match client.receive_commit(commit_bytes, profile)? {
+    let outcome = {
+        let _unprofiled = is_unprofiled_setup(benchmark_context).then(suppress_profiling);
+        client.receive_commit(commit_bytes, profile)?
+    };
+    match outcome {
         CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
             if self_removed {
                 *queued_intent = None;

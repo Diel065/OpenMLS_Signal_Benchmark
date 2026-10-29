@@ -27,7 +27,7 @@ use crate::http_retry::{
 use crate::worker_api::PendingKind;
 use crate::worker_api::{
     BatchCommandItem, BatchCommandRequest, BatchCommandResponse, Command, CommandRequestEnvelope,
-    CommandResponse,
+    CommandResponse, TREE_FILL_PHASE,
 };
 
 const WORKER_COMMAND_MAX_ATTEMPTS: usize = 10;
@@ -101,6 +101,7 @@ pub struct StaircaseConfig {
     pub profiled_failure_policy: ProfiledFailurePolicy,
     pub profiled_failure_stop_after: usize,
     pub remove_rejoin: bool,
+    pub fill_tree_before_measure: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2058,6 +2059,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         min_external_samples_per_operation: usize,
         randomized_membership_batches: bool,
         add_batch_extremes_only: bool,
+        fill_tree_before_measure: bool,
         randomized_actor_selection: bool,
         randomized_payload_order: bool,
     }
@@ -2078,6 +2080,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         min_external_samples_per_operation: config.min_profiled_samples_per_operation,
         randomized_membership_batches: true,
         add_batch_extremes_only: config.add_batch_extremes_only,
+        fill_tree_before_measure: config.fill_tree_before_measure,
         randomized_actor_selection: true,
         randomized_payload_order: true,
     };
@@ -2244,6 +2247,27 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 &runner_events,
             )
             .await?;
+
+            if config.fill_tree_before_measure {
+                // Own controller: the unmeasured fill must not change the fan-out
+                // parallelism of the measured phases.
+                let mut fill_fanout = FanoutController::new(
+                    max_fanout_parallelism,
+                    min_fanout_parallelism,
+                    fanout_adaptive,
+                    fanout_error_rate_threshold,
+                    fanout_p95_threshold_ms,
+                );
+                run_tree_fill_phase(
+                    &http,
+                    &active,
+                    target_size,
+                    &mut fill_fanout,
+                    config.process_pending_fanout,
+                    plateau_idx + 1,
+                )
+                .await?;
+            }
 
             run_update_phase(
                 &http,
@@ -7756,6 +7780,153 @@ async fn run_single_remove_rejoin_cycle(
     Ok(())
 }
 
+/// One unprofiled SelfUpdate per active member, so that the measured phases of this plateau
+/// run on a populated ratchet tree: every parent node on every member's direct path is set
+/// and has no unmerged leaves. The worker suppresses all profile output for these commands.
+async fn run_tree_fill_phase(
+    http: &reqwest::Client,
+    active: &[WorkerSpec],
+    plateau_size: usize,
+    fanout: &mut FanoutController,
+    process_pending_fanout: bool,
+    plateau_index: usize,
+) -> Result<()> {
+    for (actor_idx, actor) in active.iter().enumerate() {
+        let cursor = BenchmarkCursor::new(
+            plateau_index,
+            plateau_size,
+            active.len(),
+            TREE_FILL_PHASE,
+            "self_update",
+        )
+        .at_operation(actor_idx + 1, None);
+        let actor_before = show_group_state(http, actor).await?;
+        let expected_state = ExpectedReceiveCommitState::Group(expected_group_state(
+            &actor_before,
+            actor_before.epoch + 1,
+            actor_before.members.clone(),
+        ));
+
+        let update_command = Command::SelfUpdate;
+        let update_context = WorkerCommandContext::with_metadata(
+            actor,
+            &update_command,
+            None,
+            Some("tree_fill.create"),
+            Some(&cursor),
+        );
+        send_cmd_expect_ok_fragment_with_context(
+            http,
+            actor,
+            &update_command,
+            "self_update commit published to group",
+            &update_context,
+        )
+        .await?;
+        if process_pending_fanout {
+            process_pending_commit_expect(
+                http,
+                actor,
+                expected_state.clone(),
+                "tree_fill.actor_process_pending",
+                Some(&cursor),
+            )
+            .await?;
+        } else {
+            receive_commit_expect(
+                http,
+                actor,
+                "own commit accepted from DS",
+                expected_state.clone(),
+                "tree_fill.actor_receive_commit",
+                Some(&cursor),
+            )
+            .await?;
+        }
+
+        let recipients: Vec<WorkerSpec> = active
+            .iter()
+            .enumerate()
+            .filter(|(idx, _)| *idx != actor_idx)
+            .map(|(_, worker)| worker.clone())
+            .collect();
+        let expected_ep = expected_epoch(&expected_state);
+        let fanout_phase = if process_pending_fanout {
+            "tree_fill.fanout_process_pending"
+        } else {
+            "tree_fill.fanout_receive_commit"
+        };
+        let commands_by_physical = build_batch_commands(&recipients, |worker| {
+            BatchFanoutCommand {
+                client_id: worker.id.clone(),
+                request_id: None,
+                command: if process_pending_fanout {
+                    Command::ProcessPending {
+                        kinds: Some(vec![PendingKind::Commits]),
+                        max_messages: None,
+                        expected_epoch: expected_ep,
+                        profile: false,
+                        commit_create_op: None,
+                        commit_receive_sampling_policy: None,
+                        commit_receive_sampling_seed: None,
+                        commit_receive_sample_index: None,
+                        commit_receive_sample_count: None,
+                        commit_receive_population_size: None,
+                    }
+                } else {
+                    Command::ReceiveCommit {
+                        profile: false,
+                        commit_create_op: None,
+                        commit_receive_sampling_policy: None,
+                        commit_receive_sampling_seed: None,
+                        commit_receive_sample_index: None,
+                        commit_receive_sample_count: None,
+                        commit_receive_population_size: None,
+                    }
+                },
+                expected_epoch: expected_ep,
+                phase: Some(fanout_phase.to_string()),
+                profile: None,
+                benchmark_plateau_index: None,
+                benchmark_target_size: None,
+                benchmark_active_size: None,
+                benchmark_phase: None,
+                benchmark_operation: None,
+                benchmark_operation_seq: None,
+                benchmark_payload_size: None,
+                membership_batch_requested: None,
+                membership_batch_effective: None,
+                membership_batch_group_cap: None,
+                membership_batch_transition_cap: None,
+                membership_batch_source: None,
+            }
+            .with_benchmark_cursor(&cursor)
+        });
+        let expected_by_client = recipients
+            .iter()
+            .map(|worker| (worker.id.clone(), expected_state.clone()))
+            .collect::<HashMap<_, _>>();
+        batch_fanout_workers(
+            http,
+            TREE_FILL_PHASE,
+            plateau_size,
+            "receive_commit",
+            &recipients,
+            fanout,
+            &commands_by_physical,
+            Some(&expected_by_client),
+        )
+        .await?;
+    }
+
+    eprintln!(
+        "\n[plateau {}] tree fill: {} unprofiled self-update commits",
+        plateau_size,
+        active.len()
+    );
+    Ok(())
+}
+
 async fn run_update_phase(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
@@ -9756,6 +9927,16 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
     {
         return Err(anyhow!(
             "--min-external-samples-per-operation requires --external-coverage-lane and at least one profile-enabled external device"
+        ));
+    }
+    if config.fill_tree_before_measure && config.remove_rejoin {
+        return Err(anyhow!(
+            "--fill-tree-before-measure cannot be combined with --remove-rejoin (no update phase)"
+        ));
+    }
+    if config.fill_tree_before_measure && config.workers.iter().any(is_external_device) {
+        return Err(anyhow!(
+            "--fill-tree-before-measure is not supported with external devices"
         ));
     }
 

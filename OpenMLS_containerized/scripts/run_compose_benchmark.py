@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use only k=1 and k=max AddCommit batches, except transition remainders.",
     )
+    p.add_argument(
+        "--fill-tree-before-measure",
+        action="store_true",
+        help="Before each measured update phase, run one unprofiled SelfUpdate per active member (populated ratchet tree).",
+    )
 
     p.add_argument("--app-rounds", type=int, default=2)
     p.add_argument("--max-app-samples-per-payload", type=int, default=16)
@@ -4541,6 +4546,7 @@ def main() -> int:
                 "--max-update-samples-per-plateau",
                 str(args.max_update_samples_per_plateau),
                 *(["--add-batch-extremes-only"] if args.add_batch_extremes_only else []),
+                *(["--fill-tree-before-measure"] if args.fill_tree_before_measure else []),
                 "--app-rounds",
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
@@ -4616,6 +4622,7 @@ def main() -> int:
                 "--max-update-samples-per-plateau",
                 str(args.max_update_samples_per_plateau),
                 *(["--add-batch-extremes-only"] if args.add_batch_extremes_only else []),
+                *(["--fill-tree-before-measure"] if args.fill_tree_before_measure else []),
                 "--app-rounds",
                 str(args.app_rounds),
                 "--max-app-samples-per-payload",
