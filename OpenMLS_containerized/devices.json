@@ -24,7 +24,7 @@
       "target": {
         "arch": "armv7l",
         "rust_target": "armv7-unknown-linux-musleabihf",
-        "binary": "target/armv7-unknown-linux-musleabihf/minsize/worker"
+        "binary": "target/armv7-unknown-linux-musleabihf/release/worker"
       },
       "worker": {
         "id": "pico-plus-00001",
@@ -69,7 +69,7 @@
       "target": {
         "arch": "aarch64",
         "rust_target": "aarch64-unknown-linux-musl",
-        "binary": "target/aarch64-unknown-linux-musl/minsize/worker"
+        "binary": "target/aarch64-unknown-linux-musl/release/worker"
       },
       "worker": {
         "id": "raspi5-00001",
@@ -113,7 +113,7 @@
       "target": {
         "arch": "armv7l",
         "rust_target": "armv7-unknown-linux-musleabihf",
-        "binary": "target/armv7-unknown-linux-musleabihf/minsize/worker"
+        "binary": "target/armv7-unknown-linux-musleabihf/release/worker"
       },
       "worker": {
         "id": "raspi3bp-00001",

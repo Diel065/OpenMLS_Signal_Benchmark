@@ -329,7 +329,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--build-external-binaries",
         action="store_true",
-        help="Cross-compile worker binaries for external devices via cargo --profile minsize",
+        help="Cross-compile worker binaries for external devices via cargo build --release",
     )
     p.add_argument(
         "--keep-stack-up",
@@ -3099,7 +3099,7 @@ def launch_external_devices(
 
         configured_binary = Path(dev_config.target.get(
             "binary",
-            "target/armv7-unknown-linux-musleabihf/minsize/worker",
+            "target/armv7-unknown-linux-musleabihf/release/worker",
         ))
         local_binary = configured_binary if configured_binary.is_absolute() else root / configured_binary
         remote_binary = dev_config.worker.get("remote_binary", "/worker")
@@ -3487,7 +3487,7 @@ def collect_cpu_metadata() -> dict:
 
 
 def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace, run_id: str, scenario: str) -> None:
-    external_binary = root / "target/armv7-unknown-linux-musleabihf/minsize/worker"
+    external_binary = root / "target/armv7-unknown-linux-musleabihf/release/worker"
     metadata = {
         "profile_schema_version": 3,
         "run_id": run_id,
@@ -3535,7 +3535,7 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "device_ids": args.external_device_ids,
             "default_binary_path": str(external_binary),
             "default_binary_sha256": sha256_file(external_binary),
-            "profile": "minsize",
+            "profile": "release",
             "rust_target": "armv7-unknown-linux-musleabihf",
             "devices": collect_external_device_build_metadata(root, args),
         },
@@ -3773,7 +3773,7 @@ def main() -> int:
                     "CC_aarch64_unknown_linux_musl": "aarch64-linux-gnu-gcc",
                 }
                 run_cmd(
-                    ["cargo", "build", "--profile", "minsize", "--target", rust_target, "--bin", "worker"],
+                    ["cargo", "build", "--release", "--target", rust_target, "--bin", "worker"],
                     cwd=root,
                     env=build_env,
                 )

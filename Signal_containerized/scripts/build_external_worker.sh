@@ -18,16 +18,16 @@ if [ -z "$TARGET" ]; then
 fi
 
 echo "[build] Building worker for target: $TARGET"
-echo "[build] Profile: minsize (optimized for size, stripped)"
+echo "[build] Profile: release (opt-level 3, thin LTO, stripped)"
 
 rustup target add "$TARGET" 2>/dev/null || true
 
 cargo build \
-    --profile minsize \
+    --release \
     --target "$TARGET" \
     --bin worker
 
-BINARY="target/$TARGET/minsize/worker"
+BINARY="target/$TARGET/release/worker"
 if [ -f "$BINARY" ]; then
     echo "[build] Success: $BINARY"
     echo "[build] Size: $(ls -lh "$BINARY" | awk '{print $5}')"
