@@ -17,7 +17,8 @@ fi
 DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
-SCENARIO="${SCENARIO:-external-device-signal-pairwise-baseline}"
+SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
+SCENARIO="${SCENARIO:-external-device-signal-${SIGNAL_GROUP_MODEL}-baseline}"
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-1}"
@@ -124,7 +125,7 @@ external_device_args() {
 
 run_external_signal() {
   local iter="$1"
-  local run_id="cal07_ext_signal_pairwise_i${iter}_${DATE_TAG}"
+  local run_id="cal07_ext_signal_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
   local run_dir="$OUTPUT_ROOT/$run_id"
   local scenario_seed singleton_selection_seed
   local -a device_args build_args image_args
@@ -158,6 +159,7 @@ run_external_signal() {
     uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
       --workers "$WORKERS" \
       --run-id "$run_id" \
+      --group-model "$SIGNAL_GROUP_MODEL" \
       --scenario "$SCENARIO" \
       --scenario-seed "$scenario_seed" \
       --singleton-selection-seed "$singleton_selection_seed" \
@@ -219,7 +221,7 @@ run_external_signal() {
 STATUS=0
 assert_no_openmls_campaign_active
 cleanup_docker
-echo "===== Signal external-device pairwise campaign: $N run(s) ====="
+echo "===== Signal external-device $SIGNAL_GROUP_MODEL campaign: $N run(s) ====="
 echo "  output_root=$OUTPUT_ROOT"
 echo "  free_space=$(df -h "$OUTPUT_ROOT" | awk 'NR==2 {print $4" avail on "$6" ("$1")"}')"
 for iter in $(seq 1 "$N"); do

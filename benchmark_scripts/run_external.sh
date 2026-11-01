@@ -15,8 +15,10 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
 DRY_RUN="${DRY_RUN:-0}"
 BUILD_IMAGES="${BUILD_IMAGES:-0}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-0}"
+CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
+SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
 CAMPAIGN_TAG="${CAMPAIGN_TAG:-$(date +%Y%m%d_%H%M%S)}"
-CAMPAIGN_DIR="$OUTPUT_ROOT/external_campaign_$CAMPAIGN_TAG"
+CAMPAIGN_DIR="$OUTPUT_ROOT/external_campaign_${CAMPAIGN_TAG}_${CRYPTO_PROFILE}_${SIGNAL_GROUP_MODEL}"
 STAGES="${STAGES:-openmls,remove-rejoin,signal}"
 STAGES="${STAGES//[[:space:]]/}"
 
@@ -90,12 +92,28 @@ run_command() {
   "$@"
 }
 
+require_plan_value() {
+  local run_dir="$1"
+  local key="$2"
+  local expected="$3"
+  uv run --frozen --project "$REPO_ROOT" python - "$run_dir/scenario_plan.json" "$key" "$expected" <<'PY'
+import json
+import sys
+
+path, key, expected = sys.argv[1:4]
+actual = json.load(open(path, encoding="utf-8")).get(key)
+if actual != expected:
+    raise SystemExit(f"{path}: {key}={actual!r}, expected {expected!r}")
+PY
+}
+
 strict_openmls_validation() {
   local run_dir="$1"
   local mode="$2"
   local coverage_json="$run_dir/external_device_coverage.json"
   local -a validator_args
 
+  require_plan_value "$run_dir" crypto_profile "$CRYPTO_PROFILE"
   validator_args=()
   if [ "$mode" = "regular" ]; then
     validator_args=(--require-k-values 1,8)
@@ -124,6 +142,7 @@ PY
 
 strict_signal_validation() {
   local run_dir="$1"
+  require_plan_value "$run_dir" group_model "${SIGNAL_GROUP_MODEL//-/_}"
   uv run --frozen --project "$REPO_ROOT" python "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
     "$run_dir/events.csv" \
     --layout "$run_dir/worker_layout.json" \
@@ -245,6 +264,7 @@ if stage_selected openmls; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$BUILD_IMAGES" BUILD_EXTERNAL_BINARIES="$BUILD_EXTERNAL_BINARIES" \
+    CRYPTO_PROFILE="$CRYPTO_PROFILE" \
     SCENARIO=external-device-openmls-1024-ascending-five-plateau \
     bash "$OPENMLS_REGULAR"
   if [ "$DRY_RUN" != "1" ]; then
@@ -278,6 +298,7 @@ if stage_selected remove-rejoin; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$remove_build_images" BUILD_EXTERNAL_BINARIES="$remove_build_external" \
+    CRYPTO_PROFILE="$CRYPTO_PROFILE" \
     SCENARIO=external-device-openmls-remove-join-1024-ascending-five-plateau \
     bash "$OPENMLS_REMOVE_JOIN"
   if [ "$DRY_RUN" != "1" ]; then
@@ -293,7 +314,7 @@ else
 fi
 
 if stage_selected signal; then
-  previous="$(latest_run cal07_ext_signal_pairwise_i1_ 2>/dev/null || true)"
+  previous="$(latest_run cal07_ext_signal_i1_ 2>/dev/null || true)"
   run_command env \
     OUTPUT_ROOT="$OUTPUT_ROOT" N=1 WORKERS=1024 \
     MIN_SIZE="$SIGNAL_MIN_SIZE" MAX_SIZE="$SIGNAL_MAX_SIZE" STEP_SIZE="$SIGNAL_STEP_SIZE" \
@@ -304,10 +325,11 @@ if stage_selected signal; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$BUILD_IMAGES" BUILD_EXTERNAL_BINARIES="$BUILD_EXTERNAL_BINARIES" \
+    SIGNAL_GROUP_MODEL="$SIGNAL_GROUP_MODEL" \
     SCENARIO=external-device-signal-1024-ascending-five-plateau \
     bash "$SIGNAL_REGULAR"
   if [ "$DRY_RUN" != "1" ]; then
-    SIGNAL_RUN="$(latest_run cal07_ext_signal_pairwise_i1_)"
+    SIGNAL_RUN="$(latest_run cal07_ext_signal_i1_)"
     [ "$SIGNAL_RUN" != "$previous" ] || {
       echo "ERROR: Signal stage did not create a new run directory" >&2
       exit 1

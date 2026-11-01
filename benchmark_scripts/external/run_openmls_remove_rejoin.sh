@@ -15,6 +15,7 @@ EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspb
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 ATTRITION_ALLOWED_WORKER_IDS="${ATTRITION_ALLOWED_WORKER_IDS:-pico-plus-00001}"
 SCENARIO="${SCENARIO:-external-device-openmls-remove-rejoin}"
+CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-1}"
@@ -88,7 +89,7 @@ external_device_args() {
 
 run_external() {
   local iter="$1"
-  local run_id="cal06_ext_remove_rejoin_openmls_i${iter}_${DATE_TAG}"
+  local run_id="cal06_ext_remove_rejoin_openmls_i${iter}_${DATE_TAG}_${CRYPTO_PROFILE}"
   local run_dir="$OUTPUT_ROOT/$run_id"
   local scenario_seed singleton_selection_seed
   local -a device_args build_args image_args
@@ -119,6 +120,7 @@ run_external() {
     uv run --frozen --project "$REPO_ROOT" python scripts/run_compose_benchmark.py \
       --workers "$WORKERS" \
       --run-id "$run_id" \
+      --crypto-profile "$CRYPTO_PROFILE" \
       --scenario "$SCENARIO" \
       --scenario-seed "$scenario_seed" \
       --singleton-selection-seed "$singleton_selection_seed" \
