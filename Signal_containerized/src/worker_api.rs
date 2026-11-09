@@ -494,14 +494,8 @@ pub fn make_subspan_event_with_span(
         .as_ref()
         .zip(parent_span_id)
         .map(|(w, s)| format!("{}:{}", w, s));
-    let bench_ctx = benchmark_context.cloned().or_else(|| {
-        // Device commands carry explicit context; TLS can belong to another async command.
-        if env_nonempty("SIGNAL_PROFILE_EXECUTION_BACKEND").as_deref() == Some("real_device") {
-            None
-        } else {
-            libsignal_protocol::profiling::current_benchmark_context()
-        }
-    });
+    // Commands carry explicit context; TLS can belong to another async command.
+    let bench_ctx = benchmark_context.cloned();
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
         profile_schema_version: 8,
@@ -2182,34 +2176,6 @@ mod tests {
     fn subspan_context_does_not_leak_between_commands() {
         use libsignal_protocol::profiling;
 
-        const CHILD: &str = "SIGNAL_TEST_SUBSPAN_CONTEXT_CHILD";
-        if std::env::var_os(CHILD).is_none() {
-            for backend in [None, Some("container"), Some("real_device")] {
-                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-                command
-                    .args([
-                        "--exact",
-                        "worker_api::tests::subspan_context_does_not_leak_between_commands",
-                        "--nocapture",
-                    ])
-                    .env(CHILD, "1")
-                    .env_remove("SIGNAL_PROFILE_EXECUTION_BACKEND");
-                if let Some(backend) = backend {
-                    command.env("SIGNAL_PROFILE_EXECUTION_BACKEND", backend);
-                }
-                let output = command.output().unwrap();
-                assert!(
-                    output.status.success(),
-                    "backend={backend:?}\n{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                assert!(String::from_utf8_lossy(&output.stdout)
-                    .contains("test result: ok. 1 passed; 0 failed;"));
-            }
-            return;
-        }
-
         let inherited_context = BenchmarkContext {
             benchmark_target_size: Some(64),
             benchmark_payload_size: Some(512),
@@ -2219,7 +2185,6 @@ mod tests {
             ..BenchmarkContext::default()
         };
         profiling::set_benchmark_context(inherited_context.clone());
-        let device = std::env::var("SIGNAL_PROFILE_EXECUTION_BACKEND").as_deref() == Ok("real_device");
         for op in [
             "signal_application_message_create.total",
             "signal_application_message_receive.total",
@@ -2247,22 +2212,11 @@ mod tests {
             assert_eq!(event.wall_ns, 101);
             assert_eq!(event.cpu_process_ns, None);
             assert_eq!(event.alloc_bytes, None);
-            if device {
-                assert_eq!(event.request_id, None);
-                assert_eq!(event.benchmark_target_size, None);
-                assert_eq!(event.benchmark_payload_size, None);
-                assert_eq!(event.benchmark_phase, None);
-                assert_eq!(event.benchmark_operation, None);
-            } else {
-                assert_eq!(event.request_id, inherited_context.request_id);
-                assert_eq!(event.benchmark_target_size, Some(64));
-                assert_eq!(event.benchmark_payload_size, Some(512));
-                assert_eq!(event.benchmark_phase.as_deref(), Some("application"));
-                assert_eq!(
-                    event.benchmark_operation.as_deref(),
-                    Some("broadcast_message")
-                );
-            }
+            assert_eq!(event.request_id, None);
+            assert_eq!(event.benchmark_target_size, None);
+            assert_eq!(event.benchmark_payload_size, None);
+            assert_eq!(event.benchmark_phase, None);
+            assert_eq!(event.benchmark_operation, None);
 
             let explicit_context = BenchmarkContext {
                 request_id: Some("own-command".to_string()),
