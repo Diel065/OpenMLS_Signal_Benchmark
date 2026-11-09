@@ -58,7 +58,7 @@
         ]
       },
       "transport": {
-        "type": "wifi_lan",
+        "type": "ethernet_lan",
         "device_ip": "192.168.178.33",
         "host_ip": "192.168.178.21",
         "worker_port": 8080,
@@ -81,7 +81,7 @@
       "metadata": {
         "execution_backend": "real_device",
         "device_kind": "raspberry_pi_5",
-        "transport": "wifi_lan",
+        "transport": "ethernet_lan",
         "access_backend": "ssh"
       }
     },
@@ -102,7 +102,7 @@
         ]
       },
       "transport": {
-        "type": "wifi_lan",
+        "type": "ethernet_lan",
         "device_ip": "192.168.178.35",
         "host_ip": "192.168.178.21",
         "worker_port": 8080,
@@ -111,9 +111,9 @@
         ]
       },
       "target": {
-        "arch": "armv7l",
-        "rust_target": "armv7-unknown-linux-musleabihf",
-        "binary": "target/armv7-unknown-linux-musleabihf/release/worker"
+        "arch": "aarch64",
+        "rust_target": "aarch64-unknown-linux-musl",
+        "binary": "target/aarch64-unknown-linux-musl/release/worker"
       },
       "worker": {
         "id": "raspi3bp-00001",
@@ -125,7 +125,7 @@
       "metadata": {
         "execution_backend": "real_device",
         "device_kind": "raspberry_pi_3b_plus",
-        "transport": "wifi_lan",
+        "transport": "ethernet_lan",
         "access_backend": "ssh"
       }
     }
