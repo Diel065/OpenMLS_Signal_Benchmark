@@ -494,8 +494,14 @@ pub fn make_subspan_event_with_span(
         .as_ref()
         .zip(parent_span_id)
         .map(|(w, s)| format!("{}:{}", w, s));
-    let bench_ctx = benchmark_context.cloned()
-        .or_else(libsignal_protocol::profiling::current_benchmark_context);
+    let bench_ctx = benchmark_context.cloned().or_else(|| {
+        // Device commands carry explicit context; TLS can belong to another async command.
+        if env_nonempty("SIGNAL_PROFILE_EXECUTION_BACKEND").as_deref() == Some("real_device") {
+            None
+        } else {
+            libsignal_protocol::profiling::current_benchmark_context()
+        }
+    });
     let request_id = bench_ctx.as_ref().and_then(|c| c.request_id.clone());
     SignalProfileEvent {
         profile_schema_version: 8,
@@ -1458,6 +1464,7 @@ async fn process_pending(
     relay_url: &str,
     max_messages: Option<usize>,
     profile_path: Option<&PathBuf>,
+    benchmark_context: Option<&BenchmarkContext>,
 ) -> Result<CommandOutcome> {
     let max_messages = max_messages.unwrap_or(usize::MAX);
     let mut remaining = max_messages;
@@ -1469,7 +1476,7 @@ async fn process_pending(
     while remaining > 0 {
         match receive_message_delivery(
             participant, relay_url, None, true, 2, None,
-            Some("process_pending"), profile_path, None,
+            Some("process_pending"), profile_path, benchmark_context,
         ).await {
             Ok(outcome) => {
                 messages_processed += 1;
@@ -2105,7 +2112,7 @@ pub async fn handle_command(
         }
 
         Command::ProcessPending { max_messages } => {
-            process_pending(participant, relay_url, max_messages, profile_path).await
+            process_pending(participant, relay_url, max_messages, profile_path, benchmark_context).await
         }
 
         Command::ShowParticipantState => Ok(CommandOutcome::message(format!(
@@ -2169,6 +2176,198 @@ mod tests {
 
         let json = serde_json::to_value(event).expect("serialize profile event");
         assert_eq!(json["cpu_process_ns"], 29);
+    }
+
+    #[test]
+    fn subspan_context_does_not_leak_between_commands() {
+        use libsignal_protocol::profiling;
+
+        const CHILD: &str = "SIGNAL_TEST_SUBSPAN_CONTEXT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            for backend in [None, Some("container"), Some("real_device")] {
+                let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+                command
+                    .args([
+                        "--exact",
+                        "worker_api::tests::subspan_context_does_not_leak_between_commands",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, "1")
+                    .env_remove("SIGNAL_PROFILE_EXECUTION_BACKEND");
+                if let Some(backend) = backend {
+                    command.env("SIGNAL_PROFILE_EXECUTION_BACKEND", backend);
+                }
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "backend={backend:?}\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout)
+                    .contains("test result: ok. 1 passed; 0 failed;"));
+            }
+            return;
+        }
+
+        let inherited_context = BenchmarkContext {
+            benchmark_target_size: Some(64),
+            benchmark_payload_size: Some(512),
+            benchmark_phase: Some("application".to_string()),
+            benchmark_operation: Some("broadcast_message".to_string()),
+            request_id: Some("other-command".to_string()),
+            ..BenchmarkContext::default()
+        };
+        profiling::set_benchmark_context(inherited_context.clone());
+        let device = std::env::var("SIGNAL_PROFILE_EXECUTION_BACKEND").as_deref() == Ok("real_device");
+        for op in [
+            "signal_application_message_create.total",
+            "signal_application_message_receive.total",
+        ] {
+            let event_for = |context| {
+                make_subspan_event(
+                    op,
+                    "message_recovery",
+                    op,
+                    "benchmark_wrapper",
+                    "protocol_operation",
+                    "participant-1",
+                    101,
+                    None,
+                    None,
+                    None,
+                    None,
+                    true,
+                    context,
+                )
+            };
+            let event = event_for(None);
+            assert_eq!(event.op, op);
+            assert!(event.success);
+            assert_eq!(event.wall_ns, 101);
+            assert_eq!(event.cpu_process_ns, None);
+            assert_eq!(event.alloc_bytes, None);
+            if device {
+                assert_eq!(event.request_id, None);
+                assert_eq!(event.benchmark_target_size, None);
+                assert_eq!(event.benchmark_payload_size, None);
+                assert_eq!(event.benchmark_phase, None);
+                assert_eq!(event.benchmark_operation, None);
+            } else {
+                assert_eq!(event.request_id, inherited_context.request_id);
+                assert_eq!(event.benchmark_target_size, Some(64));
+                assert_eq!(event.benchmark_payload_size, Some(512));
+                assert_eq!(event.benchmark_phase.as_deref(), Some("application"));
+                assert_eq!(
+                    event.benchmark_operation.as_deref(),
+                    Some("broadcast_message")
+                );
+            }
+
+            let explicit_context = BenchmarkContext {
+                request_id: Some("own-command".to_string()),
+                benchmark_target_size: Some(4),
+                ..inherited_context.clone()
+            };
+            let explicit = event_for(Some(&explicit_context));
+            assert_eq!(explicit.request_id.as_deref(), Some("own-command"));
+            assert_eq!(explicit.benchmark_target_size, Some(4));
+            assert_eq!(explicit.benchmark_payload_size, Some(512));
+            assert_eq!(explicit.cpu_process_ns, None);
+            assert_eq!(explicit.alloc_bytes, None);
+        }
+        profiling::clear_benchmark_context();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn process_pending_preserves_explicit_benchmark_context() {
+        use super::{handle_command, Command};
+        use crate::{signal_metrics::SignalProfileEvent, signal_participant::SignalParticipant};
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        use libsignal_protocol::profiling;
+
+        let mut sender = SignalParticipant::new("pending-sender").unwrap();
+        let mut receiver = SignalParticipant::new("pending-receiver").unwrap();
+        receiver.store_own_prekeys().unwrap();
+        let bundle = receiver.generate_prekey_bundle().unwrap();
+        sender
+            .establish_session_from_bundle(&receiver.address, &bundle, None, Some(2))
+            .unwrap();
+        let payload = b"pending payload";
+        let ciphertext = sender
+            .encrypt_message(&receiver.address, payload, None, Some(2))
+            .unwrap();
+        let pending = serde_json::json!({
+            "id": "pending-1", "conversation_id": "pending-test", "sender": sender.name,
+            "message_hex": hex::encode(ciphertext.serialize()),
+        });
+        let router = Router::new()
+            .route(
+                "/message/pending-receiver/pending",
+                get(move || async move { Json(pending) }),
+            )
+            .route(
+                "/message/pending-receiver/ack/pending-1",
+                post(|| async {
+                    profiling::set_benchmark_context(BenchmarkContext {
+                        request_id: Some("unrelated-command".to_string()),
+                        benchmark_target_size: Some(1024),
+                        ..BenchmarkContext::default()
+                    });
+                    StatusCode::NO_CONTENT
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let path = std::env::temp_dir().join(format!("pending-context-{}.jsonl", std::process::id()));
+        let context = BenchmarkContext {
+            request_id: Some("pending-command".to_string()),
+            benchmark_target_size: Some(4),
+            benchmark_payload_size: Some(payload.len()),
+            ..BenchmarkContext::default()
+        };
+        let outcome = handle_command(
+            &mut receiver,
+            "",
+            &relay_url,
+            Command::ProcessPending {
+                max_messages: Some(1),
+            },
+            None,
+            Some(&path),
+            Some(&context),
+        )
+        .await;
+        server.abort();
+        let _ = server.await;
+        profiling::clear_benchmark_context();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            outcome.unwrap().metrics.plaintext_bytes,
+            Some(payload.len())
+        );
+        let events: Vec<SignalProfileEvent> = raw
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let totals: Vec<_> = events
+            .iter()
+            .filter(|event| event.op == "signal_application_message_receive.total")
+            .collect();
+        assert_eq!(totals.len(), 1);
+        let total = totals[0];
+        assert_eq!(total.request_id.as_deref(), Some("pending-command"));
+        assert_eq!(total.benchmark_target_size, Some(4));
+        assert_eq!(total.benchmark_payload_size, Some(payload.len()));
+        assert!(total.success);
+        assert!(total.cpu_process_ns.is_some_and(|value| value > 0));
+        assert!(total.alloc_bytes.is_some_and(|value| value > 0));
     }
 
     #[test]
