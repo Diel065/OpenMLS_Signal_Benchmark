@@ -384,7 +384,7 @@ fn install_profile_context(
     participant_id: &str,
     benchmark_context: Option<&BenchmarkContext>,
 ) {
-    if profile_path.is_none() || benchmark_context.is_none() {
+    if profile_path.is_none() {
         return;
     }
     libsignal_protocol::profiling::clear_benchmark_context();
