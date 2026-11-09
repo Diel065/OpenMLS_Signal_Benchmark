@@ -862,7 +862,7 @@ async fn participant_command_actor(
             envelope.command,
             envelope.phase.as_deref(),
             effective_profile_path,
-            benchmark_context.as_ref().filter(|_| external_profiling || sender_keys_command),
+            benchmark_context.as_ref(),
         )
         .await;
 
