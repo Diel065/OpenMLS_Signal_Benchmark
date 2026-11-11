@@ -384,10 +384,10 @@ fn install_profile_context(
     participant_id: &str,
     benchmark_context: Option<&BenchmarkContext>,
 ) {
+    libsignal_protocol::profiling::clear_benchmark_context();
     if profile_path.is_none() {
         return;
     }
-    libsignal_protocol::profiling::clear_benchmark_context();
     libsignal_protocol::profiling::set_worker_id(participant_id.to_string());
     if let Some(context) = benchmark_context {
         libsignal_protocol::profiling::set_benchmark_context(context.clone());
@@ -1307,8 +1307,8 @@ async fn receive_message_delivery(
     };
 
     let decrypt_start = Instant::now();
+    install_profile_context(profile_path, &participant.name, benchmark_context);
     let (decrypt_result, mut profile_metrics) = if profile {
-        install_profile_context(profile_path, &participant.name, benchmark_context);
         measure_profile(|| {
             participant.decrypt_message(
                 &sender_address,
@@ -2231,6 +2231,116 @@ mod tests {
             assert_eq!(explicit.alloc_bytes, None);
         }
         profiling::clear_benchmark_context();
+    }
+
+    #[test]
+    fn unprofiled_command_clears_previous_benchmark_context() {
+        use super::install_profile_context;
+        use libsignal_protocol::profiling;
+
+        let current = BenchmarkContext {
+            request_id: Some("current-command".to_string()),
+            ..BenchmarkContext::default()
+        };
+        for context in [None, Some(&current)] {
+            profiling::set_benchmark_context(BenchmarkContext {
+                request_id: Some("previous-command".to_string()),
+                benchmark_target_size: Some(1024),
+                ..BenchmarkContext::default()
+            });
+            install_profile_context(None, "unprofiled-participant", context);
+            let installed = profiling::current_benchmark_context();
+            profiling::clear_benchmark_context();
+            assert!(installed.is_none(), "stale unprofiled context: {installed:?}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unprofiled_receive_clears_context_after_relay_wait() {
+        use super::{handle_command, Command};
+        use crate::signal_participant::SignalParticipant;
+        use axum::{
+            http::StatusCode,
+            routing::{get, post},
+            Json, Router,
+        };
+        use libsignal_protocol::profiling;
+        use std::future::{poll_fn, Future};
+
+        let mut sender = SignalParticipant::new("unprofiled-sender").unwrap();
+        let mut receiver = SignalParticipant::new("unprofiled-receiver").unwrap();
+        receiver.store_own_prekeys().unwrap();
+        let bundle = receiver.generate_prekey_bundle().unwrap();
+        sender
+            .establish_session_from_bundle(&receiver.address, &bundle, None, Some(2))
+            .unwrap();
+        let payload = b"unprofiled payload";
+        let ciphertext = sender
+            .encrypt_message(&receiver.address, payload, None, Some(2))
+            .unwrap();
+        let pending = serde_json::json!({
+            "id": "unprofiled-1", "conversation_id": "unprofiled-test",
+            "sender": sender.name.clone(), "message_hex": hex::encode(ciphertext.serialize()),
+        });
+        let router = Router::new()
+            .route(
+                "/message/unprofiled-receiver/pending",
+                get(move || async move { Json(pending) }),
+            )
+            .route(
+                "/message/unprofiled-receiver/ack/unprofiled-1",
+                post(|| async { StatusCode::NO_CONTENT }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let relay_url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        let path = std::env::temp_dir().join(format!("unprofiled-context-{}.jsonl", std::process::id()));
+        assert!(!path.exists());
+        let mut receive = Box::pin(handle_command(
+            &mut receiver,
+            "",
+            &relay_url,
+            Command::DecryptMessage {
+                sender: sender.name.clone(),
+                profile: false,
+                conversation_size: Some(2),
+                expected_plaintext_bytes: None,
+            },
+            None,
+            Some(&path),
+            None,
+        ));
+        let mut observed_decrypt = false;
+        let mut decrypt_context = None;
+        let outcome = poll_fn(|cx| {
+            // Emulate resuming relay I/O on a thread used by an earlier command.
+            profiling::set_benchmark_context(BenchmarkContext {
+                request_id: Some("previous-command".to_string()),
+                benchmark_target_size: Some(1024),
+                ..BenchmarkContext::default()
+            });
+            let result = receive.as_mut().poll(cx);
+            if !observed_decrypt
+                && std::fs::read_to_string(&path)
+                    .unwrap_or_default()
+                    .contains("signal_application_message_receive.message_decrypt")
+            {
+                observed_decrypt = true;
+                decrypt_context = profiling::current_benchmark_context();
+            }
+            result
+        })
+        .await;
+        server.abort();
+        let _ = server.await;
+        profiling::clear_benchmark_context();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(outcome.unwrap().metrics.plaintext_bytes, Some(payload.len()));
+        assert!(observed_decrypt);
+        assert!(
+            decrypt_context.is_none(),
+            "stale decrypt context: {decrypt_context:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
