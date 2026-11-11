@@ -120,6 +120,11 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     profile_only_singletons: bool,
 
+    /// Spread the profiled singletons over the join order (first to last joiner) instead of
+    /// letting them join first, to measure onboarding at many group sizes.
+    #[arg(long, action = ArgAction::SetTrue)]
+    spread_profiled_joiners: bool,
+
     #[arg(long, action = ArgAction::SetTrue)]
     no_aggregate: bool,
 
@@ -230,6 +235,7 @@ fn main() -> Result<()> {
         fanout_p95_threshold_ms: args.fanout_p95_threshold_ms,
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         profile_only_singletons: args.profile_only_singletons,
+        spread_profiled_joiners: args.spread_profiled_joiners,
         no_aggregate: args.no_aggregate,
         profiled_failure_stop_after: args.profiled_failure_stop_after,
         worker_layout,

@@ -96,7 +96,7 @@ cmd=(
   --min-size 2
   --max-size "$MAX_SIZE"
   --step-size "$STEP_SIZE"
-  --plateau-order staircase
+  --plateau-order ascending
   --roundtrips "$ROUNDTRIPS"
   --update-rounds 0
   --app-rounds 0

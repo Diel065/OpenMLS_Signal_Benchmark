@@ -116,6 +116,7 @@ pub struct StaircaseConfig {
     pub fanout_p95_threshold_ms: u128,
     pub http_pool_max_idle_per_host: usize,
     pub profile_only_singletons: bool,
+    pub spread_profiled_joiners: bool,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
     pub profiled_failure_stop_after: usize,
@@ -948,6 +949,36 @@ fn frontload_profile_enabled_singletons_in_idle(
         .collect()
 }
 
+/// Join order with the profile-enabled singletons spread evenly from the first to the last
+/// joiner of the run (the first `join_span` joiners), so each one is measured as a newcomer
+/// that sets up sessions with a different number of existing members.
+fn spread_profile_enabled_singletons_in_idle(
+    idle: VecDeque<WorkerSpec>,
+    join_span: usize,
+) -> VecDeque<WorkerSpec> {
+    let (profiled_singletons, other_workers): (Vec<_>, Vec<_>) = idle.into_iter().partition(
+        |worker| worker.profile_enabled && worker.container_mode == ContainerMode::Singleton,
+    );
+    let total = profiled_singletons.len() + other_workers.len();
+    let span = total.min(join_span).max(profiled_singletons.len());
+    let gaps = profiled_singletons.len().saturating_sub(1).max(1);
+    let mut positions = (0..profiled_singletons.len())
+        .map(|j| j * span.saturating_sub(1) / gaps)
+        .peekable();
+    let mut profiled_singletons = profiled_singletons.into_iter();
+    let mut other_workers = other_workers.into_iter();
+    (0..total)
+        .map(|index| {
+            if positions.next_if_eq(&index).is_some() {
+                profiled_singletons.next()
+            } else {
+                other_workers.next()
+            }
+            .expect("one worker per join position")
+        })
+        .collect()
+}
+
 pub fn physical_groups<'a>(
     workers: impl Iterator<Item = &'a WorkerSpec>,
 ) -> HashMap<String, Vec<&'a WorkerSpec>> {
@@ -1372,6 +1403,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         plateau_sizes: Option<&'a [usize]>,
         payload_sizes: String,
         min_external_samples_per_operation: usize,
+        spread_profiled_joiners: bool,
     }
     let scenario_plan = ScenarioPlan {
         group_model: config.group_model,
@@ -1385,6 +1417,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         plateau_sizes: (!config.plateau_sizes.is_empty()).then_some(&config.plateau_sizes),
         payload_sizes: config.payload_sizes.to_string(),
         min_external_samples_per_operation: config.min_profiled_samples_per_operation,
+        spread_profiled_joiners: config.spread_profiled_joiners,
     };
     fs::write(
         run_dir.join("scenario_plan.json"),
@@ -1419,7 +1452,13 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let mut active: Vec<WorkerSpec> = Vec::new();
     let mut idle: VecDeque<WorkerSpec> = config.workers.iter().cloned().collect();
-    if config.profile_only_singletons {
+    if config.profile_only_singletons && config.spread_profiled_joiners {
+        let join_span = plateau_sequence.iter().copied().max().unwrap_or(max_size);
+        idle = spread_profile_enabled_singletons_in_idle(idle, join_span);
+        eprintln!(
+            "[sampling] spread profile-enabled singleton joiners from the first to the last join; packed clients remain unprofiled"
+        );
+    } else if config.profile_only_singletons {
         idle = frontload_profile_enabled_singletons_in_idle(idle);
         eprintln!(
             "[sampling] front-loaded profile-enabled singleton joiners for PQXDH initiator coverage; packed clients remain unprofiled"
@@ -4001,6 +4040,15 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
     if config.roundtrips == 0 {
         return Err(anyhow!("--roundtrips must be at least 1"));
     }
+    if config.spread_profiled_joiners
+        && (!config.profile_only_singletons
+            || config.plateau_order != PlateauOrder::Ascending
+            || config.roundtrips != 1)
+    {
+        return Err(anyhow!(
+            "--spread-profiled-joiners requires --profile-only-singletons, --plateau-order ascending and --roundtrips 1"
+        ));
+    }
     if config.payload_sizes.is_empty() {
         return Err(anyhow!("At least one payload size is required"));
     }
@@ -4068,15 +4116,16 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
 
 #[cfg(test)]
 mod random_input_tests {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
 
     use rand::{rngs::StdRng, SeedableRng};
 
     use super::{
         build_plateau_sequence, build_plateau_sequence_for_step_size,
         building_plateau_sequence_with_piecewise, profiled_density_pair, profiled_recipient_index,
-        sampled_participant_index, session_density_peer, session_established_count, ContainerMode,
-        PayloadSizeSource, PayloadSizes, StepSize, WorkerSpec,
+        sampled_participant_index, session_density_peer, session_established_count,
+        spread_profile_enabled_singletons_in_idle, ContainerMode, PayloadSizeSource, PayloadSizes,
+        StepSize, WorkerSpec,
     };
 
     #[test]
@@ -4237,6 +4286,44 @@ mod random_input_tests {
 
         let peer = session_density_peer(&active[0], &active, &external_ids).unwrap();
         assert_eq!(peer.id, "docker-peer");
+    }
+
+    #[test]
+    fn spread_profiled_joiners_cover_first_to_last_join() {
+        let worker = |id: usize, profiled: bool| WorkerSpec {
+            id: format!("{id:05}"),
+            url: format!("http://{id}"),
+            command_url: format!("http://{id}/command"),
+            health_url: format!("http://{id}/health"),
+            physical_worker_id: format!("{id:05}"),
+            container_mode: if profiled { ContainerMode::Singleton } else { ContainerMode::Packed },
+            profile_enabled: profiled,
+        };
+        let idle: VecDeque<_> = (0..1024).map(|id| worker(id, id % 100 == 7 && id < 1000)).collect();
+        let order: Vec<_> = spread_profile_enabled_singletons_in_idle(idle.clone(), 1024).into_iter().collect();
+
+        assert_eq!(order.len(), 1024);
+        let positions: Vec<_> = order.iter().enumerate()
+            .filter(|(_, w)| w.profile_enabled)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(positions, vec![0, 113, 227, 341, 454, 568, 682, 795, 909, 1023]);
+        let profiled: Vec<_> = order.iter().filter(|w| w.profile_enabled).map(|w| w.id.clone()).collect();
+        assert_eq!(profiled, (0..10).map(|j| format!("{:05}", j * 100 + 7)).collect::<Vec<_>>());
+        let others: Vec<_> = order.iter().filter(|w| !w.profile_enabled).map(|w| w.id.clone()).collect();
+        let expected_others: Vec<_> = (0..1024)
+            .filter(|id| !(id % 100 == 7 && *id < 1000))
+            .map(|id| format!("{id:05}"))
+            .collect();
+        assert_eq!(others, expected_others);
+
+        // A run that stops at N = 128 must still spread the profiled joiners up to N = 128.
+        let order: Vec<_> = spread_profile_enabled_singletons_in_idle(idle, 128).into_iter().collect();
+        let positions: Vec<_> = order.iter().enumerate()
+            .filter(|(_, w)| w.profile_enabled)
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(positions, vec![0, 14, 28, 42, 56, 70, 84, 98, 112, 127]);
     }
 }
 

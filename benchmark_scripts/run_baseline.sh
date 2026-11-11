@@ -51,6 +51,9 @@ SIGNAL_APP_ROUNDS="${SIGNAL_APP_ROUNDS:-4}"
 SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
 SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
 SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
+# 1: the profiled participants join spread over the run instead of first, so the
+# newcomer session setup (Signal onboarding) is measured at many group sizes.
+SIGNAL_SPREAD_PROFILED_JOINERS="${SIGNAL_SPREAD_PROFILED_JOINERS:-0}"
 
 # full: keep every file. events-csv: after a successful run, keep events.csv as
 # events.csv.xz and delete the participant/client JSONL traces (retain_events_csv.py).
@@ -185,12 +188,16 @@ run_signal_baseline() {
   local run_id="cal02_signal_unconstrained_baseline_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
   local run_dir="$SIGNAL_DIR/benchmark_output/$run_id"
   local singleton_selection_seed
-  local -a image_args
+  local -a image_args join_args
 
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
   image_args=()
   if [ "$BUILD_IMAGES" = "1" ]; then
     image_args=(--build-images)
+  fi
+  join_args=()
+  if [ "$SIGNAL_SPREAD_PROFILED_JOINERS" = "1" ]; then
+    join_args=(--spread-profiled-joiners)
   fi
 
   echo "===== [02/Signal-baseline] iteration $iter/$N run_id=$run_id ====="
@@ -227,6 +234,7 @@ run_signal_baseline() {
     --max-fanout-parallelism "$FANOUT_PARALLELISM" \
     --force-cleanup-signal-ports \
     --runner-in-docker \
+    "${join_args[@]}" \
     "${image_args[@]}"
   require_events_csv "$run_dir"
   cd "$REPO_ROOT"

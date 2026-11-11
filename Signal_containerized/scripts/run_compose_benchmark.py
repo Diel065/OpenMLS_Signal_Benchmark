@@ -395,6 +395,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only profile singleton measured clients (default: true)",
     )
     p.add_argument(
+        "--spread-profiled-joiners",
+        action="store_true",
+        help="Let the profiled singletons join spread from the first to the last join "
+        "instead of first (measures newcomer session setup at many group sizes)",
+    )
+    p.add_argument(
         "--disable-container-profiling",
         action="store_true",
         help="Disable profiling for Docker workers; external devices remain profiled.",
@@ -3649,6 +3655,10 @@ def main() -> int:
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
 
+    if args.spread_profiled_joiners and (args.enable_external_devices or args.resource_experiment != "none"):
+        raise SystemExit("--spread-profiled-joiners is for container baselines only "
+                         "(no external devices, no resource experiment)")
+
     if args.plateau_sizes:
         configured_max = args.max_size if args.max_size is not None else args.workers
         if args.plateau_order != "ascending":
@@ -4279,6 +4289,7 @@ def main() -> int:
                 str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
+                *(["--spread-profiled-joiners"] if args.spread_profiled_joiners else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--profiled-failure-stop-after",
                 str(args.profiled_failure_stop_after),
@@ -4349,6 +4360,7 @@ def main() -> int:
                 str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
+                *(["--spread-profiled-joiners"] if args.spread_profiled_joiners else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--profiled-failure-stop-after",
                 str(args.profiled_failure_stop_after),
