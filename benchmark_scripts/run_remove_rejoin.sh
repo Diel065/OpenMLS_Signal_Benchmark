@@ -28,6 +28,9 @@ FANOUT_MIN="${FANOUT_MIN:-16}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
+# full: keep every file. events-csv: after a successful run, keep events.csv as
+# events.csv.xz and delete the client JSONL traces (retain_events_csv.py).
+OUTPUT_RETENTION="${OUTPUT_RETENTION:-full}"
 
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 RUN_TOKEN="remove_rejoin_${DATE_TAG}_pid$$"
@@ -37,6 +40,11 @@ REPORT="$OUTPUT_ROOT/${RUN_TOKEN}_report.txt"
 
 log() { printf '%s\n' "$*" | tee -a "$REPORT"; }
 
+retain_output() {
+  uv run --frozen --project "$REPO_ROOT" python "$SCRIPT_DIR/retain_events_csv.py" \
+    --mode "$OUTPUT_RETENTION" "$@"
+}
+retain_output  # checks OUTPUT_RETENTION, and xz for events-csv, before the run
 
 cleanup() {
   if [ -f "$RUN_DIR/docker-compose.generated.yml" ]; then
@@ -116,3 +124,5 @@ set -e
 log "exit_code=$rc"
 
 if [ "$rc" -eq 0 ]; then log "status=pass"; else log "status=fail"; exit "$rc"; fi
+cleanup  # the stack must be down before its trace files are deleted
+retain_output "$RUN_DIR"

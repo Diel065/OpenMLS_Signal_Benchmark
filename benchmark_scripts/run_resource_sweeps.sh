@@ -10,6 +10,8 @@ DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
 PROTOCOL="${PROTOCOL:-openmls}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
+# Absolute once: the run functions change directory.
+if [ -n "$OUTPUT_ROOT" ]; then OUTPUT_ROOT="$(realpath -ms -- "$OUTPUT_ROOT")"; fi
 
 N="${N:-3}"
 SWEEP="${SWEEP:-both}"
@@ -67,6 +69,10 @@ SIGNAL_WORKERS="${SIGNAL_WORKERS:-256}"
 SIGNAL_PACKED_PER_CONTAINER="${SIGNAL_PACKED_PER_CONTAINER:-64}"
 SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
 
+# full: keep every file. events-csv: after a successful run, keep events.csv as
+# events.csv.xz and delete the participant/client JSONL traces (retain_events_csv.py).
+OUTPUT_RETENTION="${OUTPUT_RETENTION:-full}"
+
 export PATH="$HOME/.cargo/bin:$PATH"
 export OPENMLS_CPU_THROTTLED_PERIOD_THRESHOLD="$CPU_THROTTLED_PERIOD_THRESHOLD"
 
@@ -116,6 +122,11 @@ require_events_csv() {
     echo "ERROR: missing or empty events.csv in $run_dir" >&2
     return 1
   }
+}
+
+retain_output() {
+  uv run --frozen --project "$REPO_ROOT" python "$SCRIPT_DIR/retain_events_csv.py" \
+    --mode "$OUTPUT_RETENTION" "$@"
 }
 
 validate_resource_output() {
@@ -234,6 +245,7 @@ run_sweep() {
   validate_resource_output "$run_dir"
   cd "$REPO_ROOT"
   cleanup_docker
+  retain_output "$run_dir"
 }
 
 run_signal_sweep() {
@@ -365,8 +377,10 @@ run_signal_sweep() {
   validate_resource_output_signal "$run_dir"
   cd "$REPO_ROOT"
   cleanup_docker_signal
+  retain_output "$run_dir"
 }
 
+retain_output  # checks OUTPUT_RETENTION, and xz for events-csv, before any run
 raise_nofile_limit
 
 if [ "$PROTOCOL" = "openmls" ] || [ "$PROTOCOL" = "both" ]; then

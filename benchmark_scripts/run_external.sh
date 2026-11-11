@@ -17,6 +17,10 @@ BUILD_IMAGES="${BUILD_IMAGES:-0}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-0}"
 CRYPTO_PROFILE="${CRYPTO_PROFILE:-classical}"
 SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
+# full: keep every file. events-csv: the stages delete the device copies of the traces
+# after a verified pull; after all campaign checks, this script keeps events.csv of each
+# stage run of this campaign as events.csv.xz and deletes its JSONL traces.
+OUTPUT_RETENTION="${OUTPUT_RETENTION:-full}"
 CAMPAIGN_TAG="${CAMPAIGN_TAG:-$(date +%Y%m%d_%H%M%S)}"
 CAMPAIGN_DIR="$OUTPUT_ROOT/external_campaign_${CAMPAIGN_TAG}_${CRYPTO_PROFILE}_${SIGNAL_GROUP_MODEL}"
 STAGES="${STAGES:-openmls,remove-rejoin,signal}"
@@ -80,6 +84,11 @@ latest_run() {
   shopt -u nullglob
   [ -n "$latest" ] || return 1
   printf '%s\n' "$latest"
+}
+
+retain_output() {
+  uv run --frozen --project "$REPO_ROOT" python "$SCRIPT_DIR/retain_events_csv.py" \
+    --mode "$OUTPUT_RETENTION" "$@"
 }
 
 run_command() {
@@ -215,6 +224,7 @@ PY
 }
 
 validate_stage_list
+retain_output  # checks OUTPUT_RETENTION, and xz for events-csv, before any stage
 [ "$PLATEAU_SIZES" = "$EXPECTED_PLATEAU_SIZES" ] || {
   echo "ERROR: production plateaus must be exactly $EXPECTED_PLATEAU_SIZES" >&2
   exit 2
@@ -264,7 +274,7 @@ if stage_selected openmls; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$BUILD_IMAGES" BUILD_EXTERNAL_BINARIES="$BUILD_EXTERNAL_BINARIES" \
-    CRYPTO_PROFILE="$CRYPTO_PROFILE" \
+    CRYPTO_PROFILE="$CRYPTO_PROFILE" OUTPUT_RETENTION="$OUTPUT_RETENTION" \
     SCENARIO=external-device-openmls-1024-ascending-five-plateau \
     bash "$OPENMLS_REGULAR"
   if [ "$DRY_RUN" != "1" ]; then
@@ -298,7 +308,7 @@ if stage_selected remove-rejoin; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$remove_build_images" BUILD_EXTERNAL_BINARIES="$remove_build_external" \
-    CRYPTO_PROFILE="$CRYPTO_PROFILE" \
+    CRYPTO_PROFILE="$CRYPTO_PROFILE" OUTPUT_RETENTION="$OUTPUT_RETENTION" \
     SCENARIO=external-device-openmls-remove-join-1024-ascending-five-plateau \
     bash "$OPENMLS_REMOVE_JOIN"
   if [ "$DRY_RUN" != "1" ]; then
@@ -325,7 +335,7 @@ if stage_selected signal; then
     MAX_APP_SAMPLES_PER_PAYLOAD="$PROFILE_SAMPLE_CAP" PAYLOAD_SIZES=512 \
     MIN_EXTERNAL_SAMPLES_PER_OPERATION="$MIN_EXTERNAL_SAMPLES_PER_OPERATION" \
     BUILD_IMAGES="$BUILD_IMAGES" BUILD_EXTERNAL_BINARIES="$BUILD_EXTERNAL_BINARIES" \
-    SIGNAL_GROUP_MODEL="$SIGNAL_GROUP_MODEL" \
+    SIGNAL_GROUP_MODEL="$SIGNAL_GROUP_MODEL" OUTPUT_RETENTION="$OUTPUT_RETENTION" \
     SCENARIO=external-device-signal-1024-ascending-five-plateau \
     bash "$SIGNAL_REGULAR"
   if [ "$DRY_RUN" != "1" ]; then
@@ -347,6 +357,11 @@ if [ "$DRY_RUN" = "1" ]; then
 fi
 
 write_campaign_manifest
+
+# Only the stage runs of this campaign; reused runs keep their files.
+if stage_selected openmls; then retain_output "$OPENMLS_RUN"; fi
+if stage_selected remove-rejoin; then retain_output "$OPENMLS_REMOVE_JOIN_RUN"; fi
+if stage_selected signal; then retain_output "$SIGNAL_RUN"; fi
 
 echo "External-device campaign completed with strict coverage checks."
 echo "  OpenMLS: $OPENMLS_RUN"

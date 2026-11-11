@@ -628,6 +628,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Wipe remote device run directories before starting",
     )
     p.add_argument(
+        "--output-retention",
+        choices=("full", "events-csv"),
+        default="full",
+        help="events-csv: after a successful run, delete this run's trace directory on each "
+        "external device once its local copy is verified (local files: retain_events_csv.py)",
+    )
+    p.add_argument(
         "--no-device-stop-after-run",
         action="store_true",
         help="Do not stop external device workers after the benchmark run",
@@ -3233,6 +3240,93 @@ def pull_external_device_profiles(
                 print(f"[device] {dev_id}: could not list remote dir: {ls_err}", flush=True)
 
 
+def remove_pulled_external_device_results(
+    args: argparse.Namespace,
+    root: Path,
+    run_id: str,
+    run_dir: Path,
+) -> None:
+    """--output-retention events-csv: delete this run's result directory on each device.
+
+    Only when the workers were stopped, none is running, and every remote file has a local
+    copy of the same name and size in the raw pull under external/<device>/ (fsynced first).
+    Otherwise, and on any error, the device copy stays.
+    """
+    from external_devices import create_backend, load_devices_config, validate_run_id as py_validate_run_id
+
+    devices_file = Path(args.devices_file)
+    if not devices_file.is_absolute():
+        devices_file = root / devices_file
+    if not devices_file.exists():
+        return
+
+    py_validate_run_id(run_id)
+    if args.no_device_stop_after_run:
+        print("[device] device copies kept: the device workers were not stopped", flush=True)
+        return
+
+    configs = load_devices_config(devices_file)
+    enabled = [c for c in configs if c.enabled]
+    if args.external_device_ids:
+        enabled = [c for c in enabled if c.id in args.external_device_ids]
+
+    for dev_config in enabled:
+        dev_id = dev_config.id
+        remote_results_root = dev_config.worker.get("remote_results_root", "/results/openmls")
+        remote_path = f"{remote_results_root}/{run_id}"
+        try:
+            if (not remote_results_root.startswith("/") or not remote_results_root.strip("/")
+                    or ".." in remote_results_root.split("/")):
+                raise RuntimeError(f"unsafe remote_results_root {remote_results_root!r}")
+            backend = create_backend(dev_config)
+            listing = backend.shell(
+                f"cd {shlex.quote(remote_path)} || exit 1; "
+                "if pidof worker >/dev/null 2>&1 || pgrep -x worker >/dev/null 2>&1; "
+                'then echo "O 0 worker-still-running"; fi; '
+                "for f in * .[!.]*; do "
+                '[ -e "$f" ] || continue; '
+                'if [ -f "$f" ]; then echo "F $(wc -c < "$f") $f"; else echo "O 0 $f"; fi; '
+                "done",
+                check=True,
+            )
+            local_copies: dict[tuple[str, int], Path] = {}
+            for path in (run_dir / "external" / dev_id).rglob("*"):
+                if path.is_file():
+                    local_copies[(path.name, path.stat().st_size)] = path
+            verified: list[tuple[str, int]] = []
+            unverified = []
+            for line in listing.stdout.splitlines():
+                parts = line.split(maxsplit=2)
+                if (len(parts) == 3 and parts[0] == "F" and parts[1].isdigit()
+                        and (parts[2], int(parts[1])) in local_copies):
+                    verified.append((parts[2], int(parts[1])))
+                else:
+                    unverified.append(line)
+            if unverified:
+                raise RuntimeError(f"no verified local copy of {unverified}")
+            # The local copies must be on disk before the device copy goes.
+            for key in verified:
+                for path in (local_copies[key], local_copies[key].parent):
+                    fd = os.open(path, os.O_RDONLY)
+                    try:
+                        os.fsync(fd)
+                    finally:
+                        os.close(fd)
+            # Delete only the verified files, each still at its verified size; rmdir fails
+            # if anything else appeared since the listing.
+            commands = [f"cd {shlex.quote(remote_path)} || exit 1"]
+            commands += [
+                f'[ "$(wc -c < {shlex.quote(name)})" -eq {size} ] && rm -f {shlex.quote(name)}'
+                for name, size in verified
+            ]
+            commands.append(f"cd / && rmdir {shlex.quote(remote_path)}")
+            backend.shell("; ".join(commands), check=True)
+            print(f"[device] {dev_id}: deleted device copy {remote_path}", flush=True)
+        except Exception as e:
+            print(f"[device] {dev_id}: device copy {remote_path} not deleted, or not completely: {e}",
+                  flush=True)
+
+
 def trim_incomplete_jsonl_tail(path: Path, block_size: int = 64 * 1024) -> int:
     if not path.is_file():
         return 0
@@ -5013,6 +5107,13 @@ def main() -> int:
                 else None,
             },
         )
+        if (
+            args.output_retention == "events-csv"
+            and args.enable_external_devices
+            and args.devices_file
+            and not args.preflight_only
+        ):
+            remove_pulled_external_device_results(args, root, run_id, run_dir)
         if resource_experiment != "none" and getattr(args, "resource_output_validation", True):
             validator_path = os.path.join(
                 os.path.dirname(os.path.abspath(__file__)),

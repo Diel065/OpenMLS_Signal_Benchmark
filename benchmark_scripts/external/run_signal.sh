@@ -8,7 +8,7 @@ SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 DATE_TAG="$(date +%Y%m%d_%H%M%S)"
 
 export PATH="$HOME/.cargo/bin:$PATH"
-OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
+OUTPUT_ROOT="$(realpath -ms -- "${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}")"  # absolute: the run function changes directory
 N="${N:-1}"
 if [ "$N" != "1" ]; then
   echo "ERROR: this Signal external-device benchmark is intentionally exactly one run; got N=$N" >&2
@@ -22,6 +22,9 @@ SCENARIO="${SCENARIO:-external-device-signal-${SIGNAL_GROUP_MODEL}-baseline}"
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
 BUILD_EXTERNAL_BINARIES="${BUILD_EXTERNAL_BINARIES:-1}"
+# full or events-csv; events-csv also deletes the device copy of the traces after a
+# verified pull. run_external.sh deletes the local traces after its checks.
+OUTPUT_RETENTION="${OUTPUT_RETENTION:-full}"
 NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 WORKERS="${WORKERS:-1024}"
 MAX_SIZE="${MAX_SIZE:-1024}"
@@ -205,7 +208,8 @@ run_external_signal() {
       --devices-file "$DEVICES_FILE" \
       --enable-external-devices \
       "${device_args[@]}" \
-      --wipe-device-run-dirs )
+      --wipe-device-run-dirs \
+      --output-retention "$OUTPUT_RETENTION" )
 
   require_events_csv "$run_dir"
   echo "----- Signal external-device verification (alloc_bytes + cpu_process_ns + coverage) -----"
