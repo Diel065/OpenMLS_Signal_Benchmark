@@ -401,6 +401,12 @@ def build_parser() -> argparse.ArgumentParser:
         "instead of first (measures newcomer session setup at many group sizes)",
     )
     p.add_argument(
+        "--external-session-join",
+        action="store_true",
+        help="Measure a fresh N-1-session join per external device and plateau (device lane only)",
+    )
+    p.add_argument("--luckfox-join-max-size", type=int, help="Planned Luckfox join cap after an evidenced failure")
+    p.add_argument(
         "--disable-container-profiling",
         action="store_true",
         help="Disable profiling for Docker workers; external devices remain profiled.",
@@ -3640,6 +3646,9 @@ def write_benchmark_metadata(run_dir: Path, root: Path, args: argparse.Namespace
             "devices": collect_external_device_build_metadata(root, args),
         },
     }
+    if args.external_session_join:
+        metadata["benchmark_profile"]["external_session_join"] = True
+        metadata["benchmark_profile"]["luckfox_join_max_size"] = args.luckfox_join_max_size
     (run_dir / "benchmark_run_metadata.json").write_text(
         json.dumps(metadata, indent=2, sort_keys=True),
         encoding="utf-8",
@@ -3658,6 +3667,17 @@ def main() -> int:
     if args.spread_profiled_joiners and (args.enable_external_devices or args.resource_experiment != "none"):
         raise SystemExit("--spread-profiled-joiners is for container baselines only "
                          "(no external devices, no resource experiment)")
+    if args.external_session_join and (
+        not args.enable_external_devices or args.resource_experiment != "none"
+        or args.group_model != "pairwise" or args.spread_profiled_joiners
+        or args.plateau_order != "ascending" or args.roundtrips != 1
+        or args.app_rounds != 0 or args.max_app_samples_per_payload != 0
+        or args.min_profiled_samples_per_operation != 0 or not args.disable_container_profiling
+    ):
+        raise SystemExit("--external-session-join requires external devices, pairwise, ascending, "
+                         "one roundtrip, no application/density samples and disabled Docker profiling")
+    if args.luckfox_join_max_size is not None and not args.external_session_join:
+        raise SystemExit("--luckfox-join-max-size requires --external-session-join")
 
     if args.plateau_sizes:
         configured_max = args.max_size if args.max_size is not None else args.workers
@@ -3774,6 +3794,16 @@ def main() -> int:
     if args.enable_external_devices and not args.devices_file:
         raise SystemExit("--enable-external-devices requires --devices-file")
 
+    if args.external_session_join:
+        from external_devices import load_devices_config
+        devices_path = Path(args.devices_file)
+        if not devices_path.is_absolute():
+            devices_path = root / devices_path
+        selected = [device for device in load_devices_config(devices_path)
+                    if device.enabled and (not args.external_device_ids or device.id in args.external_device_ids)]
+        if not selected:
+            raise SystemExit("--external-session-join requires at least one enabled, selected external device")
+
     run_id = args.run_id or timestamped_run_id(args.workers)
     try:
         validate_run_id(run_id)
@@ -3821,6 +3851,21 @@ def main() -> int:
         nonlocal external_device_stop_required, external_profiles_pulled
         if not external_devices_launched or external_profiles_pulled:
             return
+        if args.external_session_join:
+            from external_devices import create_backend, load_devices_config
+            devices_path = Path(args.devices_file)
+            if not devices_path.is_absolute():
+                devices_path = root / devices_path
+            memory_dir = run_dir / "device_memory"
+            memory_dir.mkdir(exist_ok=True)
+            for device in load_devices_config(devices_path):
+                if not device.enabled or (args.external_device_ids and device.id not in args.external_device_ids):
+                    continue
+                snapshot = create_backend(device).shell(
+                    'for p in $(pidof worker); do echo "worker_pid=$p"; cat "/proc/$p/status"; done',
+                    check=True,
+                )
+                (memory_dir / f"{device.id}.status.txt").write_text(snapshot.stdout, encoding="utf-8")
         if external_device_stop_required:
             stop_external_device_workers(args, root)
             external_device_stop_required = False
@@ -4290,6 +4335,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--spread-profiled-joiners"] if args.spread_profiled_joiners else []),
+                *(["--external-session-join"] if args.external_session_join else []),
+                *(["--luckfox-join-max-size", str(args.luckfox_join_max_size)] if args.luckfox_join_max_size is not None else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--profiled-failure-stop-after",
                 str(args.profiled_failure_stop_after),
@@ -4361,6 +4408,8 @@ def main() -> int:
                 *(["--preflight-only"] if args.preflight_only else []),
                 *(["--profile-only-singletons"] if args.profile_only_singletons else []),
                 *(["--spread-profiled-joiners"] if args.spread_profiled_joiners else []),
+                *(["--external-session-join"] if args.external_session_join else []),
+                *(["--luckfox-join-max-size", str(args.luckfox_join_max_size)] if args.luckfox_join_max_size is not None else []),
                 *(["--no-aggregate"] if use_no_aggregate else []),
                 "--profiled-failure-stop-after",
                 str(args.profiled_failure_stop_after),
@@ -4461,7 +4510,7 @@ def main() -> int:
             },
         )
         if (
-            args.output_retention == "events-csv"
+            (args.output_retention == "events-csv" or args.external_session_join)
             and args.enable_external_devices
             and args.devices_file
             and not args.preflight_only

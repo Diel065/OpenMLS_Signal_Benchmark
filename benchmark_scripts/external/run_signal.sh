@@ -18,6 +18,7 @@ DEVICES_FILE="${DEVICES_FILE:-devices.json}"
 EXTERNAL_DEVICES="${EXTERNAL_DEVICES:-luckfox-pico-plus-01 raspberry-pi-01 raspberry-pi-3bplus-01}"
 EXTERNAL_WORKER_IDS="${EXTERNAL_WORKER_IDS:-pico-plus-00001 raspi5-00001 raspi3bp-00001}"
 SIGNAL_GROUP_MODEL="${SIGNAL_GROUP_MODEL:-pairwise}"
+EXTERNAL_SESSION_JOIN="${EXTERNAL_SESSION_JOIN:-0}"
 SCENARIO="${SCENARIO:-external-device-signal-${SIGNAL_GROUP_MODEL}-baseline}"
 RESOURCE_FAILURE_POLICY="${RESOURCE_FAILURE_POLICY:-remove-and-continue}"
 BUILD_IMAGES="${BUILD_IMAGES:-1}"
@@ -99,6 +100,9 @@ verify_signal_external_metrics() {
   for worker_id in $EXTERNAL_WORKER_IDS; do
     worker_args+=(--external-worker-id "$worker_id")
   done
+  if [ "$EXTERNAL_SESSION_JOIN" = "1" ]; then
+    worker_args+=(--external-session-join)
+  fi
 
   uv run --frozen --project "$REPO_ROOT" python "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
     "$run_dir/events.csv" \
@@ -129,15 +133,29 @@ external_device_args() {
 run_external_signal() {
   local iter="$1"
   local run_id="cal07_ext_signal_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
+  if [ "$EXTERNAL_SESSION_JOIN" = "1" ]; then
+    run_id="cal08_ext_signal_join_i${iter}_${DATE_TAG}_${SIGNAL_GROUP_MODEL}"
+  fi
   local run_dir="$OUTPUT_ROOT/$run_id"
   local scenario_seed singleton_selection_seed
-  local -a device_args build_args image_args
+  local -a device_args build_args image_args join_args
 
   scenario_seed="$(shuf -i 1-2147483647 -n 1)"
   singleton_selection_seed="$(shuf -i 1-2147483647 -n 1)"
 
   image_args=()
   build_args=()
+  join_args=()
+  [ "$EXTERNAL_SESSION_JOIN" = "1" ] && join_args=(--external-session-join)
+  if [ "$EXTERNAL_SESSION_JOIN" = "1" ] && [ -n "${LUCKFOX_JOIN_MAX_SIZE:-}" ]; then
+    if [ -z "${LUCKFOX_JOIN_CAP_REASON:-}" ]; then
+      echo "ERROR: LUCKFOX_JOIN_MAX_SIZE requires LUCKFOX_JOIN_CAP_REASON" >&2
+      return 2
+    fi
+    mkdir -p "$run_dir"
+    printf '%s\n' "$LUCKFOX_JOIN_CAP_REASON" > "$run_dir/luckfox_join_cap_reason.txt"
+    join_args+=(--luckfox-join-max-size "$LUCKFOX_JOIN_MAX_SIZE")
+  fi
   [ "$BUILD_IMAGES" = "1" ] && image_args=(--build-images)
   if [ "$BUILD_EXTERNAL_BINARIES" = "1" ]; then
     if ! command -v cargo >/dev/null 2>&1; then
@@ -163,6 +181,7 @@ run_external_signal() {
       --workers "$WORKERS" \
       --run-id "$run_id" \
       --group-model "$SIGNAL_GROUP_MODEL" \
+      "${join_args[@]}" \
       --scenario "$SCENARIO" \
       --scenario-seed "$scenario_seed" \
       --singleton-selection-seed "$singleton_selection_seed" \

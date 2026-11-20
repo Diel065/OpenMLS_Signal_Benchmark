@@ -125,6 +125,14 @@ struct Args {
     #[arg(long, action = ArgAction::SetTrue)]
     spread_profiled_joiners: bool,
 
+    /// Measure a fresh N-1-session join on each external device at every plateau.
+    #[arg(long, action = ArgAction::SetTrue)]
+    external_session_join: bool,
+
+    /// Explicit measured plateau cap after an evidenced Luckfox failure.
+    #[arg(long)]
+    luckfox_join_max_size: Option<usize>,
+
     #[arg(long, action = ArgAction::SetTrue)]
     no_aggregate: bool,
 
@@ -236,8 +244,22 @@ fn main() -> Result<()> {
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         profile_only_singletons: args.profile_only_singletons,
         spread_profiled_joiners: args.spread_profiled_joiners,
+        external_session_join: args.external_session_join,
+        luckfox_join_max_size: args.luckfox_join_max_size,
         no_aggregate: args.no_aggregate,
         profiled_failure_stop_after: args.profiled_failure_stop_after,
         worker_layout,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_join_is_off_by_default() {
+        let args = <Args as clap::Parser>::try_parse_from(["runner"]).unwrap();
+        assert!(!args.external_session_join);
+        assert!(args.luckfox_join_max_size.is_none());
+    }
 }

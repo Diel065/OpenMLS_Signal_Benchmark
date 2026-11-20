@@ -5,6 +5,7 @@ import argparse
 import csv
 import json
 import math
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -135,7 +136,136 @@ def failure_boundary(
     return (min(luckfox_targets) if luckfox_targets else None), errors
 
 
+def validate_external_join(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
+    run_dir = args.events.parent
+    plan = json.loads((run_dir / "scenario_plan.json").read_text())
+    if (plan.get("external_session_join") is not True or plan.get("group_model") != "pairwise"
+            or plan.get("plateau_order") != "ascending" or plan.get("spread_profiled_joiners")):
+        raise ValueError("expected an ascending external-session-join pairwise plan without spread joiners")
+    targets = expected_plateau_targets(args)
+    layout = json.loads(args.layout.read_text())
+    ids = set(args.external_worker_id)
+    clients = {c["client_id"]: c for c in layout["clients"] if c.get("profile_enabled")}
+    errors = []
+    if set(clients) != ids or any(clients[i].get("execution_backend") != "real_device" for i in ids & set(clients)):
+        errors.append("join profiling must cover exactly the selected external devices")
+    boundary, failures = failure_boundary(parse_failure_events(args.runner_events), ids,
+                                          args.luckfox_id, False)
+    errors.extend(failures)
+    cap = plan.get("luckfox_join_max_size")
+    if cap is not None:
+        reason = run_dir / "luckfox_join_cap_reason.txt"
+        if cap not in targets or not reason.is_file() or not reason.read_text().strip():
+            errors.append("Luckfox cap requires a planned plateau and recorded failure reason")
+    windows = defaultdict(list)
+    joins = defaultdict(list)
+    with args.events.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            key = (row.get("participant_id"), row.get("request_id"))
+            if row.get("benchmark_phase") == "application":
+                errors.append("application phase found in join-only run")
+            if row.get("measurement_plane") == "wrapper_total" and key[1]:
+                start = int(row["ts_unix_ns"])
+                windows[key].append((start, start + int(row["wall_ns"])))
+            if row.get("op") == "session_establish_pair_wrapper" and row.get("benchmark_operation") == "establish_session_external_join":
+                target = int(row["benchmark_target_size"])
+                if key[0] not in ids or target not in targets:
+                    errors.append(f"unexpected join device or plateau: {key[0]}/N={target}")
+                if row.get("measurement_plane") != "wrapper_total" or row.get("benchmark_phase") != "enrollment":
+                    errors.append(f"join row has the wrong measurement plane or phase: {key}")
+                joins[(key[0], target)].append({
+                    k: row.get(k, "") for k in (
+                        "request_id", "peer_id", "success", "new_session_established", "cpu_process_ns",
+                        "alloc_bytes", "wall_ns", "benchmark_active_size", "workflow_pair_index",
+                        "workflow_pair_count", "benchmark_workflow_id",
+                    )
+                })
+    one_time = set()
+    timing_errors = 0
+    with args.events.open(newline="", encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            key = (row.get("participant_id"), row.get("request_id"))
+            if not key[1]:
+                continue
+            timestamp = int(row["ts_unix_ns"])
+            if not any(start - 1_000_000 <= timestamp <= end + 1_000_000 for start, end in windows[key]):
+                timing_errors += 1
+            if row.get("benchmark_operation") == "establish_session_external_join":
+                present = row.get("classical_one_time_prekey_present", "").lower()
+                if present == "true":
+                    one_time.add(key)
+                elif present == "false":
+                    errors.append(f"join used a bundle without a classical one-time prekey: {key}")
+    if timing_errors:
+        errors.append(f"{timing_errors} request-tagged events fall outside their wrapper window (1 ms allowance)")
+    maintenance = defaultdict(list)
+    for line in (run_dir / "terminal_output.txt").read_text().splitlines():
+        marker = "[external-join-prekey] "
+        if marker not in line:
+            continue
+        record = json.loads(line.split(marker, 1)[1])
+        message = record["maintenance"]
+        fields = {k: int(v) for k, v in re.findall(r"\b(available|threshold|before|after|refill)=(\d+)", message)}
+        if "available" in fields and "threshold" in fields:
+            valid = fields["available"] > fields["threshold"]
+        else:
+            valid = all(k in fields for k in ("before", "after", "refill")) and fields["refill"] > 0 and fields["after"] > fields["before"]
+        if not valid:
+            errors.append(f"unverified prekey maintenance reply: {record}")
+        maintenance[(record["actor"], record["target"])].append(record)
+    coverage = []
+    for device in sorted(ids):
+        memory_path = run_dir / "device_memory" / f"{clients.get(device, {}).get('physical_worker_id', device)}.status.txt"
+        memory = memory_path.read_text() if memory_path.exists() else ""
+        peaks = re.findall(r"^VmHWM:\s+(\d+)\s+kB", memory, re.MULTILINE)
+        peak = int(peaks[0]) if len(peaks) == 1 else None
+        if not peak:
+            errors.append(f"missing unique worker peak RSS for {device}")
+        for target in targets:
+            rows = joins[(device, target)]
+            attrited = device == args.luckfox_id and (
+                (boundary is not None and target >= boundary) or (cap is not None and target > cap))
+            expected = target - 1
+            cell_errors = []
+            if attrited and rows:
+                cell_errors.append("rows above the explicit Luckfox cap must not be silently used")
+            if not attrited:
+                if cap is not None and target > cap and any(r["peer_id"] == args.luckfox_id for r in rows):
+                    cell_errors.append("capped Luckfox remains a join peer")
+                if len(rows) != expected or len({r["peer_id"] for r in rows}) != expected or any(r["peer_id"] == device for r in rows):
+                    cell_errors.append(f"expected exactly {expected} distinct-peer join rows, got {len(rows)}")
+                if ({int(r["workflow_pair_index"]) for r in rows} != set(range(expected))
+                        or len({r["benchmark_workflow_id"] for r in rows}) != 1
+                        or any(not r["benchmark_workflow_id"] or not r["request_id"] for r in rows)
+                        or len({r["request_id"] for r in rows}) != expected):
+                    cell_errors.append("incomplete or mixed join workflow")
+                for row in rows:
+                    if (row["success"].lower() != "true" or row["new_session_established"].lower() != "true"
+                            or int(row["benchmark_active_size"]) != target or int(row["workflow_pair_count"]) != expected
+                            or not all(positive(row[k]) for k in ("cpu_process_ns", "alloc_bytes", "wall_ns"))
+                            or (device, row["request_id"]) not in one_time):
+                        cell_errors.append(f"invalid fresh-session metrics or one-time bundle: {row['request_id']}")
+                calls = maintenance[(device, target)]
+                if len(calls) != expected or {r["peer"] for r in calls} != {r["peer_id"] for r in rows}:
+                    cell_errors.append("missing per-peer UpdateOneTimePrekeys evidence")
+            errors.extend(f"{device}/N={target}: {error}" for error in cell_errors)
+            coverage.append({
+                "participant_id": device, "operation": "establish_session_external_join", "target": target,
+                "eligible_rows": len(rows), "expected_rows": expected, "attrited": attrited,
+                "cpu_ms": sum(int(r["cpu_process_ns"]) for r in rows) / 1e6,
+                "alloc_mib": sum(int(r["alloc_bytes"]) for r in rows) / (1 << 20),
+                "wall_ms": sum(int(r["wall_ns"]) for r in rows) / 1e6,
+                "peak_rss_kib": peak, "errors": cell_errors,
+            })
+    return {"status": "fail" if errors else "pass", "expected_plateau_targets": targets,
+            "external_session_join": True, "context_window_errors": timing_errors,
+            "luckfox_failure_target": boundary, "luckfox_join_max_size": cap,
+            "coverage": coverage, "errors": errors}, errors
+
+
 def validate(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
+    if args.external_session_join:
+        return validate_external_join(args)
     if args.minimum_observations < 1:
         raise ValueError("minimum_observations must be positive")
     expected_targets = expected_plateau_targets(args)
@@ -325,6 +455,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--external-worker-id", action="append", required=True)
     parser.add_argument("--luckfox-id", default="pico-plus-00001")
     parser.add_argument("--allow-luckfox-attrition", action="store_true")
+    parser.add_argument("--external-session-join", action="store_true")
     parser.add_argument("--min-size", type=int, required=True)
     parser.add_argument("--max-size", type=int, required=True)
     parser.add_argument("--step-size", type=int, required=True)
@@ -351,6 +482,11 @@ def main() -> int:
     print(f"Signal external coverage: {summary['status'].upper()}")
     print(f"  expected plateau targets: {summary['expected_plateau_targets']}")
     for cell in summary["coverage"]:
+        if args.external_session_join:
+            print(f"  {cell['participant_id']} N={cell['target']}: rows={cell['eligible_rows']}/{cell['expected_rows']} "
+                  f"CPU={cell['cpu_ms']:.3f} ms alloc={cell['alloc_mib']:.3f} MiB peak_RSS={cell['peak_rss_kib']} KiB "
+                  f"attrited={cell['attrited']}")
+            continue
         print(
             f"  {cell['participant_id']} {cell['operation']}: "
             f"rows={cell['eligible_rows']} required={cell['required_cells']} "

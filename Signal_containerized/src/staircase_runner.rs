@@ -117,6 +117,8 @@ pub struct StaircaseConfig {
     pub http_pool_max_idle_per_host: usize,
     pub profile_only_singletons: bool,
     pub spread_profiled_joiners: bool,
+    pub external_session_join: bool,
+    pub luckfox_join_max_size: Option<usize>,
     pub worker_layout: Option<WorkerLayout>,
     pub no_aggregate: bool,
     pub profiled_failure_stop_after: usize,
@@ -1404,6 +1406,10 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         payload_sizes: String,
         min_external_samples_per_operation: usize,
         spread_profiled_joiners: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        external_session_join: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        luckfox_join_max_size: Option<usize>,
     }
     let scenario_plan = ScenarioPlan {
         group_model: config.group_model,
@@ -1418,6 +1424,8 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
         payload_sizes: config.payload_sizes.to_string(),
         min_external_samples_per_operation: config.min_profiled_samples_per_operation,
         spread_profiled_joiners: config.spread_profiled_joiners,
+        external_session_join: config.external_session_join.then_some(true),
+        luckfox_join_max_size: config.luckfox_join_max_size,
     };
     fs::write(
         run_dir.join("scenario_plan.json"),
@@ -1467,7 +1475,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
 
     let run_result = {
         let mut plateau_result = Ok(());
-        for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
+        'plateaus: for (plateau_idx, &target_size) in plateau_sequence.iter().enumerate() {
             eprintln!(
                 "\n=== Plateau {}/{} | target active participants = {} ===",
                 plateau_idx + 1,
@@ -1475,11 +1483,26 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
                 target_size
             );
 
+            let mut join_device_ids = external_density_ids.clone();
+            if config.external_session_join && config.luckfox_join_max_size.is_some_and(|cap| target_size > cap) {
+                join_device_ids.remove("pico-plus-00001");
+                if let Some(index) = active.iter().position(|worker| worker.id == "pico-plus-00001") {
+                    let capped = active.remove(index);
+                    for peer in &active {
+                        if let Err(error) = reset_session_pair(&http, &capped, peer).await {
+                            plateau_result = Err(error);
+                            break 'plateaus;
+                        }
+                    }
+                }
+                idle.retain(|worker| worker.id != "pico-plus-00001");
+                eprintln!("[external-join-cap] Luckfox capped at {:?}; target {} uses replacement peers", config.luckfox_join_max_size, target_size);
+            }
             let mut external_session_budget = external_density_ids
                 .iter()
                 .map(|worker_id| (worker_id.clone(), config.min_profiled_samples_per_operation))
                 .collect::<HashMap<_, _>>();
-            let external_session_budget_arg = (config.min_profiled_samples_per_operation > 0)
+            let external_session_budget_arg = (config.min_profiled_samples_per_operation > 0 || config.external_session_join)
                 .then_some(&mut external_session_budget);
             if let Err(e) = transition_to_size(
                 &http,
@@ -1499,6 +1522,18 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             {
                 plateau_result = Err(e);
                 break;
+            }
+
+            if config.external_session_join {
+                if let Err(error) = run_external_session_join(
+                    &http, &active, &join_device_ids, &mut fanout,
+                    plateau_idx + 1, target_size, &runner_events,
+                ).await {
+                    plateau_result = Err(error);
+                    break;
+                }
+                eprintln!("\n=== Plateau {} complete ===", target_size);
+                continue;
             }
 
             if config.min_profiled_samples_per_operation > 0 {
@@ -2362,6 +2397,12 @@ async fn establish_sessions(
                 return Err(error);
             }
         };
+        if cursor.operation == "establish_session_external_join"
+            && session_established_count(&establishment_message) != 1
+        {
+            return Err(anyhow!("external join {} -> {} did not establish exactly one new session: {}",
+                actor.id, peer.id, establishment_message));
+        }
         if profile && session_established_count(&establishment_message) > 0 {
             if let Some(remaining) = external_profile_budget
                 .as_deref_mut()
@@ -2456,15 +2497,23 @@ async fn establish_sessions(
                 &update_opks_command,
                 Some("prekey.maintenance_after_handshake"),
             );
-            if let Err(error) = send_cmd_expect_ok_fragment_with_context(
+            let maintenance_result = send_cmd_expect_ok_fragment_with_context(
                 http,
                 peer,
                 &update_opks_command,
                 "one-time prekey stock",
                 &update_opks_context,
             )
-            .await
-            {
+            .await;
+            if cursor.operation == "establish_session_external_join" {
+                if let Ok(message) = &maintenance_result {
+                    eprintln!("[external-join-prekey] {}", serde_json::json!({
+                        "actor": actor.id, "peer": peer.id, "target": conversation_size,
+                        "maintenance": message,
+                    }));
+                }
+            }
+            if let Err(error) = maintenance_result {
                 if runner_events.resource_sweep
                     && record_worker_oom_if_evidenced(
                         runner_events,
@@ -2529,6 +2578,39 @@ async fn reset_session_pair(
             &reset_context,
         )
         .await?;
+    }
+    Ok(())
+}
+
+async fn run_external_session_join(
+    http: &reqwest::Client,
+    active: &[WorkerSpec],
+    external_ids: &HashSet<String>,
+    fanout: &mut FanoutController,
+    plateau_index: usize,
+    target_size: usize,
+    runner_events: &RunnerEventLog,
+) -> Result<()> {
+    if active.len() != target_size
+        || active.iter().filter(|worker| external_ids.contains(&worker.id)).count() != external_ids.len()
+    {
+        return Err(anyhow!("external join requires all devices and exactly {} active participants", target_size));
+    }
+    for actor in active.iter().filter(|worker| external_ids.contains(&worker.id)) {
+        let peers: Vec<_> = active.iter().filter(|peer| peer.id != actor.id).cloned().collect();
+        for peer in &peers {
+            reset_session_pair(http, actor, peer).await?;
+        }
+        let cursor = BenchmarkCursor::new(
+            plateau_index, target_size, active.len(), "enrollment",
+            "establish_session_external_join",
+        );
+        let failed = establish_sessions(
+            http, actor, &peers, fanout, target_size, &cursor, true, runner_events, None,
+        ).await?;
+        if !failed.is_empty() {
+            return Err(anyhow!("external join {} failed for workers {:?}", actor.id, failed));
+        }
     }
     Ok(())
 }
@@ -4031,6 +4113,36 @@ fn external_profiled_client_ids(worker_layout: Option<&WorkerLayout>) -> HashSet
 }
 
 fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usize> {
+    if config.luckfox_join_max_size.is_some() && !config.external_session_join {
+        return Err(anyhow!("--luckfox-join-max-size requires --external-session-join"));
+    }
+    if config.external_session_join {
+        let external_ids = external_profiled_client_ids(config.worker_layout.as_ref());
+        if external_ids.is_empty() {
+            return Err(anyhow!("--external-session-join requires profile-enabled external devices"));
+        }
+        if let Some(cap) = config.luckfox_join_max_size {
+            if !external_ids.contains("pico-plus-00001") || cap < config.min_size
+                || cap > config.max_size.unwrap_or(worker_count)
+                || !config.plateau_sizes.contains(&cap)
+            {
+                return Err(anyhow!("Luckfox join cap must name a planned plateau with Luckfox selected"));
+            }
+            if cap < config.max_size.unwrap_or(worker_count)
+                && worker_count <= config.max_size.unwrap_or(worker_count)
+            {
+                return Err(anyhow!("Luckfox join cap requires a reserve worker to keep the final plateau size"));
+            }
+        }
+        if config.group_model != GroupModel::Pairwise || !config.profile_only_singletons
+            || config.spread_profiled_joiners || config.plateau_order != PlateauOrder::Ascending
+            || config.roundtrips != 1 || config.app_rounds != 0
+            || config.max_app_samples_per_payload != 0 || config.min_profiled_samples_per_operation != 0
+            || config.min_size < external_ids.len() + 1
+        {
+            return Err(anyhow!("--external-session-join requires pairwise, singleton profiling, ascending, one roundtrip, no spread joiners, no application/density samples, and initial space for all devices plus a peer"));
+        }
+    }
     if config.min_size == 0 {
         return Err(anyhow!("--min-size must be at least 1"));
     }
@@ -5496,6 +5608,174 @@ mod external_density_failure_tests {
                 let _ = fs::remove_dir_all(run_dir);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod external_join_tests {
+    use super::*;
+    use axum::{extract::State, routing::{get, post}, Json, Router};
+
+    type Requests = Arc<std::sync::Mutex<Vec<serde_json::Value>>>;
+
+    async fn command(
+        State(requests): State<Requests>,
+        Json(request): Json<serde_json::Value>,
+    ) -> Json<CommandResponse> {
+        let cmd = request["command"]["cmd"].as_str().unwrap().to_string();
+        requests.lock().unwrap().push(request);
+        Json(CommandResponse::ok(match cmd.as_str() {
+            "register_participant" => "registered",
+            "publish_prekey_bundle" => "prekeys stored locally",
+            "generate_prekey_bundle" => "prekey bundle generated and published",
+            "reset_sessions" => "sessions reset",
+            "establish_sessions" => "session establishment: new=1 existing=0 total_target=1",
+            "encrypt_message" => "encrypted and sent",
+            "decrypt_message" => "pairwise message received",
+            "update_one_time_prekeys" => "one-time prekey stock is above low watermark: available=64 threshold=20",
+            other => panic!("unexpected command {other}"),
+        }))
+    }
+
+    fn config(url: &str, directory: &Path) -> StaircaseConfig {
+        StaircaseConfig {
+            group_model: GroupModel::Pairwise, preflight_only: false,
+            kr_url: url.into(), relay_url: url.into(),
+            workers: vec![WorkerSpec::legacy("a".into(), url.into()), WorkerSpec::legacy("b".into(), url.into())],
+            min_size: 2, max_size: Some(2), step_size: StepSize::Fixed(1), plateau_sizes: vec![2],
+            step_size_switch_at: None, step_size_after_switch: None,
+            plateau_order: PlateauOrder::Ascending, roundtrips: 1, app_rounds: 0,
+            max_app_samples_per_payload: 0, min_profiled_samples_per_operation: 0,
+            payload_sizes: PayloadSizes::Fixed(vec![512]), run_id: "container-plan".into(),
+            scenario: "unit-check".into(), output_dir: directory.to_string_lossy().into_owned(),
+            worker_health_timeout_seconds: 2, worker_health_poll_ms: 1,
+            max_fanout_parallelism: 1, min_fanout_parallelism: 1, fanout_adaptive: Some(false),
+            fanout_error_rate_threshold: 0.0, fanout_p95_threshold_ms: 0,
+            http_pool_max_idle_per_host: 4, profile_only_singletons: true,
+            spread_profiled_joiners: false, external_session_join: false, luckfox_join_max_size: None,
+            worker_layout: None, no_aggregate: true, profiled_failure_stop_after: 0,
+        }
+    }
+
+    async fn server() -> (String, Requests, tokio::task::JoinHandle<()>) {
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let router = Router::new().route("/health", get(|| async { "ok" }))
+            .route("/command", post(command)).with_state(Arc::clone(&requests));
+        let task = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        (url, requests, task)
+    }
+
+    #[tokio::test]
+    async fn container_plan_and_commands_are_unchanged_with_flag_off() {
+        let (url, requests, task) = server().await;
+        let directory = std::env::temp_dir().join(format!("signal-join-container-plan-{}-{}", std::process::id(), url.rsplit(':').next().unwrap()));
+        let cfg = config(&url, &directory);
+        run_staircase_benchmark_async(cfg.clone()).await.unwrap();
+        let plan: serde_json::Value = serde_json::from_slice(&fs::read(directory.join("container-plan/scenario_plan.json")).unwrap()).unwrap();
+        assert_eq!(plan, serde_json::json!({
+            "group_model": "pairwise", "sender_key_removal_policy": null,
+            "run_id": "container-plan", "plateau_order": "ascending", "plateau_sequence": [2],
+            "min_size": 2, "max_size": 2, "step_size": "1", "plateau_sizes": [2],
+            "payload_sizes": "512", "min_external_samples_per_operation": 0,
+            "spread_profiled_joiners": false,
+        }));
+        assert_eq!(requests.lock().unwrap().len(), 14);
+        let mut forbidden = cfg;
+        forbidden.external_session_join = true;
+        assert!(validate_config(&forbidden, 2).unwrap_err().to_string().contains("requires profile-enabled external devices"));
+        task.abort();
+        let _ = task.await;
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_join_resets_all_pairs_then_establishes_exactly_n_minus_one() {
+        let (url, requests, task) = server().await;
+        let active: Vec<_> = ["device", "peer-a", "peer-b", "peer-c"].into_iter()
+            .map(|id| WorkerSpec::legacy(id.into(), url.clone())).collect();
+        let directory = std::env::temp_dir().join(format!("signal-join-helper-{}-{}", std::process::id(), url.rsplit(':').next().unwrap()));
+        fs::create_dir_all(&directory).unwrap();
+        let mut journal = RunnerEventLog::new(&directory, 0);
+        journal.external_devices = true;
+        run_external_session_join(
+            &reqwest::Client::new(), &active, &HashSet::from(["device".into()]),
+            &mut FanoutController::new(1, 1, false, 0.0, 0), 1, 4, &journal,
+        ).await.unwrap();
+        let rows = requests.lock().unwrap();
+        assert_eq!(rows.len(), 18);
+        assert!(rows[..6].iter().all(|row| row["command"]["cmd"] == "reset_sessions"));
+        let joins: Vec<_> = rows.iter().filter(|row| row["command"]["cmd"] == "establish_sessions").collect();
+        assert_eq!(joins.len(), 3);
+        for row in joins {
+            assert_eq!(row["command"]["profile"], true);
+            assert_eq!(row["benchmark_operation"], "establish_session_external_join");
+            assert_eq!(row["benchmark_target_size"], 4);
+            assert_eq!(row["benchmark_active_size"], 4);
+            assert_eq!(row["workflow_pair_count"], 3);
+        }
+        assert_eq!(rows.iter().filter(|row| row["command"]["cmd"] == "update_one_time_prekeys").count(), 3);
+        drop(rows);
+        task.abort();
+        let _ = task.await;
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn external_join_cap_replaces_luckfox_without_changing_plateau_size() {
+        let (url, requests, task) = server().await;
+        let directory = std::env::temp_dir().join(format!("signal-join-cap-{}-{}", std::process::id(), url.rsplit(':').next().unwrap()));
+        let mut cfg = config(&url, &directory);
+        cfg.workers = ["pico-plus-00001", "raspi5-00001", "a", "b", "c"].into_iter().map(|id| {
+            let mut worker = WorkerSpec::legacy(id.into(), url.clone());
+            worker.profile_enabled = id == "pico-plus-00001" || id == "raspi5-00001";
+            worker
+        }).collect();
+        cfg.min_size = 3;
+        cfg.max_size = Some(4);
+        cfg.plateau_sizes = vec![3, 4];
+        cfg.external_session_join = true;
+        cfg.luckfox_join_max_size = Some(3);
+        cfg.worker_layout = Some(serde_json::from_value(serde_json::json!({
+            "version": 1, "logical_worker_count": 5, "physical_worker_count": 5,
+            "layout_mode": "hybrid", "profile_policy": "external", "physical_workers": [],
+            "clients": cfg.workers.iter().map(|worker| serde_json::json!({
+                "client_id": worker.id, "physical_worker_id": worker.id,
+                "container_mode": "singleton", "profile_enabled": worker.profile_enabled,
+                "command_url": url, "health_url": url,
+                "execution_backend": if worker.profile_enabled { "real_device" } else { "docker" },
+            })).collect::<Vec<_>>(),
+        })).unwrap());
+        let mut unplanned_cap = cfg.clone();
+        unplanned_cap.plateau_sizes.clear();
+        assert!(validate_config(&unplanned_cap, 5).unwrap_err().to_string().contains("Luckfox join cap"));
+        assert!(validate_config(&cfg, 4).unwrap_err().to_string().contains("requires a reserve worker"));
+        run_staircase_benchmark_async(cfg).await.unwrap();
+        let rows = requests.lock().unwrap();
+        let joins: Vec<_> = rows.iter().filter(|row| row["command"]["cmd"] == "establish_sessions"
+            && row["benchmark_operation"] == "establish_session_external_join").collect();
+        assert_eq!(joins.len(), 7);
+        assert_eq!(joins.iter().filter(|row| row["benchmark_target_size"] == 3).count(), 4);
+        let final_join: Vec<_> = joins.iter().filter(|row| row["benchmark_target_size"] == 4).collect();
+        assert_eq!(final_join.len(), 3);
+        assert!(final_join.iter().all(|row| row["benchmark_active_size"] == 4));
+        assert!(final_join.iter().all(|row| row["command"]["participants"].as_array().unwrap()
+            .iter().all(|peer| peer != "pico-plus-00001")));
+        let enrollment: Vec<_> = rows.iter().filter(|row| {
+            let request_id = row["request_id"].as_str().unwrap();
+            row["command"]["cmd"] == "establish_sessions"
+                && row["benchmark_operation"] != "establish_session_external_join"
+                && (request_id.contains("pico-plus-00001") || request_id.contains("raspi5-00001"))
+        }).collect();
+        assert!(!enrollment.is_empty());
+        assert!(enrollment.iter().all(|row| row["command"]["profile"] == false));
+        assert!(rows.iter().filter(|row| row["benchmark_target_size"] == 4)
+            .all(|row| !row["request_id"].as_str().unwrap().contains("pico-plus-00001")));
+        drop(rows);
+        task.abort();
+        let _ = task.await;
+        fs::remove_dir_all(directory).unwrap();
     }
 }
 

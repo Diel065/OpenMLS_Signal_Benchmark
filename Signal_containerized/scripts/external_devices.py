@@ -257,14 +257,20 @@ class AdbDeviceBackend(DeviceBackend):
         self._adb(["pull", remote, str(local)])
 
     def _do_wipe(self, safe_run_id: str) -> None:
+        remote_results_root = self.config.worker.get("remote_results_root", "/results/signal")
+        remote_tmp = self.config.worker.get("remote_tmp", "/tmp/signal-benchmark")
+        for path in (remote_results_root, remote_tmp):
+            if (not isinstance(path, str) or not PurePosixPath(path).is_absolute()
+                    or not PurePosixPath(path).name or ".." in PurePosixPath(path).parts):
+                raise ValueError(f"unsafe device wipe path: {path!r}")
         self._ensure_selected()
         cmds = (
             f"set -e; "
             f"killall worker 2>/dev/null || pkill worker 2>/dev/null || true; "
-            f"rm -rf /results/signal/{shlex.quote(safe_run_id)}; "
-            f"mkdir -p /results/signal/{shlex.quote(safe_run_id)}; "
-            f"rm -rf /tmp/signal-benchmark; "
-            f"mkdir -p /tmp/signal-benchmark"
+            f"rm -rf {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"mkdir -p {shlex.quote(remote_results_root)}/{shlex.quote(safe_run_id)}; "
+            f"rm -rf {shlex.quote(remote_tmp)}; "
+            f"mkdir -p {shlex.quote(remote_tmp)}"
         )
         self._adb(["shell", cmds])
 

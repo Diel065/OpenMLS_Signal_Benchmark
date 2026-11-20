@@ -10,6 +10,7 @@ SIGNAL_DIR="$REPO_ROOT/Signal_containerized"
 OPENMLS_REGULAR="$SCRIPT_DIR/external/run_openmls.sh"
 OPENMLS_REMOVE_JOIN="$SCRIPT_DIR/external/run_openmls_remove_rejoin.sh"
 SIGNAL_REGULAR="$SCRIPT_DIR/external/run_signal.sh"
+SIGNAL_JOIN="$SCRIPT_DIR/external/run_signal_join.sh"
 
 OUTPUT_ROOT="${OUTPUT_ROOT:-/home/diel/openmls_external_benchmark_output}"
 DRY_RUN="${DRY_RUN:-0}"
@@ -44,6 +45,7 @@ SIGNAL_TARGETS="$PLATEAU_SIZES"
 OPENMLS_RUN="${OPENMLS_REGULAR_RUN:-}"
 OPENMLS_REMOVE_JOIN_RUN="${OPENMLS_REMOVE_JOIN_RUN:-}"
 SIGNAL_RUN="${SIGNAL_RUN:-}"
+SIGNAL_JOIN_RUN="${SIGNAL_JOIN_RUN:-}"
 
 stage_selected() {
   case ",$STAGES," in
@@ -62,9 +64,9 @@ validate_stage_list() {
   }
   for stage in "${requested[@]}"; do
     case "$stage" in
-      openmls|remove-rejoin|signal) ;;
+      openmls|remove-rejoin|signal|signal-join) ;;
       *)
-        echo "ERROR: unknown stage '$stage'; use openmls,remove-rejoin,signal" >&2
+        echo "ERROR: unknown stage '$stage'; use openmls,remove-rejoin,signal,signal-join" >&2
         return 1
         ;;
     esac
@@ -172,6 +174,18 @@ strict_signal_validation() {
     --minimum-observations "$MIN_EXTERNAL_SAMPLES_PER_OPERATION"
 }
 
+strict_signal_join_validation() {
+  local run_dir="$1"
+  require_plan_value "$run_dir" group_model pairwise
+  uv run --frozen --project "$REPO_ROOT" python "$SIGNAL_DIR/scripts/validate_external_device_coverage.py" \
+    "$run_dir/events.csv" --external-session-join \
+    --layout "$run_dir/worker_layout.json" --runner-events "$run_dir/runner-events.jsonl" \
+    --external-worker-id pico-plus-00001 --external-worker-id raspi5-00001 \
+    --external-worker-id raspi3bp-00001 --luckfox-id pico-plus-00001 \
+    --min-size "$SIGNAL_MIN_SIZE" --max-size "$SIGNAL_MAX_SIZE" --step-size "$SIGNAL_STEP_SIZE" \
+    --plateau-sizes "$SIGNAL_TARGETS" --payload-sizes 512 --expected-profiled-docker 0
+}
+
 require_reused_run() {
   local stage="$1"
   local run_dir="$2"
@@ -186,10 +200,13 @@ write_campaign_manifest() {
   ln -sfn "$OPENMLS_RUN" "$CAMPAIGN_DIR/openmls/regular"
   ln -sfn "$OPENMLS_REMOVE_JOIN_RUN" "$CAMPAIGN_DIR/openmls/remove-rejoin"
   ln -sfn "$SIGNAL_RUN" "$CAMPAIGN_DIR/signal"
+  if [ -n "$SIGNAL_JOIN_RUN" ]; then
+    ln -sfn "$SIGNAL_JOIN_RUN" "$CAMPAIGN_DIR/signal-join"
+  fi
 
   uv run --frozen --project "$REPO_ROOT" python - \
     "$CAMPAIGN_DIR" "$OPENMLS_RUN" "$OPENMLS_REMOVE_JOIN_RUN" "$SIGNAL_RUN" \
-    "$OPENMLS_TARGETS" "$MIN_EXTERNAL_SAMPLES_PER_OPERATION" <<'PY'
+    "$OPENMLS_TARGETS" "$MIN_EXTERNAL_SAMPLES_PER_OPERATION" "$SIGNAL_JOIN_RUN" <<'PY'
 import json
 import pathlib
 import sys
@@ -200,6 +217,7 @@ openmls_remove_rejoin = pathlib.Path(sys.argv[3]).resolve()
 signal = pathlib.Path(sys.argv[4]).resolve()
 plateaus = [int(value) for value in sys.argv[5].split(",")]
 minimum = int(sys.argv[6])
+signal_join = pathlib.Path(sys.argv[7]).resolve() if sys.argv[7] else None
 
 manifest = {
     "schema_version": 1,
@@ -214,6 +232,9 @@ manifest = {
         "signal": str(signal),
     },
 }
+if signal_join is not None:
+    manifest["runs"]["signal_join"] = str(signal_join)
+    manifest["signal_join_observation"] = "one measured join per device/plateau; exactly N-1 fresh pair wrappers"
 (campaign_dir / "campaign_manifest.json").write_text(
     json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
 )
@@ -224,6 +245,11 @@ PY
 }
 
 validate_stage_list
+if { stage_selected signal-join || [ -n "$SIGNAL_JOIN_RUN" ]; } && \
+   { [ "$CRYPTO_PROFILE" != "classical" ] || [ "$SIGNAL_GROUP_MODEL" != "pairwise" ]; }; then
+  echo "ERROR: the external Signal join stage requires classical/pairwise" >&2
+  exit 2
+fi
 retain_output  # checks OUTPUT_RETENTION, and xz for events-csv, before any stage
 [ "$PLATEAU_SIZES" = "$EXPECTED_PLATEAU_SIZES" ] || {
   echo "ERROR: production plateaus must be exactly $EXPECTED_PLATEAU_SIZES" >&2
@@ -235,7 +261,9 @@ retain_output  # checks OUTPUT_RETENTION, and xz for events-csv, before any stag
 }
 
 mkdir -p "$OUTPUT_ROOT"
-for required_script in "$OPENMLS_REGULAR" "$OPENMLS_REMOVE_JOIN" "$SIGNAL_REGULAR"; do
+required_scripts=("$OPENMLS_REGULAR" "$OPENMLS_REMOVE_JOIN" "$SIGNAL_REGULAR")
+if stage_selected signal-join; then required_scripts+=("$SIGNAL_JOIN"); fi
+for required_script in "${required_scripts[@]}"; do
   test -x "$required_script" || {
     echo "ERROR: required executable script is missing: $required_script" >&2
     exit 2
@@ -350,6 +378,28 @@ else
   strict_signal_validation "$SIGNAL_RUN"
 fi
 
+if stage_selected signal-join; then
+  previous="$(latest_run cal08_ext_signal_join_i1_ 2>/dev/null || true)"
+  run_command env \
+    OUTPUT_ROOT="$OUTPUT_ROOT" N=1 WORKERS=1024 \
+    MIN_SIZE="$SIGNAL_MIN_SIZE" MAX_SIZE="$SIGNAL_MAX_SIZE" STEP_SIZE="$SIGNAL_STEP_SIZE" \
+    PLATEAU_SIZES="$SIGNAL_TARGETS" \
+    STEP_SIZE_SWITCH_AT="$SIGNAL_MAX_SIZE" STEP_SIZE_AFTER_SWITCH="$SIGNAL_STEP_SIZE" \
+    BUILD_IMAGES="$BUILD_IMAGES" BUILD_EXTERNAL_BINARIES=0 \
+    CRYPTO_PROFILE="$CRYPTO_PROFILE" SIGNAL_GROUP_MODEL="$SIGNAL_GROUP_MODEL" \
+    OUTPUT_RETENTION="$OUTPUT_RETENTION" bash "$SIGNAL_JOIN"
+  if [ "$DRY_RUN" != "1" ]; then
+    SIGNAL_JOIN_RUN="$(latest_run cal08_ext_signal_join_i1_)"
+    [ "$SIGNAL_JOIN_RUN" != "$previous" ] || {
+      echo "ERROR: Signal join stage did not create a new run directory" >&2
+      exit 1
+    }
+    strict_signal_join_validation "$SIGNAL_JOIN_RUN"
+  fi
+elif [ -n "$SIGNAL_JOIN_RUN" ]; then
+  strict_signal_join_validation "$SIGNAL_JOIN_RUN"
+fi
+
 echo ""
 if [ "$DRY_RUN" = "1" ]; then
   echo "Dry run complete; no benchmark was started."
@@ -362,8 +412,10 @@ write_campaign_manifest
 if stage_selected openmls; then retain_output "$OPENMLS_RUN"; fi
 if stage_selected remove-rejoin; then retain_output "$OPENMLS_REMOVE_JOIN_RUN"; fi
 if stage_selected signal; then retain_output "$SIGNAL_RUN"; fi
+if stage_selected signal-join; then retain_output "$SIGNAL_JOIN_RUN"; fi
 
 echo "External-device campaign completed with strict coverage checks."
 echo "  OpenMLS: $OPENMLS_RUN"
 echo "  OpenMLS Remove/Join: $OPENMLS_REMOVE_JOIN_RUN"
 echo "  Signal: $SIGNAL_RUN"
+if [ -n "$SIGNAL_JOIN_RUN" ]; then echo "  Signal join: $SIGNAL_JOIN_RUN"; fi
