@@ -597,6 +597,8 @@ impl ProfileScope {
         let wall_ns = self.wall_start.elapsed().as_nanos();
         let cpu_thread_ns = self.cpu_start.map(|start| start.elapsed().as_nanos());
         let resource_end = ResourceSnapshot::capture_end();
+        // The throttle window spans both counter reads, so throttling during the end read stays inside it.
+        let throttle_window_ns = self.wall_start.elapsed().as_nanos();
         let process_cpu_ns = self
             .resource_start
             .process_cpu_start
@@ -611,8 +613,8 @@ impl ProfileScope {
         });
         let cpu_throttled_time_ratio =
             match (self.resource_start.throttled_ns, resource_end.throttled_ns) {
-                (Some(start), Some(end)) if wall_ns > 0 && end >= start => {
-                    Some((end - start) as f64 / wall_ns as f64)
+                (Some(start), Some(end)) if throttle_window_ns > 0 && end >= start => {
+                    Some((end - start) as f64 / throttle_window_ns as f64)
                 }
                 _ => None,
             };

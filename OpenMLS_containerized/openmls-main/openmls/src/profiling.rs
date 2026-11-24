@@ -1150,7 +1150,7 @@ pub struct ProfileEvent {
     pub cpu_process_ns: u128,
     // Quota-normalized span signal. Sub-period CFS bursts can make this exceed 1.
     pub cpu_envelope_utilization: Option<f64>,
-    // Shared cgroup throttled-time delta divided by span wall time; not a bounded fraction.
+    // Shared cgroup throttled-time delta divided by the window spanning both counter reads; bounded only on one CPU.
     pub cpu_throttled_time_ratio: Option<f64>,
     pub cpu_nr_periods_delta: Option<u64>,
     pub cpu_nr_throttled_delta: Option<u64>,
@@ -1610,6 +1610,7 @@ pub struct ProfileScope {
     op: String,
     implementation: String,
     wall_start: Instant,
+    throttle_window_start: Instant,
     cpu_start: Option<ThreadTime>,
     process_cpu_start: Option<ProcessTime>,
     resource_start: ResourceSnapshot,
@@ -1637,6 +1638,7 @@ impl ProfileScope {
 
         let process_allocation_start = process_snapshot();
         let structural_start = StructuralCounterSnapshot::capture();
+        let throttle_window_start = Instant::now();
         let resource_start = ResourceSnapshot::capture_start();
         CPU_STAT_BASELINE.get_or_init(|| resource_start.cpu_stat);
         let wall_start = Instant::now();
@@ -1647,6 +1649,7 @@ impl ProfileScope {
             op: op_name,
             implementation: implementation.into(),
             wall_start,
+            throttle_window_start,
             cpu_start,
             process_cpu_start,
             resource_start,
@@ -1684,6 +1687,8 @@ impl ProfileScope {
         let structural_counters =
             StructuralCounterSnapshot::capture().delta_since(self.structural_start);
         let resource_end = ResourceSnapshot::capture_end();
+        // The throttle window spans both counter reads, so throttling during either read stays inside it.
+        let throttle_window_ns = self.throttle_window_start.elapsed().as_nanos();
         let effective_cpu_limit = effective_cpu_limit_cores().unwrap_or(1.0);
         let cpu_envelope_utilization = if wall_ns > 0 && effective_cpu_limit > 0.0 {
             Some(cpu_process_ns as f64 / (wall_ns as f64 * effective_cpu_limit))
@@ -1705,8 +1710,8 @@ impl ProfileScope {
             |(periods, throttled, _)| (periods > 0).then_some(throttled as f64 / periods as f64),
         );
         let cpu_throttled_time_ratio = cpu_throttled_usec_delta
-            .filter(|_| wall_ns > 0)
-            .map(|microseconds| microseconds as f64 * 1_000.0 / wall_ns as f64);
+            .filter(|_| throttle_window_ns > 0)
+            .map(|microseconds| microseconds as f64 * 1_000.0 / throttle_window_ns as f64);
         let cpu_stat_cumulative = match (
             CPU_STAT_BASELINE.get().copied().flatten(),
             resource_end.cpu_stat,

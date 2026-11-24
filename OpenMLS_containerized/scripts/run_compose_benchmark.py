@@ -4073,6 +4073,13 @@ def main() -> int:
             profile_id = getattr(args, "resource_profile_id", None)
 
             is_parallel_sweep = resource_experiment in ("ram-app-heap-sweep", "cpu-quota-sweep")
+            # As in Signal: every singleton is profiled and gets exactly one profile, so no profile repeats or is dropped.
+            if is_parallel_sweep and not len(profiles) == len(singleton_ids) == args.profiled_singleton_count:
+                raise SystemExit(
+                    "OpenMLS resource sweeps require exactly one profile per profiled singleton. "
+                    f"Got {len(profiles)} profiles and {len(singleton_ids)} singleton containers, "
+                    f"expected {args.profiled_singleton_count} of each."
+                )
 
             if is_parallel_sweep:
                 profiles = select_all_profiles(profiles)

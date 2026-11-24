@@ -23,6 +23,8 @@ NOFILE_LIMIT="${NOFILE_LIMIT:-1048576}"
 WORKERS="${WORKERS:-1024}"
 PROFILED_SINGLETON_COUNT="${PROFILED_SINGLETON_COUNT:-10}"
 PROFILED_FAILURE_STOP_AFTER="${PROFILED_FAILURE_STOP_AFTER:-0}"
+# Non-limiting Docker memory envelope of the profiled heap-sweep singletons; trace files on a RAM file system count toward it.
+EMBEDDED_DOCKER_MEMORY="${EMBEDDED_DOCKER_MEMORY:-4g}"
 SINGLETON_MIN_COUNT="${SINGLETON_MIN_COUNT:-10}"
 SINGLETON_FRACTION="${SINGLETON_FRACTION:-0.000000001}"
 PACKED_PER_CONTAINER="${PACKED_PER_CONTAINER:-256}"
@@ -213,7 +215,7 @@ run_sweep() {
     --resource-failure-policy remove-and-continue \
     --cpu-affinity-mode "$mode" \
     --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
-    --embedded-docker-memory 4g \
+    --embedded-docker-memory "$EMBEDDED_DOCKER_MEMORY" \
     --cpu-sweep-fractions "$CPU_SWEEP_FRACTIONS" \
     --ram-app-heap-sweep-values "$OPENMLS_RAM_SWEEP_VALUES" \
     --health-timeout-seconds "$HEALTH_TIMEOUT" \
@@ -342,7 +344,7 @@ run_signal_sweep() {
         --resource-failure-policy "$ram_policy" \
         --strict-cpuset \
         --cpu-affinity-sample-seconds "$CPU_AFFINITY_SAMPLE" \
-        --embedded-docker-memory 4g \
+        --embedded-docker-memory "$EMBEDDED_DOCKER_MEMORY" \
         "${ram_args[@]}" \
         --health-timeout-seconds "$HEALTH_TIMEOUT" \
         --worker-health-timeout-seconds "$WORKER_HEALTH_TIMEOUT" \

@@ -3704,15 +3704,17 @@ async fn run_application_phase(
             .await;
 
             if let Err(error) = broadcast {
-                if record_worker_oom_if_evidenced(
-                    runner_events,
-                    &cursor,
-                    &actor,
-                    &error,
-                    "remove_active_actor_and_retry",
-                    active.iter().find(|worker| worker.id != actor.id),
-                )
-                .await?
+                // A batch fan-out error holds recipient failures only; its text must not remove the actor.
+                if error.downcast_ref::<BatchFanoutError>().is_none()
+                    && record_worker_oom_if_evidenced(
+                        runner_events,
+                        &cursor,
+                        &actor,
+                        &error,
+                        "remove_active_actor_and_retry",
+                        active.iter().find(|worker| worker.id != actor.id),
+                    )
+                    .await?
                 {
                     active.retain(|worker| worker.id != actor.id);
                     if runner_events.group_model == GroupModel::SenderKeys {

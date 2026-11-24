@@ -290,10 +290,12 @@ impl DeliveryService {
     }
 
     pub fn publish_welcome(&self, recipient: &str, welcome_bytes: Vec<u8>) {
-        self.inbox_queue(&self.welcome_inboxes, recipient)
-            .lock()
-            .unwrap()
-            .push_back(Arc::new(welcome_bytes));
+        let queue = self.inbox_queue(&self.welcome_inboxes, recipient);
+        let mut queue = queue.lock().unwrap();
+        // A client holds one group, so a newer Welcome supersedes an unconsumed one (left by an add whose actor
+        // failed after publishing it and whose joiners the runner re-adds).
+        queue.clear();
+        queue.push_back(Arc::new(welcome_bytes));
     }
 
     pub fn fetch_welcome(&self, recipient: &str) -> Option<Vec<u8>> {
@@ -488,5 +490,15 @@ mod tests {
         assert_eq!(first[0].epoch, 1);
         assert_eq!(first[0].commit_hex, hex::encode(b"commit-1"));
         assert!(ds.fetch_pending_commits("alice", 1).is_empty());
+    }
+
+    #[test]
+    fn newer_welcome_replaces_unconsumed_one() {
+        let ds = DeliveryService::with_delivery_mode(CommitDeliveryMode::GroupLog);
+        ds.publish_welcome("bob", b"welcome-1".to_vec());
+        ds.publish_welcome("bob", b"welcome-2".to_vec());
+
+        assert_eq!(ds.fetch_welcome("bob"), Some(b"welcome-2".to_vec()));
+        assert!(ds.fetch_welcome("bob").is_none());
     }
 }

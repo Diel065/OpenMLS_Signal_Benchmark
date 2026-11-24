@@ -6462,9 +6462,13 @@ async fn evict_oom_group_members(
             )
             .await?
             {
-                for worker in new_dead_workers {
-                    dead_ids.insert(worker.id);
-                }
+                // The eviction commit is merged; its removed members must not be looked for again.
+                active.retain(|worker| !dead_ids.contains(&worker.id));
+                dead_ids = new_dead_workers.into_iter().map(|worker| worker.id).collect();
+                eprintln!(
+                    "[oom-eviction] recipient(s) failed after merged eviction commit; actor={} evicting next: {:?}",
+                    actor.id, dead_ids
+                );
                 continue;
             }
             if runner_events.resource_sweep {

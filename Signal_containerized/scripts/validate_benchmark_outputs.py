@@ -6,9 +6,8 @@ import csv
 import json
 import os
 import sys
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 MIN_PROFILE_SCHEMA_VERSION = 3
@@ -164,6 +163,29 @@ def validate_run(
         result.add_error("missing events.csv")
         return result
 
+    # One streaming pass with small aggregates, because heap-sweep events.csv files reach several GB.
+    # The group model is known only after the pass, so the wrapper and send aggregates cover both models.
+    candidate_wrappers = {
+        "session_establish_pair_wrapper",
+        "sender_key_send_wrapper",
+        "sender_key_receive_wrapper",
+        "pairwise_fanout_send_wrapper",
+        "pairwise_fanout_receive_wrapper",
+    }
+    candidate_send_ops = {"signal_application_message_create.total", "pairwise_fanout_send_wrapper"}
+    profile_row_count = 0
+    run_ids: Set[str] = set()
+    schema_versions: Set[int] = set()
+    models: Set[str] = set()
+    sender_key_op_seen = False
+    observed_wrappers: Set[str] = set()
+    unsuccessful_wrappers: List[str] = []
+    # (wrapper, workflow id) -> [row count, workflow_pair_count values, all rows on real_device]
+    workflows: Dict[Tuple[str, str], List[Any]] = {}
+    # (send op, participant, workflow id) -> [row count, first benchmark_active_size, workflow_pair_count values]
+    send_totals: Dict[Tuple[str, Optional[str], str], List[Any]] = {}
+    seen_spans: Set[str] = set()
+    span_warnings: List[str] = []
     with open(events_path, "r", newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         headers = set(reader.fieldnames or [])
@@ -171,68 +193,98 @@ def validate_run(
         if missing_columns:
             result.add_error(f"missing required CSV columns: {missing_columns}")
             return result
-        rows = list(reader)
-    result.csv_row_count = len(rows)
-    if not rows:
+        for row in reader:
+            result.csv_row_count += 1
+            if not present(row.get("op")):
+                continue
+            profile_row_count += 1
+            row_number = profile_row_count + 1
+            if present(row.get("run_id")):
+                run_ids.add(row["run_id"])
+
+            schema = integer(row, "profile_schema_version")
+            if schema is None:
+                result.add_error(f"row {row_number} ({row.get('op')}): invalid profile_schema_version")
+            else:
+                schema_versions.add(schema)
+                if schema < MIN_PROFILE_SCHEMA_VERSION:
+                    result.add_error(
+                        f"row {row_number} ({row.get('op')}): stale schema {schema}; "
+                        f"requires >= {MIN_PROFILE_SCHEMA_VERSION}"
+                    )
+
+            validate_numeric_nonnegative(result, row, row_number, "wall_ns")
+            validate_numeric_nonnegative(result, row, row_number, "cpu_thread_ns", required=False)
+            validate_numeric_nonnegative(result, row, row_number, "cpu_process_ns", required=False)
+            validate_numeric_nonnegative(result, row, row_number, "alloc_bytes", required=False)
+            validate_numeric_nonnegative(result, row, row_number, "alloc_count", required=False)
+
+            span_name = row.get("span_name", "")
+            if span_name:
+                result.observed_spans.add(span_name)
+            op = row.get("op", "")
+            if op:
+                result.observed_operations.add(op)
+
+            measurement_class = row.get("measurement_class", "")
+            span_layer = row.get("span_layer", "")
+            if measurement_class == "protocol" or span_layer == "protocol_core":
+                result.protocol_core_row_count += 1
+            if span_layer == "benchmark_wrapper" or op in WRAPPER_SPANS:
+                result.wrapper_row_count += 1
+
+            success_val = row.get("success", "")
+            if not present(success_val):
+                result.add_warning(f"row {row_number} ({row.get('op')}): missing success field")
+            elif truthy(success_val) is False:
+                result.add_warning(
+                    f"row {row_number} ({row.get('op')}): operation failed (success=false)"
+                )
+
+            if not present(row.get("protocol_stack")):
+                result.add_error(f"row {row_number} ({row.get('op')}): missing protocol_stack")
+            if not present(row.get("implementation")):
+                result.add_error(f"row {row_number} ({row.get('op')}): missing implementation")
+
+            models.add(row.get("group_model", "pairwise"))
+            sender_key_op_seen = sender_key_op_seen or "sender_key" in op
+            subtype = row.get("event_subtype")
+            if subtype in candidate_wrappers:
+                observed_wrappers.add(subtype)
+                if truthy(row.get("success")) is not True:
+                    unsuccessful_wrappers.append(subtype)
+                workflow_id = row.get("benchmark_workflow_id")
+                if present(workflow_id):
+                    workflow = workflows.setdefault((subtype, workflow_id), [0, set(), True])
+                    workflow[0] += 1
+                    workflow[1].add(integer(row, "workflow_pair_count"))
+                    workflow[2] = workflow[2] and row.get("execution_backend") == "real_device"
+            if (op in candidate_send_ops
+                    and row.get("benchmark_phase") == "application"
+                    and present(row.get("benchmark_workflow_id"))):
+                totals = send_totals.setdefault(
+                    (op, row.get("participant_id"), row["benchmark_workflow_id"]),
+                    [0, integer(row, "benchmark_active_size"), set()],
+                )
+                totals[0] += 1
+                totals[2].add(integer(row, "workflow_pair_count"))
+
+            if not span_name:
+                span_warnings.append(f"row with op={op} has no span_name")
+            seen_spans.add(span_name or op)
+
+    if not result.csv_row_count:
         result.add_error("events.csv contains no rows")
         return result
-
-    profile_rows = [row for row in rows if present(row.get("op"))]
-    if not profile_rows:
+    if not profile_row_count:
         result.add_error("events.csv contains only header or empty rows with no 'op' field")
         return result
 
-    run_ids = {row["run_id"] for row in profile_rows if present(row.get("run_id"))}
+    # First error, as in the former order (run ids were checked before the row loop).
     if len(run_ids) != 1:
-        result.add_error(f"expected one nonblank run_id, found {sorted(run_ids)}")
+        result.errors.insert(0, f"expected one nonblank run_id, found {sorted(run_ids)}")
     else:
         result.run_id = next(iter(run_ids))
-
-    schema_versions: Set[int] = set()
-    for row_number, row in enumerate(profile_rows, start=2):
-        schema = integer(row, "profile_schema_version")
-        if schema is None:
-            result.add_error(f"row {row_number} ({row.get('op')}): invalid profile_schema_version")
-        else:
-            schema_versions.add(schema)
-            if schema < MIN_PROFILE_SCHEMA_VERSION:
-                result.add_error(
-                    f"row {row_number} ({row.get('op')}): stale schema {schema}; "
-                    f"requires >= {MIN_PROFILE_SCHEMA_VERSION}"
-                )
-
-        validate_numeric_nonnegative(result, row, row_number, "wall_ns")
-        validate_numeric_nonnegative(result, row, row_number, "cpu_thread_ns", required=False)
-        validate_numeric_nonnegative(result, row, row_number, "cpu_process_ns", required=False)
-        validate_numeric_nonnegative(result, row, row_number, "alloc_bytes", required=False)
-        validate_numeric_nonnegative(result, row, row_number, "alloc_count", required=False)
-
-        span_name = row.get("span_name", "")
-        if span_name:
-            result.observed_spans.add(span_name)
-        op = row.get("op", "")
-        if op:
-            result.observed_operations.add(op)
-
-        measurement_class = row.get("measurement_class", "")
-        span_layer = row.get("span_layer", "")
-        if measurement_class == "protocol" or span_layer == "protocol_core":
-            result.protocol_core_row_count += 1
-        if span_layer == "benchmark_wrapper" or op in WRAPPER_SPANS:
-            result.wrapper_row_count += 1
-
-        success_val = row.get("success", "")
-        if not present(success_val):
-            result.add_warning(f"row {row_number} ({row.get('op')}): missing success field")
-        elif truthy(success_val) is False:
-            result.add_warning(
-                f"row {row_number} ({row.get('op')}): operation failed (success=false)"
-            )
-
-        if not present(row.get("protocol_stack")):
-            result.add_error(f"row {row_number} ({row.get('op')}): missing protocol_stack")
-        if not present(row.get("implementation")):
-            result.add_error(f"row {row_number} ({row.get('op')}): missing implementation")
 
     if schema_versions:
         result.schema_version = max(schema_versions)
@@ -246,11 +298,7 @@ def validate_run(
     if result.wrapper_row_count == result.csv_row_count and result.csv_row_count > 0:
         result.add_error("all rows are benchmark_wrapper only; no protocol subspans present")
 
-    observed_op_families = {
-        row.get("op", "").split(".")[0]
-        for row in profile_rows
-        if present(row.get("op"))
-    }
+    observed_op_families = {op.split(".")[0] for op in result.observed_operations}
 
     required_core_ops = {
         "signal_session_establish",
@@ -263,21 +311,18 @@ def validate_run(
             f"missing required Signal core operation families: {sorted(missing_core)}"
         )
 
-    models = {row.get("group_model", "pairwise") for row in profile_rows}
     if len(models) != 1 or not models <= {"pairwise", "sender_keys"}:
         result.add_error(f"invalid or mixed group_model values: {sorted(models)}")
     sender_keys = models == {"sender_keys"}
-    if not sender_keys and any("sender_key" in row.get("op", "") for row in profile_rows):
+    if not sender_keys and sender_key_op_seen:
         result.add_error("Sender Keys operations require group_model=sender_keys")
     required_wrappers = {
         "session_establish_pair_wrapper",
         "sender_key_send_wrapper" if sender_keys else "pairwise_fanout_send_wrapper",
         "sender_key_receive_wrapper" if sender_keys else "pairwise_fanout_receive_wrapper",
     }
-    wrapper_rows = [row for row in profile_rows if row.get("event_subtype") in required_wrappers]
     if sender_keys and "signal_sender_key_onboarding" not in observed_op_families:
         result.add_error("missing Sender Keys onboarding measurements")
-    observed_wrappers = {row.get("event_subtype") for row in wrapper_rows}
     missing_wrappers = required_wrappers - observed_wrappers
     if missing_wrappers:
         result.add_error(f"missing required wrapper rows: {sorted(missing_wrappers)}")
@@ -286,15 +331,12 @@ def validate_run(
             external_density = int(json.load(handle).get("min_external_samples_per_operation", 0)) > 0
     except (OSError, ValueError, TypeError, AttributeError):
         external_density = False
-    workflows = defaultdict(list)
-    for row in wrapper_rows:
-        if truthy(row.get("success")) is not True:
-            result.add_error(f"required wrapper row success is not true: {row.get('event_subtype')}")
-        workflow_id = row.get("benchmark_workflow_id")
-        if present(workflow_id):
-            workflows[(row.get("event_subtype"), workflow_id)].append(row)
-    for (wrapper, workflow_id), rows_for_workflow in workflows.items():
-        counts = {integer(row, "workflow_pair_count") for row in rows_for_workflow}
+    for wrapper in unsuccessful_wrappers:
+        if wrapper in required_wrappers:
+            result.add_error(f"required wrapper row success is not true: {wrapper}")
+    for (wrapper, workflow_id), (row_count, counts, real_device_only) in workflows.items():
+        if wrapper not in required_wrappers:
+            continue
         if len(counts) != 1 or None in counts:
             result.add_error(f"workflow {workflow_id} ({wrapper}) has invalid workflow_pair_count values")
             continue
@@ -302,27 +344,22 @@ def validate_run(
         sampled_external_setup = (
             external_density
             and wrapper == "session_establish_pair_wrapper"
-            and all(row.get("execution_backend") == "real_device" for row in rows_for_workflow)
-            and 0 < len(rows_for_workflow) < expected
+            and real_device_only
+            and 0 < row_count < expected
         )
-        if len(rows_for_workflow) != expected and not sampled_external_setup:
+        if row_count != expected and not sampled_external_setup:
             result.add_error(
-                f"workflow {workflow_id} ({wrapper}) row count {len(rows_for_workflow)} != workflow_pair_count {expected}"
+                f"workflow {workflow_id} ({wrapper}) row count {row_count} != workflow_pair_count {expected}"
             )
 
-    send_totals = defaultdict(list)
     send_op = "signal_application_message_create.total" if sender_keys else "pairwise_fanout_send_wrapper"
-    for row in profile_rows:
-        if (row.get("op") == send_op
-                and row.get("benchmark_phase") == "application"
-                and present(row.get("benchmark_workflow_id"))):
-            send_totals[(row.get("participant_id"), row["benchmark_workflow_id"])].append(row)
-    for (_, workflow), totals in send_totals.items():
-        population = integer(totals[0], "benchmark_active_size")
+    for (total_op, _, workflow), (row_count, population, pair_counts) in send_totals.items():
+        if total_op != send_op:
+            continue
         expected = 1 if sender_keys else (population - 1 if population else None)
-        if expected is not None and len(totals) != expected:
-            result.add_error(f"logical send {workflow} has {len(totals)} totals; expected {expected}")
-        if any(integer(row, "workflow_pair_count") != expected for row in totals):
+        if expected is not None and row_count != expected:
+            result.add_error(f"logical send {workflow} has {row_count} totals; expected {expected}")
+        if pair_counts - {expected}:
             result.add_error(f"logical send {workflow} has incorrect workflow_pair_count")
 
     prekey_ops = {"signal_prekey_bundle_create", "signal_prekey_maintenance"}
@@ -333,13 +370,7 @@ def validate_run(
             f"(may be acceptable if prekeys are pre-provisioned)"
         )
 
-    seen_spans = set()
-    for row in profile_rows:
-        span_name = row.get("span_name", "")
-        op = row.get("op", "")
-        if not span_name and op:
-            result.add_warning(f"row with op={op} has no span_name")
-        seen_spans.add(span_name or op)
+    result.warnings.extend(span_warnings)
 
     if seen_spans & WRAPPER_SPANS and not (seen_spans - WRAPPER_SPANS):
         result.add_error("only wrapper spans found; no Signal protocol subspans present")
